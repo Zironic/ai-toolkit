@@ -215,7 +215,7 @@ export default function SampleImageViewer({
                   <div className="absolute inset-0 grid place-items-center overflow-auto mr-4">
                     <div className="w-full">
                       <span className="text-gray-400 mr-1">Prompt:</span>
-                      <span className="whitespace-pre-wrap break-words">{sampleItem.prompt}</span>
+                      <span className="text-gray-100 whitespace-pre-wrap break-words">{sampleItem.prompt}</span>
                     </div>
                   </div>
                 )}
@@ -235,13 +235,13 @@ export default function SampleImageViewer({
 
               <div className="text-xs">
                 <div>
-                  <span className="text-gray-400">Step:</span> {imgInfo.step.toLocaleString()}
+                  <span className="text-gray-400">Step:</span> <span className="text-gray-100">{imgInfo.step.toLocaleString()}</span>
                 </div>
                 <div>
-                  <span className="text-gray-400">Sample #:</span> {imgInfo.promptIdx + 1}
+                  <span className="text-gray-400">Sample #:</span> <span className="text-gray-100">{imgInfo.promptIdx + 1}</span>
                 </div>
                 <div>
-                  <span className="text-gray-400">Seed:</span> {seed}
+                  <span className="text-gray-400">Seed:</span> <span className="text-gray-100">{seed}</span>
                 </div>
               </div>
             </div>
