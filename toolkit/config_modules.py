@@ -32,7 +32,7 @@ class SaveConfig:
 
 class LoggingConfig:
     def __init__(self, **kwargs):
-        self.log_every: int = kwargs.get('log_every', 100)
+        self.log_every: int = kwargs.get('performance_log_every', 10)
         self.verbose: bool = kwargs.get('verbose', False)
         self.use_wandb: bool = kwargs.get('use_wandb', False)
         self.use_ui_logger: bool = kwargs.get('use_ui_logger', False)
