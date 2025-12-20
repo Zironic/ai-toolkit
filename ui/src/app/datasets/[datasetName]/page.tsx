@@ -24,9 +24,23 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       .then((res: any) => {
         const data = res.data;
         console.log('Images:', data.images);
-        // sort
-        data.images.sort((a: { img_path: string }, b: { img_path: string }) => a.img_path.localeCompare(b.img_path));
-        setImgList(data.images);
+
+        // Defensive handling: ensure we have an array of images and each image path is a string.
+        let images: { img_path: string }[] = [];
+        if (Array.isArray(data.images)) {
+          images = data.images
+            .map((img: any) => {
+              // some backends may accidentally return parsed objects; coerce to string safely
+              const imgPath = img && typeof img.img_path === 'string' ? img.img_path : String(img?.img_path ?? img?.path ?? img ?? '');
+              return { img_path: imgPath };
+            })
+            .filter((i: { img_path: string }) => i.img_path.length > 0);
+
+          // sort safely
+          images.sort((a: { img_path: string }, b: { img_path: string }) => a.img_path.localeCompare(b.img_path));
+        }
+
+        setImgList(images);
         setStatus('success');
       })
       .catch(error => {
@@ -100,7 +114,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
           </Button>
         </div>
         <div>
-          <h1 className="text-lg">Dataset: {datasetName}</h1>
+          <h1 className="text-lg">Dataset: {String(datasetName)}</h1>
         </div>
         <div className="flex-1"></div>
         <div>
@@ -116,12 +130,12 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         {PageInfoContent}
         {status === 'success' && imgList.length > 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-            {imgList.map(img => (
+            {imgList.map((img, idx) => (
               <DatasetImageCard
-                key={img.img_path}
+                key={img.img_path || String(idx)}
                 alt="image"
-                imageUrl={img.img_path}
-                onDelete={() => refreshImageList(datasetName)}
+                imageUrl={String(img.img_path)}
+                onDelete={() => refreshImageList(String(datasetName))}
               />
             ))}
           </div>
