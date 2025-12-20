@@ -32,14 +32,41 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const fetchCaption = async () => {
     if (isGettingCaption.current || isCaptionLoaded) return;
     isGettingCaption.current = true;
+    // coerce imageUrl to string to avoid crashes when the backend returns non-string values
+    const safeImageUrl = String(imageUrl || '');
+
     apiClient
-      .post(`/api/caption/get`, { imgPath: imageUrl })
+      .post(`/api/caption/get`, { imgPath: safeImageUrl })
       .then(res => res.data)
       .then(data => {
         console.log('Caption fetched:', data);
+        // If the server returned an object (JSON), stringify it so the UI shows useful content
+        let captionText: string;
+        if (data && typeof data === 'object') {
+          try {
+            captionText = JSON.stringify(data, null, 2);
+          } catch (e) {
+            captionText = String(data);
+          }
+        } else if (typeof data === 'string') {
+          // If the server returned a JSON string, try to parse + pretty-print it; otherwise use raw string
+          const s = data.trim();
+          if (s.startsWith('{') || s.startsWith('[')) {
+            try {
+              const parsed = JSON.parse(s);
+              captionText = typeof parsed === 'string' ? parsed : JSON.stringify(parsed, null, 2);
+            } catch (e) {
+              captionText = s;
+            }
+          } else {
+            captionText = s;
+          }
+        } else {
+          captionText = String(data ?? '');
+        }
 
-        setCaption(data || '');
-        setSavedCaption(data || '');
+        setCaption(captionText);
+        setSavedCaption(captionText);
         setIsCaptionLoaded(true);
       })
       .catch(error => {
@@ -53,8 +80,10 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const saveCaption = () => {
     const trimmedCaption = caption.trim();
     if (trimmedCaption === savedCaption) return;
+    // coerce imageUrl to string just in case
+    const safeImageUrl = String(imageUrl || '');
     apiClient
-      .post('/api/img/caption', { imgPath: imageUrl, caption: trimmedCaption })
+      .post('/api/img/caption', { imgPath: safeImageUrl, caption: trimmedCaption })
       .then(res => res.data)
       .then(data => {
         console.log('Caption saved:', data);
@@ -134,7 +163,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             <>
               {isItAVideo ? (
                 <video
-                  src={`/api/img/${encodeURIComponent(imageUrl)}`}
+                  src={`/api/img/${encodeURIComponent(String(imageUrl || ''))}`}
                   className={`w-full h-full object-contain`}
                   autoPlay={false}
                   loop
@@ -143,7 +172,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                 />
               ) : (
                 <img
-                  src={`/api/img/${encodeURIComponent(imageUrl)}`}
+                  src={`/api/img/${encodeURIComponent(String(imageUrl || ''))}`}
                   alt={alt}
                   onLoad={handleLoad}
                   className={`w-full h-full object-contain transition-opacity duration-300 ${
@@ -187,8 +216,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           </div>
         </div>
         {inViewport && isVisible && (
-          <div className="text-xs text-gray-100 bg-gray-950 mt-1 absolute bottom-0 left-0 p-1 opacity-25 hover:opacity-90 transition-opacity duration-300 w-full">
-            {imageUrl}
+            <div className="text-xs text-gray-100 bg-gray-950 mt-1 absolute bottom-0 left-0 p-1 opacity-25 hover:opacity-90 transition-opacity duration-300 w-full">
+            {String(imageUrl || '')}
           </div>
         )}
       </div>

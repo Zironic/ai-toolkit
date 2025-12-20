@@ -30,8 +30,8 @@ export default function Datasets() {
       title: 'Dataset Name',
       key: 'name',
       render: row => (
-        <Link href={`/datasets/${row.name}`} className="text-gray-200 hover:text-gray-100">
-          {row.name}
+        <Link href={`/datasets/${encodeURIComponent(String(row.name))}`} className="text-gray-200 hover:text-gray-100">
+          {String(row.name)}
         </Link>
       ),
     },
@@ -42,7 +42,7 @@ export default function Datasets() {
       render: row => (
         <button
           className="text-gray-200 hover:bg-red-600 p-2 rounded-full transition-colors"
-          onClick={() => handleDeleteDataset(row.name)}
+            onClick={() => handleDeleteDataset(String(row.name))}
         >
           <FaRegTrashAlt />
         </button>
