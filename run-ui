@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# run-ui - forward to UI npm scripts
+# Usage: ./run-ui [npm-script] [args]
+# Example: ./run-ui (defaults to build_and_start)
+# Example: ./run-ui test:caption --silent
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/ui" || exit 1
+
+if [ "$#" -lt 1 ]; then
+  npm run build_and_start
+  exit $?
+fi
+
+# Pass the script name and arguments: npm run <script> -- <args>
+SCRIPT="$1"
+shift
+if [ "$#" -eq 0 ]; then
+  npm run "$SCRIPT"
+else
+  npm run "$SCRIPT" -- "$@"
+fi

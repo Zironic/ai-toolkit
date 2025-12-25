@@ -14,6 +14,27 @@ All of these people / organizations are the ones who selflessly make this projec
 
 _Last updated: 2025-12-17 22:19 UTC_
 
+---
+
+## Developer shortcuts 🔧
+Use the convenience scripts in the repository root to run UI npm scripts without remembering the path.
+
+- Windows (cmd):
+  - run-ui [npm-script] [args]
+  - Example: run-ui (defaults to `build_and_start`)
+  - Example: run-ui test:caption --silent
+- PowerShell:
+  - .\run-ui.ps1 [npm-script] [args]
+  - Example: .\run-ui.ps1 (defaults to `build_and_start`)
+  - Example: .\run-ui.ps1 test:caption --silent
+- Unix (bash):
+  - ./run-ui [npm-script] [args]
+  - Example: ./run-ui (defaults to `build_and_start`)
+  - Example: ./run-ui test:caption --silent
+
+These scripts forward the command to the `ui` project so you don't have to `cd ui` first; when used without arguments they will run `npm run build_and_start` which installs, updates the DB, builds, and starts the UI.
+
+
 <p align="center">
 <a href="https://x.com/NuxZoe" target="_blank" rel="noopener noreferrer"><img src="https://pbs.twimg.com/profile_images/1919488160125616128/QAZXTMEj_400x400.png" alt="a16z" width="280" height="280" style="border-radius:8px;margin:5px;display: inline-block;"></a>
 <a href="https://github.com/replicate" target="_blank" rel="noopener noreferrer"><img src="https://avatars.githubusercontent.com/u/60410876?v=4" alt="Replicate" width="280" height="280" style="border-radius:8px;margin:5px;display: inline-block;"></a>

@@ -125,16 +125,36 @@ save_loss_json: false  # when true, write a per-save-step JSON report to the sav
 
 - Defaults are conservative: per-example logging disabled; dataset summaries enabled.
 
+**Note on logging behavior:** Per-example logging is intentionally limited to *simple runs* (when a single batch is processed and both `gradient_accumulation` and `gradient_accumulation_steps` are 1). This avoids producing partial or misleading per-example logs when the training uses gradient accumulation or multi-batch processing.
+
+---
+
+## Status & Progress ✅
+- Implemented: `toolkit/util/loss_utils.py` (StreamingAggregator, `per_sample_from_loss_tensor`, `compute_per_example_loss`, `evaluate_dataset`, `run_dataset_evaluation`). ✅
+- Implemented: Trainer wiring in `extensions_built_in/sd_trainer/SDTrainer.py` to capture per-example CPU losses and to **only log** per-example entries for simple runs (single batch, no gradient accumulation). ✅
+- Implemented: Streaming per-save-step JSON outputs in `jobs/process/BaseSDTrainProcess.py` when `TrainConfig.save_loss_json` is true. ✅
+- Tests added and passing: unit tests for aggregator, per-sample loss, evaluate->JSON, integration save JSON, trainer logging helper. ✅
+- Dev UX: Added `run-ui` shortcuts (bat/ps1/bash) and README guidance to run UI scripts easily (defaults to `build_and_start`). ✅
+
 ---
 
 ## Tests & Acceptance Criteria ✅
-- Numerical parity: `compute_per_example_loss(...).losses.mean()` matches the scalar loss used in current training (within floating tolerance).
+- Numerical parity: `compute_per_example_loss(...).mean()` matches the scalar loss used in training.
 - Aggregation correctness: `aggregate_by_dataset` calculates means, medians, and top-k correctly.
 - Caption detection: unit tests flag synthetic bad captions.
-- Logging gating: enabling/disabling config flags shapes output as expected.
-- Dataset evaluator: CSV output format is stable and includes path, dataset, caption, loss. Optionally save a JSON report per run and for every save step that records, for each dataset item, only the **average**, **min**, and **max** loss — computed using a streaming/incremental aggregator so the report is memory-efficient for large datasets. The per-step JSON should be named using the job name and zero-padded step count (e.g. `{job.name}_000000123.json`).
+- Logging gating: per-example logging runs only for simple runs (single batch, no accumulation). Enabling/disabling config flags shapes output as expected.
+- Dataset evaluator: CSV output format is stable and includes path, dataset, caption, loss. Streaming JSON report per run and per save step includes per-item **average**, **min**, and **max** loss and is memory-efficient for large datasets.
 
 ---
+
+## Next steps (priority order)
+1. Backend API & background job runner for dataset evaluator (High) — implement POST/GET endpoints, background worker, job tracking, and unit tests. (3–5h)
+2. Frontend UI: Dataset evaluator panel (Medium) — model selector, run controls, job status, results display and download. (3–5h)
+3. Integration tests and docs (Low-Med) — e2e tests and usage docs. (1–2h)
+
+---
+
+If you want, I can start the **Backend API** now (implement endpoints + background job + tests). Say "Proceed with backend" and I'll begin. 
 
 ## Performance considerations ⚡
 - Keep per-sample tensors on CPU (detached) to avoid persistent GPU memory growth.

@@ -32,10 +32,32 @@ A short, prioritized plan to finish dataset-loss evaluation and training-time pe
 ---
 
 ## Follow-ups (next priority)
-- Implement `compute_per_example_loss` call and safe CPU-copy behavior inside `SDTrainer.calculate_loss` (capture unreduced per-sample losses reliably across accumulations). (High)
-- Add tests for `calculate_loss` per-sample behavior and numeric parity with scalar loss. (High)
+- Implement `compute_per_example_loss` call and safe CPU-copy behavior inside `SDTrainer.calculate_loss` (capture unreduced per-sample losses reliably across accumulations). (High) — **Done**
+- Add tests for `calculate_loss` per-sample behavior and numeric parity with scalar loss. (High) — **Done**
+- Logging note: per-example logging is limited to simple runs (single batch & no accumulation) to avoid misleading partial logs. (Decision) — **Done**
 - Integrate `dataset_summary` more fully into `BaseSDTrainProcess` logs and TensorBoard output. (Medium)
 - Implement a dataset evaluator UI that runs evaluation and lets users export CSV/JSON. (Medium)
+
+---
+
+## Planned next work (detailed)
+1. **Backend API & background job runner** (3–5h) — *in progress*
+   - Implement POST `/api/eval_dataset` accepting {model, dataset, sample_fraction, max_samples}
+   - Start an async background job that runs `run_dataset_evaluation(...)` and writes the streaming JSON report to the job save directory
+   - Add GET `/api/eval_status/{job_id}` and GET `/api/eval_result/{job_id}` returning job state and result path/content
+   - Tests: unit tests for API validation and a mocked run that verifies JSON write and endpoint flow
+
+2. **Frontend UI (Dataset view)** (3–5h)
+   - Add an `Evaluate dataset` panel: model selector, sample_fraction, max_samples, run button
+   - Show job status, progress (stdout/log tail), and links to JSON/CSV. Display top flagged captions inline
+   - Tests: basic UI tests and manual verification
+
+3. **Integration & QA** (1–2h)
+   - End-to-end test: trigger evaluation via API, wait for completion, fetch results, assert JSON schema and flagged captions
+   - Update docs with usage examples and developer notes
+
+These tasks are prioritized: Backend API → Frontend UI → Integration tests & docs.
+
 
 ---
 

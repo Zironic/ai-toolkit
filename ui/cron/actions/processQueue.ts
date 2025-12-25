@@ -1,4 +1,5 @@
 import prisma from '../prisma';
+import processEvalQueue from './processEvalQueue';
 
 import { Job, Queue } from '@prisma/client';
 import startJob from './startJob';
@@ -9,6 +10,9 @@ export default async function processQueue() {
       id: 'asc',
     },
   });
+
+  // process one eval job (if any) independently
+  await processEvalQueue();
 
   for (const queue of queues) {
     if (!queue.is_running) {

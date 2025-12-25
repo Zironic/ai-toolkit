@@ -172,6 +172,41 @@ def per_sample_from_loss_tensor(loss: 'torch.Tensor') -> 'torch.Tensor':
     return out.detach().cpu()
 
 
+def compute_per_example_loss(loss_tensor: 'torch.Tensor', prior_loss_tensor: 'torch.Tensor' = None, normalize_batch_mean: bool = False) -> tuple:
+    """Compute per-example scalar losses and optional components from unreduced loss tensors.
+
+    Args:
+      loss_tensor: unreduced loss (e.g., shape B,C,H,W or B,C,T,H,W or already reduced to B,)
+      prior_loss_tensor: optional per-element prior loss (same shape semantics as loss_tensor)
+      normalize_batch_mean: if True, return per-sample normalised so that batch mean equals 1 (rarely used)
+
+    Returns:
+      (per_sample_tensor_cpu, components_dict)
+        - per_sample_tensor_cpu: torch.Tensor on CPU, shape (B,)
+        - components_dict: dict with keys like 'main' and 'prior' mapping to per-sample CPU tensors
+    """
+    import torch
+    components = {}
+
+    # main per-sample
+    main = per_sample_from_loss_tensor(loss_tensor)
+    components['main'] = main
+
+    if prior_loss_tensor is not None:
+        prior = per_sample_from_loss_tensor(prior_loss_tensor)
+        components['prior'] = prior
+        combined = (main.to(torch.float32) + prior.to(torch.float32))
+    else:
+        combined = main.to(torch.float32)
+
+    if normalize_batch_mean:
+        m = float(combined.mean()) if combined.numel() > 0 else 1.0
+        if m != 0:
+            combined = combined / m
+
+    return combined.detach().cpu(), components
+
+
 def per_example_from_batch(batch: 'DataLoaderBatchDTO', per_sample_losses: 'torch.Tensor') -> List[Dict[str, Any]]:
     """Build per-example records from a batch and a tensor of per-sample losses.
 
@@ -365,3 +400,19 @@ def evaluate_dataset(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataload
         'flagged': flagged,
         'json_report': json_report,
     }
+
+
+def run_dataset_evaluation(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataloader, job_name: Optional[str] = None, step: Optional[int] = None, out_dir: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    """Convenience wrapper to run dataset evaluation and write a job/step-named JSON report.
+
+    If `out_dir`, `job_name`, and `step` are provided, this function will create a JSON file named
+    `{job_name}_{step_zfilled}.json` inside `out_dir` using the streaming JSON writer in `evaluate_dataset`.
+
+    Returns the same dict structure returned by `evaluate_dataset`.
+    """
+    import os
+    if out_dir is not None and job_name is not None and step is not None:
+        filename = f"{job_name}_{str(step).zfill(9)}.json"
+        kwargs['out_json'] = os.path.join(out_dir, filename)
+    # evaluate_dataset will write out_json if present
+    return evaluate_dataset(compute_fn, dataloader, **kwargs)

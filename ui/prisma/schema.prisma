@@ -39,3 +39,17 @@ model Job {
   @@index([status])
   @@index([gpu_ids])
 }
+
+model EvalJob {
+  id          String   @id @default(uuid())
+  dataset     String
+  model       String
+  params      String   @default("{}") // JSON string for additional params
+  status      String   @default("queued")
+  out_json    String?
+  info        String   @default("")
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@index([status])
+}

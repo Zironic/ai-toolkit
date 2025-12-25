@@ -860,13 +860,16 @@ class SDTrainer(BaseSDTrainProcess):
 
         # Capture per-example scalar losses (after per-pixel/channel reduction/weights but before final mean over batch)
         try:
-            from toolkit.util.loss_utils import per_sample_from_loss_tensor
-            per_sample = per_sample_from_loss_tensor(loss)
+            from toolkit.util.loss_utils import compute_per_example_loss
+            per_sample, comps = compute_per_example_loss(loss, prior_loss_tensor=prior_loss)
             # attach to self so hook_train_loop and others can access it (CPU tensor)
             self.last_example_losses = per_sample
+            # store components in case we want to inspect later
+            self.last_example_loss_components = comps
         except Exception:
             # non-fatal: if anything goes wrong, don't break training
             self.last_example_losses = None
+            self.last_example_loss_components = None
 
         loss = loss.mean()
 
@@ -2042,6 +2045,40 @@ class SDTrainer(BaseSDTrainProcess):
         return loss.detach()
         # flush()
 
+    def _maybe_log_per_example(self, batch: 'DataLoaderBatchDTO', batch_list_len: int) -> list:
+        """Return per-example entries for the given batch and update streaming aggregator.
+
+        Logging is only performed when the run is simple (single-batch and no gradient accumulation)
+        to avoid misleading or partial per-example logs during accumulation or multi-batch processing.
+        """
+        entries = []
+        try:
+            # Only log when a single batch was processed and there is no gradient accumulation configured
+            grad_accum = getattr(self.train_config, 'gradient_accumulation', 1)
+            grad_accum_steps = getattr(self.train_config, 'gradient_accumulation_steps', 1)
+            if batch_list_len != 1 or grad_accum != 1 or grad_accum_steps != 1:
+                return entries
+
+            from toolkit.util.loss_utils import per_example_from_batch, StreamingAggregator
+            if hasattr(self, 'last_example_losses') and self.last_example_losses is not None:
+                try:
+                    mapped = per_example_from_batch(batch, self.last_example_losses)
+                    entries.extend(mapped)
+                    # add entries to a streaming dataset aggregator for per-save-step JSON reporting
+                    try:
+                        if not hasattr(self, '_dataset_aggregator') or self._dataset_aggregator is None:
+                            self._dataset_aggregator = StreamingAggregator()
+                        for e in mapped:
+                            self._dataset_aggregator.add_entry(e)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return entries
+
+
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
             batch_list = batch
@@ -2114,29 +2151,12 @@ class SDTrainer(BaseSDTrainProcess):
         # collect per-example losses from the processed batches if available
         per_example = []
         try:
-            from toolkit.util.loss_utils import per_example_from_batch, aggregate_by_dataset, flag_bad_captions
-            if hasattr(self, 'last_example_losses') and self.last_example_losses is not None:
-                # Attempt to map last_example_losses to the last processed batch
-                # Note: if multiple batches were passed, this will be for the last one; more advanced collection
-                # (across accumulations) can be added if desired.
-                try:
-                    # assume 'batch' refers to last batch variable from loop
-                    entries = per_example_from_batch(batch, self.last_example_losses)
-                    per_example.extend(entries)
+            # Use helper that only logs per-example entries for simple runs (batch=1 and no accumulation)
+            entries = self._maybe_log_per_example(batch, len(batch_list))
+            if entries:
+                per_example.extend(entries)
 
-                    # add entries to a streaming dataset aggregator for per-save-step JSON reporting
-                    try:
-                        if not hasattr(self, '_dataset_aggregator') or self._dataset_aggregator is None:
-                            from toolkit.util.loss_utils import StreamingAggregator
-                            self._dataset_aggregator = StreamingAggregator()
-                        for e in entries:
-                            self._dataset_aggregator.add_entry(e)
-                    except Exception:
-                        # ensure logging doesn't interrupt training
-                        pass
-                except Exception:
-                    pass
-
+            from toolkit.util.loss_utils import aggregate_by_dataset, flag_bad_captions
             # Optionally add aggregated summaries to the loss dict based on config
             if getattr(self.train_config, 'log_per_dataset', True) and len(per_example) > 0:
                 agg = aggregate_by_dataset(per_example)
