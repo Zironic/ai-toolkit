@@ -319,6 +319,8 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
             onNewFinishedJob={(job) => {
               // automatically switch to the newly finished job if it's for this dataset
               setSelectedEvalJobId(job.id);
+              // Rescan dataset JSON files so the dropdown is updated to include newly-written model-named reports
+              try { loadEvaluatedModels(datasetName); } catch (e) { console.error('Failed to rescan eval files on job finish', e); }
             }}
           />
         </div>
