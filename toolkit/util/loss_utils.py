@@ -473,4 +473,4 @@ def run_dataset_evaluation(compute_fn: Callable[[Any], List[Dict[str, Any]]], da
         filename = f"{job_name}_{str(step).zfill(9)}.json"
         kwargs['out_json'] = os.path.join(out_dir, filename)
     # evaluate_dataset will write out_json if present
-    return evaluate_dataset(compute_fn, dataloader, **kwargs)"
+    return evaluate_dataset(compute_fn, dataloader, **kwargs)
