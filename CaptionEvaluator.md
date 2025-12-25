@@ -120,6 +120,7 @@ max_examples_print: 50
 log_per_dataset: true
 flag_bad_captions: true
 dataset_eval_sample_fraction: 0.1
+save_loss_json: false  # when true, write a per-save-step JSON report to the save root named {job.name}_{step}.json (streaming, memory-efficient)
 ```
 
 - Defaults are conservative: per-example logging disabled; dataset summaries enabled.
@@ -131,7 +132,7 @@ dataset_eval_sample_fraction: 0.1
 - Aggregation correctness: `aggregate_by_dataset` calculates means, medians, and top-k correctly.
 - Caption detection: unit tests flag synthetic bad captions.
 - Logging gating: enabling/disabling config flags shapes output as expected.
-- Dataset evaluator: CSV output format is stable and includes path, dataset, caption, loss.
+- Dataset evaluator: CSV output format is stable and includes path, dataset, caption, loss. Optionally save a JSON report per run and for every save step that records, for each dataset item, only the **average**, **min**, and **max** loss — computed using a streaming/incremental aggregator so the report is memory-efficient for large datasets. The per-step JSON should be named using the job name and zero-padded step count (e.g. `{job.name}_000000123.json`).
 
 ---
 

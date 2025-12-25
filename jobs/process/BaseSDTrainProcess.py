@@ -683,6 +683,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.clean_up_saves()
         self.post_save_hook(file_path)
 
+        # optionally write a per-save-step dataset JSON report (memory-efficient streaming)
+        try:
+            if getattr(self.train_config, 'save_loss_json', False) and hasattr(self, '_dataset_aggregator') and self._dataset_aggregator is not None:
+                try:
+                    json_report = self._dataset_aggregator.build_report(eval_config=self.meta)
+                    out_json = os.path.join(self.save_root, f"{self.job.name}{step_num}.json")
+                    with open(out_json, 'w', encoding='utf-8') as f:
+                        json.dump(json_report, f, indent=2)
+                    print_acc(f"Saved dataset evaluation JSON to {out_json}")
+                except Exception as e:
+                    print_acc(f"Could not write dataset JSON: {e}")
+        except Exception:
+            # non-fatal
+            pass
+
         if self.ema is not None:
             self.ema.train()
         flush()

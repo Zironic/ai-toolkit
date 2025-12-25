@@ -458,6 +458,14 @@ class TrainConfig:
         
         # blank prompt preservation will preserve the model's knowledge of a blank prompt
         self.blank_prompt_preservation = kwargs.get('blank_prompt_preservation', False)
+
+        # Loss logging and caption checking
+        self.log_per_example: bool = kwargs.get('log_per_example', False)
+        self.max_examples_print: int = kwargs.get('max_examples_print', 50)
+        self.log_per_dataset: bool = kwargs.get('log_per_dataset', True)
+        self.flag_bad_captions: bool = kwargs.get('flag_bad_captions', True)
+        # When true, write a per-save-step JSON report to the save root (job.name_{step}.json)
+        self.save_loss_json: bool = kwargs.get('save_loss_json', False)
         self.blank_prompt_preservation_multiplier = kwargs.get('blank_prompt_preservation_multiplier', 1.0)
         
         # legacy

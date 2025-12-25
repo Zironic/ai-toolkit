@@ -858,6 +858,16 @@ class SDTrainer(BaseSDTrainProcess):
                 # add min_snr_gamma
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
+        # Capture per-example scalar losses (after per-pixel/channel reduction/weights but before final mean over batch)
+        try:
+            from toolkit.util.loss_utils import per_sample_from_loss_tensor
+            per_sample = per_sample_from_loss_tensor(loss)
+            # attach to self so hook_train_loop and others can access it (CPU tensor)
+            self.last_example_losses = per_sample
+        except Exception:
+            # non-fatal: if anything goes wrong, don't break training
+            self.last_example_losses = None
+
         loss = loss.mean()
 
         # check for additional losses
@@ -2100,6 +2110,46 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
+
+        # collect per-example losses from the processed batches if available
+        per_example = []
+        try:
+            from toolkit.util.loss_utils import per_example_from_batch, aggregate_by_dataset, flag_bad_captions
+            if hasattr(self, 'last_example_losses') and self.last_example_losses is not None:
+                # Attempt to map last_example_losses to the last processed batch
+                # Note: if multiple batches were passed, this will be for the last one; more advanced collection
+                # (across accumulations) can be added if desired.
+                try:
+                    # assume 'batch' refers to last batch variable from loop
+                    entries = per_example_from_batch(batch, self.last_example_losses)
+                    per_example.extend(entries)
+
+                    # add entries to a streaming dataset aggregator for per-save-step JSON reporting
+                    try:
+                        if not hasattr(self, '_dataset_aggregator') or self._dataset_aggregator is None:
+                            from toolkit.util.loss_utils import StreamingAggregator
+                            self._dataset_aggregator = StreamingAggregator()
+                        for e in entries:
+                            self._dataset_aggregator.add_entry(e)
+                    except Exception:
+                        # ensure logging doesn't interrupt training
+                        pass
+                except Exception:
+                    pass
+
+            # Optionally add aggregated summaries to the loss dict based on config
+            if getattr(self.train_config, 'log_per_dataset', True) and len(per_example) > 0:
+                agg = aggregate_by_dataset(per_example)
+                loss_dict['dataset_summary'] = agg['dataset_summary']
+            if getattr(self.train_config, 'log_per_example', False) and len(per_example) > 0:
+                max_print = getattr(self.train_config, 'max_examples_print', 50)
+                loss_dict['per_example'] = per_example[:max_print]
+            if getattr(self.train_config, 'flag_bad_captions', True) and len(per_example) > 0:
+                flags = flag_bad_captions(per_example)
+                loss_dict['caption_flags'] = flags
+        except Exception:
+            # don't fail training for logging-related issues
+            pass
 
         self.end_of_training_loop()
 
