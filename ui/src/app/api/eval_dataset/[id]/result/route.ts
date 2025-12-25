@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import prisma from '@/../../cron/prisma';
+import prisma from '@/server/prisma';
 import fs from 'fs';
 
 export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
@@ -14,7 +14,12 @@ export async function GET(request: NextRequest, { params }: { params: { id: stri
     }
     try {
       const contents = fs.readFileSync(job.out_json, { encoding: 'utf-8' });
-      return new NextResponse(contents, { status: 200 });
+      try {
+        const parsed = JSON.parse(contents);
+        return NextResponse.json(parsed);
+      } catch (e) {
+        return NextResponse.json({ error: 'Result file is not valid JSON', info: e?.message }, { status: 500 });
+      }
     } catch (e) {
       return NextResponse.json({ error: 'Could not read result file', info: e?.message }, { status: 500 });
     }

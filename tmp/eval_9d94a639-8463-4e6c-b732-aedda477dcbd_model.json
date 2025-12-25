@@ -1,0 +1,7 @@
+{
+  "name_or_path": "Tongyi-MAI/Z-Image-Turbo",
+  "arch": "zimage:turbo",
+  "assistant_lora_path": "ostris/zimage_turbo_training_adapter/zimage_turbo_training_adapter_v2.safetensors",
+  "quantize": true,
+  "low_vram": true
+}

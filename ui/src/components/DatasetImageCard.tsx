@@ -11,6 +11,12 @@ interface DatasetImageCardProps {
   children?: ReactNode;
   className?: string;
   onDelete?: () => void;
+  // raw mean-squared-error (pre-normalization)
+  rawLoss?: number | null;
+  // normalized loss (global normalization, mean==1)
+  normLoss?: number | null;
+  // legacy single-loss prop (kept for backwards compatibility)
+  loss?: number | null;
 }
 
 const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
@@ -19,6 +25,9 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   children,
   className = '',
   onDelete = () => {},
+  rawLoss = null,
+  normLoss = null,
+  loss = null,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [isVisible, setIsVisible] = useState<boolean>(false);
@@ -189,6 +198,24 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             </div>
           )}
           {children && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
+          {/* Loss overlay (top-left) - show raw prominently and normalized secondary */}
+          {
+            /* Show a single primary value (prefer raw, then loss, then normalized) and
+               render the normalized value as secondary when the primary is raw/loss */
+          }
+          <div className="absolute top-1 left-1">
+            <div className="bg-black bg-opacity-70 text-white text-xs px-2 py-1 rounded text-left">
+              <div className="font-medium leading-tight">
+                {(() => {
+                  const primary = rawLoss != null ? rawLoss : (loss != null ? loss : normLoss);
+                  return primary != null ? Number(primary).toFixed(3) : '—';
+                })()}
+              </div>
+              {normLoss != null && (rawLoss != null || loss == null) && (
+                <div className="text-[10px] opacity-80">norm {Number(normLoss).toFixed(3)}</div>
+              )}
+            </div>
+          </div>
           <div className="absolute top-1 right-1 flex space-x-2">
             <button
               className="bg-gray-800 rounded-full p-2"

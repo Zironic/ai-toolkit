@@ -1,0 +1,34 @@
+{
+  "timestamp": "2025-12-25T11:05:00Z",
+  "workspace": "C:/GenAI/AI-Toolkit-Easy-Install/AI-Toolkit",
+  "db_path": "C:/GenAI/AI-Toolkit-Easy-Install/AI-Toolkit/aitk_db.db",
+  "failed_eval_jobs": [
+    {
+      "id": "54039473-41b5-4f33-8057-09c43fa565e8",
+      "status": "error",
+      "info": "eval_dataset.py not found",
+      "created_at": "2025-12-25 11:01:36"
+    }
+  ],
+  "finished_eval_jobs": [
+    {
+      "id": "d599e41e-c5f4-4c40-8d12-1e00fa89127b",
+      "status": "finished",
+      "out_json": "datasets/test_smoke_eval/d599e41e-c5f4-4c40-8d12-1e00fa89127b_000000000.json",
+      "created_at": "2025-12-25 10:58:33"
+    }
+  ],
+  "key_files": [
+    "tools/eval_dataset.py",
+    "ui/src/app/api/eval_dataset/route.ts",
+    "ui/cron/actions/processEvalQueue.ts",
+    "datasets/test_smoke_eval/"
+  ],
+  "resume_commands": [
+    "npm --prefix ui install",
+    "npx prisma@6.3.1 generate --schema ui/prisma/schema.prisma",
+    "npx prisma@6.3.1 db push --schema ui/prisma/schema.prisma --accept-data-loss",
+    "npx ts-node -P ui/tsconfig.worker.json ui/scripts/run_process_eval.ts",
+    "python tools/eval_dataset.py --dataset-path datasets/test_smoke_eval --model <model> --out-dir datasets/test_smoke_eval --job-name <id> --step 0"
+  ]
+}

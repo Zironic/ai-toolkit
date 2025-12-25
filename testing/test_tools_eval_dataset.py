@@ -71,3 +71,55 @@ def test_compute_fn_dummy_sd():
         assert 'path' in e and 'caption' in e and 'loss' in e
         assert e['dataset'] == 'dummy_dataset'
         assert isinstance(e['loss'], float)
+
+
+def test_compute_fn_records_sample_min_max():
+    # Use a deterministic random seed for reproducibility in test environment
+    torch.manual_seed(12345)
+
+    sd = DummySD()
+    # make predict_noise return zeros so loss is purely noise^2 and varies per sample
+    compute_fn = make_compute_fn_for_sd(sd, normalize_loss=False, samples_per_image=4)
+
+    lat = torch.randn(2, 4, 16, 16)
+    files = [DummyFile('/tmp/a.png', 'a caption'), DummyFile('/tmp/b.png', 'b caption')]
+    batch = DummyBatch(files, latents=lat)
+
+    entries = compute_fn(batch)
+    assert len(entries) == 2
+    for e in entries:
+        # ensure we recorded min_loss and max_loss from the multiple stochastic samples
+        assert 'min_loss' in e and 'max_loss' in e
+        assert isinstance(e['min_loss'], float) and isinstance(e['max_loss'], float)
+        # with multiple stochastic samples these should often differ
+        # if they are equal, warn but don't strictly fail; otherwise assert min <= loss <= max
+        assert e['min_loss'] <= e['loss'] <= e['max_loss']
+
+
+def test_compute_fn_does_not_normalize_per_batch():
+    """Ensure that compute_fn leaves raw per-sample losses unchanged so the
+    outer `evaluate_dataset` can perform global normalization and `average_loss_raw`
+    remains a true pre-normalized value."""
+    class SDWithTargets(DummySD):
+        def get_loss_target(self, noise=None, batch=None, timesteps=None):
+            # produce deterministic targets: sample0 -> zeros, sample1 -> ones
+            bs = noise.shape[0]
+            out = torch.zeros_like(noise)
+            if bs >= 2:
+                out[1] = torch.ones_like(noise[1])
+            return out
+
+    sd2 = SDWithTargets()
+    compute_fn = make_compute_fn_for_sd(sd2, normalize_loss=True, samples_per_image=1)
+
+    lat = torch.randn(2, 4, 16, 16)
+    files = [DummyFile('/tmp/a.png', 'a caption'), DummyFile('/tmp/b.png', 'b caption')]
+    batch = DummyBatch(files, latents=lat)
+
+    entries = compute_fn(batch)
+    # With our deterministic targets and predict_noise() == 0, the per-sample
+    # raw MSE should be 0.0 for sample 0 and 1.0 for sample 1. If compute_fn
+    # performed per-batch normalization these values would be altered.
+    assert len(entries) == 2
+    assert abs(entries[0]['loss'] - 0.0) < 1e-6
+    assert abs(entries[1]['loss'] - 1.0) < 1e-6

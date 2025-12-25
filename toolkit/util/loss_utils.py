@@ -277,6 +277,20 @@ class StreamingAggregator:
         path = entry.get('path', '')
         loss = float(entry.get('loss', 0.0))
         caption = entry.get('caption', '')
+        # allow entries to include per-image sample min/max (from repeated stochastic samples)
+        entry_min = None
+        entry_max = None
+        if 'min_loss' in entry and entry.get('min_loss') is not None:
+            try:
+                entry_min = float(entry.get('min_loss'))
+            except Exception:
+                entry_min = None
+        if 'max_loss' in entry and entry.get('max_loss') is not None:
+            try:
+                entry_max = float(entry.get('max_loss'))
+            except Exception:
+                entry_max = None
+
         if ds not in self.datasets:
             self.datasets[ds] = {}
         items = self.datasets[ds]
@@ -284,17 +298,26 @@ class StreamingAggregator:
             items[path] = {
                 'count': 0,
                 'sum': 0.0,
-                'min': loss,
-                'max': loss,
+                'min': entry_min if entry_min is not None else loss,
+                'max': entry_max if entry_max is not None else loss,
                 'caption': caption,
             }
         st = items[path]
         st['count'] += 1
         st['sum'] += loss
-        if loss < st['min']:
-            st['min'] = loss
-        if loss > st['max']:
-            st['max'] = loss
+        # incorporate entry-provided min/max if present, otherwise fall back to the loss value
+        if entry_min is not None:
+            if entry_min < st['min']:
+                st['min'] = entry_min
+        else:
+            if loss < st['min']:
+                st['min'] = loss
+        if entry_max is not None:
+            if entry_max > st['max']:
+                st['max'] = entry_max
+        else:
+            if loss > st['max']:
+                st['max'] = loss
 
     def build_report(self, eval_config: Optional[Dict[str, Any]] = None, top_k: int = 10) -> Dict[str, Any]:
         datasets_report = {}
@@ -334,7 +357,7 @@ class StreamingAggregator:
         return json_report
 
 
-def evaluate_dataset(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataloader, sample_fraction: float = 1.0, max_samples: Optional[int] = None, out_csv: Optional[str] = None, eval_config: Optional[Dict[str, Any]] = None, out_json: Optional[str] = None) -> Dict[str, Any]:
+def evaluate_dataset(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataloader, sample_fraction: float = 1.0, max_samples: Optional[int] = None, out_csv: Optional[str] = None, eval_config: Optional[Dict[str, Any]] = None, out_json: Optional[str] = None, normalize_loss: bool = False) -> Dict[str, Any]:
     """Run compute_fn on the dataset batches to produce per-example list and aggregated results.
 
     compute_fn is expected to be a callable that accepts a batch and returns a list of per-sample dicts {
@@ -348,7 +371,8 @@ def evaluate_dataset(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataload
     """
     per_example = []
     total = 0
-    aggregator = StreamingAggregator() if out_json is not None else None
+    # We'll build the aggregator after optionally normalizing losses so summaries reflect
+    # the post-normalized values. This avoids incorrect per-batch normalization artifacts.
     for batch in dataloader:
         total += 1
         # sampling at batch granularity
@@ -359,12 +383,28 @@ def evaluate_dataset(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataload
         batch_entries = compute_fn(batch)
         for e in batch_entries:
             per_example.append(e)
-            if aggregator is not None:
-                aggregator.add_entry(e)
             if max_samples is not None and len(per_example) >= max_samples:
                 break
         if max_samples is not None and len(per_example) >= max_samples:
             break
+
+    # Build raw report (pre-normalization) so we can preserve raw numbers for consumers
+    raw_report = None
+    if out_json is not None and len(per_example) > 0:
+        try:
+            raw_aggregator = StreamingAggregator()
+            for e in per_example:
+                raw_aggregator.add_entry(e)
+            raw_report = raw_aggregator.build_report(eval_config=None)
+        except Exception:
+            raw_report = None
+
+    # If requested, normalize losses across the entire set so the global mean equals 1.
+    if normalize_loss and len(per_example) > 0:
+        mean_all = float(sum([e.get('loss', 0.0) for e in per_example]) / len(per_example))
+        if mean_all != 0:
+            for e in per_example:
+                e['loss'] = float(e.get('loss', 0.0) / mean_all)
 
     results = aggregate_by_dataset(per_example)
     flagged = flag_bad_captions(per_example) if len(per_example) > 0 else {'flagged': [], 'summary': {}}
@@ -386,8 +426,25 @@ def evaluate_dataset(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataload
     json_report = None
     if out_json is not None:
         try:
-            # use streaming aggregator if available
+            # create aggregator from post-normalized per_example entries
+            aggregator = StreamingAggregator()
+            for e in per_example:
+                aggregator.add_entry(e)
             json_report = aggregator.build_report(eval_config=eval_config)
+
+            # merge raw per-item average_loss into the json report so UIs can show raw values
+            if raw_report is not None and 'datasets' in raw_report and 'datasets' in json_report:
+                for ds_name, ds in json_report['datasets'].items():
+                    raw_ds = raw_report['datasets'].get(ds_name, {})
+                    raw_item_stats = raw_ds.get('item_stats', {})
+                    item_stats = ds.get('item_stats', {})
+                    for path_key, stats in item_stats.items():
+                        raw_stats = raw_item_stats.get(path_key)
+                        if raw_stats is not None:
+                            stats['average_loss_raw'] = raw_stats.get('average_loss')
+                        else:
+                            stats['average_loss_raw'] = None
+
             import json
             with open(out_json, 'w', encoding='utf-8') as f:
                 json.dump(json_report, f, indent=2)
@@ -411,8 +468,9 @@ def run_dataset_evaluation(compute_fn: Callable[[Any], List[Dict[str, Any]]], da
     Returns the same dict structure returned by `evaluate_dataset`.
     """
     import os
-    if out_dir is not None and job_name is not None and step is not None:
+    # Only set a job-based out_json when the caller did NOT provide an explicit out_json.
+    if out_dir is not None and job_name is not None and step is not None and 'out_json' not in kwargs:
         filename = f"{job_name}_{str(step).zfill(9)}.json"
         kwargs['out_json'] = os.path.join(out_dir, filename)
     # evaluate_dataset will write out_json if present
-    return evaluate_dataset(compute_fn, dataloader, **kwargs)
+    return evaluate_dataset(compute_fn, dataloader, **kwargs)"
