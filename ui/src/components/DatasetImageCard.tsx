@@ -35,12 +35,14 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
     // coerce imageUrl to string to avoid crashes when the backend returns non-string values
     const safeImageUrl = String(imageUrl || '');
 
+    // coerce imageUrl to string to avoid crashes when the backend returns non-string values
+    const safeImageUrl = String(imageUrl || '');
+
     apiClient
       .post(`/api/caption/get`, { imgPath: safeImageUrl })
       .then(res => res.data)
       .then(data => {
         console.log('Caption fetched:', data);
-
         // If the server returned an object (JSON), stringify it so the UI shows useful content
         let captionText: string;
         if (data && typeof data === 'object') {
