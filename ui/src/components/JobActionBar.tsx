@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { Eye, Trash2, Pen, Play, Pause, Cog, X } from 'lucide-react';
+import { Eye, Trash2, Pen, Play, Pause, Cog, X, Save, Square } from 'lucide-react';
 import { Button } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
 import { Job } from '@prisma/client';
@@ -60,24 +60,44 @@ export default function JobActionBar({
         </Button>
       )}
       {canStop && (
-        <Button
-          onClick={() => {
-            if (!canStop) return;
-            openConfirm({
-              title: 'Stop Job',
-              message: `Are you sure you want to stop the job "${job.name}"? You CAN resume later.`,
-              type: 'info',
-              confirmText: 'Stop',
-              onConfirm: async () => {
-                await stopJob(job.id);
-                if (onRefresh) onRefresh();
-              },
-            });
-          }}
-          className={`ml-2 opacity-100`}
-        >
-          <Pause />
-        </Button>
+        <>
+          <Button
+            onClick={() => {
+              if (!canStop) return;
+              openConfirm({
+                title: 'Stop and Save Job',
+                message: `This will stop the training and save the model for "${job.name}". You CAN resume later.`,
+                type: 'info',
+                confirmText: 'Stop and Save',
+                onConfirm: async () => {
+                  await stopJob(job.id, true);
+                  if (onRefresh) onRefresh();
+                },
+              });
+            }}
+            className={`ml-2 opacity-100`}
+          >
+            <Save />
+          </Button>
+          <Button
+            onClick={() => {
+              if (!canStop) return;
+              openConfirm({
+                title: 'Stop Job',
+                message: `Are you sure you want to stop the job "${job.name}"? You CAN resume later.`,
+                type: 'info',
+                confirmText: 'Stop',
+                onConfirm: async () => {
+                  await stopJob(job.id);
+                  if (onRefresh) onRefresh();
+                },
+              });
+            }}
+            className={`ml-2 opacity-100`}
+          >
+            <Square />
+          </Button>
+        </>
       )}
       {!hideView && (
         <Link href={`/jobs/${job.id}`} className="ml-2 text-gray-200 hover:text-gray-100 inline-block">

@@ -116,6 +116,13 @@ class UITrainer(SDTrainer):
 
         return _check_stop()
     
+    def should_save_before_stop(self):
+        try:
+            return self.config.get('save_before_stop', False)
+        except Exception:
+            pass
+        return False
+    
     def should_return_to_queue(self):
         def _check_return_to_queue():
             with self._db_connect() as conn:
@@ -129,6 +136,10 @@ class UITrainer(SDTrainer):
 
     def maybe_stop(self):
         if self.should_stop():
+            if self.should_save_before_stop():
+                self._run_async_operation(
+                    self._update_status("running", "Saving before stop..."))
+                self.save()
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
             self.is_stopping = True

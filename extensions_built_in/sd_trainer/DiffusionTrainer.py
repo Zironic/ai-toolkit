@@ -124,6 +124,15 @@ class DiffusionTrainer(SDTrainer):
 
         return _check_stop()
 
+    def should_save_before_stop(self):
+        if not self.is_ui_trainer:
+            return False
+        try:
+            return self.config.get('save_before_stop', False)
+        except Exception:
+            pass
+        return False
+
     def should_return_to_queue(self):
         if not self.is_ui_trainer:
             return False
@@ -141,6 +150,10 @@ class DiffusionTrainer(SDTrainer):
         if not self.is_ui_trainer:
             return
         if self.should_stop():
+            if self.should_save_before_stop():
+                self._run_async_operation(
+                    self._update_status("running", "Saving before stop..."))
+                self.save()
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
             self.is_stopping = True
