@@ -35,8 +35,6 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
     // coerce imageUrl to string to avoid crashes when the backend returns non-string values
     const safeImageUrl = String(imageUrl || '');
 
-    // coerce imageUrl to string to avoid crashes when the backend returns non-string values
-    const safeImageUrl = String(imageUrl || '');
 
     apiClient
       .post(`/api/caption/get`, { imgPath: safeImageUrl })
