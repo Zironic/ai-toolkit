@@ -34,6 +34,17 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       const jobs = res.data?.jobs || [];
       // filter finished jobs that reference this dataset exactly or by suffix
       const matched = jobs.filter((j: any) => j.status === 'finished' && j.dataset && (String(j.dataset) === dsName || String(j.dataset).endsWith(dsName) || String(j.dataset).includes(dsName)));
+
+      // Also scan dataset folder for model-named JSON files and include them as report sources
+      let fileReports: Array<{ filename: string; path: string; modelName: string | null }> = [];
+      try {
+        const filesRes = await apiClient.get(`/api/eval_dataset/files?dataset=${encodeURIComponent(dsName)}`);
+        fileReports = filesRes.data?.files || [];
+      } catch (e) {
+        // ignore file scan failures
+        console.error('Failed to scan dataset files for eval reports', e);
+      }
+
       // group by model name and pick most recent job for each model
       const perModel: Record<string, any> = {};
       for (const j of matched) {
@@ -54,6 +65,16 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
           perModel[modelName] = j;
         }
       }
+
+      // Merge file-based reports: for files with a modelName, ensure we have an entry; for those without modelName use filename as label
+      for (const f of fileReports) {
+        const label = f.modelName || f.filename.replace(/\.json$/, '');
+        if (!perModel[label]) {
+          // create a synthetic entry with jobId prefixed by 'file:' so we can fetch it specially
+          perModel[label] = { synthetic_file: true, file_path: f.path, id: `file:${encodeURIComponent(f.path)}`, created_at: new Date().toISOString(), model: f.modelName || null };
+        }
+      }
+
       const list = Object.entries(perModel).map(([m, j]) => ({ label: m, jobId: j.id }));
       // sort by label for deterministic order
       list.sort((a, b) => a.label.localeCompare(b.label));
@@ -75,6 +96,10 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         setSelectedEvalJobId(latestJobOverall.id);
         // load results for that job
         await fetchResultsForJob(latestJobOverall.id, dsName);
+      } else if (list.length > 0) {
+        // no finished job; pick the first available report (could be a file-based one)
+        setSelectedEvalJobId(list[0].jobId || null);
+        await fetchResultsForJob(list[0].jobId || null, dsName);
       } else {
         setSelectedEvalJobId(null);
         setEvalMap({});
@@ -94,6 +119,31 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       return;
     }
     try {
+      // If synthetic file-based selection (id starts with 'file:'), fetch directly from file endpoint
+      if (String(jobId).startsWith('file:')) {
+        const filePath = decodeURIComponent(String(jobId).slice('file:'.length));
+        const resJson = await apiClient.get(`/api/eval_dataset/file?path=${encodeURIComponent(filePath)}`);
+        const j = resJson.data;
+        if (!j || !j.datasets) {
+          setEvalMap({});
+          return;
+        }
+        const datasetKey = Object.keys(j.datasets)[0];
+        const itemStats = j.datasets[datasetKey]?.item_stats || {};
+        const map: Record<string, { raw?: number; norm?: number }> = {};
+        for (const [pathKey, stats] of Object.entries(itemStats)) {
+          const parts = String(pathKey).split(/[\\/]/);
+          const b = parts[parts.length - 1];
+          const s: any = stats as any;
+          const raw = typeof s.average_loss_raw !== 'undefined' && s.average_loss_raw !== null ? Number(s.average_loss_raw) : undefined;
+          const norm = typeof s.average_loss !== 'undefined' && s.average_loss !== null ? Number(s.average_loss) : undefined;
+          map[b] = { raw, norm };
+        }
+        console.log('Loaded eval map for file', filePath, map);
+        setEvalMap(map);
+        return;
+      }
+
       const resJson = await apiClient.get(`/api/eval_dataset/${jobId}/result`);
       const j = resJson.data;
       if (!j || !j.datasets) {
