@@ -20,8 +20,9 @@ export async function GET(request: NextRequest) {
       .filter(e => e.isFile() && e.name.endsWith('.json'))
       .map(e => {
         const p = path.join(absDataset, e.name);
-        // Try to parse model name from file contents
+        // Try to parse model name from file contents and record modification time
         let modelName: string | null = null;
+        let mtimeMs: number | null = null;
         try {
           const contents = fs.readFileSync(p, 'utf-8');
           const parsed = JSON.parse(contents);
@@ -29,7 +30,13 @@ export async function GET(request: NextRequest) {
         } catch (e) {
           // ignore parse errors
         }
-        return { filename: e.name, path: p, modelName };
+        try {
+          const st = fs.statSync(p);
+          mtimeMs = st.mtimeMs;
+        } catch (e) {
+          mtimeMs = null;
+        }
+        return { filename: e.name, path: p, modelName, mtimeMs };
       });
 
     return NextResponse.json({ files: jsonFiles });

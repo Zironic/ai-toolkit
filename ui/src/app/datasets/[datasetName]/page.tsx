@@ -35,71 +35,36 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       // filter finished jobs that reference this dataset exactly or by suffix
       const matched = jobs.filter((j: any) => j.status === 'finished' && j.dataset && (String(j.dataset) === dsName || String(j.dataset).endsWith(dsName) || String(j.dataset).includes(dsName)));
 
-      // Also scan dataset folder for model-named JSON files and include them as report sources
-      let fileReports: Array<{ filename: string; path: string; modelName: string | null }> = [];
+      // Populate dropdown ONLY from model-named JSON files in the dataset folder
+      let fileReports: Array<{ filename: string; path: string; modelName: string | null; mtimeMs?: number | null }> = [];
       try {
         const filesRes = await apiClient.get(`/api/eval_dataset/files?dataset=${encodeURIComponent(dsName)}`);
         fileReports = filesRes.data?.files || [];
       } catch (e) {
-        // ignore file scan failures
         console.error('Failed to scan dataset files for eval reports', e);
       }
 
-      // group by model name and pick most recent job for each model
       const perModel: Record<string, any> = {};
-      for (const j of matched) {
-        // prefer explicit job.model, but fall back to parsing params.model_config.name_or_path
-        let modelName = '';
-        try {
-          modelName = (j.model || '').toString();
-          if (!modelName && j.params) {
-            const p = JSON.parse(j.params || '{}');
-            if (p && p.model_config && p.model_config.name_or_path) modelName = String(p.model_config.name_or_path);
-          }
-        } catch (e) {
-          modelName = (j.model || '').toString();
-        }
-        if (!modelName) continue;
-        const existing = perModel[modelName];
-        if (!existing || new Date(j.created_at) > new Date(existing.created_at)) {
-          perModel[modelName] = j;
-        }
-      }
-
-      // Merge file-based reports: for files with a modelName, ensure we have an entry; for those without modelName use filename as label
       for (const f of fileReports) {
         const label = f.modelName || f.filename.replace(/\.json$/, '');
-        if (!perModel[label]) {
-          // create a synthetic entry with jobId prefixed by 'file:' so we can fetch it specially
-          perModel[label] = { synthetic_file: true, file_path: f.path, id: `file:${encodeURIComponent(f.path)}`, created_at: new Date().toISOString(), model: f.modelName || null };
-        }
+        perModel[label] = { synthetic_file: true, file_path: f.path, id: `file:${encodeURIComponent(f.path)}`, created_at: f.mtimeMs ? new Date(f.mtimeMs).toISOString() : new Date().toISOString(), mtimeMs: f.mtimeMs || 0, model: f.modelName || null };
       }
 
-      const list = Object.entries(perModel).map(([m, j]) => ({ label: m, jobId: j.id }));
+      const list = Object.entries(perModel).map(([m, j]) => ({ label: m, jobId: j.id, mtimeMs: j.mtimeMs }));
       // sort by label for deterministic order
       list.sort((a, b) => a.label.localeCompare(b.label));
 
-      // pick the latest finished job overall as a default selection (if any)
-      const latestJobOverall = matched.sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
-
-      // If the latest finished job isn't represented in the models list (no model label), add it as '(Latest)'
-      if (latestJobOverall) {
-        const alreadyHas = list.find(l => l.jobId === latestJobOverall.id);
-        const latestLabel = (latestJobOverall.model && String(latestJobOverall.model)) || '(Latest)';
-        if (!alreadyHas) {
-          list.unshift({ label: latestLabel, jobId: latestJobOverall.id });
-        }
+      // pick the latest file by modification time as default selection
+      let defaultId: string | null = null;
+      if (list.length > 0) {
+        const latest = list.slice().sort((a, b) => (b.mtimeMs || 0) - (a.mtimeMs || 0))[0];
+        defaultId = latest?.jobId || list[0].jobId;
       }
 
       setModelsList(list);
-      if (latestJobOverall) {
-        setSelectedEvalJobId(latestJobOverall.id);
-        // load results for that job
-        await fetchResultsForJob(latestJobOverall.id, dsName);
-      } else if (list.length > 0) {
-        // no finished job; pick the first available report (could be a file-based one)
-        setSelectedEvalJobId(list[0].jobId || null);
-        await fetchResultsForJob(list[0].jobId || null, dsName);
+      if (defaultId) {
+        setSelectedEvalJobId(defaultId);
+        await fetchResultsForJob(defaultId, dsName);
       } else {
         setSelectedEvalJobId(null);
         setEvalMap({});
