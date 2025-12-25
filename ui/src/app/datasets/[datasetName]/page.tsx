@@ -37,7 +37,17 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       // group by model name and pick most recent job for each model
       const perModel: Record<string, any> = {};
       for (const j of matched) {
-        const modelName = (j.model || '').toString();
+        // prefer explicit job.model, but fall back to parsing params.model_config.name_or_path
+        let modelName = '';
+        try {
+          modelName = (j.model || '').toString();
+          if (!modelName && j.params) {
+            const p = JSON.parse(j.params || '{}');
+            if (p && p.model_config && p.model_config.name_or_path) modelName = String(p.model_config.name_or_path);
+          }
+        } catch (e) {
+          modelName = (j.model || '').toString();
+        }
         if (!modelName) continue;
         const existing = perModel[modelName];
         if (!existing || new Date(j.created_at) > new Date(existing.created_at)) {
@@ -45,11 +55,21 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         }
       }
       const list = Object.entries(perModel).map(([m, j]) => ({ label: m, jobId: j.id }));
-      // sort by label for deterministic order, but also put 'Latest' first
+      // sort by label for deterministic order
       list.sort((a, b) => a.label.localeCompare(b.label));
 
       // pick the latest finished job overall as a default selection (if any)
       const latestJobOverall = matched.sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+
+      // If the latest finished job isn't represented in the models list (no model label), add it as '(Latest)'
+      if (latestJobOverall) {
+        const alreadyHas = list.find(l => l.jobId === latestJobOverall.id);
+        const latestLabel = (latestJobOverall.model && String(latestJobOverall.model)) || '(Latest)';
+        if (!alreadyHas) {
+          list.unshift({ label: latestLabel, jobId: latestJobOverall.id });
+        }
+      }
+
       setModelsList(list);
       if (latestJobOverall) {
         setSelectedEvalJobId(latestJobOverall.id);
@@ -92,7 +112,8 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       const itemStats = j.datasets[datasetKey]?.item_stats || {};
       const map: Record<string, { raw?: number; norm?: number }> = {};
       for (const [pathKey, stats] of Object.entries(itemStats)) {
-        const parts = String(pathKey).split(/[\/]/);
+        // Support both forward and back slashes so Windows absolute paths are handled correctly
+        const parts = String(pathKey).split(/[\\/]/);
         const b = parts[parts.length - 1];
         const s: any = stats as any;
         const raw = typeof s.average_loss_raw !== 'undefined' && s.average_loss_raw !== null ? Number(s.average_loss_raw) : undefined;
