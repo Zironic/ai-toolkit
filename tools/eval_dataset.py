@@ -425,6 +425,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             pass
 
+    # Include noise and sampling configuration so evaluation artifacts are self-describing.
+    try:
+        num_train_steps = None
+        try:
+            num_train_steps = int(sd.noise_scheduler.config.num_train_timesteps)
+        except Exception:
+            num_train_steps = None
+        eval_conf['noise'] = {
+            'fixed_noise_std': args.fixed_noise_std,
+            'timestep_type': args.timestep_type,
+            'samples_per_image': args.samples_per_image,
+            'normalize_loss': bool(args.normalize_loss),
+            'num_train_timesteps': num_train_steps,
+        }
+    except Exception:
+        # best-effort: do not fail evaluation if metadata collection fails
+        pass
+
     res = run_dataset_evaluation(
         compute_fn,
         dataloader,
