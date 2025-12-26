@@ -129,7 +129,22 @@ If an agent must schedule training remotely, ensure it uses a proper GPU cluster
 un-ui.ps1`).
 - Use targeted tests when changing code to reduce CI runtime: `python -m pytest testing/test_foo.py -q`.
 - Run the minimal reproducible test locally before opening a PR.
-- **Prefer built-in toolkit helpers over reimplementing functionality.** Check `toolkit/` for dataset helpers (resize/crop), model utilities, and processing utilities before adding new code; this reduces duplication and avoids subtle incompatibilities.
+
+### Toolkit quick reference (agents) 🔎
+A concise index of common helpers and where to find them. Check here first before reimplementing features.
+
+- `toolkit/dataloader_mixins.py` — dataset loading, resizing, cropping, random/POI cropping, buckets logic, and image transforms.
+- `toolkit/config_modules.py` — `DatasetConfig`, `ModelConfig`, and related defaults for datasets and models.
+- `toolkit/stable_diffusion_model.py` — `StableDiffusion` wrapper: `encode_images`, `decode_latents`, `encode_prompt`, `predict_noise` and other model-serving utilities.
+- `toolkit/model_utils.py` — safe model loading utilities (inference-mode loader, apply LoRA helpers).
+- `toolkit/util/loss_utils.py` — evaluation helpers: `run_dataset_evaluation`, per-example aggregation, and caption-flagging heuristics.
+- `toolkit/prompt_utils.py` — prompt embedding helpers, prompt concatenation, and prompt-related utilities.
+- `toolkit/train_tools.py` — encoding helpers, tokenization utilities, and training-time helpers useful for inference compatibility.
+- `toolkit/accelerator.py` — device/dtype helpers and accelerator selection utilities.
+- `toolkit/paths.py` — canonical repo paths (e.g., `MODELS_PATH`, `DIFFUSERS_CONFIGS_ROOT`).
+- `toolkit/metadata.py` — helpers for safetensors and metadata extraction.
+
+Tip: search quickly with ripgrep (e.g., `rg "def my_symbol" toolkit/`) or use the file names above to find implementation details. Update this list when you add or find commonly reused helpers.- **Prefer built-in toolkit helpers over reimplementing functionality.** Check `toolkit/` for dataset helpers (resize/crop), model utilities, and processing utilities before adding new code; this reduces duplication and avoids subtle incompatibilities.
 
 ---
 
