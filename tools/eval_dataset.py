@@ -220,7 +220,25 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                             emb_info = None
                     except Exception as e:
                         emb_info = {'error': str(e)}
-                    print(f"[EVAL-CAPTION-DEBUG] captions={captions_list}, embeds={emb_info}")
+                    msg = f"[EVAL-CAPTION-DEBUG] captions={captions_list}, embeds={emb_info}"
+                    print(msg)
+                    # Also persist debug info into a file in dataset folder so it is
+                    # available even if worker logs are not accessible.
+                    try:
+                        ds_path = None
+                        if len(batch.file_items) > 0 and getattr(batch.file_items[0], 'dataset_config', None) is not None:
+                            ds_path = getattr(batch.file_items[0].dataset_config, 'dataset_path', None) or getattr(batch.file_items[0].dataset_config, 'folder_path', None)
+                        if ds_path:
+                            import time
+                            safe_name = f".eval_caption_debug_{int(time.time())}.log"
+                            p = os.path.join(ds_path, safe_name)
+                            try:
+                                with open(p, 'a', encoding='utf-8') as _f:
+                                    _f.write(msg + '\n')
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
