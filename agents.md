@@ -129,6 +129,7 @@ If an agent must schedule training remotely, ensure it uses a proper GPU cluster
 un-ui.ps1`).
 - Use targeted tests when changing code to reduce CI runtime: `python -m pytest testing/test_foo.py -q`.
 - Run the minimal reproducible test locally before opening a PR.
+- **Prefer built-in toolkit helpers over reimplementing functionality.** Check `toolkit/` for dataset helpers (resize/crop), model utilities, and processing utilities before adding new code; this reduces duplication and avoids subtle incompatibilities.
 
 ---
 
@@ -246,3 +247,41 @@ If you'd like, I can:
 - Add a short `AGENTS.md` inside `ui/` with `pnpm`/`npm` commands; or
 - Add a `smoke` test target to the test suite for a quick agent-run check; or
 - Provide a sample minimal `AGENTS.md` for a CI job that runs fast tests only.
+
+---
+
+## Eval & Caption Debugging (agents) 🔎
+
+Guidance for working with the dataset evaluation and caption-debugging flow:
+
+- Quick, safe checks:
+  - Run a short eval with sampling capped: `python tools/eval_dataset.py --dataset-path <dataset> --model <model> --samples-per-image 2 --fixed-noise-std 0.6 --sample-fraction 0.1 --max-samples 50 --out-dir <dataset>`
+  - Enqueue via the UI API: POST `/api/eval_dataset` with `debug_captions: true`, `samples_per_image`, and `fixed_noise_std` fields in the request body.
+
+- Debug logs & locations:
+  - Caption debug lines are printed with the tag `[EVAL-CAPTION-DEBUG]` and persisted to the dataset folder as `*.eval_caption_debug_<jobid>.log` (NDJSON-like lines recommended when available).
+  - The evaluation job summary prints `Total examples: X, mean loss: Y` and `Flagged captions: N` to help triage quickly.
+
+- Useful scripts and helpers:
+  - `ui/scripts/run_debug_eval.js` — enqueue a debug eval job programmatically.
+  - `tools/run_caption_debug_sim.py` — local compute_fn simulator intended for quick checks (requires `diffusers` in the environment).
+  - `ui/scripts/check_eval_jobs.js`, `ui/scripts/print_eval_job.js` — DB inspection helpers.
+
+- Defaults & behavior to know:
+  - `samples_per_image` default: **8** (configurable via UI/API/CLI).
+  - `fixed_noise_std` default: **0.6** (configurable via UI/API/CLI).
+  - Flagging: captions that are short, repeated, suspicious tokens, empty, or extremely long are collected via `toolkit/util/loss_utils.py::flag_bad_captions` and returned in the job `flagged` field (contains reasons & scores).
+
+- Quick triage checklist:
+  1. Confirm job params: `debug_captions`, `samples_per_image`, `fixed_noise_std` are present in the job row.
+  2. Check worker stdout or `*.eval_caption_debug_*.log` for `[EVAL-CAPTION-DEBUG]` lines.
+  3. Inspect `res['flagged']` via `ui/scripts/print_eval_job.js` or by reading the JSON report file.
+  4. If pipeline load errors occur, inspect `EvalJob.info` and the worker logs for model / HF auth / missing package messages.
+
+- Known gaps and follow-ups for agents:
+  - Paired-eval (A/B with identical noise/timesteps) is not implemented yet — avoid assuming paired noise in comparisons.
+  - Local simulations (`run_caption_debug_sim.py`) require `diffusers` and related packages; add to env before running.
+
+---
+
+If you'd like, I can also append a short 'Eval & Caption Debugging' checklist to `LEARNINGS.md` summarizing recent discoveries and suggested follow-ups.
