@@ -73,8 +73,10 @@ export async function POST(request: NextRequest) {
     };
 
     // prefer model_config.name_or_path if provided and try to resolve local paths, and enrich using jobs/new defaults
-    const paramsObj: any = { batch_size, sample_fraction: 1.0, device, samples_per_image: 4 };
-
+    // Respect UI-provided options: samples_per_image, fixed_noise_std, and debug_captions
+    const paramsObj: any = { batch_size, sample_fraction: 1.0, device, samples_per_image: (body.samples_per_image ?? 8) };
+    if (typeof body.fixed_noise_std !== 'undefined') paramsObj.fixed_noise_std = body.fixed_noise_std;
+    if (typeof body.debug_captions !== 'undefined') paramsObj.debug_captions = body.debug_captions;
     if (model_config) {
       // if model_config.name_or_path points to a known local path, prefer that
       const resolved = resolveLocalModelPath(model_config.name_or_path);
