@@ -172,3 +172,35 @@ def test_compute_fn_ablation_compare():
     assert abs(e['loss_with_caption'] - 0.0) < 1e-6
     assert abs(e['loss_with_blank'] - 1.0) < 1e-6
     assert abs(e['ablation_delta'] - 1.0) < 1e-6
+
+
+def test_eval_enforces_dropout_zero():
+    import torch.nn as nn
+    # create a DummySD with a dropout in its unet
+    class SDWithDropout(DummySD):
+        def __init__(self):
+            super().__init__()
+            class U(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.drop = nn.Dropout(0.05)
+            self.unet = U()
+
+    sd = SDWithDropout()
+    # ensure dropout initially non-zero
+    import torch.nn as _nn
+    found = False
+    for m in sd.unet.modules():
+        if isinstance(m, _nn.Dropout):
+            found = True
+            assert m.p == 0.05
+    assert found
+
+    # creating the compute fn should enforce dropout=0
+    compute_fn = make_compute_fn_for_sd(sd)
+    found_after = False
+    for m in sd.unet.modules():
+        if isinstance(m, _nn.Dropout):
+            found_after = True
+            assert m.p == 0.0
+    assert found_after

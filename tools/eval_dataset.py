@@ -87,7 +87,50 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
 
     def compute_fn(batch) -> List[Dict[str, Any]]:
         results = []
-        with torch.no_grad():
+        # Safety: enforce evaluation mode and disable any configured dropout to ensure
+        # deterministic/no-dropout behavior during evaluation (protect against jobs/new defaults)
+        try:
+            try:
+                sd.te_eval()
+            except Exception:
+                pass
+            try:
+                sd.vae.eval()
+            except Exception:
+                pass
+            try:
+                sd.unet.eval()
+            except Exception:
+                pass
+            # Zero-out nn.Dropout probabilities where possible
+            import torch.nn as _nn
+            changed = False
+            for root in (getattr(sd, 'unet', None), getattr(sd, 'text_encoder', None), getattr(sd, 'vae', None)):
+                if root is None:
+                    continue
+                for m in root.modules():
+                    if isinstance(m, _nn.Dropout):
+                        try:
+                            if getattr(m, 'p', None) is not None and float(m.p) != 0.0:
+                                m.p = 0.0
+                                changed = True
+                        except Exception:
+                            pass
+            # Also, if model_config includes an explicit dropout field, override it
+            try:
+                if hasattr(sd, 'model_config') and sd.model_config is not None and hasattr(sd.model_config, 'dropout'):
+                    if getattr(sd.model_config, 'dropout') is not None and float(sd.model_config.dropout) != 0.0:
+                        sd.model_config.dropout = 0.0
+                        changed = True
+            except Exception:
+                pass
+            if changed:
+                print('Enforced dropout=0.0 for evaluation (overrode model config or modules)')
+        except Exception:
+            # do not fail the evaluation if enforcement cannot run
+            pass
+
+        with torch.no_grad(): 
             # prepare prompt embeddings
             if getattr(batch, 'prompt_embeds', None) is not None:
                 conditional_embeds = batch.prompt_embeds
