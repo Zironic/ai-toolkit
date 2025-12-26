@@ -265,38 +265,29 @@ If you'd like, I can:
 
 ---
 
-## Eval & Caption Debugging (agents) 🔎
+## Diagnostics — Eval & Caption Debugging 🔎
 
-Guidance for working with the dataset evaluation and caption-debugging flow:
+Purpose: verify captions are actually used and quantify their impact with low-variance, reproducible checks.
 
-- Quick, safe checks:
-  - Run a short eval with sampling capped: `python tools/eval_dataset.py --dataset-path <dataset> --model <model> --samples-per-image 2 --fixed-noise-std 0.6 --sample-fraction 0.1 --max-samples 50 --out-dir <dataset>`
-  - Enqueue via the UI API: POST `/api/eval_dataset` with `debug_captions: true`, `samples_per_image`, and `fixed_noise_std` fields in the request body.
+Quick commands:
+- Small eval (shape-focused):
+  `python tools/eval_dataset.py --dataset-path <dataset> --model <model> --samples-per-image 2 --fixed-noise-std 0.6 --caption-ablation zero --caption-ablation-compare --log-conditioning --eval-resolution 256 --max-samples 50 --out-dir <dataset>`
+- Enqueue via API: POST `/api/eval_dataset` with `{ debug_captions, samples_per_image, fixed_noise_std, ablation_compare }`.
 
-- Debug logs & locations:
-  - Caption debug lines are printed with the tag `[EVAL-CAPTION-DEBUG]` and persisted to the dataset folder as `*.eval_caption_debug_<jobid>.log` (NDJSON-like lines recommended when available).
-  - The evaluation job summary prints `Total examples: X, mean loss: Y` and `Flagged captions: N` to help triage quickly.
+Artifacts & logs:
+- `.eval_caption_debug_*.log` — per-batch `captions` and embedding shapes/norms (human-readable, persisted).
+- `.eval_caption_cond_*.log` — NDJSON lines with conditioning stats and ablation MSE (useful for automated parsing).
+- JSON report fields: `loss_with_caption`, `loss_with_blank`, `ablation_delta` (positive = caption helped).
 
-- Useful scripts and helpers:
-  - `ui/scripts/run_debug_eval.js` — enqueue a debug eval job programmatically.
-  - `tools/run_caption_debug_sim.py` — local compute_fn simulator intended for quick checks (requires `diffusers` in the environment).
-  - `ui/scripts/check_eval_jobs.js`, `ui/scripts/print_eval_job.js` — DB inspection helpers.
+Triage checklist:
+1. Confirm job params are persisted in the DB (`samples_per_image`, `fixed_noise_std`, `debug_captions`, `ablation_compare`).
+2. Inspect worker logs for `[EVAL-CAPTION-DEBUG]` and dataset logs for `.eval_caption_cond_*.log`.
+3. Check JSON report `ablation_delta` mean and `flagged` captions.
 
-- Defaults & behavior to know:
-  - `samples_per_image` default: **8** (configurable via UI/API/CLI).
-  - `fixed_noise_std` default: **0.6** (configurable via UI/API/CLI).
-  - Flagging: captions that are short, repeated, suspicious tokens, empty, or extremely long are collected via `toolkit/util/loss_utils.py::flag_bad_captions` and returned in the job `flagged` field (contains reasons & scores).
-
-- Quick triage checklist:
-  1. Confirm job params: `debug_captions`, `samples_per_image`, `fixed_noise_std` are present in the job row.
-  2. Check worker stdout or `*.eval_caption_debug_*.log` for `[EVAL-CAPTION-DEBUG]` lines.
-  3. Inspect `res['flagged']` via `ui/scripts/print_eval_job.js` or by reading the JSON report file.
-  4. If pipeline load errors occur, inspect `EvalJob.info` and the worker logs for model / HF auth / missing package messages.
-
-- Known gaps and follow-ups for agents:
-  - Paired-eval (A/B with identical noise/timesteps) is not implemented yet — avoid assuming paired noise in comparisons.
-  - Local simulations (`run_caption_debug_sim.py`) require `diffusers` and related packages; add to env before running.
+Notes & caveats:
+- Paired-eval with identical seeds is not implemented; ablation-compare runs in-batch A/B and reports `abl - orig` deltas.
+- Local sim tools (e.g., `tools/run_caption_debug_sim.py`) require `diffusers` and related packages.
 
 ---
 
-If you'd like, I can also append a short 'Eval & Caption Debugging' checklist to `LEARNINGS.md` summarizing recent discoveries and suggested follow-ups.
+If you want, I can add a short 'Eval troubleshooting' checklist to `LEARNINGS.md` summarizing common failure modes (missing HF tokens, pipeline load errors, permission issues).
