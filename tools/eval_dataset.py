@@ -347,6 +347,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
     if model_cfg is not None:
+        # For evaluation we do not want to create or attach LoRA/training adapters unless
+        # explicitly requested via --apply-inference-lora. To avoid accidental side-effects
+        # strip known LoRA fields when apply_inference_lora is False.
+        if not args.apply_inference_lora:
+            for k in ['assistant_lora_path', 'lora_path', 'inference_lora_path']:
+                if k in model_cfg:
+                    print(f"Stripping model_config field {k} for eval (apply_inference_lora is False)")
+                    model_cfg.pop(k, None)
+
         print(f"Loading model config (inference-safe) from {args.model_config_file} on {device}... apply_lora={args.apply_inference_lora}")
         try:
             # model_utils will sanitize and load in inference mode
