@@ -71,7 +71,7 @@ def build_sd_model(name_or_path: str, device: str = "cpu", dtype: str = "float32
     return sd
 
 
-def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 4, debug_noise: bool = False) -> Callable[[Any], List[Dict[str, Any]]]:
+def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 4, debug_noise: bool = False, debug_noise_timestep_type: str = 'sigmoid') -> Callable[[Any], List[Dict[str, Any]]]:
     """Return a compute_fn(batch) suitable for evaluate_dataset / run_dataset_evaluation.
 
     The compute_fn expects a batch-like object with attributes used by the training
@@ -129,13 +129,38 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
             bs = latents.shape[0]
             # sample noise and timesteps
             noise = torch.randn_like(latents).to(sd.device_torch)
-            # choose timesteps uniformly across scheduler steps
+            # choose timesteps according to selected strategy
             try:
                 max_steps = int(sd.noise_scheduler.config.num_train_timesteps)
             except Exception:
                 # fallback to 1000
                 max_steps = 1000
-            timesteps = torch.randint(0, max_steps, (bs,), device=sd.device_torch, dtype=torch.long)
+
+            def sample_timesteps(bs_local: int):
+                ttype = debug_noise_timestep_type
+                if ttype == 'uniform':
+                    return torch.randint(0, max_steps, (bs_local,), device=sd.device_torch, dtype=torch.long)
+                if ttype == 'one_step':
+                    return torch.zeros((bs_local,), device=sd.device_torch, dtype=torch.long)
+                if ttype == 'cubic_early':
+                    r = torch.rand(bs_local, device=sd.device_torch)
+                    idx = (r ** 3 * (max_steps)).to(torch.long)
+                    return torch.clamp(idx, 0, max_steps - 1)
+                if ttype == 'cubic_late':
+                    r = torch.rand(bs_local, device=sd.device_torch)
+                    idx = ((1.0 - (1.0 - r) ** 3) * (max_steps)).to(torch.long)
+                    return torch.clamp(idx, 0, max_steps - 1)
+                if ttype == 'sigmoid':
+                    # Match trainer default: generate timesteps by applying sigmoid to normal noise
+                    # This produces a bell-like distribution biased toward the center when turned into timesteps
+                    r = torch.randn((bs_local,), device=sd.device_torch)
+                    tvals = torch.sigmoid(r)
+                    idx = ((1.0 - tvals) * (max_steps)).to(torch.long)
+                    return torch.clamp(idx, 0, max_steps - 1)
+                # default
+                return torch.randint(0, max_steps, (bs_local,), device=sd.device_torch, dtype=torch.long)
+
+            timesteps = sample_timesteps(bs)
 
             noisy = sd.noise_scheduler.add_noise(latents, noise, timesteps)
 
@@ -207,7 +232,7 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                             tlist = timesteps.detach().cpu().tolist() if isinstance(timesteps, torch.Tensor) else list(timesteps)
                         except Exception:
                             tlist = None
-                        print(f"[EVAL-DEBUG] rep={_rep}, paths={paths}, timesteps={tlist}, noise_std={noise_std_per_sample}, sched_std={sched_stds}")
+                        print(f"[EVAL-DEBUG] rep={_rep}, timestep_type={debug_noise_timestep_type}, paths={paths}, timesteps={tlist}, noise_std={noise_std_per_sample}, sched_std={sched_stds}")
                 except Exception:
                     # swallow debug failures so evaluation doesn't stop
                     pass
@@ -215,11 +240,7 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                 # resample noise and timesteps for next repetition if any
                 if _rep != samples - 1:
                     noise = torch.randn_like(latents).to(sd.device_torch)
-                    try:
-                        max_steps = int(sd.noise_scheduler.config.num_train_timesteps)
-                    except Exception:
-                        max_steps = 1000
-                    timesteps = torch.randint(0, max_steps, (bs,), device=sd.device_torch, dtype=torch.long)
+                    timesteps = sample_timesteps(bs)
                     noisy = sd.noise_scheduler.add_noise(latents, noise, timesteps)
                     try:
                         noise_pred = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch)
@@ -286,6 +307,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Number of stochastic samples (noise/timesteps) to average per image
     parser.add_argument('--samples-per-image', type=int, default=4, help='Number of independent stochastic forward passes per image to average (default: 4)')
     parser.add_argument('--debug-noise', action='store_true', help='If set, print debug info about noise std and scheduler std per repetition')
+    parser.add_argument('--timestep-type', choices=['uniform','one_step','cubic_early','cubic_late','sigmoid'], default='sigmoid', help='Timestep sampling strategy to mirror training. "uniform" samples uniformly, "one_step" uses timestep 0, "cubic_early" biases toward early timesteps, "cubic_late" biases toward late timesteps, "sigmoid" matches trainer default sigmoid schedule.')
 
     args = parser.parse_args(argv)
 
@@ -337,7 +359,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Building dataloader for {args.dataset_path} (batch_size={args.batch_size})...")
     dataloader = build_dataloader_for_folder(args.dataset_path, args.batch_size, sd)
 
-    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image, debug_noise=args.debug_noise)
+    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image, debug_noise=args.debug_noise, debug_noise_timestep_type=args.timestep_type)
 
     out_dir = args.out_dir or args.dataset_path
     if not os.path.exists(out_dir):
