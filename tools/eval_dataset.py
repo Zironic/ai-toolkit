@@ -622,9 +622,16 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
     return compute_fn
 
 
-def build_dataloader_for_folder(folder_path: str, batch_size: int, sd: StableDiffusion):
-    """Create a dataloader for a single dataset folder using DatasetConfig."""
-    ds = DatasetConfig(folder_path=folder_path)
+def build_dataloader_for_folder(folder_path: str, batch_size: int, sd: StableDiffusion, eval_resolution: int | None = None):
+    """Create a dataloader for a single dataset folder using DatasetConfig.
+
+    If `eval_resolution` is provided it overrides the dataset's configured `resolution`
+    for evaluation runs (useful to reduce pixel resolution while preserving shape information).
+    """
+    if eval_resolution is not None:
+        ds = DatasetConfig(folder_path=folder_path, resolution=eval_resolution)
+    else:
+        ds = DatasetConfig(folder_path=folder_path)
     return get_dataloader_from_datasets([ds], batch_size=batch_size, sd=sd)
 
 
@@ -657,6 +664,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument('--caption-ablation', choices=['none','zero','random'], default='none', help='If set, replace prompt embeddings per-batch with zeros or random noise to test whether captions affect model predictions')
     parser.add_argument('--caption-ablation-compare', action='store_true', help='If set, run each evaluation twice (real vs blank) and store the difference as the recorded loss')
     parser.add_argument('--log-conditioning', action='store_true', help='If set, emit per-batch embedding statistics (mean/std) and, if caption-ablation used, the MSE between original and ablated noise predictions')
+
+    # Evaluation dataset resolution (optional): override dataset resolution for evaluation (default: 256)
+    parser.add_argument('--eval-resolution', type=int, default=256, help='If set, override dataset resolution for evaluation crops and resizing (default: 256)')
 
     args = parser.parse_args(argv)
 
@@ -714,8 +724,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("This likely means the model id was not found on Hugging Face or is private. Confirm the model name is correct or set HF_TOKEN to access private models.")
             return 3
 
-    print(f"Building dataloader for {args.dataset_path} (batch_size={args.batch_size})...")
-    dataloader = build_dataloader_for_folder(args.dataset_path, args.batch_size, sd)
+    print(f"Building dataloader for {args.dataset_path} (batch_size={args.batch_size}, eval_resolution={args.eval_resolution})...")
+    dataloader = build_dataloader_for_folder(args.dataset_path, args.batch_size, sd, eval_resolution=args.eval_resolution)
 
     compute_fn = make_compute_fn_for_sd(
         sd,
