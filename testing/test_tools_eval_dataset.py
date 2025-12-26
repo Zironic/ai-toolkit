@@ -123,3 +123,45 @@ def test_compute_fn_does_not_normalize_per_batch():
     assert len(entries) == 2
     assert abs(entries[0]['loss'] - 0.0) < 1e-6
     assert abs(entries[1]['loss'] - 1.0) < 1e-6
+
+
+def test_compute_fn_ablation_compare():
+    # predict_noise returns 0 for normal embeddings, 1 for ablated (zeros) embeddings
+    class SDAblation(DummySD):
+        def predict_noise(self, noisy, text_embeddings=None, timestep=None, batch=None, **kwargs):
+            te = text_embeddings
+            # crude check: if embeddings are zero tensor, return ones; else zeros
+            if hasattr(te, 'text_embeds'):
+                t = te.text_embeds
+                if isinstance(t, torch.Tensor):
+                    if torch.all(t == 0):
+                        return torch.ones_like(noisy)
+                    else:
+                        return torch.zeros_like(noisy)
+                elif isinstance(t, (list, tuple)):
+                    # if first tensor is zero
+                    if torch.all(t[0] == 0):
+                        return torch.ones_like(noisy)
+                    else:
+                        return torch.zeros_like(noisy)
+            return torch.zeros_like(noisy)
+
+        def get_loss_target(self, noise=None, batch=None, timesteps=None):
+            # return zeros so loss equals prediction^2
+            return torch.zeros_like(noise)
+
+    sd = SDAblation()
+    compute_fn = make_compute_fn_for_sd(sd, normalize_loss=False, samples_per_image=2, caption_ablation_compare=True)
+
+    lat = torch.randn(1, 4, 16, 16)
+    files = [DummyFile('/tmp/a.png', 'a caption')]
+    batch = DummyBatch(files, latents=lat)
+
+    entries = compute_fn(batch)
+    assert len(entries) == 1
+    e = entries[0]
+    # ablated prediction is ones so loss_with_blank ~ 1.0, loss_with_caption ~ 0.0, delta ~ 1.0
+    assert 'loss_with_caption' in e and 'loss_with_blank' in e and 'ablation_delta' in e
+    assert abs(e['loss_with_caption'] - 0.0) < 1e-6
+    assert abs(e['loss_with_blank'] - 1.0) < 1e-6
+    assert abs(e['ablation_delta'] - 1.0) < 1e-6

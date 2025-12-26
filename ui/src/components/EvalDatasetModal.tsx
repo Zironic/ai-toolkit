@@ -19,6 +19,7 @@ export default function EvalDatasetModal({ datasetName, isOpen, onClose, onStart
   const [samplesPerImage, setSamplesPerImage] = useState<number>(8);
   const [fixedNoiseStd, setFixedNoiseStd] = useState<number>(0.6);
   const [debugCaptions, setDebugCaptions] = useState<boolean>(false);
+  const [ablationCompare, setAblationCompare] = useState<boolean>(false);
   const [device, setDevice] = useState<string>('cuda');
 
   // sample_fraction and max_samples are enforced server-side and removed from the UI
@@ -68,6 +69,7 @@ export default function EvalDatasetModal({ datasetName, isOpen, onClose, onStart
         samples_per_image: samplesPerImage,
         fixed_noise_std: fixedNoiseStd,
         debug_captions: debugCaptions,
+        ablation_compare: ablationCompare,
       };
       if (useJobModel && modelConfig) {
         payload.model_config = modelConfig;
@@ -150,6 +152,10 @@ export default function EvalDatasetModal({ datasetName, isOpen, onClose, onStart
                 <div className="flex items-center gap-2">
                   <input type="checkbox" checked={debugCaptions} onChange={(e) => setDebugCaptions(e.target.checked)} id="debugCaptions" />
                   <label htmlFor="debugCaptions" className="text-sm">Enable caption debug logging</label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input type="checkbox" checked={ablationCompare} onChange={(e) => setAblationCompare(e.target.checked)} id="ablationCompare" />
+                  <label htmlFor="ablationCompare" className="text-sm">Enable ablation compare (run with captions and blank captions and store their difference as the loss)</label>
                 </div>
                 <div>
                   <label className="block text-sm font-medium mb-1">Device</label>

@@ -65,6 +65,11 @@ export default async function processEvalQueue() {
   if (typeof params.fixed_noise_std !== 'undefined') args.push('--fixed-noise-std', String(params.fixed_noise_std));
   // pass debug-captions flag if requested
   if (params.debug_captions) args.push('--debug-captions');
+  // ablation compare: run caption ablation (zero) and request compare
+  if (params.ablation_compare) {
+    args.push('--caption-ablation', 'zero');
+    args.push('--caption-ablation-compare');
+  }
   // do not pass max_samples (not supported for full per-image evaluation)
 
 

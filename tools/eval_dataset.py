@@ -71,7 +71,7 @@ def build_sd_model(name_or_path: str, device: str = "cpu", dtype: str = "float32
     return sd
 
 
-def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 8, debug_noise: bool = False, debug_noise_timestep_type: str = 'sigmoid', fixed_noise_std: float | None = 0.6, debug_captions: bool = False) -> Callable[[Any], List[Dict[str, Any]]]:
+def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 8, debug_noise: bool = False, debug_noise_timestep_type: str = 'sigmoid', fixed_noise_std: float | None = 0.6, debug_captions: bool = False, caption_ablation: str = 'none', caption_ablation_compare: bool = False, log_conditioning: bool = False) -> Callable[[Any], List[Dict[str, Any]]]:
     """Return a compute_fn(batch) suitable for evaluate_dataset / run_dataset_evaluation.
 
     The compute_fn expects a batch-like object with attributes used by the training
@@ -242,12 +242,109 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
             except Exception:
                 pass
 
-            # obtain model prediction
+            # obtain model prediction (instrumented)
             try:
-                noise_pred = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch)
+                # request conditional prediction as well when supported
+                try:
+                    noise_pred, conditional_pred = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                except TypeError:
+                    noise_pred, conditional_pred = sd.predict_noise(noisy, prompt_embeds=conditional_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
             except TypeError:
-                # older signatures may expect 'prompt_embeds' naming
-                noise_pred = sd.predict_noise(noisy, prompt_embeds=conditional_embeds, timestep=timesteps, batch=batch)
+                # older signatures may not accept return_conditional_pred; fallback
+                try:
+                    noise_pred = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch)
+                    conditional_pred = None
+                except TypeError:
+                    noise_pred = sd.predict_noise(noisy, prompt_embeds=conditional_embeds, timestep=timesteps, batch=batch)
+                    conditional_pred = None
+
+            # optional: perform caption ablation and/or conditioning stats
+            _mse_all = None
+            _per_sample_mse = None
+            if caption_ablation != 'none' or log_conditioning:
+                try:
+                    # helper to build ablated PromptEmbeds matching the original
+                    def _make_ablated(pe, mode='zero'):
+                        pe2 = pe.clone()
+                        if isinstance(pe2.text_embeds, (list, tuple)):
+                            new = []
+                            for t in pe2.text_embeds:
+                                if mode == 'zero':
+                                    new.append(torch.zeros_like(t))
+                                else:
+                                    new.append(torch.randn_like(t))
+                            pe2.text_embeds = new
+                        else:
+                            if mode == 'zero':
+                                pe2.text_embeds = torch.zeros_like(pe2.text_embeds)
+                            else:
+                                pe2.text_embeds = torch.randn_like(pe2.text_embeds)
+                        return pe2
+
+                    if caption_ablation != 'none':
+                        ablated = _make_ablated(conditional_embeds, caption_ablation)
+                        try:
+                            try:
+                                noise_pred_abl, cond_pred_abl = sd.predict_noise(noisy, text_embeddings=ablated, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                            except TypeError:
+                                noise_pred_abl, cond_pred_abl = sd.predict_noise(noisy, prompt_embeds=ablated, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                        except TypeError:
+                            # fallback if return_conditional_pred unsupported
+                            try:
+                                noise_pred_abl = sd.predict_noise(noisy, text_embeddings=ablated, timestep=timesteps, batch=batch)
+                            except TypeError:
+                                noise_pred_abl = sd.predict_noise(noisy, prompt_embeds=ablated, timestep=timesteps, batch=batch)
+
+                        try:
+                            _mse_all = float(((noise_pred.float() - noise_pred_abl.float()) ** 2).mean().item())
+                            _per_sample_mse = ((noise_pred.float() - noise_pred_abl.float()).view(noise_pred.shape[0], -1).pow(2).mean(dim=1).detach().cpu().tolist())
+                        except Exception:
+                            _mse_all = None
+                            _per_sample_mse = None
+
+                    # conditioning stats (means/stds)
+                    if log_conditioning:
+                        try:
+                            te_obj = conditional_embeds.text_embeds
+                            if isinstance(te_obj, torch.Tensor):
+                                flat = te_obj.view(te_obj.shape[0], -1)
+                                means = flat.mean(dim=1).detach().cpu().tolist()
+                                stds = flat.std(dim=1).detach().cpu().tolist()
+                            else:
+                                means = []
+                                stds = []
+                                for t in te_obj:
+                                    f = t.view(t.shape[0], -1)
+                                    means.append(float(f.mean().detach().cpu().tolist()[0]) if hasattr(f.mean(),'tolist') else float(f.mean().detach().cpu()))
+                                    stds.append(float(f.std().detach().cpu().tolist()[0]))
+                        except Exception:
+                            means = None
+                            stds = None
+
+                        try:
+                            caps = captions_list if 'captions_list' in locals() else None
+                        except Exception:
+                            caps = None
+
+                        print(f"[EVAL-CONDITIONING] captions={caps}, means={means}, stds={stds}, ablation_mse={_mse_all}, per_sample_mse={_per_sample_mse}")
+                        # also persist to dataset folder
+                        try:
+                            ds_path = None
+                            if len(batch.file_items) > 0 and getattr(batch.file_items[0], 'dataset_config', None) is not None:
+                                ds_path = getattr(batch.file_items[0].dataset_config, 'dataset_path', None) or getattr(batch.file_items[0].dataset_config, 'folder_path', None)
+                            if ds_path:
+                                import time
+                                safe_name = f".eval_caption_cond_{int(time.time())}.log"
+                                p = os.path.join(ds_path, safe_name)
+                                try:
+                                    with open(p, 'a', encoding='utf-8') as _f:
+                                        _f.write(json.dumps({'captions': caps, 'means': means, 'stds': stds, 'ablation_mse': _mse_all, 'per_sample_mse': _per_sample_mse}) + '\n')
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             # determine target for loss
             try:
@@ -255,13 +352,41 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
             except Exception:
                 target = noise
 
-            # Optionally run multiple stochastic samples per image and average
+            # Optionally run multiple stochastic samples per image and average.
+            # If caption_ablation_compare is enabled we compute losses for both original
+            # and ablated conditionings and record the delta (blank - caption) as the 'loss'.
             samples = max(1, int(samples_per_image))
             sum_per_sample = None
+            sum_per_sample_abl = None
             # prepare per-image lists to capture raw sample losses
             samples_list_local = [ [] for _ in range(bs) ]
+            samples_list_local_abl = [ [] for _ in range(bs) ]
+            samples_list_local_delta = [ [] for _ in range(bs) ]
+
+            # prepare ablated embeddings if requested (zero by default)
+            ablated_embeds = None
+            if caption_ablation != 'none' or caption_ablation_compare:
+                def _make_ablated(pe, mode='zero'):
+                    pe2 = pe.clone()
+                    if isinstance(pe2.text_embeds, (list, tuple)):
+                        new = []
+                        for t in pe2.text_embeds:
+                            if mode == 'zero':
+                                new.append(torch.zeros_like(t))
+                            else:
+                                new.append(torch.randn_like(t))
+                        pe2.text_embeds = new
+                    else:
+                        if mode == 'zero':
+                            pe2.text_embeds = torch.zeros_like(pe2.text_embeds)
+                        else:
+                            pe2.text_embeds = torch.randn_like(pe2.text_embeds)
+                    return pe2
+
+                ablated_embeds = _make_ablated(conditional_embeds, 'zero')
+
             for _rep in range(samples):
-                # compute per-element MSE (no reduction)
+                # compute per-element MSE (no reduction) for original conditioning
                 loss_per_element = (noise_pred.float() - target.float()) ** 2
                 per_sample = per_sample_from_loss_tensor(loss_per_element)
                 if sum_per_sample is None:
@@ -276,6 +401,41 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                         samples_list_local[ii].append(float(per_sample_cpu[ii].item()))
                     except Exception:
                         # be defensive; ignore failures and continue
+                        pass
+
+                # if ablation-compare is requested, compute ablated prediction and losses
+                if caption_ablation_compare and ablated_embeds is not None:
+                    try:
+                        try:
+                            noise_pred_abl, _ = sd.predict_noise(noisy, text_embeddings=ablated_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                        except TypeError:
+                            noise_pred_abl, _ = sd.predict_noise(noisy, prompt_embeds=ablated_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                    except TypeError:
+                        try:
+                            noise_pred_abl = sd.predict_noise(noisy, text_embeddings=ablated_embeds, timestep=timesteps, batch=batch)
+                        except TypeError:
+                            noise_pred_abl = sd.predict_noise(noisy, prompt_embeds=ablated_embeds, timestep=timesteps, batch=batch)
+
+                    try:
+                        loss_per_element_abl = (noise_pred_abl.float() - target.float()) ** 2
+                        per_sample_abl = per_sample_from_loss_tensor(loss_per_element_abl)
+                        if sum_per_sample_abl is None:
+                            sum_per_sample_abl = per_sample_abl
+                        else:
+                            sum_per_sample_abl = sum_per_sample_abl + per_sample_abl
+
+                        per_sample_abl_cpu = per_sample_abl.detach().cpu()
+                        # compute per-sample delta (blank - caption)
+                        for ii in range(per_sample_abl_cpu.shape[0]):
+                            try:
+                                a = float(per_sample_abl_cpu[ii].item())
+                                m = float(per_sample_cpu[ii].item())
+                                samples_list_local_abl[ii].append(a)
+                                samples_list_local_delta[ii].append(a - m)
+                            except Exception:
+                                pass
+                    except Exception:
+                        # swallow ablation failures
                         pass
 
                 # Debug: report noise magnitude and scheduler-derived std for this repetition
@@ -334,13 +494,35 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
             # average over samples
             avg_per_sample = (sum_per_sample / float(samples)).detach().cpu()
 
+            # if ablation-compare was used, compute averages for ablated predictions and
+            # set the recorded loss to the mean delta (blank - caption). Also include
+            # supporting fields for diagnostics.
+            if caption_ablation_compare and sum_per_sample_abl is not None:
+                avg_per_sample_abl = (sum_per_sample_abl / float(samples)).detach().cpu()
+                # compute delta per-sample (abl - orig)
+                try:
+                    avg_delta = (avg_per_sample_abl - avg_per_sample).detach().cpu()
+                except Exception:
+                    # fallback: convert to lists
+                    try:
+                        orig_list = avg_per_sample.tolist() if hasattr(avg_per_sample, 'tolist') else list(avg_per_sample)
+                        abl_list = avg_per_sample_abl.tolist() if hasattr(avg_per_sample_abl, 'tolist') else list(avg_per_sample_abl)
+                        avg_delta = [ (abl_list[i] - orig_list[i]) for i in range(min(len(orig_list), len(abl_list))) ]
+                    except Exception:
+                        avg_delta = None
+            else:
+                avg_per_sample_abl = None
+                avg_delta = None
+
             # NOTE: per-batch normalization was removed here to ensure raw per-sample
             # losses are preserved into the post-collection `raw_report`. Global
             # normalization (across all examples) is handled by `evaluate_dataset`.
-            # (Left intentionally empty)
 
             # build records (include per-image sample min/max from the repeated stochastic samples)
             losses = avg_per_sample.tolist() if hasattr(avg_per_sample, 'tolist') else list(avg_per_sample)
+            losses_abl = avg_per_sample_abl.tolist() if (avg_per_sample_abl is not None and hasattr(avg_per_sample_abl, 'tolist')) else (list(avg_per_sample_abl) if avg_per_sample_abl is not None else None)
+            deltas = avg_delta.tolist() if (avg_delta is not None and hasattr(avg_delta, 'tolist')) else (list(avg_delta) if avg_delta is not None else None)
+
             for i, fi in enumerate(batch.file_items):
                 sl = samples_list_local[i] if i < len(samples_list_local) else None
                 if sl and isinstance(sl, list) and len(sl) > 0:
@@ -350,14 +532,35 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                     min_s = float(losses[i]) if i < len(losses) else None
                     max_s = float(losses[i]) if i < len(losses) else None
 
-                results.append({
+                # ablation-specific min/max (from deltas) if present
+                if deltas is not None and i < len(deltas):
+                    min_delta = float(min(samples_list_local_delta[i])) if len(samples_list_local_delta[i]) > 0 else float(deltas[i])
+                    max_delta = float(max(samples_list_local_delta[i])) if len(samples_list_local_delta[i]) > 0 else float(deltas[i])
+                    loss_value = float(deltas[i])
+                    loss_with_caption = float(losses[i]) if i < len(losses) else None
+                    loss_with_blank = float(losses_abl[i]) if (losses_abl is not None and i < len(losses_abl)) else None
+                else:
+                    min_delta = None
+                    max_delta = None
+                    loss_value = float(losses[i]) if i < len(losses) else None
+                    loss_with_caption = None
+                    loss_with_blank = None
+
+                out_item = {
                     'path': getattr(fi, 'path', None),
                     'dataset': getattr(fi.dataset_config, 'dataset_path', None) or getattr(fi.dataset_config, 'folder_path', None) if getattr(fi, 'dataset_config', None) is not None else None,
                     'caption': getattr(fi, 'raw_caption', '') or '',
-                    'loss': float(losses[i]) if i < len(losses) else None,
-                    'min_loss': min_s,
-                    'max_loss': max_s,
-                })
+                    'loss': loss_value,
+                    'min_loss': min_delta if min_delta is not None else min_s,
+                    'max_loss': max_delta if max_delta is not None else max_s,
+                }
+                # attach additional diagnostics when ablation compare was used
+                if caption_ablation_compare:
+                    out_item['loss_with_caption'] = loss_with_caption
+                    out_item['loss_with_blank'] = loss_with_blank
+                    out_item['ablation_delta'] = loss_value
+
+                results.append(out_item)
         return results
 
     return compute_fn
@@ -395,6 +598,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument('--timestep-type', choices=['uniform','one_step','cubic_early','cubic_late','sigmoid'], default='sigmoid', help='Timestep sampling strategy to mirror training. "uniform" samples uniformly, "one_step" uses timestep 0, "cubic_early" biases toward early timesteps, "cubic_late" biases toward late timesteps, "sigmoid" matches trainer default sigmoid schedule.')
     parser.add_argument('--fixed-noise-std', type=float, default=0.6, help='If set (0.0-1.0), use this fixed noise std instead of sampling timesteps. Defaults to 0.6 (60% noise magnitude) to reduce evaluation variance when comparing captions.')
     parser.add_argument('--debug-captions', action='store_true', help='If set, print debug info about prompt embeddings (shapes, norms) and whether classifier-free guidance is active for each batch')
+    parser.add_argument('--caption-ablation', choices=['none','zero','random'], default='none', help='If set, replace prompt embeddings per-batch with zeros or random noise to test whether captions affect model predictions')
+    parser.add_argument('--caption-ablation-compare', action='store_true', help='If set, run each evaluation twice (real vs blank) and store the difference as the recorded loss')
+    parser.add_argument('--log-conditioning', action='store_true', help='If set, emit per-batch embedding statistics (mean/std) and, if caption-ablation used, the MSE between original and ablated noise predictions')
 
     args = parser.parse_args(argv)
 
@@ -455,7 +661,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Building dataloader for {args.dataset_path} (batch_size={args.batch_size})...")
     dataloader = build_dataloader_for_folder(args.dataset_path, args.batch_size, sd)
 
-    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image, debug_noise=args.debug_noise, debug_noise_timestep_type=args.timestep_type, fixed_noise_std=args.fixed_noise_std, debug_captions=args.debug_captions)
+    compute_fn = make_compute_fn_for_sd(
+        sd,
+        device=device,
+        normalize_loss=args.normalize_loss,
+        samples_per_image=args.samples_per_image,
+        debug_noise=args.debug_noise,
+        debug_noise_timestep_type=args.timestep_type,
+        fixed_noise_std=args.fixed_noise_std,
+        debug_captions=args.debug_captions,
+        caption_ablation=args.caption_ablation,
+        caption_ablation_compare=args.caption_ablation_compare,
+        log_conditioning=args.log_conditioning,
+    )
 
     out_dir = args.out_dir or args.dataset_path
     if not os.path.exists(out_dir):
