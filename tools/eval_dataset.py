@@ -71,7 +71,7 @@ def build_sd_model(name_or_path: str, device: str = "cpu", dtype: str = "float32
     return sd
 
 
-def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 4, debug_noise: bool = False, debug_noise_timestep_type: str = 'sigmoid') -> Callable[[Any], List[Dict[str, Any]]]:
+def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 4, debug_noise: bool = False, debug_noise_timestep_type: str = 'sigmoid', fixed_noise_std: float | None = None) -> Callable[[Any], List[Dict[str, Any]]]:
     """Return a compute_fn(batch) suitable for evaluate_dataset / run_dataset_evaluation.
 
     The compute_fn expects a batch-like object with attributes used by the training
@@ -160,9 +160,18 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                 # default
                 return torch.randint(0, max_steps, (bs_local,), device=sd.device_torch, dtype=torch.long)
 
-            timesteps = sample_timesteps(bs)
-
-            noisy = sd.noise_scheduler.add_noise(latents, noise, timesteps)
+            if fixed_noise_std is not None:
+                # Apply direct mixture to achieve fixed noise std s such that
+                # noisy = sqrt(1 - s^2) * latents + s * noise
+                s = float(fixed_noise_std)
+                if s < 0 or s > 1:
+                    raise ValueError('fixed_noise_std must be between 0 and 1')
+                lat_coeff = float((1.0 - s * s) ** 0.5)
+                noisy = latents * lat_coeff + noise * s
+                timesteps = None
+            else:
+                timesteps = sample_timesteps(bs)
+                noisy = sd.noise_scheduler.add_noise(latents, noise, timesteps)
 
             # obtain model prediction
             try:
@@ -209,11 +218,13 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                         except Exception:
                             noise_std_per_sample = None
 
-                        # scheduler-derived std (if alphas_cumprod available)
+                        # scheduler-derived std (if alphas_cumprod available), fallback to fixed std s when used
                         sched = getattr(sd, 'noise_scheduler', None)
                         sched_stds = None
                         try:
-                            if sched is not None and hasattr(sched, 'alphas_cumprod'):
+                            if fixed_noise_std is not None:
+                                sched_stds = [float(fixed_noise_std)] * latents.shape[0]
+                            elif sched is not None and hasattr(sched, 'alphas_cumprod'):
                                 ac = sched.alphas_cumprod
                                 import numpy as _np
                                 if hasattr(ac, 'detach'):
@@ -229,7 +240,7 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                         # show file paths if available for context
                         paths = [getattr(fi, 'path', None) for fi in batch.file_items]
                         try:
-                            tlist = timesteps.detach().cpu().tolist() if isinstance(timesteps, torch.Tensor) else list(timesteps)
+                            tlist = None if timesteps is None else (timesteps.detach().cpu().tolist() if isinstance(timesteps, torch.Tensor) else list(timesteps))
                         except Exception:
                             tlist = None
                         print(f"[EVAL-DEBUG] rep={_rep}, timestep_type={debug_noise_timestep_type}, paths={paths}, timesteps={tlist}, noise_std={noise_std_per_sample}, sched_std={sched_stds}")
@@ -308,6 +319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument('--samples-per-image', type=int, default=4, help='Number of independent stochastic forward passes per image to average (default: 4)')
     parser.add_argument('--debug-noise', action='store_true', help='If set, print debug info about noise std and scheduler std per repetition')
     parser.add_argument('--timestep-type', choices=['uniform','one_step','cubic_early','cubic_late','sigmoid'], default='sigmoid', help='Timestep sampling strategy to mirror training. "uniform" samples uniformly, "one_step" uses timestep 0, "cubic_early" biases toward early timesteps, "cubic_late" biases toward late timesteps, "sigmoid" matches trainer default sigmoid schedule.')
+    parser.add_argument('--fixed-noise-std', type=float, default=None, help='If set (0.0-1.0), use this fixed noise std instead of sampling timesteps. e.g. 0.75 applies approx 75%% noise magnitude (deterministic across timesteps).')
 
     args = parser.parse_args(argv)
 
@@ -359,7 +371,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Building dataloader for {args.dataset_path} (batch_size={args.batch_size})...")
     dataloader = build_dataloader_for_folder(args.dataset_path, args.batch_size, sd)
 
-    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image, debug_noise=args.debug_noise, debug_noise_timestep_type=args.timestep_type)
+    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image, debug_noise=args.debug_noise, debug_noise_timestep_type=args.timestep_type, fixed_noise_std=args.fixed_noise_std)
 
     out_dir = args.out_dir or args.dataset_path
     if not os.path.exists(out_dir):
