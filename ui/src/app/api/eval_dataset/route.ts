@@ -75,7 +75,21 @@ export async function POST(request: NextRequest) {
     // prefer model_config.name_or_path if provided and try to resolve local paths, and enrich using jobs/new defaults
     // Respect UI-provided options: samples_per_image, fixed_noise_std, and debug_captions
     const paramsObj: any = { batch_size, sample_fraction: 1.0, device, samples_per_image: (body.samples_per_image ?? 8) };
-    if (typeof body.fixed_noise_std !== 'undefined') paramsObj.fixed_noise_std = body.fixed_noise_std;
+    // Coerce and validate fixed_noise_std (numbers or numeric strings allowed)
+    if (typeof body.fixed_noise_std !== 'undefined') {
+      const fn = Number(body.fixed_noise_std);
+      if (Number.isFinite(fn) && fn >= 0.0 && fn <= 1.0) {
+        paramsObj.fixed_noise_std = fn;
+      } else {
+        // ignore invalid values and keep CLI default
+        console.warn('Ignored invalid fixed_noise_std from request:', body.fixed_noise_std);
+      }
+    }
+    // Coerce samples_per_image to an integer, with a sensible lower bound of 1
+    if (typeof body.samples_per_image !== 'undefined') {
+      const spi = Math.max(1, parseInt(String(body.samples_per_image), 10) || 1);
+      paramsObj.samples_per_image = spi;
+    }
     if (typeof body.debug_captions !== 'undefined') paramsObj.debug_captions = body.debug_captions;
     if (typeof body.ablation_compare !== 'undefined') paramsObj.ablation_compare = body.ablation_compare;
     if (model_config) {
