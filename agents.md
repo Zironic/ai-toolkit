@@ -61,12 +61,16 @@ UI (Node.js > 18):
 
 ```bash
 # from repo root
-# Windows: .\run-ui.ps1 or use `run-ui` helper
+# Recommended (non-interactive / agent-safe): start the production server (non-interactive)
 ./run-ui build_and_start
-# or: cd ui && npm run build_and_start
+# or: npm --prefix ui run start
+
+# Developer (interactive, hot-reload) - NOT recommended for unattended agents
+# Windows: .\run-ui-dev.bat (starts Next dev + worker, interactive)
+# POSIX: nohup npm --prefix ui run dev >/dev/null 2>&1 &
 ```
 
-> Tip: Use `AI_TOOLKIT_AUTH` env var to protect the UI when exposing it publicly.
+> Tip: Use `AI_TOOLKIT_AUTH` env var to protect the UI when exposing it publicly. For automated agents prefer the non-interactive production start (`build_and_start` or `npm --prefix ui run start`) rather than the interactive dev server.
 
 ---
 
@@ -125,8 +129,6 @@ If an agent must schedule training remotely, ensure it uses a proper GPU cluster
 
 ## Development tips (fast iteration) 💡
 
-- When working on the UI, prefer the `run-ui` helper from the repo root (Windows PowerShell: `.
-un-ui.ps1`).
 - Use targeted tests when changing code to reduce CI runtime: `python -m pytest testing/test_foo.py -q`.
 - Run the minimal reproducible test locally before opening a PR.
 
@@ -219,13 +221,16 @@ Small checklist for running Playwright tests locally:
 Tip: If `npx playwright` resolves the wrong package path (e.g., nested `ui/ui`), inspect `Get-Location` or `pwd` before running and prefer `npm --prefix ui exec playwright test ...` when scripting.
 
 Start server in background to avoid blocking test runs:
-- Preferred for E2E: run production server (`build` + `start`):
-  - `cd ui && npm run build && npm run start`  # avoids dev overlays and dev-only artifacts
-- Windows (PowerShell/dev):
-  - Start in background: `Start-Process -NoNewWindow -FilePath npm -ArgumentList '--prefix','ui','run','dev' -PassThru`
-  - Or use a job: `Start-Job -ScriptBlock { npm --prefix ui run dev } -Name PlaywrightUI`
-- macOS / Linux (POSIX):
-  - `nohup npm --prefix ui run dev >/dev/null 2>&1 &`
+- Preferred for E2E and for agents: run production server (non-interactive `build` + `start`) using the helper scripts (non-interactive and safe for unattended agents):
+  - Windows PowerShell (agent-safe): `.\run-ui-start.ps1`  # starts `npm --prefix ui run start` in background and writes `ui/ui_start.pid`
+  - POSIX (agent-safe): `./run-ui-start.sh`  # starts `npm --prefix ui run start` under `nohup` and writes `ui/ui_start.pid`
+  - To stop the background server: `.\run-ui-stop.ps1` (Windows) or `./run-ui-stop.sh` (POSIX)
+
+- If you need hot-reload (developer mode), prefer starting the dev server non-interactively only when necessary and in a controlled environment:
+  - Windows (PowerShell/dev): `Start-Process -NoNewWindow -FilePath npm -ArgumentList '--prefix','ui','run','dev' -PassThru`
+  - macOS / Linux (POSIX): `nohup npm --prefix ui run dev >/dev/null 2>&1 &`
+
+> Note: The interactive `npm run dev` (or `run-ui-dev.bat`) requires an attached terminal and is **not** recommended for unattended agents; prefer the background production start scripts for automation.
 
 > NOTE (agents): **Always start the UI server in a separate shell and do not run other commands in that same terminal.** Keeping the server in its own terminal avoids accidentally killing it, prevents interference with logs, and ensures Playwright tests run against a stable process.
 
@@ -268,12 +273,6 @@ A: Add them to the `What agents may run` section along with cost and runtime exp
 
 ---
 
-If you'd like, I can:
-- Add a short `AGENTS.md` inside `ui/` with `pnpm`/`npm` commands; or
-- Add a `smoke` test target to the test suite for a quick agent-run check; or
-- Provide a sample minimal `AGENTS.md` for a CI job that runs fast tests only.
-
----
 
 ## Diagnostics — Eval & Caption Debugging 🔎
 
@@ -298,6 +297,3 @@ Notes & caveats:
 - Paired-eval with identical seeds is not implemented; ablation-compare runs in-batch A/B and reports `abl - orig` deltas.
 - Local sim tools (e.g., `tools/run_caption_debug_sim.py`) require `diffusers` and related packages.
 
----
-
-If you want, I can add a short 'Eval troubleshooting' checklist to `LEARNINGS.md` summarizing common failure modes (missing HF tokens, pipeline load errors, permission issues).
