@@ -71,7 +71,7 @@ def build_sd_model(name_or_path: str, device: str = "cpu", dtype: str = "float32
     return sd
 
 
-def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 4) -> Callable[[Any], List[Dict[str, Any]]]:
+def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 4, debug_noise: bool = False) -> Callable[[Any], List[Dict[str, Any]]]:
     """Return a compute_fn(batch) suitable for evaluate_dataset / run_dataset_evaluation.
 
     The compute_fn expects a batch-like object with attributes used by the training
@@ -175,6 +175,43 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                         # be defensive; ignore failures and continue
                         pass
 
+                # Debug: report noise magnitude and scheduler-derived std for this repetition
+                try:
+                    if debug_noise:
+                        # per-sample raw noise std (computed on the current noise tensor)
+                        try:
+                            noise_std_per_sample = noise.view(noise.shape[0], -1).std(dim=1).detach().cpu().numpy().tolist()
+                        except Exception:
+                            noise_std_per_sample = None
+
+                        # scheduler-derived std (if alphas_cumprod available)
+                        sched = getattr(sd, 'noise_scheduler', None)
+                        sched_stds = None
+                        try:
+                            if sched is not None and hasattr(sched, 'alphas_cumprod'):
+                                ac = sched.alphas_cumprod
+                                import numpy as _np
+                                if hasattr(ac, 'detach'):
+                                    ac_cpu = ac.detach().cpu().numpy()
+                                else:
+                                    ac_cpu = _np.array(ac)
+                                timesteps_cpu = timesteps.detach().cpu().numpy() if isinstance(timesteps, torch.Tensor) else _np.array(timesteps)
+                                alpha_vals = ac_cpu[timesteps_cpu]
+                                sched_stds = (_np.sqrt(1.0 - alpha_vals)).tolist()
+                        except Exception:
+                            sched_stds = None
+
+                        # show file paths if available for context
+                        paths = [getattr(fi, 'path', None) for fi in batch.file_items]
+                        try:
+                            tlist = timesteps.detach().cpu().tolist() if isinstance(timesteps, torch.Tensor) else list(timesteps)
+                        except Exception:
+                            tlist = None
+                        print(f"[EVAL-DEBUG] rep={_rep}, paths={paths}, timesteps={tlist}, noise_std={noise_std_per_sample}, sched_std={sched_stds}")
+                except Exception:
+                    # swallow debug failures so evaluation doesn't stop
+                    pass
+
                 # resample noise and timesteps for next repetition if any
                 if _rep != samples - 1:
                     noise = torch.randn_like(latents).to(sd.device_torch)
@@ -248,6 +285,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Number of stochastic samples (noise/timesteps) to average per image
     parser.add_argument('--samples-per-image', type=int, default=4, help='Number of independent stochastic forward passes per image to average (default: 4)')
+    parser.add_argument('--debug-noise', action='store_true', help='If set, print debug info about noise std and scheduler std per repetition')
 
     args = parser.parse_args(argv)
 
@@ -299,7 +337,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Building dataloader for {args.dataset_path} (batch_size={args.batch_size})...")
     dataloader = build_dataloader_for_folder(args.dataset_path, args.batch_size, sd)
 
-    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image)
+    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image, debug_noise=args.debug_noise)
 
     out_dir = args.out_dir or args.dataset_path
     if not os.path.exists(out_dir):
