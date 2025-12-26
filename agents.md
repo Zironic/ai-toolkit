@@ -144,7 +144,17 @@ A concise index of common helpers and where to find them. Check here first befor
 - `toolkit/paths.py` — canonical repo paths (e.g., `MODELS_PATH`, `DIFFUSERS_CONFIGS_ROOT`).
 - `toolkit/metadata.py` — helpers for safetensors and metadata extraction.
 
-Tip: search quickly with ripgrep (e.g., `rg "def my_symbol" toolkit/`) or use the file names above to find implementation details. Update this list when you add or find commonly reused helpers.- **Prefer built-in toolkit helpers over reimplementing functionality.** Check `toolkit/` for dataset helpers (resize/crop), model utilities, and processing utilities before adding new code; this reduces duplication and avoids subtle incompatibilities.
+Tip: search quickly with ripgrep (e.g., `rg "def my_symbol" toolkit/`) or use the file names above to find implementation details. Update this list when you add or find commonly reused helpers.
+
+**Prefer built-in toolkit helpers** over reimplementing functionality — check `toolkit/` for dataset helpers (resize/crop), model utilities, and processing utilities before adding new code; this reduces duplication and avoids subtle incompatibilities.
+
+### Pre-change checklist (use before adding new helpers) ✅
+- **Read** `AGENTS.md` and `LEARNINGS.md` to confirm there isn't an existing helper or prior attempt for this task.
+- **Search the toolkit** for existing functions/classes: `rg "<keyword>|def <name>|class <Name>" toolkit/ -n` and inspect likely files (`dataloader_mixins.py`, `model_utils.py`, `util/loss_utils.py`).
+- **Run targeted tests** relevant to the area: `python -m pytest testing -q -k <test-name-substring>` and add tests for any new behavior in `testing/`.
+- **If adding CLI/UI behavior**, update API routes and worker persistence (e.g., `ui/src/app/api/eval_dataset/route.ts`, `ui/cron/actions/processEvalQueue.ts`) and add smoke checks.
+- **Document** the change in `AGENTS.md` (brief note) and `LEARNINGS.md` (why, tests, caveats).
+- **Keep changes small & testable**; add a focused unit test and a short eval smoke run before larger refactors.
 
 ---
 
