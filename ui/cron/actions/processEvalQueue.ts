@@ -58,9 +58,13 @@ export default async function processEvalQueue() {
   if (params.device) args.push('--device', String(params.device));
   // force sample fraction to 1 (process every image)
   args.push('--sample-fraction', '1');
-  // samples per image: prefer params value, otherwise use default 4
+  // samples per image: prefer params value, otherwise use default 8
   if (params.samples_per_image) args.push('--samples-per-image', String(params.samples_per_image));
-  else args.push('--samples-per-image', '4');
+  else args.push('--samples-per-image', '8');
+  // fixed noise std: pass if provided; otherwise the CLI default (0.6) will be used
+  if (typeof params.fixed_noise_std !== 'undefined') args.push('--fixed-noise-std', String(params.fixed_noise_std));
+  // pass debug-captions flag if requested
+  if (params.debug_captions) args.push('--debug-captions');
   // do not pass max_samples (not supported for full per-image evaluation)
 
 

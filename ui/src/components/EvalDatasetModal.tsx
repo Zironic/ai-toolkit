@@ -16,7 +16,9 @@ export default function EvalDatasetModal({ datasetName, isOpen, onClose, onStart
   const [modelConfig, setModelConfig] = useState<any>({ ...defaultModel });
   const [modelArch, setModelArch] = useState<string>(defaultModel.arch || 'zimage:turbo');
   const [useJobModel, setUseJobModel] = useState<boolean>(false);
-  const [batchSize, setBatchSize] = useState<number>(1);
+  const [samplesPerImage, setSamplesPerImage] = useState<number>(8);
+  const [fixedNoiseStd, setFixedNoiseStd] = useState<number>(0.6);
+  const [debugCaptions, setDebugCaptions] = useState<boolean>(false);
   const [device, setDevice] = useState<string>('cuda');
 
   // sample_fraction and max_samples are enforced server-side and removed from the UI
@@ -63,6 +65,9 @@ export default function EvalDatasetModal({ datasetName, isOpen, onClose, onStart
         dataset_path: datasetName,
         model: model,
         device: device,
+        samples_per_image: samplesPerImage,
+        fixed_noise_std: fixedNoiseStd,
+        debug_captions: debugCaptions,
       };
       if (useJobModel && modelConfig) {
         payload.model_config = modelConfig;
@@ -133,9 +138,18 @@ export default function EvalDatasetModal({ datasetName, isOpen, onClose, onStart
                   <label htmlFor="useJobModel" className="text-sm">Use training job model configuration</label>
                 </div>
                 <div>
-                  <label className="block text-sm font-medium mb-1">Batch size</label>
-                  <input type="number" value={1} min={1} disabled className="w-full rounded bg-gray-100 dark:bg-gray-800 p-2 opacity-50 cursor-not-allowed" />
-                  <div className="text-xs text-gray-500 mt-1">Batch size is fixed to 1 and sample_fraction is fixed to 1.0 for per-example loss evaluation.</div>
+                  <label className="block text-sm font-medium mb-1">Samples per image</label>
+                  <input type="number" value={samplesPerImage} min={1} onChange={(e) => setSamplesPerImage(Number(e.target.value))} className="w-full rounded bg-white dark:bg-gray-800 p-2" />
+                  <div className="text-xs text-gray-500 mt-1">Number of independent stochastic forward passes to average per image (default: 8). Batch size is fixed to 1 and sample_fraction is fixed to 1.0 for per-example loss evaluation.</div>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Fixed noise std</label>
+                  <input type="number" value={fixedNoiseStd} min={0} max={1} step={0.01} onChange={(e) => setFixedNoiseStd(Number(e.target.value))} className="w-full rounded bg-white dark:bg-gray-800 p-2" />
+                  <div className="text-xs text-gray-500 mt-1">If set (0.0–1.0), use fixed noise magnitude instead of sampling timesteps (default: 0.6).</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input type="checkbox" checked={debugCaptions} onChange={(e) => setDebugCaptions(e.target.checked)} id="debugCaptions" />
+                  <label htmlFor="debugCaptions" className="text-sm">Enable caption debug logging</label>
                 </div>
                 <div>
                   <label className="block text-sm font-medium mb-1">Device</label>

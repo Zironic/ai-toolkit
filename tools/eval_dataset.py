@@ -71,7 +71,7 @@ def build_sd_model(name_or_path: str, device: str = "cpu", dtype: str = "float32
     return sd
 
 
-def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 4, debug_noise: bool = False, debug_noise_timestep_type: str = 'sigmoid', fixed_noise_std: float | None = None) -> Callable[[Any], List[Dict[str, Any]]]:
+def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_loss: bool = True, samples_per_image: int = 8, debug_noise: bool = False, debug_noise_timestep_type: str = 'sigmoid', fixed_noise_std: float | None = 0.6, debug_captions: bool = False) -> Callable[[Any], List[Dict[str, Any]]]:
     """Return a compute_fn(batch) suitable for evaluate_dataset / run_dataset_evaluation.
 
     The compute_fn expects a batch-like object with attributes used by the training
@@ -162,16 +162,67 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
 
             if fixed_noise_std is not None:
                 # Apply direct mixture to achieve fixed noise std s such that
-                # noisy = sqrt(1 - s^2) * latents + s * noise
+                # noisy = sqrt(1 - s^2) * latents + s * noise. We still supply
+                # a placeholder timestep tensor because some model implementations
+                # expect a tensor and call `.to()` on it.
                 s = float(fixed_noise_std)
                 if s < 0 or s > 1:
                     raise ValueError('fixed_noise_std must be between 0 and 1')
                 lat_coeff = float((1.0 - s * s) ** 0.5)
                 noisy = latents * lat_coeff + noise * s
-                timesteps = None
+                # Use a mid-range timestep so model timestep embeddings are valid.
+                try:
+                    mid_t = max(1, max_steps // 2)
+                    timesteps = torch.full((bs,), mid_t, device=sd.device_torch, dtype=torch.long)
+                except Exception:
+                    timesteps = torch.zeros((bs,), device=sd.device_torch, dtype=torch.long)
             else:
                 timesteps = sample_timesteps(bs)
                 noisy = sd.noise_scheduler.add_noise(latents, noise, timesteps)
+
+            # Debug: inspect prompt embeddings to ensure captions are being used by the model
+            try:
+                if debug_captions:
+                    # gather caption strings
+                    captions_list = [getattr(fi, 'raw_caption', '') or '' for fi in batch.file_items]
+                    te = conditional_embeds
+                    emb_info = None
+                    try:
+                        if hasattr(te, 'text_embeds'):
+                            te_obj = te.text_embeds
+                            if isinstance(te_obj, torch.Tensor):
+                                shapes = [tuple(te_obj.shape)]
+                                try:
+                                    norms = te_obj.view(te_obj.shape[0], -1).norm(dim=1).detach().cpu().tolist()
+                                except Exception:
+                                    norms = None
+                            elif isinstance(te_obj, (list, tuple)):
+                                shapes = [tuple(t.shape) if hasattr(t, 'shape') else None for t in te_obj]
+                                norms = []
+                                for t in te_obj:
+                                    try:
+                                        norms.append(t.view(t.shape[0], -1).norm(dim=1).detach().cpu().tolist())
+                                    except Exception:
+                                        norms.append(None)
+                            else:
+                                shapes = [None]
+                                norms = None
+                            # determine if classifier-free guidance will be used (heuristic)
+                            guidance_possible = False
+                            if isinstance(te_obj, torch.Tensor):
+                                if te_obj.shape[0] == latents.shape[0] * 2:
+                                    guidance_possible = True
+                            elif isinstance(te_obj, (list, tuple)):
+                                # assume lists are XL-style which typically include both
+                                guidance_possible = True
+                            emb_info = {'shapes': shapes, 'norms': norms, 'guidance_possible': guidance_possible}
+                        else:
+                            emb_info = None
+                    except Exception as e:
+                        emb_info = {'error': str(e)}
+                    print(f"[EVAL-CAPTION-DEBUG] captions={captions_list}, embeds={emb_info}")
+            except Exception:
+                pass
 
             # obtain model prediction
             try:
@@ -251,8 +302,13 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                 # resample noise and timesteps for next repetition if any
                 if _rep != samples - 1:
                     noise = torch.randn_like(latents).to(sd.device_torch)
-                    timesteps = sample_timesteps(bs)
-                    noisy = sd.noise_scheduler.add_noise(latents, noise, timesteps)
+                    if fixed_noise_std is not None:
+                        # Use the same fixed-noise mixing for subsequent repetitions
+                        noisy = latents * lat_coeff + noise * s
+                        # keep timesteps as the previously chosen constant tensor
+                    else:
+                        timesteps = sample_timesteps(bs)
+                        noisy = sd.noise_scheduler.add_noise(latents, noise, timesteps)
                     try:
                         noise_pred = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch)
                     except TypeError:
@@ -316,10 +372,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument('--no-normalize-loss', dest='normalize_loss', action='store_false', help='Disable normalization of per-sample losses (default: enabled)')
 
     # Number of stochastic samples (noise/timesteps) to average per image
-    parser.add_argument('--samples-per-image', type=int, default=4, help='Number of independent stochastic forward passes per image to average (default: 4)')
+    parser.add_argument('--samples-per-image', type=int, default=8, help='Number of independent stochastic forward passes per image to average (default: 8)')
     parser.add_argument('--debug-noise', action='store_true', help='If set, print debug info about noise std and scheduler std per repetition')
     parser.add_argument('--timestep-type', choices=['uniform','one_step','cubic_early','cubic_late','sigmoid'], default='sigmoid', help='Timestep sampling strategy to mirror training. "uniform" samples uniformly, "one_step" uses timestep 0, "cubic_early" biases toward early timesteps, "cubic_late" biases toward late timesteps, "sigmoid" matches trainer default sigmoid schedule.')
-    parser.add_argument('--fixed-noise-std', type=float, default=0.75, help='If set (0.0-1.0), use this fixed noise std instead of sampling timesteps. Defaults to 0.75 (75% noise magnitude) to reduce evaluation variance when comparing captions.')
+    parser.add_argument('--fixed-noise-std', type=float, default=0.6, help='If set (0.0-1.0), use this fixed noise std instead of sampling timesteps. Defaults to 0.6 (60% noise magnitude) to reduce evaluation variance when comparing captions.')
+    parser.add_argument('--debug-captions', action='store_true', help='If set, print debug info about prompt embeddings (shapes, norms) and whether classifier-free guidance is active for each batch')
 
     args = parser.parse_args(argv)
 
@@ -380,7 +437,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Building dataloader for {args.dataset_path} (batch_size={args.batch_size})...")
     dataloader = build_dataloader_for_folder(args.dataset_path, args.batch_size, sd)
 
-    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image, debug_noise=args.debug_noise, debug_noise_timestep_type=args.timestep_type, fixed_noise_std=args.fixed_noise_std)
+    compute_fn = make_compute_fn_for_sd(sd, device=device, normalize_loss=args.normalize_loss, samples_per_image=args.samples_per_image, debug_noise=args.debug_noise, debug_noise_timestep_type=args.timestep_type, fixed_noise_std=args.fixed_noise_std, debug_captions=args.debug_captions)
 
     out_dir = args.out_dir or args.dataset_path
     if not os.path.exists(out_dir):
