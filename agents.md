@@ -62,15 +62,32 @@ UI (Node.js > 18):
 ```bash
 # from repo root
 # Recommended (non-interactive / agent-safe): start the production server (non-interactive)
-./run-ui build_and_start
-# or: npm --prefix ui run start
+# Use the helper scripts (they perform install/update/build and then start)
+# Windows (agent-safe):  .\run-ui-start-background.ps1
+# POSIX (agent-safe):    ./run-ui-start-background.sh
+# To stop the background server:
+# Windows: .\run-ui-stop-background.ps1
+# POSIX:   ./run-ui-stop-background.sh
 
-# Developer (interactive, hot-reload) - NOT recommended for unattended agents
+# Alternative (foreground/interactive) - NOT recommended for unattended agents
+# ./run-ui build_and_start  # runs in foreground and may block the terminal
+# Dev hot-reload (interactive, not agent-safe):
 # Windows: .\run-ui-dev.bat (starts Next dev + worker, interactive)
 # POSIX: nohup npm --prefix ui run dev >/dev/null 2>&1 &
 ```
 
-> Tip: Use `AI_TOOLKIT_AUTH` env var to protect the UI when exposing it publicly. For automated agents prefer the non-interactive production start (`build_and_start` or `npm --prefix ui run start`) rather than the interactive dev server.
+> Tip: Use `AI_TOOLKIT_AUTH` env var to protect the UI when exposing it publicly. For automated agents prefer the non-interactive background start scripts (`run-ui-start.ps1` / `run-ui-start.sh`) rather than running interactive dev servers.
+
+### Agent-safe UI start (quick verification)
+- Start: `.\run-ui-start.ps1` (Windows) or `./run-ui-start.sh` (POSIX)
+- Stop: `.\run-ui-stop.ps1` (Windows) or `./run-ui-stop.sh` (POSIX)
+- PID file: `ui/ui_start.pid` (contains the server process id)
+- Logs: `ui/ui_start.log` (stdout) and `ui/ui_start.err` (stderr)
+- Health check (POSIX / default): `curl -sfS http://localhost:8675 || echo "server not reachable"`
+- Health check (PowerShell): `try { (Invoke-WebRequest -Uri http://localhost:8675 -UseBasicParsing -TimeoutSec 5).StatusCode } catch { Write-Output 'not-reachable' }`
+
+> Note: The background helpers use the repo's `build_and_start` behavior (so the server will listen on port **8675** by default). If you need to confirm the port or readiness, run the health check after starting the helper.
+
 
 ---
 
