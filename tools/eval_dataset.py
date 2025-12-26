@@ -319,7 +319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument('--samples-per-image', type=int, default=4, help='Number of independent stochastic forward passes per image to average (default: 4)')
     parser.add_argument('--debug-noise', action='store_true', help='If set, print debug info about noise std and scheduler std per repetition')
     parser.add_argument('--timestep-type', choices=['uniform','one_step','cubic_early','cubic_late','sigmoid'], default='sigmoid', help='Timestep sampling strategy to mirror training. "uniform" samples uniformly, "one_step" uses timestep 0, "cubic_early" biases toward early timesteps, "cubic_late" biases toward late timesteps, "sigmoid" matches trainer default sigmoid schedule.')
-    parser.add_argument('--fixed-noise-std', type=float, default=None, help='If set (0.0-1.0), use this fixed noise std instead of sampling timesteps. e.g. 0.75 applies approx 75%% noise magnitude (deterministic across timesteps).')
+    parser.add_argument('--fixed-noise-std', type=float, default=0.75, help='If set (0.0-1.0), use this fixed noise std instead of sampling timesteps. Defaults to 0.75 (75% noise magnitude) to reduce evaluation variance when comparing captions.')
 
     args = parser.parse_args(argv)
 
