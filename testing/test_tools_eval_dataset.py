@@ -128,6 +128,13 @@ def test_compute_fn_does_not_normalize_per_batch():
 def test_compute_fn_ablation_compare():
     # predict_noise returns 0 for normal embeddings, 1 for ablated (zeros) embeddings
     class SDAblation(DummySD):
+        def encode_prompt(self, prompts):
+            # Return zero embeddings for empty prompt to emulate model's empty encoding
+            if len(prompts) == 1 and prompts[0] == '':
+                return type('P', (), {'text_embeds': torch.zeros((1, 4))})
+            # otherwise return non-zero to indicate 'real' caption
+            return type('P', (), {'text_embeds': torch.ones((len(prompts), 4))})
+
         def predict_noise(self, noisy, text_embeddings=None, timestep=None, batch=None, **kwargs):
             te = text_embeddings
             # crude check: if embeddings are zero tensor, return ones; else zeros

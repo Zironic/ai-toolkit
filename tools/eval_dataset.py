@@ -367,21 +367,34 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
             ablated_embeds = None
             if caption_ablation != 'none' or caption_ablation_compare:
                 def _make_ablated(pe, mode='zero'):
-                    pe2 = pe.clone()
-                    if isinstance(pe2.text_embeds, (list, tuple)):
-                        new = []
-                        for t in pe2.text_embeds:
-                            if mode == 'zero':
-                                new.append(torch.zeros_like(t))
-                            else:
-                                new.append(torch.randn_like(t))
-                        pe2.text_embeds = new
-                    else:
-                        if mode == 'zero':
-                            pe2.text_embeds = torch.zeros_like(pe2.text_embeds)
+                    # Prefer the model's empty prompt encoding when available (in-distribution baseline)
+                    try:
+                        empty_pe = sd.encode_prompt([""])
+                        # expand to batch size if supported
+                        try:
+                            empty_pe = empty_pe.expand_to_batch(bs)
+                        except Exception:
+                            # fall back to manual expansion for simple tensor shapes
+                            if hasattr(empty_pe, 'text_embeds') and isinstance(empty_pe.text_embeds, torch.Tensor):
+                                empty_pe.text_embeds = empty_pe.text_embeds.expand(bs, -1)
+                        return empty_pe
+                    except Exception:
+                        # fallback to previous behavior (zeros or random)
+                        pe2 = pe.clone()
+                        if isinstance(pe2.text_embeds, (list, tuple)):
+                            new = []
+                            for t in pe2.text_embeds:
+                                if mode == 'zero':
+                                    new.append(torch.zeros_like(t))
+                                else:
+                                    new.append(torch.randn_like(t))
+                            pe2.text_embeds = new
                         else:
-                            pe2.text_embeds = torch.randn_like(pe2.text_embeds)
-                    return pe2
+                            if mode == 'zero':
+                                pe2.text_embeds = torch.zeros_like(pe2.text_embeds)
+                            else:
+                                pe2.text_embeds = torch.randn_like(pe2.text_embeds)
+                        return pe2
 
                 ablated_embeds = _make_ablated(conditional_embeds, 'zero')
 
