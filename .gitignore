@@ -165,6 +165,7 @@ cython_debug/
 /custom/*
 !/custom/.gitkeep
 /.tmp
+/tmp
 /venv.bkp
 /venv.*
 /config/*
