@@ -116,8 +116,20 @@ def flag_bad_captions(per_example_list: List[Dict[str, Any]], heuristics: Option
 
         # optional: add loss-weighted importance; we'll add normalized loss contribution
         # Note: caller may choose to filter by loss percentiles before calling this helper
-        loss_contrib = losses
-        score += math.log(1.0 + loss_contrib)
+        try:
+            # Guard against non-finite or negative values (e.g., ablation deltas can be negative
+            # when captions improve). We only want a positive contribution for "bad" captions.
+            if not math.isfinite(losses):
+                loss_contrib = 0.0
+            else:
+                # For ablation-style deltas: negative means caption helped, positive means caption hurt.
+                # Use the magnitude of the "bad" direction so we don't penalize good captions.
+                loss_contrib = -losses if losses < 0 else losses
+            # use log1p for numerical safety and ensure non-negative input
+            score += math.log1p(max(0.0, loss_contrib))
+        except Exception:
+            # Do not let scoring failures stop caption flagging
+            pass
 
         if len(reasons) > 0:
             flagged.append({
@@ -392,9 +404,15 @@ def evaluate_dataset(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataload
     raw_report = None
     if out_json is not None and len(per_example) > 0:
         try:
+            # Build a raw report whose "loss" values reflect the non-ablated/original
+            # per-sample losses when available (e.g., `loss_with_caption`). This ensures
+            # `average_loss_raw` reflects the true non-ablated average even when the
+            # active `loss` values in `per_example` represent ablation deltas.
             raw_aggregator = StreamingAggregator()
             for e in per_example:
-                raw_aggregator.add_entry(e)
+                e_copy = dict(e)
+                e_copy['loss'] = e.get('loss_with_caption', e.get('loss', 0.0))
+                raw_aggregator.add_entry(e_copy)
             raw_report = raw_aggregator.build_report(eval_config=None)
         except Exception:
             raw_report = None
@@ -444,6 +462,31 @@ def evaluate_dataset(compute_fn: Callable[[Any], List[Dict[str, Any]]], dataload
                             stats['average_loss_raw'] = raw_stats.get('average_loss')
                         else:
                             stats['average_loss_raw'] = None
+
+            # Compute average ablation deltas per item if any were recorded in per_example entries.
+            try:
+                # build sums/counts by path
+                ab_sums = {}
+                ab_counts = {}
+                for e in per_example:
+                    path = e.get('path')
+                    if path is None:
+                        continue
+                    if 'ablation_delta' in e and e.get('ablation_delta') is not None:
+                        ab_sums[path] = ab_sums.get(path, 0.0) + float(e.get('ablation_delta'))
+                        ab_counts[path] = ab_counts.get(path, 0) + 1
+                # assign averages into json_report item_stats
+                for ds_name, ds in json_report['datasets'].items():
+                    item_stats = ds.get('item_stats', {})
+                    for path_key, stats in item_stats.items():
+                        path = path_key
+                        if path in ab_sums and ab_counts.get(path, 0) > 0:
+                            stats['average_ablation_delta'] = float(ab_sums[path] / ab_counts[path])
+                        else:
+                            stats['average_ablation_delta'] = None
+            except Exception:
+                # don't fail the entire evaluation on ablation aggregation errors
+                pass
 
             import json
             with open(out_json, 'w', encoding='utf-8') as f:

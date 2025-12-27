@@ -1,0 +1,220 @@
+INFO  2025-12-26 11:40:49,864 [MainThread] serena.cli:start_mcp_server:229 - Initializing Serena MCP server
+INFO  2025-12-26 11:40:49,866 [MainThread] serena.cli:start_mcp_server:230 - Storing logs in C:\Users\johan\.serena\logs\2025-12-26\mcp_20251226-114049.txt
+INFO  2025-12-26 11:40:49,866 [MainThread] serena.cli:start_mcp_server:237 - Auto-detected project root: C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit
+INFO  2025-12-26 11:40:49,876 [MainThread] serena.config.serena_config:from_config_file:462 - Loading Serena configuration from C:\Users\johan\.serena\serena_config.yml
+INFO  2025-12-26 11:40:49,883 [MainThread] serena.agent:__init__:226 - Will record tool usage statistics with token count estimator: CHAR_COUNT.
+INFO  2025-12-26 11:40:50,056 [MainThread] serena.agent:__init__:230 - Starting Serena server (version=0.1.4-8d8c087e-dirty, process id=31100, parent process id=58852; language backend=LSP)
+INFO  2025-12-26 11:40:50,057 [MainThread] serena.agent:__init__:234 - Configuration file: C:\Users\johan\.serena\serena_config.yml
+INFO  2025-12-26 11:40:50,057 [MainThread] serena.agent:__init__:235 - Available projects: 
+INFO  2025-12-26 11:40:50,057 [MainThread] serena.agent:__init__:236 - Loaded tools (38): read_file, create_text_file, list_dir, find_file, replace_content, delete_lines, replace_lines, insert_at_line, search_for_pattern, restart_language_server, get_symbols_overview, find_symbol, find_referencing_symbols, replace_symbol_body, insert_after_symbol, insert_before_symbol, rename_symbol, write_memory, read_memory, list_memories, delete_memory, edit_memory, execute_shell_command, activate_project, remove_project, switch_modes, get_current_config, check_onboarding_performed, onboarding, think_about_collected_information, think_about_task_adherence, think_about_whether_you_are_done, summarize_changes, prepare_for_new_conversation, initial_instructions, jet_brains_find_symbol, jet_brains_find_referencing_symbols, jet_brains_get_symbols_overview
+INFO  2025-12-26 11:40:50,058 [MainThread] serena.agent:apply:129 - SerenaAgentContext[name='ide'] excluded 4 tools: create_text_file, read_file, execute_shell_command, prepare_for_new_conversation
+INFO  2025-12-26 11:40:50,058 [MainThread] serena.agent:__init__:250 - Number of exposed tools: 24
+INFO  2025-12-26 11:40:50,068 [MainThread] serena.agent:_update_active_tools:490 - Active tools (24): activate_project, check_onboarding_performed, delete_memory, edit_memory, find_file, find_referencing_symbols, find_symbol, get_current_config, get_symbols_overview, initial_instructions, insert_after_symbol, insert_before_symbol, list_dir, list_memories, onboarding, read_memory, rename_symbol, replace_content, replace_symbol_body, search_for_pattern, think_about_collected_information, think_about_task_adherence, think_about_whether_you_are_done, write_memory
+INFO  2025-12-26 11:40:50,071 [MainThread] serena.util.file_system:start:360 - Loading of .gitignore files starting ...
+INFO  2025-12-26 11:40:50,072 [MainThread] serena.util.file_system:_load_gitignore_files:148 - Processing .gitignore file: C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit\.gitignore
+INFO  2025-12-26 11:40:50,077 [MainThread] serena.util.file_system:_load_gitignore_files:148 - Processing .gitignore file: C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit\.serena\.gitignore
+INFO  2025-12-26 11:40:50,080 [MainThread] serena.util.file_system:_load_gitignore_files:148 - Processing .gitignore file: C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit\ui\.gitignore
+INFO  2025-12-26 11:40:50,108 [MainThread] serena.util.file_system:stop:367 - Loading of .gitignore files completed in 0.037 seconds
+INFO  2025-12-26 11:40:50,111 [MainThread] serena.agent:load_project_from_path_or_name:557 - Added new project AI-Toolkit for path C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit
+INFO  2025-12-26 11:40:50,112 [MainThread] serena.agent:_activate_project:527 - Activating AI-Toolkit at C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit
+INFO  2025-12-26 11:40:50,112 [MainThread] serena.agent:_update_active_tools:490 - Active tools (24): activate_project, check_onboarding_performed, delete_memory, edit_memory, find_file, find_referencing_symbols, find_symbol, get_current_config, get_symbols_overview, initial_instructions, insert_after_symbol, insert_before_symbol, list_dir, list_memories, onboarding, read_memory, rename_symbol, replace_content, replace_symbol_body, search_for_pattern, think_about_collected_information, think_about_task_adherence, think_about_whether_you_are_done, write_memory
+INFO  2025-12-26 11:40:50,112 [MainThread] serena.task_executor:issue_task:192 - Scheduling Task-1:init_language_server_manager
+INFO  2025-12-26 11:40:50,116 [MainThread] serena.dashboard:run_in_thread:578 - Starting dashboard (listen_address=127.0.0.1, port=24282)
+INFO  2025-12-26 11:40:50,117 [MainThread] serena.agent:__init__:286 - Serena web dashboard started at http://127.0.0.1:24282/dashboard/index.html
+INFO  2025-12-26 11:40:50,159 [SerenaAgentTaskExecutor] serena.task_executor:_process_task_queue:123 - Starting execution of Task-1:init_language_server_manager
+INFO  2025-12-26 11:40:50,159 [Task-1:init_language_server_manager] serena.task_executor:start:360 - Task-1:init_language_server_manager starting ...
+INFO  2025-12-26 11:40:50,159 [Task-1:init_language_server_manager] serena.agent:start:360 - Language server initialization starting ...
+INFO  2025-12-26 11:40:50,161 [Task-1:init_language_server_manager] serena.project:create_language_server_manager:384 - Creating language server manager for C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit
+INFO  2025-12-26 11:40:50,162 [StartLS:python] sensai.util.logging:start:360 - Language server startup (language=python) starting ...
+INFO  2025-12-26 11:40:50,162 [StartLS:python] serena.ls_manager:create_language_server:41 - Creating language server instance for C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit, language=python.
+INFO  2025-12-26 11:40:50,172 [StartLS:python] solidlsp.ls:start:1886 - Starting language server with language python for C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit
+INFO  2025-12-26 11:40:50,173 [StartLS:python] solidlsp.language_servers.pyright_server:_start_server:169 - Starting pyright-langserver server process
+INFO  2025-12-26 11:40:50,173 [StartLS:python] solidlsp.ls_handler:start:194 - Starting language server process via command: python -m pyright.langserver --stdio
+INFO  2025-12-26 11:40:50,178 [StartLS:python] solidlsp.language_servers.pyright_server:_start_server:175 - Sending initialize request from LSP client to pyright server and awaiting response
+INFO  2025-12-26 11:40:50,436 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Pyright language server 1.1.407 starting
+INFO  2025-12-26 11:40:50,437 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Server root directory: file:///c%3A/Users/johan/AppData/Local/uv/cache/archive-v0/thMvTI_ti8BnFKRcPpMc0/Lib/site-packages/pyright/dist/dist
+INFO  2025-12-26 11:40:50,439 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Starting service instance "AI-Toolkit"
+INFO  2025-12-26 11:40:50,439 [StartLS:python] solidlsp.language_servers.pyright_server:_start_server:177 - Received initialize response from pyright server: {'capabilities': {'textDocumentSync': 2, 'definitionProvider': {'workDoneProgress': True}, 'declarationProvider': {'workDoneProgress': True}, 'typeDefinitionProvider': {'workDoneProgress': True}, 'referencesProvider': {'workDoneProgress': True}, 'documentSymbolProvider': {'workDoneProgress': True}, 'workspaceSymbolProvider': {'workDoneProgress': True}, 'hoverProvider': {'workDoneProgress': True}, 'documentHighlightProvider': {'workDoneProgress': True}, 'renameProvider': {'prepareProvider': True, 'workDoneProgress': True}, 'completionProvider': {'triggerCharacters': ['.', '[', '"', "'"], 'resolveProvider': True, 'workDoneProgress': True, 'completionItem': {'labelDetailsSupport': True}}, 'signatureHelpProvider': {'triggerCharacters': ['(', ',', ')'], 'workDoneProgress': True}, 'codeActionProvider': {'codeActionKinds': ['quickfix', 'source.organizeImports'], 'workDoneProgress': True}, 'executeCommandProvider': {'commands': [], 'workDoneProgress': True}, 'callHierarchyProvider': True, 'workspace': {'workspaceFolders': {'supported': True, 'changeNotifications': True}}}}
+INFO  2025-12-26 11:40:50,440 [StartLS:python] solidlsp.language_servers.pyright_server:_start_server:189 - Waiting for Pyright to complete initial workspace analysis...
+INFO  2025-12-26 11:40:50,593 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: No include entries specified; assuming c:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit
+INFO  2025-12-26 11:40:50,594 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Auto-excluding **/node_modules
+INFO  2025-12-26 11:40:50,594 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Auto-excluding **/__pycache__
+INFO  2025-12-26 11:40:50,594 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Auto-excluding **/.*
+INFO  2025-12-26 11:40:50,594 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Assuming Python version 3.12.2.final.0
+INFO  2025-12-26 11:40:50,727 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Auto-excluding c:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit\venv
+INFO  2025-12-26 11:40:50,728 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:139 - LSP: window/logMessage: Found 301 source files
+INFO  2025-12-26 11:40:50,729 [LSP-stdout-reader:python] solidlsp.language_servers.pyright_server:window_log_message:144 - Pyright workspace scanning complete
+INFO  2025-12-26 11:40:50,729 [StartLS:python] solidlsp.language_servers.pyright_server:_start_server:191 - Pyright initial analysis complete, server ready
+INFO  2025-12-26 11:40:50,730 [StartLS:python] sensai.util.logging:stop:367 - Language server startup (language=python) completed in 0.570 seconds
+INFO  2025-12-26 11:40:50,730 [Task-1:init_language_server_manager] serena.agent:stop:367 - Language server initialization completed in 0.571 seconds
+INFO  2025-12-26 11:40:50,731 [Task-1:init_language_server_manager] serena.task_executor:stop:367 - Task-1:init_language_server_manager completed in 0.572 seconds
+INFO  2025-12-26 11:40:51,128 [MainThread] serena.agent:create_system_prompt:457 - Generating system prompt with available_tools=(see exposed tools), available_markers={'InsertAfterSymbolTool', 'ToolMarkerCanEdit', 'GetSymbolsOverviewTool', 'RenameSymbolTool', 'ToolMarkerSymbolicEdit', 'ReplaceSymbolBodyTool', 'InsertBeforeSymbolTool', 'InitialInstructionsTool', 'ToolMarkerDoesNotRequireActiveProject', 'FindSymbolTool', 'ActivateProjectTool', 'ToolMarkerSymbolicRead', 'FindReferencingSymbolsTool', 'ReplaceContentTool'}
+INFO  2025-12-26 11:40:51,130 [MainThread] serena.agent:create_system_prompt:469 - System prompt:
+You are a professional coding agent. 
+You have access to semantic coding tools upon which you rely heavily for all your work.
+You operate in a resource-efficient and intelligent manner, always keeping in mind to not read or generate
+content that is not needed for the task at hand.
+
+Some tasks may require you to understand the architecture of large parts of the codebase, while for others,
+it may be enough to read a small set of symbols or a single file.
+You avoid reading entire files unless it is absolutely necessary, instead relying on intelligent step-by-step 
+acquisition of information. Once you have read a full file, it does not make
+sense to analyse it with the symbolic read tools; you already have the information.
+
+You can achieve intelligent reading of code by using the symbolic tools for getting an overview of symbols and
+the relations between them, and then only reading the bodies of symbols that are necessary to complete the task at hand. 
+You can use the standard tools like list_dir, find_file and search_for_pattern if you need to.
+Where appropriate, you pass the `relative_path` parameter to restrict the search to a specific file or directory.
+
+If you are unsure about a symbol's name or location (to the extent that substring_matching for the symbol name is not enough), you can use the `search_for_pattern` tool, which allows fast
+and flexible search for patterns in the codebase. In this way, you can first find candidates for symbols or files,
+and then proceed with the symbolic tools.
+
+
+
+Symbols are identified by their `name_path` and `relative_path` (see the description of the `find_symbol` tool).
+You can get information about the symbols in a file by using the `get_symbols_overview` tool or use the `find_symbol` to search. 
+You only read the bodies of symbols when you need to (e.g. if you want to fully understand or edit it).
+For example, if you are working with Python code and already know that you need to read the body of the constructor of the class Foo, you can directly
+use `find_symbol` with name path pattern `Foo/__init__` and `include_body=True`. If you don't know yet which methods in `Foo` you need to read or edit,
+you can use `find_symbol` with name path pattern `Foo`, `include_body=False` and `depth=1` to get all (top-level) methods of `Foo` before proceeding
+to read the desired methods with `include_body=True`.
+You can understand relationships between symbols by using the `find_referencing_symbols` tool.
+
+
+
+You generally have access to memories and it may be useful for you to read them.
+You infer whether memories are relevant based on their names.
+
+
+The context and modes of operation are described below. These determine how to interact with your user
+and which kinds of interactions are expected of you.
+
+Context description:
+You are running in an IDE assistant context where file operations, basic (line-based) edits and reads, 
+and shell commands are handled by your own, internal tools.
+
+If Serena's tools can be used to achieve your task, you should prioritize them.
+In particular, it is important that you avoid reading entire source code files unless it is strictly necessary!
+Instead, for exploring and reading code in a token-efficient manner, use Serena's overview and symbolic search tools.
+For non-code files or for reads where you don't know the symbol's name path, you can use the pattern search tool.
+
+Modes descriptions:
+
+You are operating in interactive mode. You should engage with the user throughout the task, asking for clarification
+whenever anything is unclear, insufficiently specified, or ambiguous.
+
+Break down complex tasks into smaller steps and explain your thinking at each stage. When you're uncertain about
+a decision, present options to the user and ask for guidance rather than making assumptions.
+
+Focus on providing informative results for intermediate steps, such that the user can follow along with your progress and
+provide feedback as needed.
+
+You are operating in editing mode. You can edit files with the provided tools.
+You adhere to the project's code style and patterns.
+
+Use symbolic editing tools whenever possible for precise code modifications.
+If no explicit editing task has yet been provided, wait for the user to provide one. Do not be overly eager.
+
+When writing new code, think about where it belongs best. Don't generate new files if you don't plan on actually
+properly integrating them into the codebase.
+
+You have two main approaches for editing code: (a) editing at the symbol level and (b) file-based editing.
+The symbol-based approach is appropriate if you need to adjust an entire symbol, e.g. a method, a class, a function, etc.
+It is not appropriate if you need to adjust just a few lines of code within a larger symbol.
+
+**Symbolic editing**
+Use symbolic retrieval tools to identify the symbols you need to edit.
+If you need to replace the definition of a symbol, use the `replace_symbol_body` tool.
+If you want to add some new code at the end of the file, use the `insert_after_symbol` tool with the last top-level symbol in the file. 
+Similarly, you can use `insert_before_symbol` with the first top-level symbol in the file to insert code at the beginning of a file.
+You can understand relationships between symbols by using the `find_referencing_symbols` tool. If not explicitly requested otherwise by the user,
+you make sure that when you edit a symbol, the change is either backward-compatible or you find and update all references as needed.
+The `find_referencing_symbols` tool will give you code snippets around the references as well as symbolic information.
+You can assume that all symbol editing tools are reliable, so you never need to verify the results if the tools return without error.
+
+
+**File-based editing**
+The `replace_content` tool allows you to perform regex-based replacements within files (as well as simple string replacements).
+This is your primary tool for editing code whenever replacing or deleting a whole symbol would be a more expensive operation,
+e.g. if you need to adjust just a few lines of code within a method.
+You are extremely good at regex, so you never need to check whether the replacement produced the correct result.
+In particular, you know how to use wildcards effectively in order to avoid specifying the full original text to be replaced!
+
+
+
+You have hereby read the 'Serena Instructions Manual' and do not need to read it again.
+
+Created and activated a new project with name 'AI-Toolkit' at C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit. 
+Programming languages: python; file encoding: utf-8
+INFO  2025-12-26 11:40:51,133 [MainThread] serena.cli:start_mcp_server:257 - Starting MCP server …
+INFO  2025-12-26 11:40:51,161 [MainThread] serena.mcp:_set_mcp_tools:244 - Starting MCP server with 24 tools: ['list_dir', 'find_file', 'replace_content', 'search_for_pattern', 'get_symbols_overview', 'find_symbol', 'find_referencing_symbols', 'replace_symbol_body', 'insert_after_symbol', 'insert_before_symbol', 'rename_symbol', 'write_memory', 'read_memory', 'list_memories', 'delete_memory', 'edit_memory', 'activate_project', 'get_current_config', 'check_onboarding_performed', 'onboarding', 'think_about_collected_information', 'think_about_task_adherence', 'think_about_whether_you_are_done', 'initial_instructions']
+INFO  2025-12-26 11:40:51,162 [MainThread] serena.mcp:server_lifespan:355 - MCP server lifetime setup complete
+INFO  2025-12-27 11:30:58,882 [Thread-5878 (process_request_thread)] serena.task_executor:issue_task:192 - Scheduling Task-2:AddLanguage:powershell
+INFO  2025-12-27 11:30:58,893 [SerenaAgentTaskExecutor] serena.task_executor:_process_task_queue:123 - Starting execution of Task-2:AddLanguage:powershell
+INFO  2025-12-27 11:30:58,906 [Task-2:AddLanguage:powershell] serena.task_executor:start:360 - Task-2:AddLanguage:powershell starting ...
+INFO  2025-12-27 11:30:58,907 [Task-2:AddLanguage:powershell] serena.project:add_language:412 - Adding and starting the language server for new language powershell ...
+INFO  2025-12-27 11:30:58,908 [Task-2:AddLanguage:powershell] serena.ls_manager:create_language_server:41 - Creating language server instance for C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit, language=powershell.
+ERROR 2025-12-27 11:30:58,986 [Task-2:AddLanguage:powershell] serena.task_executor:__exit__:373 - Task-2:AddLanguage:powershell failed after 0.081 seconds
+ERROR 2025-12-27 11:30:58,987 [Task-2:AddLanguage:powershell] serena.task_executor:run_task:62 - Error during execution of Task-2:AddLanguage:powershell: PowerShell Core (pwsh) is not installed or not in PATH. Please install PowerShell 7+ from https://github.com/PowerShell/PowerShell
+Traceback (most recent call last):
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\task_executor.py", line 57, in run_task
+    result = self._function()
+             ^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\agent.py", line 673, in <lambda>
+    self.execute_task(lambda: self.get_active_project_or_raise().add_language(language), name=f"AddLanguage:{language.value}")
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\project.py", line 413, in add_language
+    self.language_server_manager.add_language_server(language)
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\ls_manager.py", line 172, in add_language_server
+    return self._create_and_start_language_server(language)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\ls_manager.py", line 145, in _create_and_start_language_server
+    language_server = self._language_server_factory.create_language_server(language)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\ls_manager.py", line 42, in create_language_server
+    return SolidLanguageServer.create(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\solidlsp\ls.py", line 237, in create
+    ls = ls_class(config, repository_root_path, solidlsp_settings)  # type: ignore
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\solidlsp\language_servers\powershell_language_server.py", line 164, in __init__
+    pwsh_path, pses_path, bundled_modules_path = self._setup_runtime_dependency(solidlsp_settings)
+                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\solidlsp\language_servers\powershell_language_server.py", line 147, in _setup_runtime_dependency
+    raise RuntimeError(
+RuntimeError: PowerShell Core (pwsh) is not installed or not in PATH. Please install PowerShell 7+ from https://github.com/PowerShell/PowerShell
+INFO  2025-12-27 11:31:28,705 [Thread-6011 (process_request_thread)] serena.task_executor:issue_task:192 - Scheduling Task-3:AddLanguage:powershell
+INFO  2025-12-27 11:31:28,747 [SerenaAgentTaskExecutor] serena.task_executor:_process_task_queue:123 - Starting execution of Task-3:AddLanguage:powershell
+INFO  2025-12-27 11:31:28,748 [Task-3:AddLanguage:powershell] serena.task_executor:start:360 - Task-3:AddLanguage:powershell starting ...
+INFO  2025-12-27 11:31:28,749 [Task-3:AddLanguage:powershell] serena.project:add_language:412 - Adding and starting the language server for new language powershell ...
+INFO  2025-12-27 11:31:28,750 [Task-3:AddLanguage:powershell] serena.ls_manager:create_language_server:41 - Creating language server instance for C:\GenAI\AI-Toolkit-Easy-Install\AI-Toolkit, language=powershell.
+ERROR 2025-12-27 11:31:28,766 [Task-3:AddLanguage:powershell] serena.task_executor:__exit__:373 - Task-3:AddLanguage:powershell failed after 0.018 seconds
+ERROR 2025-12-27 11:31:28,767 [Task-3:AddLanguage:powershell] serena.task_executor:run_task:62 - Error during execution of Task-3:AddLanguage:powershell: PowerShell Core (pwsh) is not installed or not in PATH. Please install PowerShell 7+ from https://github.com/PowerShell/PowerShell
+Traceback (most recent call last):
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\task_executor.py", line 57, in run_task
+    result = self._function()
+             ^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\agent.py", line 673, in <lambda>
+    self.execute_task(lambda: self.get_active_project_or_raise().add_language(language), name=f"AddLanguage:{language.value}")
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\project.py", line 413, in add_language
+    self.language_server_manager.add_language_server(language)
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\ls_manager.py", line 172, in add_language_server
+    return self._create_and_start_language_server(language)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\ls_manager.py", line 145, in _create_and_start_language_server
+    language_server = self._language_server_factory.create_language_server(language)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\serena\ls_manager.py", line 42, in create_language_server
+    return SolidLanguageServer.create(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\solidlsp\ls.py", line 237, in create
+    ls = ls_class(config, repository_root_path, solidlsp_settings)  # type: ignore
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\solidlsp\language_servers\powershell_language_server.py", line 164, in __init__
+    pwsh_path, pses_path, bundled_modules_path = self._setup_runtime_dependency(solidlsp_settings)
+                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\johan\AppData\Local\uv\cache\archive-v0\thMvTI_ti8BnFKRcPpMc0\Lib\site-packages\solidlsp\language_servers\powershell_language_server.py", line 147, in _setup_runtime_dependency
+    raise RuntimeError(
+RuntimeError: PowerShell Core (pwsh) is not installed or not in PATH. Please install PowerShell 7+ from https://github.com/PowerShell/PowerShell

@@ -286,19 +286,31 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                 pass
 
             # obtain model prediction (instrumented)
+            # Be defensive: different SD implementations may accept different kwargs and
+            # may return either a single prediction or a (prediction, conditional) tuple.
+            noise_pred = None
+            conditional_pred = None
             try:
-                # request conditional prediction as well when supported
-                try:
-                    noise_pred, conditional_pred = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
-                except TypeError:
-                    noise_pred, conditional_pred = sd.predict_noise(noisy, prompt_embeds=conditional_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
-            except TypeError:
-                # older signatures may not accept return_conditional_pred; fallback
-                try:
-                    noise_pred = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch)
+                out = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                if isinstance(out, tuple) and len(out) == 2:
+                    noise_pred, conditional_pred = out
+                else:
+                    noise_pred = out
                     conditional_pred = None
+            except TypeError:
+                try:
+                    out = sd.predict_noise(noisy, prompt_embeds=conditional_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                    if isinstance(out, tuple) and len(out) == 2:
+                        noise_pred, conditional_pred = out
+                    else:
+                        noise_pred = out
+                        conditional_pred = None
                 except TypeError:
-                    noise_pred = sd.predict_noise(noisy, prompt_embeds=conditional_embeds, timestep=timesteps, batch=batch)
+                    # older signatures may not accept return_conditional_pred; fallback to single-return calls
+                    try:
+                        noise_pred = sd.predict_noise(noisy, text_embeddings=conditional_embeds, timestep=timesteps, batch=batch)
+                    except TypeError:
+                        noise_pred = sd.predict_noise(noisy, prompt_embeds=conditional_embeds, timestep=timesteps, batch=batch)
                     conditional_pred = None
 
             # optional: perform caption ablation and/or conditioning stats
@@ -326,17 +338,29 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
 
                     if caption_ablation != 'none':
                         ablated = _make_ablated(conditional_embeds, caption_ablation)
+                        noise_pred_abl = None
+                        cond_pred_abl = None
                         try:
-                            try:
-                                noise_pred_abl, cond_pred_abl = sd.predict_noise(noisy, text_embeddings=ablated, timestep=timesteps, batch=batch, return_conditional_pred=True)
-                            except TypeError:
-                                noise_pred_abl, cond_pred_abl = sd.predict_noise(noisy, prompt_embeds=ablated, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                            out = sd.predict_noise(noisy, text_embeddings=ablated, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                            if isinstance(out, tuple) and len(out) == 2:
+                                noise_pred_abl, cond_pred_abl = out
+                            else:
+                                noise_pred_abl = out
+                                cond_pred_abl = None
                         except TypeError:
-                            # fallback if return_conditional_pred unsupported
                             try:
-                                noise_pred_abl = sd.predict_noise(noisy, text_embeddings=ablated, timestep=timesteps, batch=batch)
+                                out = sd.predict_noise(noisy, prompt_embeds=ablated, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                                if isinstance(out, tuple) and len(out) == 2:
+                                    noise_pred_abl, cond_pred_abl = out
+                                else:
+                                    noise_pred_abl = out
+                                    cond_pred_abl = None
                             except TypeError:
-                                noise_pred_abl = sd.predict_noise(noisy, prompt_embeds=ablated, timestep=timesteps, batch=batch)
+                                try:
+                                    noise_pred_abl = sd.predict_noise(noisy, text_embeddings=ablated, timestep=timesteps, batch=batch)
+                                except TypeError:
+                                    noise_pred_abl = sd.predict_noise(noisy, prompt_embeds=ablated, timestep=timesteps, batch=batch)
+                                cond_pred_abl = None
 
                         try:
                             _mse_all = float(((noise_pred.float() - noise_pred_abl.float()) ** 2).mean().item())
@@ -463,9 +487,17 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                 if caption_ablation_compare and ablated_embeds is not None:
                     try:
                         try:
-                            noise_pred_abl, _ = sd.predict_noise(noisy, text_embeddings=ablated_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                            out = sd.predict_noise(noisy, text_embeddings=ablated_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                            if isinstance(out, tuple) and len(out) == 2:
+                                noise_pred_abl, _ = out
+                            else:
+                                noise_pred_abl = out
                         except TypeError:
-                            noise_pred_abl, _ = sd.predict_noise(noisy, prompt_embeds=ablated_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                            out = sd.predict_noise(noisy, prompt_embeds=ablated_embeds, timestep=timesteps, batch=batch, return_conditional_pred=True)
+                            if isinstance(out, tuple) and len(out) == 2:
+                                noise_pred_abl, _ = out
+                            else:
+                                noise_pred_abl = out
                     except TypeError:
                         try:
                             noise_pred_abl = sd.predict_noise(noisy, text_embeddings=ablated_embeds, timestep=timesteps, batch=batch)
@@ -599,7 +631,9 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                     min_delta = None
                     max_delta = None
                     loss_value = float(losses[i]) if i < len(losses) else None
-                    loss_with_caption = None
+                    # even when ablation is not used, record the non-ablated/original loss so
+                    # consumers can choose which metric to display in the UI
+                    loss_with_caption = float(losses[i]) if i < len(losses) else None
                     loss_with_blank = None
 
                 out_item = {
@@ -607,17 +641,37 @@ def make_compute_fn_for_sd(sd: StableDiffusion, device: str = "cpu", normalize_l
                     'dataset': getattr(fi.dataset_config, 'dataset_path', None) or getattr(fi.dataset_config, 'folder_path', None) if getattr(fi, 'dataset_config', None) is not None else None,
                     'caption': getattr(fi, 'raw_caption', '') or '',
                     'loss': loss_value,
+                    'loss_with_caption': loss_with_caption,
                     'min_loss': min_delta if min_delta is not None else min_s,
                     'max_loss': max_delta if max_delta is not None else max_s,
                 }
                 # attach additional diagnostics when ablation compare was used
                 if caption_ablation_compare:
-                    out_item['loss_with_caption'] = loss_with_caption
                     out_item['loss_with_blank'] = loss_with_blank
                     out_item['ablation_delta'] = loss_value
 
                 results.append(out_item)
         return results
+
+    # Also enforce dropout=0.0 eagerly at compute_fn creation time so callers observe the change immediately
+    try:
+        import torch.nn as _nn
+        _changed = False
+        for root in (getattr(sd, 'unet', None), getattr(sd, 'text_encoder', None), getattr(sd, 'vae', None)):
+            if root is None:
+                continue
+            for m in root.modules():
+                if isinstance(m, _nn.Dropout):
+                    try:
+                        if getattr(m, 'p', None) is not None and float(m.p) != 0.0:
+                            m.p = 0.0
+                            _changed = True
+                    except Exception:
+                        pass
+        if _changed:
+            print('Enforced dropout=0.0 for evaluation (creation-time)')
+    except Exception:
+        pass
 
     return compute_fn
 

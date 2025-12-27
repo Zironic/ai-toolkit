@@ -34,6 +34,37 @@ Purpose: an agent-first **change log of attempted approaches, experiments, failu
 
 ## Recent entries (most recent on top)
 
+- date: 2025-12-26
+  author: GitHub Copilot
+  tags: [dataset-eval, caption-debug, ui, worker]
+  summary: "Added caption-debugging flow: debug prints persisted, per-sample min/max recorded, UI flags persisted, and default noise/samples updated"
+  config: `tools/eval_dataset.py`, `toolkit/util/loss_utils.py`, `ui/src/app/api/eval_dataset/route.ts`, `ui/cron/actions/processEvalQueue.ts`, `ui/scripts/run_debug_eval.js`
+  commands:
+    - python tools/eval_dataset.py --dataset-path datasets/jinx_references --model <model> --samples-per-image 2 --fixed-noise-std 0.6 --debug-captions --max-samples 50 --out-dir datasets/jinx_references --job-name debugtest --step 0
+    - node ui/scripts/run_debug_eval.js
+  logs: `datasets/<dataset>/*.eval_caption_debug_<jobid>.log`, `datasets/<dataset>/{job_name}_{step_zfilled}.json`, `EvalJob.info` in DB
+  outcome: "Debug prints and embeds were written to dataset logs and job completed successfully in tested runs; `flagged` captions list is returned using `toolkit/util/loss_utils.py::flag_bad_captions`; API fix persisted UI options. Some earlier debug jobs failed during pipeline load (missing packages or access), and local simulation requires `diffusers` to run."
+  notes: "Per-sample min/max recorded; default `samples_per_image=8` and `fixed_noise_std=0.6` set for evaluations; flagged captions heuristics combine text heuristics with `log(1+loss)` to rank bad captions. Recommend NDJSON logs and embedding-norm sanity checks in next iteration."
+  follow_up:
+    - "Convert caption debug logs to NDJSON and include `flagged` reasons and `is_test_caption` tagging"
+    - "Add embedding-norm sanity checks and unit tests for NDJSON format"
+    - "Implement paired-eval mode (paired seeds) for A/B caption comparisons and add smoke tests for it"
+
+- date: 2025-12-27
+  author: GitHub Copilot
+  tags: [controlnet, tests, precompute]
+  summary: "Implemented shortcut rerouting and precomputed per-scale residuals support"
+  config: `toolkit/config_modules.py` (`controlnet_reroute`), `toolkit/dataloader_mixins.py` (`control_residuals_path`), `toolkit/controlnet_offload.py` (`compute_control_residuals`), `extensions_built_in/sd_trainer/SDTrainer.py` (use_precomputed_control_residuals, reroute wiring), `testing/test_shortcut_rerouting.py`, `testing/test_precompute_residuals_integration.py`
+  commands:
+    - python -m pytest testing/test_shortcut_rerouting.py -q
+    - python -m pytest testing/test_precompute_residuals_integration.py -q
+  logs: `testing/*` (unit & integration tests added)
+  outcome: "Added opt-in `controlnet_reroute` behavior, dataloader support for per-file residuals stored under `control_residuals_path`, and tests that verify helper behavior and batch aggregation. Integration tests validate file naming, loading, shape normalization, and helper pick-up."
+  notes: "Residual files should be saved as `<basename>_residuals.pt` and contain a tuple/list of tensors (per-scale). The dataloader accepts either `[C,H,W]` or `[1,C,H,W]` per-file tensors and normalizes them to a per-batch `[batch,C,H,W]` shape. Be careful with augmentation alignment: generate after augmentation or precompute augmented variants."
+  follow_up:
+    - "Add an end-to-end trainer integration smoke test asserting the UNet receives residuals during predict"
+    - "Add 'precompute_idempotence' and 'swap_correctness_test' to CI test suite (CPU-safe) and document GPU-only tests separately"
+    - "Document the config fields and update `ControlTrain.md` and `AGENTS.md` guidance for precompute-first workflows"
 - date: 2025-12-25
   author: GitHub Copilot
   tags: [dataset-eval, backend, ui, prisma, tests]

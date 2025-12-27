@@ -15,8 +15,12 @@ interface DatasetImageCardProps {
   rawLoss?: number | null;
   // normalized loss (global normalization, mean==1)
   normLoss?: number | null;
+  // ablation delta (if available)
+  ablLoss?: number | null;
   // legacy single-loss prop (kept for backwards compatibility)
   loss?: number | null;
+  // which metric to display: 'raw' | 'norm' | 'ablation'
+  displayMetric?: 'raw' | 'norm' | 'ablation';
 }
 
 const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
@@ -27,7 +31,9 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   onDelete = () => {},
   rawLoss = null,
   normLoss = null,
+  ablLoss = null,
   loss = null,
+  displayMetric,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [isVisible, setIsVisible] = useState<boolean>(false);
@@ -37,6 +43,9 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [caption, setCaption] = useState<string>('');
   const [savedCaption, setSavedCaption] = useState<string>('');
   const isGettingCaption = useRef<boolean>(false);
+  
+  // choose primary value based on displayMetric prop
+  const chosenMetric = displayMetric || 'raw';
 
   const fetchCaption = async () => {
     if (isGettingCaption.current || isCaptionLoaded) return;
@@ -207,12 +216,22 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             <div className="bg-black bg-opacity-70 text-white text-xs px-2 py-1 rounded text-left">
               <div className="font-medium leading-tight">
                 {(() => {
-                  const primary = rawLoss != null ? rawLoss : (loss != null ? loss : normLoss);
+                  let primary: number | null = null;
+                  if (chosenMetric === 'raw') {
+                    primary = rawLoss != null ? rawLoss : (loss != null ? loss : normLoss);
+                  } else if (chosenMetric === 'norm') {
+                    primary = normLoss != null ? normLoss : (rawLoss != null ? rawLoss : loss);
+                  } else if (chosenMetric === 'ablation') {
+                    primary = ablLoss != null ? ablLoss : (rawLoss != null ? rawLoss : normLoss);
+                  }
                   return primary != null ? Number(primary).toFixed(3) : '—';
                 })()}
               </div>
-              {normLoss != null && (rawLoss != null || loss == null) && (
+              {chosenMetric !== 'norm' && normLoss != null && (
                 <div className="text-[10px] opacity-80">norm {Number(normLoss).toFixed(3)}</div>
+              )}
+              {chosenMetric === 'ablation' && ablLoss != null && (
+                <div className="text-[10px] opacity-80">abl {Number(ablLoss).toFixed(3)}</div>
               )}
             </div>
           </div>

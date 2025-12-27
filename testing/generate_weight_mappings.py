@@ -40,106 +40,107 @@ def get_reduced_shape(shape_tuple):
     return tuple(new_shape)
 
 
-parser = argparse.ArgumentParser()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
 
-# require at lease one config file
-parser.add_argument(
-    'file_1',
-    nargs='+',
-    type=str,
-    help='Path to first safe tensor file'
-)
-
-parser.add_argument('--name', type=str, default='stable_diffusion', help='name for mapping to make')
-parser.add_argument('--sdxl', action='store_true', help='is sdxl model')
-parser.add_argument('--refiner', action='store_true', help='is refiner model')
-parser.add_argument('--ssd', action='store_true', help='is ssd model')
-parser.add_argument('--vega', action='store_true', help='is vega model')
-parser.add_argument('--sd2', action='store_true', help='is sd 2 model')
-
-args = parser.parse_args()
-
-file_path = args.file_1[0]
-
-find_matches = False
-
-print(f'Loading diffusers model')
-
-ignore_ldm_begins_with = []
-
-diffusers_file_path = file_path if len(args.file_1) == 1 else args.file_1[1]
-if args.ssd:
-    diffusers_file_path = "segmind/SSD-1B"
-if args.vega:
-    diffusers_file_path = "segmind/Segmind-Vega"
-
-# if args.refiner:
-#     diffusers_file_path = "stabilityai/stable-diffusion-xl-refiner-1.0"
-
-if not args.refiner:
-
-    diffusers_model_config = ModelConfig(
-        name_or_path=diffusers_file_path,
-        is_xl=args.sdxl,
-        is_v2=args.sd2,
-        is_ssd=args.ssd,
-        is_vega=args.vega,
-        dtype=dtype,
+    # require at lease one config file
+    parser.add_argument(
+        'file_1',
+        nargs='+',
+        type=str,
+        help='Path to first safe tensor file'
     )
-    diffusers_sd = StableDiffusion(
-        model_config=diffusers_model_config,
-        device=device,
-        dtype=dtype,
-    )
-    diffusers_sd.load_model()
-    # delete things we dont need
-    del diffusers_sd.tokenizer
-    flush()
 
-    print(f'Loading ldm model')
-    diffusers_state_dict = diffusers_sd.state_dict()
-else:
-    # refiner wont work directly with stable diffusion
-    # so we need to load the model and then load the state dict
-    diffusers_pipeline = StableDiffusionXLPipeline.from_single_file(
-        diffusers_file_path,
-        torch_dtype=torch.float16,
-        use_safetensors=True,
-        variant="fp16",
-    ).to(device)
-    # diffusers_pipeline = StableDiffusionXLPipeline.from_single_file(
-    #     file_path,
-    #     torch_dtype=torch.float16,
-    #     use_safetensors=True,
-    #     variant="fp16",
-    # ).to(device)
+    parser.add_argument('--name', type=str, default='stable_diffusion', help='name for mapping to make')
+    parser.add_argument('--sdxl', action='store_true', help='is sdxl model')
+    parser.add_argument('--refiner', action='store_true', help='is refiner model')
+    parser.add_argument('--ssd', action='store_true', help='is ssd model')
+    parser.add_argument('--vega', action='store_true', help='is vega model')
+    parser.add_argument('--sd2', action='store_true', help='is sd 2 model')
 
-    SD_PREFIX_VAE = "vae"
-    SD_PREFIX_UNET = "unet"
-    SD_PREFIX_REFINER_UNET = "refiner_unet"
-    SD_PREFIX_TEXT_ENCODER = "te"
+    args = parser.parse_args()
 
-    SD_PREFIX_TEXT_ENCODER1 = "te0"
-    SD_PREFIX_TEXT_ENCODER2 = "te1"
+    file_path = args.file_1[0]
 
-    diffusers_state_dict = OrderedDict()
-    for k, v in diffusers_pipeline.vae.state_dict().items():
-        new_key = k if k.startswith(f"{SD_PREFIX_VAE}") else f"{SD_PREFIX_VAE}_{k}"
-        diffusers_state_dict[new_key] = v
-    for k, v in diffusers_pipeline.text_encoder_2.state_dict().items():
-        new_key = k if k.startswith(f"{SD_PREFIX_TEXT_ENCODER2}_") else f"{SD_PREFIX_TEXT_ENCODER2}_{k}"
-        diffusers_state_dict[new_key] = v
-    for k, v in diffusers_pipeline.unet.state_dict().items():
-        new_key = k if k.startswith(f"{SD_PREFIX_UNET}_") else f"{SD_PREFIX_UNET}_{k}"
-        diffusers_state_dict[new_key] = v
+    find_matches = False
 
-    # add ignore ones as we are only going to focus on unet and copy the rest
-    # ignore_ldm_begins_with = ["conditioner.", "first_stage_model."]
+    print(f'Loading diffusers model')
 
-diffusers_dict_keys = list(diffusers_state_dict.keys())
+    ignore_ldm_begins_with = []
 
-ldm_state_dict = load_file(file_path)
-ldm_dict_keys = list(ldm_state_dict.keys())
+    diffusers_file_path = file_path if len(args.file_1) == 1 else args.file_1[1]
+    if args.ssd:
+        diffusers_file_path = "segmind/SSD-1B"
+    if args.vega:
+        diffusers_file_path = "segmind/Segmind-Vega"
+
+    # if args.refiner:
+    #     diffusers_file_path = "stabilityai/stable-diffusion-xl-refiner-1.0"
+
+    if not args.refiner:
+
+        diffusers_model_config = ModelConfig(
+            name_or_path=diffusers_file_path,
+            is_xl=args.sdxl,
+            is_v2=args.sd2,
+            is_ssd=args.ssd,
+            is_vega=args.vega,
+            dtype=dtype,
+        )
+        diffusers_sd = StableDiffusion(
+            model_config=diffusers_model_config,
+            device=device,
+            dtype=dtype,
+        )
+        diffusers_sd.load_model()
+        # delete things we dont need
+        del diffusers_sd.tokenizer
+        flush()
+
+        print(f'Loading ldm model')
+        diffusers_state_dict = diffusers_sd.state_dict()
+    else:
+        # refiner wont work directly with stable diffusion
+        # so we need to load the model and then load the state dict
+        diffusers_pipeline = StableDiffusionXLPipeline.from_single_file(
+            diffusers_file_path,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant="fp16",
+        ).to(device)
+        # diffusers_pipeline = StableDiffusionXLPipeline.from_single_file(
+        #     file_path,
+        #     torch_dtype=torch.float16,
+        #     use_safetensors=True,
+        #     variant="fp16",
+        # ).to(device)
+
+        SD_PREFIX_VAE = "vae"
+        SD_PREFIX_UNET = "unet"
+        SD_PREFIX_REFINER_UNET = "refiner_unet"
+        SD_PREFIX_TEXT_ENCODER = "te"
+
+        SD_PREFIX_TEXT_ENCODER1 = "te0"
+        SD_PREFIX_TEXT_ENCODER2 = "te1"
+
+        diffusers_state_dict = OrderedDict()
+        for k, v in diffusers_pipeline.vae.state_dict().items():
+            new_key = k if k.startswith(f"{SD_PREFIX_VAE}") else f"{SD_PREFIX_VAE}_{k}"
+            diffusers_state_dict[new_key] = v
+        for k, v in diffusers_pipeline.text_encoder_2.state_dict().items():
+            new_key = k if k.startswith(f"{SD_PREFIX_TEXT_ENCODER2}_") else f"{SD_PREFIX_TEXT_ENCODER2}_{k}"
+            diffusers_state_dict[new_key] = v
+        for k, v in diffusers_pipeline.unet.state_dict().items():
+            new_key = k if k.startswith(f"{SD_PREFIX_UNET}_") else f"{SD_PREFIX_UNET}_{k}"
+            diffusers_state_dict[new_key] = v
+
+        # add ignore ones as we are only going to focus on unet and copy the rest
+        # ignore_ldm_begins_with = ["conditioner.", "first_stage_model."]
+
+    diffusers_dict_keys = list(diffusers_state_dict.keys())
+
+    ldm_state_dict = load_file(file_path)
+    ldm_dict_keys = list(ldm_state_dict.keys())
 
 ldm_diffusers_keymap = OrderedDict()
 ldm_diffusers_shape_map = OrderedDict()

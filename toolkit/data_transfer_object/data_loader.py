@@ -145,6 +145,8 @@ class DataLoaderBatchDTO:
             self.latents: Union[torch.Tensor, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
+            # Optional precomputed control residuals: tuple/list of per-scale tensors shaped [batch, C, H, W]
+            self.control_residuals: Union[tuple, None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
             self.mask_tensor: Union[torch.Tensor, None] = None
             self.unaugmented_tensor: Union[torch.Tensor, None] = None
@@ -189,6 +191,37 @@ class DataLoaderBatchDTO:
                         raise Exception(f"Could not find control tensors for all file items, missing for {x.path}")
                     
                 
+            # handle precomputed control residuals per-file (tuple of per-scale tensors)
+            if any([getattr(x, 'control_residuals', None) is not None for x in self.file_items]):
+                # ensure all file items have residuals and same number of scales
+                base = None
+                for x in self.file_items:
+                    if getattr(x, 'control_residuals', None) is not None:
+                        base = x.control_residuals
+                        break
+                if base is None:
+                    self.control_residuals = None
+                else:
+                    num_scales = len(base)
+                    # collect per-scale tensors for each file
+                    per_scale_batches = []
+                    for scale_idx in range(num_scales):
+                        tensors = []
+                        for x in self.file_items:
+                            if getattr(x, 'control_residuals', None) is None:
+                                raise Exception(f"Missing control residuals for file {x.path}")
+                            r = x.control_residuals[scale_idx]
+                            if not isinstance(r, torch.Tensor):
+                                raise Exception(f"Invalid residual type for file {x.path}")
+                            # normalize residuals: allow saved tensors with or without leading batch dim
+                            if r.dim() == 4 and r.shape[0] == 1:
+                                r = r.squeeze(0)
+                            if r.dim() != 3:
+                                raise Exception(f"Control residual tensor for file {x.path} must be 3-D (C,H,W) or 4-D (1,C,H,W)")
+                            tensors.append(r)
+                        per_scale_batches.append(torch.cat([t.unsqueeze(0) for t in tensors], dim=0))
+                    self.control_residuals = tuple(per_scale_batches)
+
             self.inpaint_tensor: Union[torch.Tensor, None] = None
             if any([x.inpaint_tensor is not None for x in self.file_items]):
                 # find one to use as a base
@@ -331,6 +364,10 @@ class DataLoaderBatchDTO:
         del self.latents
         del self.tensor
         del self.control_tensor
+        try:
+            del self.control_residuals
+        except Exception:
+            pass
         for file_item in self.file_items:
             file_item.cleanup()
     

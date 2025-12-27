@@ -1,6 +1,7 @@
 import torch
 
 from tools.eval_dataset import make_compute_fn_for_sd
+from toolkit.util.loss_utils import evaluate_dataset
 
 
 class DummyNoiseScheduler:
@@ -35,6 +36,40 @@ class DummySD:
     def get_loss_target(self, noise=None, batch=None, timesteps=None):
         # target is the noise (so mse will be noise^2)
         return noise
+
+
+# Module-scoped SDAblation used by multiple tests; placed here so it is
+# accessible across test functions (previously it was defined inside a test
+# which made it unavailable to other tests that depended on it).
+class SDAblation(DummySD):
+    def encode_prompt(self, prompts):
+        # Return zero embeddings for empty prompt to emulate model's empty encoding
+        if len(prompts) == 1 and prompts[0] == '':
+            return type('P', (), {'text_embeds': torch.zeros((1, 4))})
+        # otherwise return non-zero to indicate 'real' caption
+        return type('P', (), {'text_embeds': torch.ones((len(prompts), 4))})
+
+    def predict_noise(self, noisy, text_embeddings=None, timestep=None, batch=None, **kwargs):
+        te = text_embeddings
+        # crude check: if embeddings are zero tensor, return ones; else zeros
+        if hasattr(te, 'text_embeds'):
+            t = te.text_embeds
+            if isinstance(t, torch.Tensor):
+                if torch.all(t == 0):
+                    return torch.ones_like(noisy)
+                else:
+                    return torch.zeros_like(noisy)
+            elif isinstance(t, (list, tuple)):
+                # if first tensor is zero
+                if torch.all(t[0] == 0):
+                    return torch.ones_like(noisy)
+                else:
+                    return torch.zeros_like(noisy)
+        return torch.zeros_like(noisy)
+
+    def get_loss_target(self, noise=None, batch=None, timesteps=None):
+        # return zeros so loss equals prediction^2
+        return torch.zeros_like(noise)
 
 
 class DummyFile:
@@ -172,6 +207,48 @@ def test_compute_fn_ablation_compare():
     assert abs(e['loss_with_caption'] - 0.0) < 1e-6
     assert abs(e['loss_with_blank'] - 1.0) < 1e-6
     assert abs(e['ablation_delta'] - 1.0) < 1e-6
+
+
+def test_compute_fn_always_records_loss_with_caption():
+    sd = DummySD()
+    compute_fn = make_compute_fn_for_sd(sd, normalize_loss=False, samples_per_image=1, caption_ablation_compare=False)
+
+    lat = torch.randn(2, 4, 16, 16)
+    files = [DummyFile('/tmp/a.png', 'a caption'), DummyFile('/tmp/b.png', 'b caption')]
+    batch = DummyBatch(files, latents=lat)
+
+    entries = compute_fn(batch)
+    assert len(entries) == 2
+    for e in entries:
+        assert 'loss_with_caption' in e
+
+
+import tempfile
+
+def test_evaluate_dataset_average_loss_raw_for_ablation():
+    # Use the SDAblation from above to produce an ablation delta and then run evaluate_dataset
+    class SDAblationLocal(SDAblation):
+        pass
+
+    sd = SDAblationLocal()
+    compute_fn = make_compute_fn_for_sd(sd, normalize_loss=False, samples_per_image=1, caption_ablation_compare=True)
+
+    lat = torch.randn(2, 4, 16, 16)
+    files = [DummyFile('/tmp/a.png', 'a caption'), DummyFile('/tmp/b.png', 'b caption')]
+    batch = DummyBatch(files, latents=lat)
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        out_path = tmp.name
+
+    res = evaluate_dataset(compute_fn, [batch], out_json=out_path, eval_config={'model': 'test'})
+    jr = res.get('json_report')
+    assert jr is not None
+    ds_key = list(jr['datasets'].keys())[0]
+    item_stats = jr['datasets'][ds_key]['item_stats']
+    for path, stats in item_stats.items():
+        # ensure we have both average_loss_raw (non-ablated) and average_ablation_delta present (may be None if no ablation recorded for that path)
+        assert 'average_loss_raw' in stats
+        assert 'average_ablation_delta' in stats
 
 
 def test_eval_enforces_dropout_zero():

@@ -391,6 +391,26 @@ class TrainConfig:
         self.free_u = kwargs.get('free_u', False)
         self.adapter_assist_name_or_path: Optional[str] = kwargs.get('adapter_assist_name_or_path', None)
         self.adapter_assist_type: Optional[str] = kwargs.get('adapter_assist_type', 't2i')  # t2i, control_net
+
+        # ControlNet configuration (safe defaults: opt-in / off)
+        self.controlnet_use: bool = kwargs.get('controlnet_use', False)
+        self.controlnet_type: str = kwargs.get('controlnet_type', 'canny')
+        self.controlnet_generate_on_the_fly: bool = kwargs.get('controlnet_generate_on_the_fly', True)
+        self.controlnet_precompute_control: bool = kwargs.get('controlnet_precompute_control', False)
+        # Offload strategy: none | manual_swap | accelerate | memory_manager
+        self.controlnet_offload_strategy: str = kwargs.get('controlnet_offload_strategy', 'none')
+        # Residual storage: gpu | cpu_pinned
+        self.controlnet_residual_storage: str = kwargs.get('controlnet_residual_storage', 'gpu')
+        # Rerouting option: 'none' | 'precompute' | 'always' (default 'none'). When set to 'precompute',
+        # the trainer will accept precomputed control residual tensors attached to the batch and use them
+        # instead of computing adapter outputs to avoid shortcut learning.
+        self.controlnet_reroute: str = kwargs.get('controlnet_reroute', 'none')
+
+        # Auxiliary controlnet loss (opt-in)
+        # Options: 'none', 'edge'  (edge compares Sobel of image to control tensor)
+        self.controlnet_aux_loss: str = kwargs.get('controlnet_aux_loss', 'none')
+        self.controlnet_aux_loss_weight: float = kwargs.get('controlnet_aux_loss_weight', 1.0)
+
         self.noise_multiplier = kwargs.get('noise_multiplier', 1.0)
         self.target_noise_multiplier = kwargs.get('target_noise_multiplier', 1.0)
         self.random_noise_multiplier = kwargs.get('random_noise_multiplier', 0.0)
@@ -875,6 +895,9 @@ class DatasetConfig:
         self.control_path: Union[str,List[str]] = kwargs.get('control_path', None)  # depth maps, etc
         if self.control_path == '':
             self.control_path = None
+        # optional path(s) for precomputed control residual tensors produced by tools/precompute_control.py
+        # expected format: files named <basename>_residuals.pt containing a tuple/list of tensors
+        self.control_residuals_path: Union[str, List[str], None] = kwargs.get('control_residuals_path', None)
         
         # handle multi control inputs from the ui. It is just easier to handle it here for a cleaner ui experience
         control_path_1 = kwargs.get('control_path_1', None)
@@ -975,6 +998,13 @@ class DatasetConfig:
             self.controls = [self.controls]
         # remove empty strings
         self.controls = [control for control in self.controls if control.strip() != '']
+        # Dataset-level control generation defaults (can be overridden per-dataset)
+        # If `control_generate_on_the_fly` is None, the train-level setting will be consulted when available.
+        self.control_generate_on_the_fly: Union[bool, None] = kwargs.get('control_generate_on_the_fly', None)
+        self.control_canny_threshold1: int = kwargs.get('control_canny_threshold1', 100)
+        self.control_canny_threshold2: int = kwargs.get('control_canny_threshold2', 200)
+        self.control_blur: int = kwargs.get('control_blur', 3)
+        self.control_size: Union[int, None] = kwargs.get('control_size', None)
         
         # if true, will use a fask method to get image sizes. This can result in errors. Do not use unless you know what you are doing
         self.fast_image_size: bool = kwargs.get('fast_image_size', False)
@@ -1346,5 +1376,19 @@ def validate_configs(
     
     if train_config.diff_output_preservation and train_config.blank_prompt_preservation:
         raise ValueError("Cannot use both differential output preservation and blank prompt preservation at the same time. Please set one of them to False.")
+        
+    # ControlNet config validation
+    allowed_offload = {'none', 'accelerate', 'memory_manager', 'manual_swap'}
+    if train_config.controlnet_offload_strategy not in allowed_offload:
+        raise ValueError(f"Invalid controlnet_offload_strategy '{train_config.controlnet_offload_strategy}'. Must be one of {allowed_offload}.")
 
-    
+    allowed_storage = {'gpu', 'cpu_pinned'}
+    if train_config.controlnet_residual_storage not in allowed_storage:
+        raise ValueError(f"Invalid controlnet_residual_storage '{train_config.controlnet_residual_storage}'. Must be one of {allowed_storage}.")
+
+    allowed_aux = {'none', 'edge', 'masked_recon'}
+    if train_config.controlnet_aux_loss not in allowed_aux:
+        raise ValueError(f"Invalid controlnet_aux_loss '{train_config.controlnet_aux_loss}'. Must be one of {allowed_aux}.")
+
+    if train_config.controlnet_precompute_control and not train_config.controlnet_use:
+        raise ValueError("controlnet_precompute_control is set but controlnet_use is False; set controlnet_use=True to precompute control inputs.")

@@ -1,5 +1,6 @@
 import prisma from '../prisma';
 import processEvalQueue from './processEvalQueue';
+import checkRunningJobs from './checkRunningJobs';
 
 import { Job, Queue } from '@prisma/client';
 import startJob from './startJob';
@@ -10,6 +11,9 @@ export default async function processQueue() {
       id: 'asc',
     },
   });
+
+  // perform liveness checks periodically (PID-only) to auto-stop stale running jobs
+  await checkRunningJobs();
 
   // process one eval job (if any) independently
   await processEvalQueue();

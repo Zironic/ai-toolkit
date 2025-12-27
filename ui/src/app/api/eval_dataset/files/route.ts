@@ -20,24 +20,32 @@ export async function GET(request: NextRequest) {
       .filter(e => e.isFile() && e.name.endsWith('.json'))
       .map(e => {
         const p = path.join(absDataset, e.name);
-        // Try to parse model name from file contents and record modification time
+        // Parse file and validate it looks like an eval report with model metadata
         let modelName: string | null = null;
         let mtimeMs: number | null = null;
+        let isValidEval = false;
         try {
           const contents = fs.readFileSync(p, 'utf-8');
           const parsed = JSON.parse(contents);
-          if (parsed && parsed.config && parsed.config.model) modelName = parsed.config.model;
-        } catch (e) {
-          // ignore parse errors
+          // Basic validation: must have a 'datasets' object and model info in config
+          if (parsed && typeof parsed === 'object' && parsed.datasets && typeof parsed.datasets === 'object') {
+            const cfg: any = parsed.config || {};
+            modelName = cfg.model || (cfg.model_config && cfg.model_config.name_or_path) || null;
+            if (modelName) isValidEval = true;
+          }
+        } catch (err) {
+          // ignore parse/validation errors
         }
         try {
           const st = fs.statSync(p);
           mtimeMs = st.mtimeMs;
-        } catch (e) {
+        } catch (err) {
           mtimeMs = null;
         }
+        if (!isValidEval) return null;
         return { filename: e.name, path: p, modelName, mtimeMs };
-      });
+      })
+      .filter(Boolean);
 
     return NextResponse.json({ files: jsonFiles });
   } catch (error) {

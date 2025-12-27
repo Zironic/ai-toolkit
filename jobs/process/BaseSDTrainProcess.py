@@ -1474,6 +1474,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 load_from_path,
                 torch_dtype=get_torch_dtype(self.train_config.dtype),
             )
+            # Default behavior: ControlNet adapters are frozen by default to provide
+            # stable spatial conditioning while lightweight adapters (LoRA/LoKr) train.
+            # Log this to make the behavior explicit. If finetuning is desired, set
+            # `adapter.train = True` in the adapter config.
+            try:
+                if not self.adapter_config.train:
+                    print_acc(f"[CONTROLNET] Loaded ControlNet adapter (frozen). To finetune, set adapter.train = True in your config.")
+                else:
+                    print_acc(f"[CONTROLNET] Loaded ControlNet adapter (finetuning enabled). Watch memory usage when training ControlNet weights.")
+            except Exception:
+                pass
         elif self.adapter_config.type == 'clip':
             self.adapter = ClipVisionAdapter(
                 sd=self.sd,
@@ -2183,7 +2194,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.torch_profiler is not None:
                 self.torch_profiler.start()
             did_oom = False
-            loss_dict = None
+            loss_dict = None9
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)

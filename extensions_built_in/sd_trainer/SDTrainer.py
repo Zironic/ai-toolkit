@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
 from torchvision.transforms import functional as TF
+import time
 
 
 def flush():
@@ -49,6 +50,22 @@ def flush():
 adapter_transforms = transforms.Compose([
     transforms.ToTensor(),
 ])
+
+
+def use_precomputed_control_residuals(trainer, dtype):
+    """Return a list of precomputed residual tensors if available and the trainer is configured to reroute.
+    Residuals are returned as a list of tensors (one per-scale) ready to be placed into pred kwargs.
+    """
+    if trainer.train_config.controlnet_reroute in ('precompute', 'always') and getattr(trainer, 'batch', None) is not None:
+        residuals = getattr(trainer.batch, 'control_residuals', None)
+        if residuals is None:
+            return None
+        try:
+            return [r.to(trainer.device_torch, dtype=dtype) for r in residuals]
+        except Exception as e:
+            print(f"[CONTROLNET-REROUTE] failed to use precomputed residuals: {e}")
+            return None
+    return None
 
 
 class SDTrainer(BaseSDTrainProcess):
@@ -639,6 +656,7 @@ class SDTrainer(BaseSDTrainProcess):
                 dfe_loss = torch.nn.functional.mse_loss(pred_features, target_features, reduction="none") * \
                     self.train_config.diffusion_feature_extractor_weight * dfe_scaler
                 additional_loss += dfe_loss.mean()
+
             elif self.dfe.version == 2:
                 # version 2
                 # do diffusion feature extraction on target
@@ -666,6 +684,27 @@ class SDTrainer(BaseSDTrainProcess):
                 additional_loss += dfe_loss * self.train_config.diffusion_feature_extractor_weight 
             else:
                 raise ValueError(f"Unknown diffusion feature extractor version {self.dfe.version}")
+
+        # Auxiliary controlnet loss (opt-in)
+        try:
+            if self.train_config.controlnet_aux_loss is not None and self.train_config.controlnet_aux_loss != 'none' and batch.control_tensor is not None:
+                from toolkit.controlnet_aux import compute_control_edge_loss
+
+                # ensure tensors are on correct device/dtype
+                img_tensor = batch.tensor.to(self.device_torch)
+                ctrl_tensor = batch.control_tensor
+                aux = compute_control_edge_loss(img_tensor, ctrl_tensor, device=self.device_torch)
+                aux = aux * float(self.train_config.controlnet_aux_loss_weight)
+                additional_loss = additional_loss + aux
+                # lightweight debug print
+                if self.train_config.controlnet_aux_loss != 'none':
+                    try:
+                        print_acc(f"[AUX-LOSS] controlnet aux loss: {aux.item():.6f}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            # non-fatal; aux loss should not break training
+            print_acc(f"ControlNet aux loss failed: {e}")
         
         if self.train_config.do_guidance_loss:
             with torch.no_grad():
@@ -1628,24 +1667,54 @@ class SDTrainer(BaseSDTrainProcess):
                 if has_adapter_img:
                     if (self.adapter and isinstance(self.adapter, T2IAdapter)) or (
                             self.assistant_adapter and isinstance(self.assistant_adapter, T2IAdapter)):
-                        with torch.set_grad_enabled(self.adapter is not None):
-                            adapter = self.assistant_adapter if self.assistant_adapter is not None else self.adapter
-                            adapter_multiplier = get_adapter_multiplier()
-                            with self.timer('encode_adapter'):
-                                down_block_additional_residuals = adapter(adapter_images)
-                                if self.assistant_adapter:
-                                    # not training. detach
-                                    down_block_additional_residuals = [
-                                        sample.to(dtype=dtype).detach() * adapter_multiplier for sample in
-                                        down_block_additional_residuals
-                                    ]
-                                else:
-                                    down_block_additional_residuals = [
-                                        sample.to(dtype=dtype) * adapter_multiplier for sample in
-                                        down_block_additional_residuals
-                                    ]
+                        adapter = self.assistant_adapter if self.assistant_adapter is not None else self.adapter
+                        adapter_multiplier = get_adapter_multiplier()
 
-                                pred_kwargs['down_intrablock_additional_residuals'] = down_block_additional_residuals
+                        # Check if we can use precomputed residuals (helper keeps logic testable)
+                        precomputed = use_precomputed_control_residuals(self, dtype)
+                        if precomputed is not None:
+                            with self.timer('use_precomputed_control_residuals'):
+                                pred_kwargs['down_intrablock_additional_residuals'] = precomputed
+                                print('[CONTROLNET-REROUTE] using precomputed residuals')
+
+                        else:
+                            with torch.set_grad_enabled(self.adapter is not None):
+                                from toolkit.controlnet_offload import offload_adapter, bring_adapter
+                                with self.timer('encode_adapter'):
+                                    strategy = self.train_config.controlnet_offload_strategy
+                                    # bring adapter to compute device when using accelerate
+                                    try:
+                                        if strategy == 'accelerate':
+                                            bring_adapter(adapter, device=self.device_torch, strategy='accelerate')
+
+                                        # ensure adapter_images on correct device
+                                        adapter_images_dev = adapter_images.to(self.device_torch)
+
+                                        down_block_additional_residuals = adapter(adapter_images_dev)
+
+                                        if self.assistant_adapter:
+                                            # not training. detach
+                                            down_block_additional_residuals = [
+                                                sample.to(dtype=dtype).detach() * adapter_multiplier for sample in
+                                                down_block_additional_residuals
+                                            ]
+                                        else:
+                                            down_block_additional_residuals = [
+                                                sample.to(dtype=dtype) * adapter_multiplier for sample in
+                                                down_block_additional_residuals
+                                            ]
+
+                                        pred_kwargs['down_intrablock_additional_residuals'] = down_block_additional_residuals
+
+                                    finally:
+                                        # offload adapter if needed to free GPU
+                                        try:
+                                            if strategy in ('accelerate', 'manual_swap'):
+                                                offload_adapter(adapter, strategy=strategy)
+                                        except Exception as e:
+                                            print(f"[CONTROLNET-OFFLOAD] offload failed: {e}")
+                                            # continue; we don't want an offload failure to crash training
+                                            pass
 
                 if self.adapter and isinstance(self.adapter, IPAdapter):
                     with self.timer('encode_adapter_embeds'):
@@ -1851,26 +1920,51 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.train_config.do_cfg:
                             raise ValueError("ControlNetModel is not supported with CFG")
                         with torch.set_grad_enabled(self.adapter is not None):
+                            from toolkit.controlnet_offload import offload_adapter, bring_adapter
                             adapter: ControlNetModel = self.assistant_adapter if self.assistant_adapter is not None else self.adapter
                             adapter_multiplier = get_adapter_multiplier()
+                            strategy = self.train_config.controlnet_offload_strategy
                             with self.timer('encode_adapter'):
-                                # add_text_embeds is pooled_prompt_embeds for sdxl
-                                added_cond_kwargs = {}
-                                if self.sd.is_xl:
-                                    added_cond_kwargs["text_embeds"] = conditional_embeds.pooled_embeds
-                                    added_cond_kwargs['time_ids'] = self.sd.get_time_ids_from_latents(noisy_latents)
-                                down_block_res_samples, mid_block_res_sample = adapter(
-                                    noisy_latents,
-                                    timesteps,
-                                    encoder_hidden_states=conditional_embeds.text_embeds,
-                                    controlnet_cond=adapter_images,
-                                    conditioning_scale=1.0,
-                                    guess_mode=False,
-                                    added_cond_kwargs=added_cond_kwargs,
-                                    return_dict=False,
-                                )
-                                pred_kwargs['down_block_additional_residuals'] = down_block_res_samples
-                                pred_kwargs['mid_block_additional_residual'] = mid_block_res_sample
+                                # bring adapter to compute device when using accelerate
+                                try:
+                                    if strategy == 'accelerate':
+                                        bring_adapter(adapter, device=self.device_torch, strategy='accelerate')
+
+                                    # ensure adapter_images on correct device
+                                    adapter_images_dev = adapter_images.to(self.device_torch)
+
+                                    # add_text_embeds is pooled_prompt_embeds for sdxl
+                                    added_cond_kwargs = {}
+                                    if self.sd.is_xl:
+                                        added_cond_kwargs["text_embeds"] = conditional_embeds.pooled_embeds
+                                        added_cond_kwargs['time_ids'] = self.sd.get_time_ids_from_latents(noisy_latents)
+
+                                    t0 = time.time()
+                                    down_block_res_samples, mid_block_res_sample = adapter(
+                                        noisy_latents,
+                                        timesteps,
+                                        encoder_hidden_states=conditional_embeds.text_embeds,
+                                        controlnet_cond=adapter_images_dev,
+                                        conditioning_scale=1.0,
+                                        guess_mode=False,
+                                        added_cond_kwargs=added_cond_kwargs,
+                                        return_dict=False,
+                                    )
+                                    t1 = time.time()
+                                    print_acc(f"[CONTROLNET-OFFLOAD] control residual compute time: {t1 - t0:.3f}s")
+
+                                    pred_kwargs['down_block_additional_residuals'] = down_block_res_samples
+                                    pred_kwargs['mid_block_additional_residual'] = mid_block_res_sample
+
+                                finally:
+                                    # offload adapter if needed to free GPU
+                                    try:
+                                        if strategy in ('accelerate', 'manual_swap'):
+                                            offload_adapter(adapter, strategy=strategy)
+                                    except Exception as e:
+                                        print(f"[CONTROLNET-OFFLOAD] offload failed: {e}")
+                                        # continue; we don't want an offload failure to crash training
+                                        pass
                 
                 if self.train_config.do_guidance_loss and isinstance(self.train_config.guidance_loss_target, list):
                     batch_size = noisy_latents.shape[0]

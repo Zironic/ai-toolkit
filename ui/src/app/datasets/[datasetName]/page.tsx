@@ -19,7 +19,8 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [showEvalModal, setShowEvalModal] = useState(false);
   const [evalRefreshKey, setEvalRefreshKey] = useState(0);
-  const [evalMap, setEvalMap] = useState<Record<string, { raw?: number; norm?: number }>>({});
+  const [evalMap, setEvalMap] = useState<Record<string, { raw?: number; norm?: number; abl?: number }>>({});
+  const [displayMetric, setDisplayMetric] = useState<'raw' | 'norm' | 'ablation'>('raw');
 
   // modelsList: array of { label, jobId }
   const [modelsList, setModelsList] = useState<Array<{ label: string; jobId: string }>>([]);
@@ -95,14 +96,15 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         }
         const datasetKey = Object.keys(j.datasets)[0];
         const itemStats = j.datasets[datasetKey]?.item_stats || {};
-        const map: Record<string, { raw?: number; norm?: number }> = {};
+        const map: Record<string, { raw?: number; norm?: number; abl?: number; abl?: number }> = {};
         for (const [pathKey, stats] of Object.entries(itemStats)) {
           const parts = String(pathKey).split(/[\\/]/);
           const b = parts[parts.length - 1];
           const s: any = stats as any;
           const raw = typeof s.average_loss_raw !== 'undefined' && s.average_loss_raw !== null ? Number(s.average_loss_raw) : undefined;
           const norm = typeof s.average_loss !== 'undefined' && s.average_loss !== null ? Number(s.average_loss) : undefined;
-          map[b] = { raw, norm };
+          const abl = typeof s.average_ablation_delta !== 'undefined' && s.average_ablation_delta !== null ? Number(s.average_ablation_delta) : undefined;
+          map[b] = { raw, norm, abl };
         }
         console.log('Loaded eval map for file', filePath, map);
         setEvalMap(map);
@@ -267,7 +269,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
             Add Images
           </Button>
           {/* Model evaluation selector */}
-          <div className="text-sm text-gray-200 bg-gray-800 rounded px-2 py-1 flex items-center">
+          <div className="text-sm text-gray-200 bg-gray-800 rounded px-2 py-1 flex items-center gap-2">
             <label className="mr-2 text-xs text-gray-300">Eval:</label>
             <select
               value={selectedEvalJobId || ''}
@@ -278,6 +280,16 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
               {modelsList.map(m => (
                 <option key={m.jobId} className="bg-gray-800 text-white" value={m.jobId}>{m.label}</option>
               ))}
+            </select>
+            {/* metric selector */}
+            <select
+              value={displayMetric}
+              onChange={e => setDisplayMetric(e.target.value as any)}
+              className="bg-gray-800 text-white text-sm outline-none rounded px-1 py-0.5 appearance-none"
+            >
+              <option value="raw">Raw</option>
+              <option value="norm">Normalized</option>
+              <option value="ablation" disabled={!Object.values(evalMap).some(x => x.abl != null)}>Ablation</option>
             </select>
           </div>
           <Button
@@ -306,6 +318,8 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                   onDelete={() => refreshImageList(String(datasetName))}
                   rawLoss={rawLoss}
                   normLoss={normLoss}
+                  ablLoss={typeof e.abl !== 'undefined' ? e.abl : null}
+                  displayMetric={displayMetric}
                 />
               );
             })}

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import prisma from '../../../../cron/prisma';
+import prisma from '@/server/prisma';
 import { getDatasetsRoot } from '@/server/settings';
 import path, { join } from 'path';
 import fs from 'fs';

@@ -13,6 +13,10 @@ device = torch.device('cpu')
 dtype = torch.float32
 vae_path = '/mnt/Models/stable-diffusion/models/VAE/vae-ft-mse-840000-ema-pruned/vae-ft-mse-840000-ema-pruned.safetensors'
 
+import pytest
+if not os.path.exists(vae_path):
+    pytest.skip('VAE file not found; skipping VAE cycle test', allow_module_level=True)
+
 find_matches = False
 
 state_dict_ldm = load_file(vae_path)

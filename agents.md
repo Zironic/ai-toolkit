@@ -63,11 +63,17 @@ UI (Node.js > 18):
 # from repo root
 # Recommended (non-interactive / agent-safe): start the production server (non-interactive)
 # Use the helper scripts (they perform install/update/build and then start)
-# Windows (agent-safe):  .\run-ui-start-background.ps1
-# POSIX (agent-safe):    ./run-ui-start-background.sh
+# Windows (agent-safe):  .\run-ui-start-background.ps1  # builds by default, then starts
+# POSIX (agent-safe):    ./run-ui-start-background.sh    # builds by default, then starts
 # To stop the background server:
 # Windows: .\run-ui-stop-background.ps1
 # POSIX:   ./run-ui-stop-background.sh
+
+# Agent note: the start script builds by default so local changes go live. To skip the build
+# (useful for fast agent restarts), pass the -NoBuild switch or set the env var NO_UI_BUILD=1:
+#   .\run-ui-start-background.ps1 -NoBuild
+#   powershell: $env:NO_UI_BUILD='1'; .\run-ui-start-background.ps1
+# The default behavior (no flag) runs `npm run build` and exits if the build fails.
 
 # Alternative (foreground/interactive) - NOT recommended for unattended agents
 # ./run-ui build_and_start  # runs in foreground and may block the terminal
@@ -102,9 +108,36 @@ These are the commands an automated agent can run by default without causing len
 - Build the UI (fast): `./run-ui build` or `cd ui && npm run build`
 - Run a lint/test subset for a change: `python -m pytest testing -q -k <test-name-substring>`
 
+> **Shell note:** Windows PowerShell does not support POSIX here-doc syntax such as `python - <<PY ... PY`. Avoid sending shell here-doc style commands from PowerShell; instead use `python -c "..."`, or create a temporary script file (e.g., `temp.py`) and run `python temp.py` when you need to execute multi-line Python. Also ensure you activate the project's virtual environment before running Python commands (Windows PowerShell: `.#\venv\\Scripts\\Activate.ps1`; POSIX: `source venv/bin/activate`).
+
+> **PowerShell examples (safe patterns):**
+> - One-liner: `python -c "print('hello')"` ✅
+> - Multi-line (here-string -> temp file):
+>   ```powershell
+>   $script = @'
+>   print("line1")
+>   print("line2")
+>   '@
+>   Set-Content -Path temp.py -Value $script -Encoding UTF8
+>   python temp.py
+>   Remove-Item temp.py -Force
+>   ```
+> - Short inline alternative: `Set-Content -Path temp.py -Value "print('hello')"; python temp.py; Remove-Item temp.py -Force` ✅
+> - Helper script (convenient): `.\
+>   scripts\run_python.ps1 -Body "print('hello')"` or `.\n>   scripts\run_python.ps1 -File scripts/some_script.py -Args 'arg1','arg2'` ✅
+>
+> **Agent tip:** If your agent is running on Windows, prefer PowerShell-safe patterns (`python -c`, temporary script, or `scripts\run_python.ps1`) and avoid POSIX here-docs to prevent parse errors.  
+> If you add automation, detect the OS and choose the appropriate invocation pattern automatically.
+
 ### Dataset evaluator (safe checks)
 You can run lightweight dataset evaluations that sample or limit the number of items to avoid heavy CPU work. Prefer running on small datasets or with `--max-samples`/`--sample-fraction` set to limit cost.
 
+> **GPU tests note (manual only):** Some tests (e.g., Accelerate offload, swap correctness, memory smoke, DDP-safety) require GPU hardware and an Accelerate-configured environment. These tests are intended to be run manually by maintainers on GPU machines and **are not** included in the standard PR CI workflow. **This repository does not maintain a GPU CI runner and we will not add one; GPU tests should remain manual and on-demand.** To run them locally:
+> - Activate venv: `.\venv\Scripts\Activate.ps1` (Windows) or `source venv/bin/activate` (POSIX)
+> - Ensure `accelerate` and CUDA drivers are available and configured.
+> - Run the GPU tests: `python -m pytest testing/test_controlnet_offload_gpu.py -q` (skips automatically on CPU-only environments)
+> - Run benchmark: `python tools/benchmark_offload.py --strategy accelerate --size-mb 200 --iters 3` (human-run profiling)
+> - Record notable findings in `LEARNINGS.md` or PR comments.
 - CLI (Python):
   - `python tools/eval_dataset.py --dataset-path <dataset_folder> --model <model_name_or_path> --batch-size 1 --out-dir <dataset_folder> --job-name <job_id> --step 0 --sample-fraction 0.1 --max-samples 100`
   - The CLI writes a JSON report named `{job_name}_{step_zfilled}.json` into the dataset folder when `--out-dir` is provided.
@@ -117,6 +150,7 @@ You can run lightweight dataset evaluations that sample or limit the number of i
   - The worker action `cron/actions/processEvalQueue.ts` will pick queued EvalJob rows and spawn `python tools/eval_dataset.py` for them. In dev you can run the worker once via:
     - `npx ts-node -P ui/tsconfig.worker.json ui/scripts/run_process_eval.ts`
   - The worker captures `stdout`/`stderr` from the Python process and writes a concise message into `EvalJob.info` (useful for diagnostics) and updates `status` to `running`, `finished`, or `error`.
+  - The cron worker now also runs a PID-only liveness checker that scans running `Job` and `EvalJob` rows for recorded PIDs and will **mark** jobs `stopped` if the PID is not present on the host; jobs without a recorded PID are left unchanged. This prevents stuck "running" entries when child processes die unexpectedly.
 
 Caveats & safety:
 - Do NOT enqueue large evaluations unboundedly. Use `max_samples` or `sample_fraction` to cap work or ask for human approval.

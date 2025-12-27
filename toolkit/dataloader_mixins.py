@@ -26,6 +26,8 @@ from toolkit.prompt_utils import inject_trigger_into_prompt
 from torchvision import transforms
 from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
+# canny helper used for on-the-fly control generation
+from tools.precompute_control import make_canny_image
 import albumentations as A
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
@@ -754,6 +756,60 @@ class ImageProcessingDTOMixin:
         if not only_load_latents:
             if self.has_control_image:
                 self.load_control_image()
+            # If there is no precomputed control image, optionally generate controls on-the-fly
+            else:
+                # generate if dataset requests it (dataset-level override) or if train-level flag is enabled on the sd object
+                do_generate = False
+                if getattr(self.dataset_config, 'control_generate_on_the_fly', None) is True:
+                    do_generate = True
+                elif getattr(self.dataset_config, 'control_generate_on_the_fly', None) is None:
+                    # fall back to train config if available on sd
+                    sd_obj = getattr(self, 'sd', None)
+                    if sd_obj is None:
+                        # sometimes sd is passed via kwargs into the DTO - try to fetch it from dataloader_transforms if present
+                        sd_obj = getattr(self, 'dataloader_transforms', None)
+                    if sd_obj is not None and hasattr(sd_obj, 'train_config'):
+                        do_generate = bool(sd_obj.train_config.controlnet_generate_on_the_fly)
+                    else:
+                        # default to True when not explicitly disabled
+                        do_generate = True
+                if do_generate and isinstance(self.dataset_config.controls, (list, tuple)) and len(self.dataset_config.controls) > 0:
+                    control_tensors = []
+                    # ensure we have a PIL image to run canny on (img may already be a tensor after transforms)
+                    pil_img = img if isinstance(img, Image.Image) else transforms.ToPILImage()(img)
+                    for control in self.dataset_config.controls:
+                        if control == 'canny' or control == 'line':
+                            # For now support canny (and treat 'line' as canny fallback)
+                            t1 = getattr(self.dataset_config, 'control_canny_threshold1', 100)
+                            t2 = getattr(self.dataset_config, 'control_canny_threshold2', 200)
+                            blur = getattr(self.dataset_config, 'control_blur', 3)
+                            try:
+                                control_img = make_canny_image(pil_img, t1, t2, blur)
+                            except Exception:
+                                # Don't raise here; generation should be best-effort
+                                control_img = None
+                            if control_img is None:
+                                continue
+                            # resize if requested
+                            control_size = getattr(self.dataset_config, 'control_size', None)
+                            if control_size is not None and not self.full_size_control_images:
+                                control_img = control_img.resize((control_size, control_size), Image.BICUBIC)
+                            # convert to tensor, applying spatial replay transforms if present
+                            transform_fn = transforms.Compose([transforms.ToTensor()])
+                            if self.aug_replay_spatial_transforms:
+                                tensor = self.augment_spatial_control(control_img, transform=transform_fn)
+                            else:
+                                tensor = transform_fn(control_img)
+                            control_tensors.append(tensor)
+                        else:
+                            # unsupported control type for generation - skip
+                            continue
+                    if len(control_tensors) == 0:
+                        self.control_tensor = None
+                    elif len(control_tensors) == 1:
+                        self.control_tensor = control_tensors[0]
+                    else:
+                        self.control_tensor = torch.stack(control_tensors, dim=0)
             if self.has_inpaint_image:
                 self.load_inpaint_image()
             if self.has_clip_image:
@@ -857,16 +913,17 @@ class ControlFileItemDTOMixin:
         self.control_tensor_list: Union[List[torch.Tensor], None] = None
         sd = kwargs.get('sd', None)
         self.use_raw_control_images = sd is not None and sd.use_raw_control_images
-        dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
+        # prefer self.dataset_config (set by FileItemDTO) over kwargs to be robust
+        dataset_config: 'DatasetConfig' = getattr(self, 'dataset_config', kwargs.get('dataset_config', None))
         self.full_size_control_images = False
-        if dataset_config.control_path is not None:
+        if dataset_config is not None and dataset_config.control_path is not None:
             # find the control image path
             control_path_list = dataset_config.control_path
             if not isinstance(control_path_list, list):
                 control_path_list = [control_path_list]
             self.full_size_control_images = dataset_config.full_size_control_images
             # we are using control images
-            img_path = kwargs.get('path', None)
+            img_path = getattr(self, 'path', kwargs.get('path', None))
             file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
             
             found_control_images = []
@@ -882,6 +939,30 @@ class ControlFileItemDTOMixin:
             elif len(self.control_path) == 1:
                 # only do one
                 self.control_path = self.control_path[0]
+
+        # precomputed control residuals path (optional). Expect files named <basename>_residuals.pt
+        self.control_residuals: Union[tuple, None] = None
+        residuals_path = getattr(dataset_config, 'control_residuals_path', None)
+        if residuals_path is not None:
+            # allow a single path or a list
+            residual_paths = residuals_path if isinstance(residuals_path, list) else [residuals_path]
+            file_name_no_ext = os.path.splitext(os.path.basename(kwargs.get('path', '')))[0]
+            found_residual = None
+            for rp in residual_paths:
+                candidate = os.path.join(rp, file_name_no_ext + '_residuals.pt')
+                if os.path.exists(candidate):
+                    found_residual = candidate
+                    break
+            if found_residual is not None:
+                try:
+                    loaded = torch.load(found_residual, map_location='cpu')
+                    # expect tuple/list of tensors
+                    if isinstance(loaded, (list, tuple)) and all([isinstance(x, torch.Tensor) for x in loaded]):
+                        self.control_residuals = tuple(loaded)
+                    else:
+                        print_acc(f"Warning: Control residual file {found_residual} is not a tuple/list of tensors")
+                except Exception as e:
+                    print_acc(f"Warning: Failed to load control residuals from {found_residual}: {e}")
 
     def load_control_image(self: 'FileItemDTO'):
         control_tensors = []
