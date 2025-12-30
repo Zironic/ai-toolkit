@@ -6,7 +6,7 @@
 
 
 
-ControlTrain adds optional \*\*ControlNet-based conditioning\*\* to the training pipeline, starting with \*\*Canny edge control\*\* and designed to extend to other modalities (e.g. OpenPose, depth).
+ControlTrain adds optional **ControlNet-based conditioning** to the training pipeline, starting with **OpenPose pose control** (default) and designed to extend to other modalities (e.g. Canny, depth).
 
 
 
@@ -18,7 +18,7 @@ The goal is to provide \*\*stable, reproducible spatial conditioning\*\* while k
 
 
 
-\* Generates or loads control signals (currently Canny edges) aligned with training images
+\* Generates or loads control signals (currently OpenPose pose maps) aligned with training images
 
 \* Feeds control tensors through the dataloader → training process → model
 
@@ -60,7 +60,7 @@ The goal is to provide \*\*stable, reproducible spatial conditioning\*\* while k
 
 
 
-\* ✅ Canny (image-space edge conditioning)
+\* ✅ OpenPose (pose / keypoint conditioning)
 
 \* ⬜ OpenPose (pose heatmaps / skeletons)
 
@@ -69,6 +69,3 @@ The goal is to provide \*\*stable, reproducible spatial conditioning\*\* while k
 
 
 For detailed requirements, configs, and acceptance criteria, see \*\*ControlTrain-Design.md\*\*.
-
-
-

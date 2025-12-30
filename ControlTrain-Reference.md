@@ -24,6 +24,10 @@ This document preserves \*\*background material, external references, and detail
 
 These informed:
 
+* Note: We now explicitly propagate ControlNet adapter expectations (channels, control image size, and num_control_images) into trainer/dataloader at adapter load time. This allows datasets to specify or inherit a non-square `control_size` (e.g., 1280x320 used by Z-Image-Turbo variants) so that control images are not forced into square 512x512 tensors. See `toolkit/config_modules.py` (`DatasetConfig.control_size`), `toolkit/dataloader_mixins.py` (`load_control_image`), and `jobs/process/BaseSDTrainProcess.py` (`setup_adapter`) for the implementation details.
+
+These informed:
+
 
 
 \* Consumer-site projection embedding
@@ -81,13 +85,14 @@ Design choice:
 
 Rationale: applying the shim only at the consumer boundary prevents inadvertent corruption of modules that expect the original encoder dimension and eliminates common matmul shape mismatch failures. This policy aligns with VideoX patterns and the project's principle of avoiding defensive, silent handling — we prefer deterministic behavior and explicit, fixable failures.
 
-* These patterns guided our implementation: explicit projection shims, zero-init defaults, and an opt-in encoder reduction (`reduce='mean'|'project'`) for concatenated encoder outputs.  Implemented parity: we now support consumer-side 1x1 projection shims that are created lazily when the adapter returns down-block residuals with channel dims that don't match UNet expectations; the behavior is enabled by the job `controlnet.auto_output_shim` flag (default: true).
+* These patterns guided our implementation: explicit projection shims, zero-init defaults, and an opt-in encoder reduction (`reduce='mean'|'project'`) for concatenated encoder outputs. Implemented parity: we now support consumer-side 1x1 projection shims that are created lazily when the adapter returns down-block residuals with channel dims that don't match UNet expectations; this behavior is controlled by the trainer config key `controlnet_auto_output_shim` (default: **False** — opt-in).
 
 **Consumer shim & projection policy update:**
 
-- **Runtime consumer shims are now opt-in and disabled by default.** The `ProjectionWrapper` will no longer insert consumer Linear shims automatically unless explicitly enabled (e.g., via trainer config). This reduces accidental insertion into UNet internals and prevents device/dtype mismatches at runtime.
-- When consumer shims are created at runtime, they are **explicitly placed on the same device and dtype as the consumer module** (the wrapper ensures `proj.to(module.weight.device, dtype=module.weight.dtype)` before use).
-- `install_projection_shim` now **detects baked shim metadata** (via `shim_meta.yaml`) and will skip runtime shim insertion when a baked shim is present (baked adapters are authoritative).
+- **Runtime consumer shims are opt-in via `TrainConfig.controlnet_auto_output_shim`.** When disabled (the default), channel mismatches will **fail fast** rather than silently inserting shims.
+- When consumer shims are created at runtime, they are **cached on the StableDiffusion instance** as `sd.control_projections = {'down': [...], 'mid': <module|None>}` and **placed on the UNet's device and dtype** when applied.
+- Projection shims are **persisted** alongside model saves to `control_projections.safetensors` with a companion `.meta.json` that includes `projections_version` (currently `v1`). The loader will raise on incompatible metadata versions to avoid silent mismatches.
+- `StableDiffusion.load_control_projections()` will try to pick up saved projections automatically when a model is loaded from a directory or a safetensors path.
 
 ---
 

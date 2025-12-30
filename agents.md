@@ -12,7 +12,7 @@ This AGENTS.md focuses on fast, safe commands agents can run and conventions tha
 
 ## Project coordination
 
-- **Current project plan:** `ControlTrain.md` — this is the active plan for ongoing work on ControlNet / Canny precompute integration. Agents MUST load and keep `ControlTrain.md` in context before starting any non-trivial change that affects controlnet, precompute, dataloader, or training flow.
+- **Current project plan:** `ControlTrain.md` — this is the active plan for ongoing work on ControlNet / OpenPose control integration. Agents MUST load and keep `ControlTrain.md` in context before starting any non-trivial change that affects controlnet, control generation, dataloader, or training flow.
 - **Plan maintenance rules:** After completing any task that materially changes behavior, tests, or configuration described in `ControlTrain.md`, update `ControlTrain.md` to reflect the change (short blurb of what changed + date) and add a short memory via Serena (`write_memory`) with the summary so future runs see it. If the task introduces further follow-ups, add them to the plan and note them in the file.
 
 > **Agent coding policy:** Prefer adding small, well-tested helper functions in `toolkit/` over adding more logic into `jobs/process/*` classes. Keep process code thin: orchestration only, not heavy parsing or transformation logic. Also, prefer *fail-fast* behavior on unexpected conditions (raise clear, testable errors) rather than silently swallowing exceptions unless there is a documented, tested fallback path.
@@ -54,9 +54,9 @@ A short list of specific files and where to look when you need to change behavio
 
 - `run.py` — Main CLI runner for local jobs and configs (human-first; do not start GPU training without explicit approval).
 - `run_modal.py` — Helper to run jobs remotely (Modal / cloud-run examples).
-- `config/examples/` — Example job configs and templates (e.g., `controlnet_canny_train.yml`).
-- `tools/precompute_control.py` — Precompute ControlNet inputs (Canny); writes `canny_manifest.json` with per-file hash/signature. Supports `--batch-size` for chunking and idempotent, atomic updates.
-- `tools/apply_canny_manifest.py` — CLI helper to write dataset-level `canny_config.json` from a manifest (safe `--force` flag and no-op behavior).
+- `config/examples/` — Example job configs and templates (e.g., `controlnet_openpose_train.yml`).
+- `tools/gen_control.py` — Generate ControlNet inputs (OpenPose by default); writes `control_manifest.json` with per-file hash/signature when caching is used. Supports `--batch-size` for chunking and idempotent, atomic updates.
+- `tools/apply_control_manifest.py` — CLI helper to write dataset-level `control_config.json` from a manifest (safe `--force` flag and no-op behavior).
 - `tools/eval_dataset.py` — Dataset evaluation CLI; produces JSON report files and is invoked by the UI worker for `EvalJob`.
 - `tools/quick_eval_sim.py` — Eval/caption debug helpers and simulation utilities.
 - `toolkit/config_modules.py` — `DatasetConfig`/`ModelConfig` and validations (e.g., blocks geometric augmentations when precomputed controls exist).
@@ -66,9 +66,9 @@ A short list of specific files and where to look when you need to change behavio
 - `toolkit/train_tools.py` — Training helpers, encoding utilities, and CLI/test conveniences.
 - `toolkit/paths.py` — Canonical repo paths (e.g., `MODELS_PATH`, `DIFFUSERS_CONFIGS_ROOT`).
 - `jobs/` — Job classes (e.g., `TrainJob.py`, `GenerateJob.py`, `ExtractJob.py`) and `jobs/process/` for per-step process implementations.
-- `ui/src/app/api/` — Server routes for the UI; notable: `api/eval_dataset/route.ts` (enqueues `EvalJob`), `api/precompute/route.ts` (enqueues `PrecomputeJob`), `api/precompute/[id]/status` (job status), `api/precompute/[id]/result` (returns a manifest JSON), and `api/precompute/[id]/apply` (runs `apply_canny_manifest.py` against the job manifest).
+- `ui/src/app/api/` — Server routes for the UI; notable: `api/eval_dataset/route.ts` (enqueues `EvalJob`) and control-generation endpoints (enqueue a control generation job, check job status, fetch results, and apply a control manifest to a dataset).
 - `ui/cron/actions/processEvalQueue.ts` — Worker that pulls `EvalJob` rows and runs `python tools/eval_dataset.py`, capturing output and updating DB `status`/`info`.
-- `ui/cron/actions/processPrecomputeQueue.ts` — Worker that pulls `PrecomputeJob` rows and runs `python tools/precompute_control.py`, capturing progress and updating DB `status`/`info`. After a successful precompute the worker will, by default, auto-apply the generated manifest to the dataset by running `tools/apply_canny_manifest.py` when `params.auto_apply` is not explicitly false; apply results are recorded in `PrecomputeJob.info` (e.g., `applied:written`, `applied:noop`, or `apply exit ...`).
+- `ui/cron/actions/processControlGenQueue.ts` — Worker that pulls control-generation jobs and runs `python tools/gen_control.py` (or `tools/apply_control_manifest.py` when applying manifests), capturing progress and updating DB `status`/`info`. After a successful run the worker may auto-apply the generated manifest to the dataset when `params.auto_apply` is not explicitly false; apply results are recorded in job info (e.g., `applied:written`, `applied:noop`, or `apply exit ...`).
 - `ui/prisma/schema.prisma` — DB models used by UI and workers: `Job`, `EvalJob`, and `PrecomputeJob` (key fields and indices).
 - `ui/src/components/` — UI components (e.g., `EvalJobsList.tsx`, `PrecomputeJobsList.tsx` and modal `PrecomputeDatasetModal.tsx`) and dataset page components that interact with API routes.
 - `ui/src/utils/precompute.ts` — Client helpers to create/list Precompute jobs from the UI (`createPrecomputeJob`, `listPrecomputeJobs`).
