@@ -1,342 +1,387 @@
-
-
-
-# ControlNet Training Plan (OpenPose → ControlNet)
+# ControlNet Training Design (OpenPose-first)
 
 ## Summary ✅
-Add an optional ControlNet-based training mode that uses OpenPose pose maps derived from the dataset as control inputs. The implementation should be **on-the-fly-first** (generate pose maps after bucket/resize and augmentations by default), with optional caching for very large datasets or for offline diagnostics. ControlNet weights should be loadable/savable as part of the existing adapter/save flow.
+This document specifies a clear, testable design to add ControlNet conditioning using OpenPose pose maps as the canonical control modality. Controls are produced at a single canonical point (after augmentations + bucket/resize, before VAE latents) to guarantee pixel-level alignment. Caching generated control maps is supported as an optional performance optimization only — correctness relies on the canonical generation point.
+
+Purpose: enable robust, reproducible ControlNet training (LoRA/LoKr/ControlLoRA) with minimal changes to existing flows and with pragmatic compatibility for non-diffusers controlnets (safetensors), channel/width mismatches, and large datasets.
 
 ---
 
-## Goals 🎯
-- Produce `control_tensor` per training sample (OpenPose pose maps / keypoint heatmaps → tensor format expected by ControlNet).
-- Provide config toggles for generation mode, thresholds, caching, and whether to train the ControlNet adapter.
-- Wire control tensors through the dataloader → `BaseSDTrainProcess.process_general_training_batch` → model training loop (ensure gradients flow into controlnet adapter if training).
-- Add tests, docs, and example config.
+## Design principles 🎯
+- Canonical generation: generate control maps from the exact pixels the model sees (after all spatial transforms and resizing, before VAE encoding).
+- Determinism: all control generation must be deterministic and record the generator version and parameters in a manifest.
+- Minimal invasive edits: reuse dataloader, batch DTOs, training loop, and adapter save/load; add small helper modules (pose generator, compatibility wrapper) rather than large rewrites.
+- Reproducible compatibility: support safetensors via a compatibility wrapper and prefer deterministic resampling + 1×1 channel projection over retraining controlnets.
 
 ---
 
-## Design & Implementation Plan (step-by-step) 🔧
-
-1) Design & API (analysis) — Files affected: `jobs/process/BaseSDTrainProcess.py`, dataloader, `DataLoaderBatchDTO`, config schemas
-   - Decide on default control type: `openpose` (extendable to other control types later).
-   - Config keys (suggested):
-     - `controlnet:`
-       - `use_controlnet: bool` (master switch)
-       - `type: 'openpose'` (other values later) 
-       - `name_or_path` (pretrained controlnet model if any)
-   - Update `config/examples/` with a short example.
-
-
-2) Dataloader & Batch DTO changes (on-the-fly-first) 
-   - Add fields to `DataLoaderBatchDTO`: `control_tensor` (torch.Tensor or None) and `control_image_path` (for caching/traceability).
-  - Provide a control generation CLI `tools/gen_control.py` to generate control maps and optionally cache them to `datasets/<dataset_name>/pose/` (filenames matching source images, e.g., `image_0001.jpg` -> `image_0001_pose.png`). The CLI should:
-    - Accept config for thresholds/blur/size and option to cache or run one-off generation.
-    - Optionally overwrite or skip existing files when caching is enabled.
-    - Produce a lightweight cache manifest or add entries to the dataset manifest mapping source -> control path when caching is used.
-   - Dataloader behavior and alignment (mitigation):
-    - **Pixel‑perfect generation point (REQUIRED):** Generate control images *after* bucket/resize and all geometric augmentations, but *before* VAE encoding. Generating at this point guarantees the control image uses the exact pixels the model will see and prevents subtle alignment or interpolation mismatches.
-    - **Single canonical helper:** Implement and require usage of `toolkit/pose.py::make_openpose_map(image, model='openpose', confidence=0.3, output_format='heatmap', size=None, channels=None, dtype=None, generator_version=None)`. Both `tools/gen_control.py` and any on-the-fly dataloader generation MUST call this helper so generation parameters and code paths are identical.
-    - **Determinism & manifest metadata:** Control generation must be deterministic (fixed interpolation/antialiasing, no stochastic steps). Record generation parameters and a `generator_version` (git-sha or release tag) in a per-dataset `control_manifest.json` with fields such as `manifest_version` (semantic, start at `1`), `generator_version`, `thresholds`, `blur`, `size`, `channels`, `dtype`, `timestamp`, `params_hash` and a per-file checksum (`sha256`) for each control image. Manifests must conform to an explicit JSON Schema (add `toolkit/control_manifest_schema_v1.json`), be validated before use, and written atomically (temp file → `os.replace`) to avoid partial state. The manifest schema includes:
-  - `manifest_version` (int)
-  - `generator_version` (string)
-  - `params_hash` (string)
-  - `generator_params` (object)
-  - `files` (dict mapping `source_image` -> `{ "control_path": "<relpath>", "sha256": "...", "size": [W,H] }`)
-  - `generated_after_augmentations` (bool)
-Add a manifest validator helper (e.g., `toolkit/control_manifest.py::validate_manifest(path)`) and unit tests `testing/control_manifest_test.py` to assert schema compliance, atomic write semantics, and that `params_hash` mismatches trigger a clear error.
-    - **On-the-fly-first policy (trade-offs):**
-      - `generate_on_the_fly=True` → **generate after bucket/resize** and augmentations (canonical, alignment-safe mode).
-      - **Caching policy & augmentation metadata:** when caching is enabled the manifest MUST include `generated_after_augmentations: bool`. If `generated_after_augmentations == true`, cached controls are treated as ready for training with geometric augments enabled. If `generated_after_augmentations == false`, the dataset onboarding must either (A) reject geometric augmentations during training for that dataset, or (B) provide deterministic augmentation-replay metadata in the manifest (e.g., per-file augmentation seeds or transform specs) that the dataloader replays to keep control and image aligned. The manifest validator should enforce this contract and the precompute CLI should optionally produce augmentation-replay metadata when requested.
-      - Optional caching: for very large datasets or offline analysis, support optional caching of generated controls to disk; if caching is used, the dataset onboarding step MUST verify bit-equivalence between cached controls and canonical on-the-fly-after-bucket generation for a representative sample set (use `params_hash` + per-file two-way checksum tests).
-      - Operational recommendation: prefer on-the-fly generation for correctness and caching only as a performance optimization when necessary; when caching is used prefer storing `generated_after_augmentations=true` variants (cache augmented variants in chunked form) to simplify training semantics.
-    - **Helper signature & placement:** The canonical helper should return a deterministic PIL/ndarray or tensor and be called after bucket-resize and any spatial augmentations but before conversion to VAE latents/dtype/device. Ensure control channel count and dtype match the adapter's `get_expected_control_spec()`.
-    - **Verification checks (design-level):** Add a verification step during dataset onboarding that performs a bit-identity check (cached control == on-the-fly-after-bucket generation when `generator_version` and params match) and a latency check to inform whether caching is recommended.
-    - **UI/CLI integration:** Allow dataset creation UI to trigger the precompute job and show progress; the precompute tool must be idempotent (safe to re-run) and update the manifest atomically to avoid inconsistent state.
-
-  - ControlNet checkpoint compatibility & conversion (safetensors, channels, resolution):
-    - **Problem statement:** Some ControlNet checkpoints are distributed as `safetensors` or with unexpected channel counts (e.g., 4 vs 16) or at a different spatial training width (e.g., 1280 vs pipeline 320). These mismatches must be handled robustly and reproducibly.
-    - **Compatibility helpers (new module):** Add `toolkit/controlnet_compat.py` with the following helpers:
-      - `load_controlnet_checkpoint(path)` — robust loader that supports `safetensors` and diffusers checkpoints and returns a toolkit-compatible `ControlNetModel` or thin wrapper.
-      - `convert_safetensors_to_diffusers(in_path, out_path)` — a conversion/validation helper for maintainers.
-      - `resample_control_image(control_image, expected_size)` — deterministic resampling with antialiasing; it should be applied after bucket/resize.
-      - `normalize_control_channels(control_tensor, expected_channels)` — channel adapter (1×1 conv / small linear projector) to map incoming channels to the model-expected channels. Projector weights must be savable as part of adapter/checkpoint metadata.
-      - Persist conversion metadata in checkpoint/manifest: `{ original_format, channel_map: '1x1conv', resampled_to, converter_version }`.
-    - **Recommended default workflow:**
-      1. `load_controlnet_checkpoint(path)` (handles safetensors/diffusers)
-      2. After bucket/resize: `resample_control_image(...)` to the pipeline size
-      3. If channel mismatch: `normalize_control_channels(...)` (persist projector when training/finetuning)
-      4. Feed into ControlNet adapter
-    - **Design decision:** Prefer deterministic resampling and a small channel projector over re-training a full ControlNet in most compatibility cases (fast, stable). Record any conversions/projections in metadata for reproducibility.
-    - **Tests & fixtures:** Add lightweight synthetic safetensors/diffusers fixtures to `testing/fixtures/` (e.g., `controlnet_safetensors_synthetic.safetensors`) and unit tests `testing/test_controlnet_compat.py` and `testing/test_convert_safetensors_to_diffusers.py` that:
-      - load a safetensors fixture via `load_controlnet_checkpoint`, run a deterministic forward with a small synthetic control image and assert numeric output and that `{ converter_version, original_format, channel_map }` metadata was written to a manifest or checkpoint.
-      - verify `convert_safetensors_to_diffusers` produces a valid diffusers artifact when requested and that round-trip metadata is recorded.
-    - **Verification checks (design-level):** During onboarding, attempt to load a known problematic checkpoint (safetensors + 4-channel + 1280 width) and run a forward pass using resampling & projection; verify the forward succeeds and conversion metadata is recorded. Add CI unit tests that cover the common variants (4ch→16ch, resample 1280→320).
-
-    - **Z-Image / Z-Image-Turbo practical guidance:**
-      - **Use the Alibaba PAI controlnets as-is (safetensors) or prefer the 8-step distilled variants** for inference speed and clarity when paired with Z-Image-Turbo (see `Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors`). VideoX-Fun maintains these weights and example inference scripts (e.g., `examples/z_image_fun/predict_t2i_control_2.1.py`).
-      - **Channel mismatch (4 vs 16):** Apply `normalize_control_channels(control_tensor, expected_channels)` (1×1 conv projector or linear mapping) as a deterministic adapter layer; save projector weights in adapter metadata so conversions are reproducible.
-      - **Resolution mismatch (1280/1328 vs 320):** Resample the *bucket/resized* image (post-augmentation) down to the pipeline control size before generating control tensors, using `resample_control_image(..., antialias=True)` with deterministic interpolation. For Z-Image specifically, prefer using the provided 8-step distilled control-compatible weights when available (they were created to address quality/speed issues observed when pairing ControlNet with Z-Image-Turbo).
-      - **Format mismatch (safetensors vs diffusers):** If no diffusers-format ControlNet exists, use `load_controlnet_checkpoint(path)` (safetensors loader) and the channel/size adapters above. Optionally provide a conversion utility `convert_safetensors_to_diffusers(...)` for maintainers and record converter_version metadata.
-      - **Operational note:** VideoX-Fun demonstrates practical ingestion of these safetensors in its `examples/` directory — replicate their wrapper pattern (load safetensors -> normalize channels -> resample -> wrap in thin ControlNet adapter) if a native diffusers model isn't available.
-      - **Search for diffusers-format alternatives:** check community spaces such as `AiSudo/ZIT-Controlnet`, `akhaliq/Z-Image-Turbo-controlnet`, and other HF collections; if a diffusers-formatted ControlNet exists, prefer using it directly to reduce conversion burden.
-
-3) BaseSDTrainProcess changes
-   - `process_general_training_batch` already references `batch.control_tensor` and `batch.control_tensor` is doubled when `do_double`, so minimal changes are needed here — however ensure control tensor is created and matches batch doubling and device/dtype.
-   - Add a preprocessing section in the batch pipeline to generate/load `batch.control_tensor` as a torch tensor on `self.device_torch` using dtype consistent with other control inputs (e.g., `dtype = get_torch_dtype(self.train_config.dtype)`).
-   - Add config validation to `validate_configs` to ensure `controlnet.*` options are valid.
-
-3.a) Memory management and Accelerate offload (primary mitigation)
-   - Purpose: Avoid exceeding GPU memory by using Accelerate's offload/dispatch features — Accelerate is already integrated into the toolkit and is the **primary, recommended** strategy for production offloading and DDP safety. `MemoryManager` can be supported as an alternate strategy, while `manual_swap` is explicitly a CPU/dev testing fallback only.
-   - Strategy (frozen ControlNet):
-     - Compute control residuals under `torch.no_grad()` with ControlNet dispatched/placed on GPU via Accelerate, then detach residuals and store them according to `controlnet.residual_storage` config (`gpu` or `cpu_pinned`).
-     - After residual computation: use Accelerate's dispatch/offload APIs to return the ControlNet to CPU or the desired device and bring the UNet to the GPU to run the forward using the computed residuals.
-     - Prefer `dispatch_model`, `load_checkpoint_and_dispatch`, `device_map='cpu'` and `offload_folder` options rather than manual `.to('cpu')` calls for DDP/compiled-model safety and correct device mapping.
-     - Add a config option `controlnet.offload_strategy` with values `accelerate | memory_manager | manual_swap | none` and `controlnet.residual_storage` with `gpu | cpu_pinned`. Note: **`accelerate` should be used in production; `manual_swap` is only for CPU dev testing.**
-   - Implementation notes:
-     - Add helper methods: `compute_control_residuals(batch, noisy_latents, timesteps) -> residuals` and `offload_adapter(adapter, strategy)` + `bring_adapter(adapter, strategy)` that integrate with Accelerate dispatch APIs.
-     - Ensure residuals are compatible with UNet (including CFG duplication) and that residuals are detached and non-grad.
-     - Add logging and timing around transfers so we can detect that swapping overhead is acceptable and fall back to other strategies if not.
-   - Tests:
-     - `swap_correctness_test` - baseline (adapter+unet GPU-resident) vs swapped flow outputs numerically close for the same inputs.
-     - `swap_memory_smoke_test` - measure peak GPU memory and assert reduced peak when offload strategy is used.
-     - `ddp_safety_test` - ensure offload strategy works (or fails with a clear message) when running under DDP; prefer Accelerate-based offload for DDP safety.
-
-4) Adapter & ControlNet integration
-   - `setup_adapter` already supports `control_net` adapter loading with `ControlNetModel.from_pretrained(...)`. Ensure that when `adapter_config.type == 'control_net'`, the adapter's forward receives control images (control tensor) as conditioning.
-   - **Default behavior for ControlNet training:** When `controlnet.use_controlnet` (or `adapter_config.type == 'control_net'`) is active, **default `adapter_config.train = False`** so pretrained ControlNet adapters remain frozen and provide stable spatial conditioning while LoRA/LoKr trains for appearance. Add a configuration validation that sets this default and logs the behavior when starting the job.
-   - Add logic to add the controlnet adapter parameters into optimizer parameter groups only when `adapter_config.train == True`. Add a unit test `optimizer_param_test` to assert that controlnet params are excluded from the optimizer when frozen, and included when `adapter_config.train=True`.
-   - Update save/load logic so that ControlNet weights are persisted (e.g., `self.adapter` saved using existing adapter codepaths). Loading `latest_save_path` for controlnet should be supported. If finetuning is enabled, record a `controlnet_finetuned` metadata flag in the checkpoint manifest.
-   - **Implementation note:** initial offload implementation is provided in `toolkit/controlnet_offload.py` with a safe `manual_swap` strategy and CPU-pinned residual support (`cpu_pinned`) for CPU-only development and unit tests. Unit tests in `testing/test_controlnet_offload.py` validate manual swap behavior and `compute_control_residuals` semantics on CPU environments. **Accelerate is the toolkit's primary offload mechanism and will be implemented next (GPU/DDP integration tests and ddp_safety_test will follow).** MemoryManager remains an optional alternate strategy for advanced deployments.
-
-5) Training loop changes
-   - Modify the training forward to pass `control_tensor` to the model's training forward path (e.g., into `sd.get_model_to_train()` / `self.sd` training step). This might involve extending the model's `forward` or the training helper to accept `control` arg.
-   - Ensure classifier-free guidance-style unconditioned control is applied when computing unconditional samples (e.g., pass zero tensor or blank control image for unconditional pass when doing CFG).
-   - If the repo's SD model pipeline already accepts a `control` input when `sd.adapter` or `sd.network` is present, wire `batch.control_tensor` into that argument. Otherwise add a new input path in `self.sd` to consume `control_tensor`.
-
-6) Sampling & eval changes
-   - `sample(...)` should support generating sample images with control images using the same OpenPose generation logic.
-   - Ensure `self.sd.generate_images` and preview code can accept control tensors and pass them to ControlNet.
-
-7) Tests & CI
-   - Unit test for `make_openpose_map` with synthetic poses and images.
-   - Unit test for the control generation CLI (`tools/gen_control.py`) verifying output files, optional caching behavior, and manifest updates when caching is used.
-   - Unit test for the control manifest validator (`testing/control_manifest_test.py`) to assert schema compliance, atomic write semantics, and `params_hash` detection.
-   - Unit test for DB migration (`testing/test_db_migrations.py`) that runs the migration against an in-memory sqlite DB and validates new schema.
-   - Unit test for safetensors/diffusers compatibility (`testing/test_controlnet_compat.py`) using a synthetic fixture to assert `load_controlnet_checkpoint` forwards and records metadata.
-   - Unit test for dataloader loading cached control images (and on-the-fly fallback when cache not present) and `augment_align_test` to verify geometric augmentations remain aligned with controls.
-   - Integration test: small training run (few steps) with a tiny dataset that has cached controls to ensure `batch.control_tensor` is loaded, gradients flow (if adapter trainable), and saving/loading of adapter weights works.
-  - **GPU / DDP tests (manual only):** Tests that validate Accelerate-based swapping, memory smoke tests, and DDP safety require a GPU and an Accelerate-configured environment. **These tests are intended to be run manually by a maintainer on GPU hardware and** **should not be added to standard PR CI workflows**. Note: this project does not have a GPU CI runner and we will not add one—GPU tests are explicitly manual and maintained as on-demand checks by contributors/maintainers.
-    To run locally on a GPU machine:
-     - Activate venv: `.\venv\Scripts\Activate.ps1` (Windows) or `source venv/bin/activate` (POSIX)
-     - Ensure `accelerate` and CUDA drivers are available and configured.
-     - Run: `python -m pytest testing/test_controlnet_offload_gpu.py -q`
-     - Run the benchmark tool for transfer timings: `python tools/benchmark_offload.py --strategy accelerate --size-mb 200 --iters 3`
-     - Document results and any environment differences in a short comment on the PR or in `LEARNINGS.md` for future reference.
-8) Docs & examples
-   - Add `ControlTrain.md` (this file) with config examples.
-   - Add sample config file `config/examples/controlnet_openpose_train.yml` demonstrating the options.
-   - Add a short subsection to README to explain controlnet options and tradeoffs.
-
-9) UI changes
-   - Add a ControlNet section to the *Jobs → New Dataset* UI:
-     - Checkbox: `Use ControlNet (OpenPose)`
-     - Control type dropdown (default: `openpose`)
-     - Toggles/inputs: `Generate on-the-fly` (checkbox, default), `Cache control maps` (checkbox, optional), `pose_model` (openpose|movenet|mediapipe), `confidence_threshold` (0.0-1.0), `skeleton_thickness`, `use_heatmaps` (bool), `control_size` (resize)
-     - When caching is enabled, save generated pose maps to `datasets/<dataset_name>/pose/` relative to the dataset root. Use a predictable filename matching source image names.
-     - Provide a UI preview showing a sample image/pose map pair and an action button `Cache pose maps for dataset` that enqueues the generation job and stores them in the `pose` subfolder.
-   - Ensure the UI persists these settings in the job payload so the backend dataloader can pick the options up.
-   - Update server-side endpoints (dataset creation API) to accept and validate the controlnet options.
+## What changes (high level)
+- New helpers:
+  - `toolkit/pose.py::make_openpose_map(...)` — canonical OpenPose map generator (heatmap/skeleton options).
+  - `toolkit/controlnet_compat.py` — safetensors loader, resampler, channel normalizer, conversion helper.
+- CLI utilities:
+  - `tools/gen_control.py` — generate pose maps and optionally cache with atomic manifests.
+  - `tools/apply_control_manifest.py` — safely apply cache manifest to dataset metadata.
+- Dataloader:
+  - Generate control maps at the canonical point and attach `batch.control_tensor` (on `self.device_torch`). Add `batch.control_image_path` (optional `str`) to `DataLoaderBatchDTO` for traceability and debugging; when caching is used populate `control_image_path` with the cached path.
+  - Cache validation & augmentation replay:
+    - If cache exists and is validated, load it; otherwise regenerate from canonical helper.
+    - When `generated_after_augmentations==false` in a manifest, the manifest MUST include `augmentation_replay` metadata (either a per-file `augmentation_seed` or a deterministic `transform_spec`) describing how to replay spatial augmentations. The dataset onboarding and the `toolkit/control_manifest.py::validate_manifest` function must enforce this: if geometric augmentations are enabled in training but the manifest was generated before augmentations, validation MUST fail unless `augmentation_replay` is present and verified.
+    - For traceability, the dataloader should call `make_openpose_map` on-the-fly when cache is absent or stale and fill `control_image_path` accordingly.
+  - Tests: add `testing/dataloader_control_traceability_test.py` to assert `control_image_path` is set and `testing/augment_align_test.py` to validate replay and alignment behavior.
+- Training loop:
+  - Accept and propagate `control_tensor` into model forward (ensure CFG/unconditioned pass uses blank control appropriately).
+  - Checkpoint metadata: when ControlNet adapters are finetuned, record `controlnet_finetuned: true` and any persisted projector weights/paths (e.g., `projector_weights_path`) in the checkpoint metadata so downstream runs and reproductions can detect finetuning and reuse projector artifacts.
+- UI & backend:
+  - Add fields in New Job UI, preview control maps, and endpoint(s) to enqueue control-generation jobs and apply manifests.
+- Tests & verification:
+  - Alignment check (bit-identity for canonical generation vs cached map with same params), cache idempotence, safetensors compatibility, channel projection correctness, residual/offload smoke tests.
 
 ---
 
+## Canonical generation contract (must-follow)
+- Execution point: after dataset augmentations and bucket resizing, before VAE encoding.
+- Determinism requirements: fixed interpolation, antialiasing, no randomness unless seeded & recorded.
 
+- **Control manifest (`control_manifest.json`) schema (recommended v1):**
 
----
+```json
+{
+  "manifest_version": "1",
+  "generator_version": "git-sha-or-tag",
+  "params_hash": "sha256-of-generator-params",
+  "generator_params": { "model": "openpose", "confidence": 0.3, ... },
+  "generated_after_augmentations": true,
+  "files": [
+    {"source": "images/00001.jpg", "control_path": "pose/00001_pose.png", "sha256": "...", "size": [H,W]}
+  ]
+}
+```
 
-## Design considerations & integration checklist ✅
-This section addresses integration decisions and practical updates needed across UI, DB, CLI and code, while keeping changes minimal and reusing existing functionality where possible.
+- **Semantics & validator contract:**
+  - Write atomically: write to a temp file then `os.replace(temp, manifest)` to avoid partial state.
+  - Validate manifests against the JSON Schema file `toolkit/control_manifest_schema_v1.json` before applying. Implement the validator `toolkit/control_manifest.py::validate_manifest(path, schema_path=None, verify_checksum_sample:int=0, verify_idempotence:int=0, allow_stale=False)` with this contract:
+    - Loads manifest JSON and validates against the schema (default schema path `toolkit/control_manifest_schema_v1.json`).
+    - Computes canonical `params_hash` from `manifest['generator_params']` using a stable serialization (sorted keys, separators=(',',':')) and compares to the manifest `params_hash`. If mismatch and `allow_stale==False`, the validator returns `(False, 'params_hash mismatch: expected <computed> != manifest <value>')`.
+    - If `verify_checksum_sample>0`, the validator samples up to `verify_checksum_sample` entries from `files` and verifies that the referenced control files exist and their `sha256` matches the manifest entry. Any mismatch causes the validator to return `(False, 'checksum mismatch for <file>')`.
+    - **Two-way idempotence check:** if `verify_idempotence>0` the validator will sample up to `verify_idempotence` entries and for each re-run `make_openpose_map` with the recorded `generator_params` (and `generator_version`) to compute an on-the-fly control and its `sha256`. If the newly generated `sha256` differs from the cached file, the validator returns `(False, 'idempotence mismatch for <file>: cached != regenerated')` (or optionally provide a `--recompute`/`--auto-fix` operator path). Add unit test `testing/control_cache_idempotence.py` to cover this behavior.
+    - Additionally, when a manifest entry has `generated_after_augmentations==false` and the training dataset is configured to apply geometric augmentations, the validator MUST require `augmentation_replay` metadata (global or per-file). If missing the validator returns `(False, 'augmentation_replay required for pre-augmentation caches when training uses geometric augmentations')`.
+    - On success returns `(True, None)`; on failure returns `(False, error_message)`. The caller should surface the error to the user and refuse to apply the manifest unless `allow_stale==True` is set explicitly by an operator with clear logging.
+  - `params_hash` semantics: `params_hash = sha256(canonical_json_bytes(generator_params))` where `canonical_json_bytes` uses sorted keys and no extra whitespace. This stable hashing ensures identical logical parameter sets produce identical hashes regardless of formatting.
+  - On job enqueue or dataset onboarding, use `validate_manifest(..., verify_checksum_sample=MAX(SOME_SMALL, N), verify_idempotence=MIN(5,N))` to detect stale or corrupted caches. If `params_hash` mismatches, prefer re-generation unless `--force`/`--apply-stale` is specified and logged. Tests: add `testing/control_manifest_augmentation_test.py` and `testing/control_cache_idempotence.py` to validate augmentation-replay enforcement and two-way idempotence checks.
 
-- Reuse existing code where sensible (minimal invasive changes):
-  - Keep dataset loading, augmentation, bucket, and VAE encoding code paths; call a new canonical helper `toolkit/pose.py::make_openpose_map(...)` at the canonical point (after bucket/resize + augs, before VAE latents) rather than reorder transforms.
-  - Reuse `BaseSDTrainProcess` adapter and optimizer flows; add small adapters/wrappers rather than rewrite training internals (`toolkit/controlnet_compat.py` wraps safetensors/diffusers handling, `tools/gen_control.py` wraps generation/caching).
-  - Avoid breaking existing canny flows — keep `tools/precompute_control.py` and `make_canny_image` for backwards compatibility and for users who prefer edge conditioning.
-
-- UI changes (`ui/src/app/jobs/new` and supporting modules):
-  - Add fields to the New Job UI: `Use ControlNet (OpenPose)`, `control_type` dropdown, `pose_model` (openpose|movenet|mediapipe), `confidence_threshold`, `skeleton_thickness`, `use_heatmaps`, `generate_on_the_fly` (default true), `cache_control` (optional), `control_size`.
-  - Add preview component showing a sample image / pose map pair and an action button `Cache pose maps for dataset` to enqueue a control-generation job (use a `POST /api/control_gen/preview` to get a single sample control preview without queuing a full job).
-  - Add client helper (e.g., `ui/src/utils/controlGen.ts`) and wire the UI to POST to `/api/control_gen`. Define a tight payload JSON schema `ui/src/schemas/control_gen_payload.json` with fields `{ dataset_id, control_type, cache_enabled, control_params }` and server-side validation mirroring the client schema.
-  - Add a background worker `ui/cron/actions/processControlGenQueue.ts` to run `tools/gen_control.py` in the background, update job progress and status, persist logs, and write `manifest_path` into the job row when complete. Include cancel/resume semantics for long-running jobs.
-
-- DB & API routes (SQLite + server routes):
-  - Minimal approach: reuse the existing `PrecomputeJob` pattern or add a dedicated `ControlGenJob` table. Add these fields to dataset/job payloads and DB rows: `control_manifest_path TEXT NULL`, `control_params JSON NULL`, `generator_version TEXT NULL`, `cache_enabled INTEGER DEFAULT 0`.
-  - **Migration script (example):** add `ui/db/migrations/20251230_add_control_manifest.sql` which performs one or both of the following depending on choice of persistence:
-    ```sql
-    -- Option A: add columns to existing datasets table
-    ALTER TABLE datasets ADD COLUMN control_manifest_path TEXT NULL;
-    ALTER TABLE datasets ADD COLUMN control_params TEXT NULL;
-    ALTER TABLE datasets ADD COLUMN generator_version TEXT NULL;
-
-    -- Option B: create a dedicated control_gen_jobs table
-    CREATE TABLE control_gen_jobs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      dataset_id INTEGER NOT NULL REFERENCES datasets(id),
-      user_id INTEGER,
-      control_type TEXT,
-      control_params JSON,
-      manifest_path TEXT,
-      generator_version TEXT,
-      cache_enabled INTEGER DEFAULT 0,
-      status TEXT,
-      progress REAL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    ```
-  - **API endpoints & contract:**
-    - POST `/api/control_gen` — body: `{"dataset_id": int, "control_type": "openpose", "control_params": {...}, "cache_enabled": bool}` → returns `{ "job_id": int, "status": "queued" }`.
-    - GET `/api/control_gen/{id}/status` — returns `{ id, dataset_id, status, progress, manifest_path, control_params }`.
-    - POST `/api/control_gen/{id}/apply` — body: `{ "apply": true }` → atomically writes `control_manifest_path` and `control_params` into the `datasets` record (server must validate manifest schema before commit).
-  - **Server behavior & validation:** validate payloads against a tight JSON schema, authorize user actions, and perform DB/manifest updates inside a single transaction to avoid partial state (use `PRAGMA foreign_keys=ON` and an explicit transaction for SQLite). Write manifests atomically (temp file → os.replace) for cross-platform safety.
-  - **Migration tests:** add `testing/test_db_migrations.py` which runs the migration against an in-memory sqlite DB and asserts the new columns/table exist and default values are correct. Add an optional backfill CLI `tools/migrate_controls.py --dataset <name> --from <manifest.json>` to assist maintainers in migrating legacy datasets.
-  - Persist manifest/params atomically and keep a reproducible `params_hash` to detect generator mismatches and stale caches.
-
-- CLI updates and tools:
-  - Add `tools/gen_control.py` to perform on-the-fly-first generation and optional caching into `datasets/<name>/pose/` with an atomic `control_manifest.json` when caching. CLI flags should include `--dataset`, `--pose-model`, `--confidence`, `--size`, `--overwrite`, `--chunk-size`, `--generate-after-augmentations`, and `--output-dir` and return machine-readable JSON on completion (`{ "manifest_path": "...", "params_hash": "..." }`).
-  - Add `tools/apply_control_manifest.py` to apply the manifest to dataset metadata with safe options (`--force`, `--noop`) and support `--dry-run` to validate manifest schema without applying.
-  - Add `run.py` integration: `run.py train --config config/examples/controlnet_openpose_train.yml` must accept `controlnet` keys and `control_params` in job payloads so CLI-created jobs behave the same as UI-created jobs. Add `tests/test_cli_control_gen.py` to assert the CLI payloads are created and accepted by server endpoints.
-  - Add `toolkit/controlnet_compat.py` to load safetensors or diffusers checkpoints, convert when requested, resample/normalize channels, and persist conversion metadata.
-
-- Dataloader & pipeline timing (explicit confirmation):
-  - Yes — the design specifies **generate control images after the dataset image has been loaded into buckets and resized/augmented, but before conversion to VAE latents**. This guarantees pixel-perfect alignment and simplifies correctness.
-
-- Safetensors / non-diffusers handling:
-  - Use `toolkit/controlnet_compat.py` which:
-    - Attempts to load a checkpoint as a Diffusers `ControlNetModel` if possible.
-    - If only safetensors are available, loads tensors and wraps them in a thin adapter that exposes the same forward signature expected by the training pipeline (or offers an optional conversion helper `convert_safetensors_to_diffusers`).
-    - Metadata (format, converter_version) must be persisted in the manifest/checkpoint for reproducibility.
-  - This mirrors VideoX-Fun patterns (they accept safetensors and use wrapper/conversion logic; prefer distilled 8-step variants for Z-Image pairing where available).
-
-- Channel / width mismatch strategy (VideoX-Fun compatible):
-  - Channel mismatch (e.g., 4 vs expected 16): apply a deterministic 1×1 convolution or linear projector `normalize_control_channels(control_tensor, expected_channels)` and persist projector weights with adapter metadata.
-  - Spatial mismatch (e.g., 1280 vs 320): resample the bucket/resized image down to pipeline control size deterministically (`resample_control_image(..., antialias=True)`) before computing pose maps or feeding to ControlNet.
-  - Prefer using distilled or converted control nets (e.g., Z-Image 8-step distilled variants) when available for better speed/quality.
-
-- Acceptance & verification checks (high-level):
-  - UI: user can enqueue control-generation jobs; job record stores `control_manifest_path` and params.
-  - Reproducibility: bit-identity check between cached control map and on-the-fly generated control when `generator_version` and params match; dataset onboarding fails with clear message if mismatch found.
-  - Compat: loading a known safetensors controlnet plus resampling & projection must produce a successful forward pass; conversion metadata is recorded.
-
-- Minimal-change principle & rollout guidance:
-  - Keep changes small and reversible: add new helpers/stubs and feature-flag complex behavior (e.g., `controlnet.offload_strategy`) behind config switches.
-  - Prefer small PRs: (1) add canonical pose helper & CLI stub, (2) wire dataloader to call helper and add verification, (3) add `controlnet_compat` loader, (4) add UI + API endpoints, (5) add offload changes & GPU manual tests.
+- Manifest format: JSON schema v1 (records global params and per-file entries: control path, file checksum, generator params, `generated_after_augmentations` boolean). The schema must include types and required fields: `manifest_version` (int), `generator_version` (string), `params_hash` (string), `generator_params` (object), `generated_after_augmentations` (bool), and `files` (array of objects with `source`, `control_path`, `sha256`, `size`).
+- Validation helper: add `toolkit/control_manifest.py::compute_params_hash(generator_params)` returning hex sha256 string and `validate_manifest` as above; callers should rely on `(True, None)` / `(False, error)` contract and propagate errors to users/ops when validation fails.
 
 ---
 
-## Acceptance Criteria ✅
-- Training pipeline can be toggled to use OpenPose control maps via config.
-- For each batch, `DataLoaderBatchDTO` carries `control_tensor` shaped appropriately and on the correct device (control created after augmentation when on-the-fly generation is enabled).
-- When using a pretrained ControlNet for conditioning, the default behavior for a 'Train with ControlNet' job is **`adapter.train = False`** (ControlNet frozen); only when explicitly enabled (`adapter.train = True`) will ControlNet params be included in optimizer groups and updated by training.
-- Training with `controlnet.train=true` updates controlnet weights and saving/loading preserves them, with a checkpoint metadata flag indicating finetuning.
-- Tests to include: `augment_align_test`, `control_cache_idempotence`, `optimizer_param_test`, memory smoke tests, and small integration run verifying LoRA/LoKr updates while ControlNet remains frozen by default.
-- Documentation, example config (`config/examples/controlnet_openpose_train.yml`), and UI changes included.
+## ControlNet compatibility & conversion
+- Load strategy:
+  - Try to load as Diffusers `ControlNetModel` when available.
+  - If only safetensors provided, `controlnet_compat.load_controlnet_checkpoint` should load weights and either wrap them in a thin adapter exposing the expected forward signature or convert to a Diffusers-compatible artifact.
+- Channel mismatch (e.g., 4 → 16): use `normalize_control_channels` (deterministic 1×1 conv projector). Persist projector weights in adapter metadata for reproducibility and record metadata keys `{ "original_format": "safetensors", "channel_map": "1x1conv", "resampled_to": [W,H], "converter_version": "git-sha-or-tag" }` alongside the adapter or manifest so conversions are fully reproducible.
+- Resolution mismatch (e.g., width 1280 → pipeline 320): resample post-bucket/resizing (deterministic antialiased resample) before producing control maps or feeding adapter; record `resampled_to` in metadata.
+- Prefer using distilled control variants (e.g., Z-Image 8-step distilled versions) when available to preserve speed/quality tradeoffs; track `converter_version` (conversion or adapter wrapper version) in manifest or artifact metadata.
+- Test fixtures & coverage: add synthetic safetensors/diffusers fixtures under `testing/fixtures/` (e.g., `controlnet_safetensors_synthetic.safetensors`, `controlnet_diffusers_synthetic/`) and unit tests that assert loader behavior and metadata keys are written (see related test files below).
+
+### Suggested helper signatures (proposed API)
+```python
+# toolkit/pose.py
+def make_openpose_map(image, model='openpose', confidence=0.3, output_format='heatmap', size=None, channels=None, dtype=None, generator_version=None, return_type='pil', return_meta=False):
+    """Canonical OpenPose generator used by both the dataloader (on-the-fly) and `tools/gen_control.py`.
+
+    Signature:
+      - `image`: PIL.Image or ndarray (H,W,C)
+      - `model`: str, choice of pose backend (`openpose`, `movenet`, `mediapipe`)
+      - `confidence`: float, minimum keypoint confidence
+      - `output_format`: 'heatmap'|'skeleton'|'keypoints' (controls output representation)
+      - `size`: (W,H) or int, optional override of output size (deterministic resize)
+      - `channels`: int, desired number of output channels (e.g., 1,3,4)
+      - `dtype`: desired return dtype when `return_type=='tensor'` (e.g., `torch.float32`)
+      - `generator_version`: string tag or git-sha to record the generator implementation/version
+      - `return_type`: 'pil'|'ndarray'|'tensor'
+      - `return_meta`: when True, return a second object with metadata (dict)
+
+    Return semantics:
+      - If `return_type=='pil'`: returns `PIL.Image` of mode `L` (single heatmap) or `RGB`/`RGBA` as appropriate. Pixel values are 0-255 (uint8).
+      - If `return_type=='ndarray'`: returns `np.ndarray` shaped (H,W,C) dtype `uint8` with values 0-255.
+      - If `return_type=='tensor'`: returns `torch.FloatTensor` shaped (C,H,W) with dtype `dtype` and values normalized to [0.0, 1.0] (documented). The caller must move this tensor to the desired device.
+      - If `return_meta==True` a tuple `(control, meta)` is returned where `meta` is a dict containing at minimum `{ 'generator_version', 'generator_params', 'params_hash', 'keypoints': [...], 'sha256': '<hex>' }`.
+
+    Determinism & reproducibility:
+      - The implementation MUST be deterministic: fixed resample filter, antialiasing enabled, and no randomness unless a seedable RNG is explicitly passed and recorded in `meta`.
+      - `params_hash` is computed as `sha256` over a canonical JSON encoding of `generator_params` (sorted keys, no whitespace). The function should include `params_hash` in returned `meta` when `return_meta` is requested.
+
+    Usage notes:
+      - The dataloader and `tools/gen_control.py` MUST call this helper at the canonical point (after augmentations and bucket/resize) to guarantee alignment.
+    """
+
+# toolkit/controlnet_compat.py
+def load_controlnet_checkpoint(path):
+    """Load a ControlNet checkpoint (Diffusers or safetensors) and return a wrapper object.
+    The wrapper should expose a predictable forward signature and metadata accessors (e.g., .meta).
+    """
+
+def convert_safetensors_to_diffusers(in_path, out_path):
+    """Convert a safetensors checkpoint to a Diffusers-compatible folder/artifact on disk and return metadata dict."""
+
+def resample_control_image(control_image, out_size, resample_mode='lanczos', antialias=True):
+    """Deterministically resample a control image to `out_size` with antialiasing."""
+
+def normalize_control_channels(control_image, out_channels):
+    """Apply a deterministic 1x1 projector to normalize channels to `out_channels`.
+    Returns (projected_image, projector_weights) for reproducibility.
+    """
+
+# Offload & residual helpers (toolkit/controlnet_offload.py or controlnet_compat helpers)
+def compute_control_residuals(adapter, batch, noisy_latents, timesteps) -> List[torch.Tensor]:
+    """Compute detached per-scale residual tensors for a batch.
+
+    Contract & ordering:
+      - Returns a `List[Tensor]` ordered **coarse -> fine** (smallest spatial resolution first, largest last).
+      - Each tensor shape: `[batch, C, H, W]` where H/W correspond to that residual's spatial resolution.
+      - Residuals MUST be detached, on CPU or GPU according to `controlnet.residual_storage`, and have `requires_grad=False`.
+      - The API consumer (e.g., training loop) must apply CFG duplication as needed to match UNet expectations.
+
+    Example: for a 3-scale adapter, `residuals[0]` is the bottleneck residual (coarse, smallest H/W) and `residuals[-1]` is the finest scale.
+    """
+
+def pack_residuals(residuals: List[torch.Tensor]) -> Dict:
+    """Pack per-scale residuals into a serializable dict for disk storage.
+
+    Output format:
+      {
+        'meta': { 'scales': n, 'shapes': [[C,H,W], ...], 'dtype': 'float32', 'version': 1 },
+        'scales': [bytes_of_tensor0, bytes_of_tensor1, ...],
+        'checksum': '<sha256-of-packed-data>'
+      }
+
+    The writer should save atomically and include a checksum for quick validation.
+    """
+
+def unpack_residuals(packed: Dict) -> List[torch.Tensor]:
+    """Validate `packed` format and return a list of tensors (coarse->fine). Raises ValueError on mismatch.
+
+    Validation steps:
+      - Check `meta.version` and shapes.
+      - Verify `checksum` matches the packed bytes.
+      - Decode tensors and return them as `torch.Tensor` objects in coarse->fine order.
+    """
+
+def offload_adapter(adapter, strategy='accelerate', **kwargs):
+    """Offload an adapter according to `strategy` (accelerate|memory_manager|manual_swap|none).
+    Implementations should prefer Accelerate dispatch APIs to ensure DDP and compiled-model safety.
+    """
+
+def bring_adapter(adapter, strategy='accelerate', **kwargs):
+    """Bring an offloaded adapter back to required device for computation. Should be a no-op if adapter is already on device."""```
 
 ---
 
-## Risks & Notes ⚠️
-- Generating OpenPose pose maps on-the-fly adds CPU overhead; consider caching for very large datasets. **Mitigation:** prefer on-the-fly generation for correctness and cache only as a performance optimization when necessary; benchmark CPU | IO overhead as part of smoke tests.
-- Spatial alignment: must ensure augmentations are applied identically to both original image and control image. **Mitigation:** enforce `generate_after_augmentation` for on-the-fly generation; for precomputed controls either disable geometric augmentations or precompute augmented variants or store augmentation metadata for deterministic transforms. Add `augment_align_test` unit test to detect misalignment.
-- ControlNet expected input format may vary per model variant; provide flexibility in processing (single-channel vs 3-channel, scaling, dtype). **Mitigation:** expose `adapter.get_expected_control_spec()` validation on load and convert/normalize precomputed or generated controls to the adapter's spec automatically.
-- Memory and OOM risks (extra control tensors, doubled batches for short/long captions, CFG duplication): **Mitigation:** add `control_size` and `control_dtype` config guidance; prefer the toolkit-integrated **Accelerate-based offload** (recommended) or existing `MemoryManager` for safe DDP-capable offloading. Add `controlnet.offload_strategy` config (values: `none|accelerate|memory_manager|manual_swap`) and test offload strategies with `swap_memory_smoke_test` and `ddp_safety_test`.
-- **Prerequisite:** Accelerate is integrated into the toolkit and should be available in runtime environments that will use offload or run DDP tests (it is already listed in `requirements.txt`).
-- Cache idempotence & manifest consistency: **Mitigation:** make the control generation CLI idempotent when caching is enabled, update manifest atomically (write to temp and rename), provide `--overwrite` flag, and add `control_cache_idempotence` unit test.
-- Optimizer parameter correctness (frozen vs trainable adapters): **Mitigation:** add `optimizer_param_test` unit test asserting controlnet params excluded when frozen; when finetuning is enabled warn about memory and recommend appropriate LR and schedules.
-- Multi-device & dtype/device mismatch: **Mitigation:** ensure control tensors are moved to `self.device_torch` with correct dtype during `process_general_training_batch`; add multi-GPU smoke tests where CI or dev machines permit and ensure offload path uses Accelerate for DDP safety.
+## UI & backend changes
+- UI (`ui/src/app/jobs/new`): add `Use ControlNet (OpenPose)` (default), `control_type` dropdown, `pose_model` selector (openpose|movenet|mediapipe), `confidence_threshold`, `use_heatmaps`, `cache enabled` flag, and a preview component with sample image / pose map. Add a **Preview** action that calls `POST /api/control_gen/preview` and returns a single sample control image (either as a link to a temporary file or base64 JSON) so users can iterate on pose-model, confidence and size without running a full precompute job.
+- Job endpoints:
+  - POST `/api/control_gen` — enqueue control generation job with params.
+  - GET `/api/control_gen/{id}/status` — job progress, manifest link.
+  - POST `/api/control_gen/{id}/apply` — apply manifest to dataset metadata (runs `tools/apply_control_manifest.py`).
+- Worker: `ui/cron/actions/processControlGenQueue.ts` runs `python tools/gen_control.py` and updates DB job statuses and progress. The worker should also support a fast **preview** mode (spawn a single-chunk `gen_control` run and return the sample control inline), support `resume` semantics for chunked precompute jobs, and honor `cancel` requests by stopping gracefully and marking the job `canceled`. Expose progress and last-updated timestamps on the job row for UI display.
+- DB: add `control_manifest_path`, `generator_version`, `control_params` fields to job row (or create `ControlGenJob` table). Keep schema minimal and backward compatible.
 
+- **Migration example (SQL):** add `ui/db/migrations/20251230_add_control_manifest.sql` with either of the following (depending on chosen approach):
+```sql
+-- Option A: add columns to existing datasets table
+ALTER TABLE datasets ADD COLUMN control_manifest_path TEXT NULL;
+ALTER TABLE datasets ADD COLUMN control_params TEXT NULL;
+ALTER TABLE datasets ADD COLUMN generator_version TEXT NULL;
 
-## Prioritized Action Items — High & Medium Priority (added)
-
-The following high- and medium-priority items are now explicitly part of the implementation plan and will be implemented and tested as described below.
-
-### High priority
-
-- Offload / DDP-safe implementation (Accelerate primary / MemoryManager optional)
-  - Implement `controlnet.offload_strategy` (values: `accelerate|memory_manager|manual_swap|none`) and helpers `offload_adapter(adapter, strategy)` and `bring_adapter(adapter, strategy)` with **Accelerate as the primary implementation** for DDP safety and production use. Provide `manual_swap` as a lightweight CPU-only fallback used in dev and unit tests.
-  - Implement `compute_control_residuals(batch, noisy_latents, timesteps)` that returns detached residual tensors and supports `residual_storage` of `gpu` or `cpu_pinned`.
-  - Tests: `swap_correctness_test` (baseline ~= swapped outputs), `swap_memory_smoke_test` (verify peak memory reduction), `ddp_safety_test` (ensure offload strategy works in DDP when using Accelerate; if environment lacks proper support the test should fail with a clear, actionable message).
-
-- Augmentation alignment
-  - Add `augment_align_test` that asserts equivalence between (apply augmentations → generate control) and (generate control → apply same augmentations) for geometric transforms.
-  - Enforce `generate_after_augmentation` semantics when `generate_on_the_fly=True`.
-
-- Optimizer parameter correctness
-  - Add `optimizer_param_test` which asserts pretrained ControlNet params are not included in optimizer when `adapter.train=False` and are included when explicitly set to `True`.
-
-- Residual correctness & CFG duplication
-  - Ensure precomputed residuals are duplicated or handled identically to on-the-fly residuals during CFG (classifier-free guidance) passes. Add to `swap_correctness_test`.
-
-### Medium priority
-
-- Precompute manifest schema & atomic updates
-  - Define manifest file format (JSON/YAML) mapping source image → control image path and precompute parameters.
-  - Implement atomic updates (write to temp file → rename) and add `precompute_idempotence` test.
-
-- Resilient precompute job semantics
-  - Implement chunked precompute with resume/cancel/retry semantics and progress updates for the UI. Add tests for job resumption and partial-failure recovery.
-
-- Performance / transfer benchmarks
-  - Add `tools/benchmark_offload.py` to measure GPU↔CPU transfer speeds on the user's hardware, residual compute time, and warn if swapping overhead exceeds acceptable thresholds. Provide a small, human-run CLI that runs on systems with Accelerate and GPU available; benchmark runs are skipped in automated CI unless explicitly enabled.
-
-- Memory smoke tests
-  - Add automated memory benchmarks that measure peak GPU memory for baseline vs offload strategies and generate guidance (control_size, batch size) when OOM is likely.
-
-- Save/load / metadata
-  - Persist precompute params, `controlnet.name_or_path`, `offload_strategy`, and `residual_storage` in checkpoint metadata (`aitk_meta.yaml`), and add `checkpoint_meta_test`.
+-- Option B: create a dedicated control_gen_jobs table
+CREATE TABLE control_gen_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  dataset_id INTEGER NOT NULL REFERENCES datasets(id),
+  user_id INTEGER,
+  control_type TEXT,
+  control_params JSON,
+  manifest_path TEXT,
+  generator_version TEXT,
+  cache_enabled INTEGER DEFAULT 0,
+  status TEXT,
+  progress REAL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+- **Apply endpoint semantics:** `POST /api/control_gen/{id}/apply` — body: `{ "apply": true }` → server MUST validate the manifest via `toolkit/control_manifest.py::validate_manifest(manifest_path)` and, if valid, atomically update the `datasets` table (or job row) with `control_manifest_path` and `control_params` within a DB transaction; if invalid, return a 400 with validator error message and do not update DB.
 
 ---
 
-## Next step (recommended - precompute-first)
-1. Implement `tools/gen_control.py` and unit tests for it (optional caching of pose maps, cache idempotence, manifest updates when caching is used, CLI options to set pose model/confidence/size/overwrite). Prioritize atomic manifest updates and `control_cache_idempotence` tests.
-2. Implement `generate_after_augmentation` behavior in the dataloader: when `generate_on_the_fly=True`, compute controls after applying geometric augmentations and add `augment_align_test` to validate alignment.
-3. Update dataloader to prefer cached pose maps (load from `datasets/<dataset_name>/pose/`) and add `control_image_path` to dataset metadata handling, including behavior options when augmentations are enabled (disable geometric augments or cache augmented variants).
-4. Implement Accelerate-based offload strategy and helpers (Accelerate is primary; MemoryManager optional): add `controlnet.offload_strategy` and `controlnet.residual_storage` configs, implement `compute_control_residuals` and adapter `offload/bring_back` helpers using Accelerate dispatch APIs, and add `swap_correctness_test`, `swap_memory_smoke_test`, and `ddp_safety_test` (ddp_safety_test should use Accelerate and provide clear failure messages when environment or configuration is unsupported).
-5. Add config fields and example config (explicitly default `adapter.train=false` for ControlNet-enabled jobs) and add a UI action to enqueue `Cache pose maps for dataset` (background job with progress/cancel).
-6. Wire `batch.control_tensor` into `BaseSDTrainProcess.process_general_training_batch`, ensure tensors are on `self.device_torch` with the correct dtype, and add `optimizer_param_test` and memory smoke tests to validate frozen-controlnet behavior and OOM guidance.
-7. Run a small integration prototype: pretrained ControlNet (frozen) + LoRA/LoKr training on a tiny dataset with precomputed controls to validate end-to-end behavior and measure offload transfer overhead in a timing benchmark.
+## CLI changes
+- `tools/gen_control.py` usage examples:
+  - `python tools/gen_control.py --dataset datasets/myset --pose-model openpose --confidence 0.3 --size 512 --chunk-size 256 --generate-after-augmentations --overwrite --output-dir datasets/myset/pose --cache --batch-size 256`
+  - CLI writes `datasets/myset/pose/control_manifest.json` atomically when `--cache` used and **prints machine-readable JSON on success**: `{ "manifest_path": "datasets/myset/pose/control_manifest.json", "params_hash": "<sha256>" }` to stdout.
+
+- Recommended CLI flags and semantics (expanded):
+  - `--dataset` (path): dataset root or named dataset
+  - `--pose-model` (openpose|movenet|mediapipe): which pose model to run
+  - `--confidence` (float): minimum keypoint confidence to keep
+  - `--size` (int or WxH): output size for control images (overrides dataset bucket size when specified)
+  - `--chunk-size` (int): number of images processed per worker chunk (enables chunked precompute)
+  - `--resume` (flag): resume a previously interrupted chunked precompute job
+  - `--cancel` (job-id): request cancellation of a running precompute job (worker must honor cancellation requests)
+  - `--generate-after-augmentations` (flag): generate control images from post-augmented images (canonical behavior)
+  - `--overwrite` (flag): overwrite existing cached control files/manifest entries
+  - `--output-dir` (path): where to write control maps and the manifest (defaults to `<dataset>/pose/`)
+  - `--cache` (flag): enable writing control images to disk
+  - `--batch-size` (int): internal processing batch size for model inference
+
+- Chunking & job control semantics (SHOULD):
+  - `tools/gen_control.py` should support idempotent chunked processing and write partial manifests/progress updates for each chunk.
+  - Workers (`ui/cron/actions/processControlGenQueue.ts`) should support resume (pick up incomplete chunks) and cancel semantics (stop gracefully and mark job `canceled`), and expose progress as a percentage and last-updated timestamp on the job row.
+  - Tests: add `testing/precompute_chunking_test.py` and `testing/precompute_resume_test.py` to validate chunked resume, idempotence and graceful cancel behavior.
+  - `--overwrite` (flag): overwrite existing cached control files/manifest entries
+  - `--output-dir` (path): where to write control maps and the manifest (defaults to `<dataset>/pose/`)
+  - `--cache` (flag): enable writing control images to disk
+  - `--batch-size` (int): internal processing batch size for model inference
+
+- `tools/apply_control_manifest.py` to update dataset-level metadata safely. Recommended flags: `--force` (apply manifest despite minor mismatches), `--noop` (report what would change), `--dry-run` (validate manifest but do not apply). The tool should use `toolkit/control_manifest.py::validate_manifest` before applying and return clear exit codes (0 success, non-zero on validation/apply error).
 
 ---
 
-## Related work & suggested plan adjustments
-Recent papers confirm the pattern of using a pretrained/frozen ControlNet branch for spatial conditioning while training lightweight adapters (LoRA/ControlLoRA/LoKr) for appearance or task-specific adaptation. Important takeaways from a quick literature survey (representative papers):
+## Tests & verification
+- Unit & integration test files (explicit):
+  - `testing/control_manifest_test.py` — schema validation, `params_hash` semantics, atomic write, and sampled checksum verification; tests validator error messages and CLI `--dry-run` behavior.
+  - `testing/control_manifest_augmentation_test.py` — assert `augmentation_replay` enforcement and that pre-augmentation caches either provide replay metadata or are rejected when geometric augmentations are enabled.
+  - `testing/control_cache_idempotence.py` — two-way idempotence tests that re-generate sampled controls and compare sha256 to cached files; verifies `validate_manifest(..., verify_idempotence=...)` behavior.
+  - `testing/augment_align_test.py` — ensure generation after augmentations yields pixel-perfect alignment with bucketed images and that cached variants with `generated_after_augmentations=true` are accepted.
+  - `testing/test_controlnet_compat.py` — safetensors/diffusers loader, conversion (`convert_safetensors_to_diffusers`), resampling (`resample_control_image`) and projector (`normalize_control_channels`) correctness, and metadata keys (`original_format`, `channel_map`, `resampled_to`, `converter_version`).
+  - `testing/test_convert_safetensors_to_diffusers.py` — conversion helper round-trip tests and metadata recording.
+  - `testing/test_control_cache_idempotence.py` — ensure cache writes are atomic and idempotent and `params_hash` mismatch behavior is correct.
+  - `testing/test_make_openpose_map.py` — validate shapes & deterministic outputs across params and `generator_version` recording.
+  - `testing/optimizer_param_test.py` — checks that ControlNet params are excluded from optimizer when frozen and included when `adapter.train=True` and that metadata flags are recorded on checkpoint.
+  - `testing/swap_correctness_test.py` — verify swap/offload correctness (accelerate vs manual_swap) with numerical closeness asserts.
+  - `testing/swap_memory_smoke_test.py` — memory smoke tests for residuals & swap throughput.
+  - `testing/ddp_safety_test.py` — DDP run (manual) asserting offload strategy works or fails with a clear actionable message.
+  - `testing/precompute_idempotence.py` — ensure precompute is resume-safe and manifest writes are atomic.
+  - `testing/precompute_chunking_test.py` — validate chunked precompute and progress semantics.
+  - `testing/precompute_resume_test.py` — validate resume and cancel behavior for long-running jobs.
+  - `testing/dataloader_control_traceability_test.py` — assert `control_image_path` is set and traceability is preserved in the batch DTO.
+  - `testing/test_db_migrations.py` — run the example migration against an in-memory sqlite DB and validate new columns/table and default values.
+  - `testing/integration_small_train_openpose.py` — short end-to-end run: generate controls + train with ControlNet frozen by default.
+  - `testing/control_preview_api_test.py` — tests `/api/control_gen/preview` returns a valid sample control image and respects params.
+  - `testing/test_convert_safetensors_to_diffusers.py` — conversion helper round-trip tests and metadata recording.
+  - `testing/test_control_cache_idempotence.py` — ensure cache writes are atomic and idempotent and `params_hash` mismatch behavior is correct.
+  - `testing/test_make_openpose_map.py` — validate shapes & deterministic outputs across params and `generator_version` recording.
+  - `testing/optimizer_param_test.py` — checks that ControlNet params are excluded from optimizer when frozen and included when `adapter.train=True` and that metadata flags are recorded on checkpoint.
+  - `testing/swap_correctness_test.py` — verify swap/offload correctness (accelerate vs manual_swap) with numerical closeness asserts.
+  - `testing/swap_memory_smoke_test.py` — memory smoke tests for residuals & swap throughput.
+  - `testing/ddp_safety_test.py` — DDP run (manual) asserting offload strategy works or fails with a clear actionable message.
+  - `testing/precompute_idempotence.py` — ensure precompute is resume-safe and manifest writes are atomic.
+  - `testing/test_db_migrations.py` — run the example migration against an in-memory sqlite DB and validate new columns/table and default values.
+  - `testing/integration_small_train_openpose.py` — short end-to-end run: generate controls + train with ControlNet frozen by default.
+- Verification checks during dataset onboarding:
+  - Bit-identity test on sample set comparing generated control vs cached map (if cache exists and `params_hash` matches); mismatches produce a clear report and a suggested remediation.
 
-- **Preventing Shortcuts in Adapter Training via Providing the Shortcuts** (arXiv:2510.20887) — proposes routing confounding factors through auxiliary modules (ControlNet/LoRA) during adapter training to avoid spurious shortcut learning and improve generalization. Implementation tasks: add `TrainConfig.controlnet_reroute` (none|precompute|always), add `shortcut_rerouting_test` to assert reroute behavior on synthetic confounded datasets (effort: low).
-- **LumiCtrl** (arXiv:2512.17489) — uses a frozen ControlNet and a masked reconstruction loss to disentangle illumination control from structure while fine-tuning other components. Implementation tasks: add `controlnet.aux_loss: none|masked_recon|edge_loss` config, implement `compute_control_masked_recon_loss` in `toolkit/controlnet_aux.py`, and a small integration example `config/examples/controlnet_lumictrl.yml` demonstrating masked-recon training (tests: `testing/test_controlnet_masked_recon.py`, effort: medium).
-- **DEMIST** (arXiv:2511.12396) — uses per-scale spatial residual hints and LoRA-modulated attention; this supports making per-scale residuals first-class. Implementation tasks: make multi-scale residual writer/reader canonical (tuple-of-tensors format), add `testing/residual_shapes_test.py`, and extend `tools/benchmark_offload.py` to collect per-scale transfer timings (effort: medium).
-- **FrameDiffuser** (arXiv:2512.16670) — trains ControlLoRA for temporal coherence in a three-stage regime. Implementation tasks: add `control_training_schedule` support and implement a modular scheduler that supports `standard|three_stage|ping_pong` phases, with a `testing/schedule_phase_transition_test.py` to validate behavior (effort: medium).
-- **GLYPH-SR** (arXiv:2510.26339) — alternates control strategies (ping-pong scheduler) and trains a dedicated ControlNet branch with frozen main branch. Implementation tasks: add a ping-pong scheduler mode and experiments config `config/examples/controlnet_pingpong.yml`, and add a small experiment script and logging to reproduce GLYPH-SR style alternating schedules (effort: medium).
+---
 
-Plan adjustments (conservative, backward compatible):
+## Risks & mitigations
+- CPU overhead for pose generation: mitigate with optional caching and recommend caching for very large datasets; provide benchmarks and sampling-based heuristics to advise users.
+- Alignment errors: canonical generation point prevents most; add dataset onboarding verification and the `augment_align_test` to catch regressions.
+- DDP & offload complications: prefer Accelerate dispatch APIs and add manual DDP safety tests; fail clearly when environment unsupported.
 
-1. **Document & test the "shortcut-rerouting" principle**: add a test/spec (`shortcut_rerouting_test`) and a short section in `ControlTrain.md` recommending that datasets with known confounders route them via ControlNet/LoRA during adapter training. Add guidance for designing auxiliary losses (e.g., masked reconstruction) that preserve disentanglement.
+- **Config knobs**:
+  - `controlnet.offload_strategy` (enum): `accelerate` | `memory_manager` | `manual_swap` | `none` — default `accelerate` when supported, `manual_swap` only as fallback.
+  - `controlnet.residual_storage` (enum): `gpu` | `cpu_pinned` — controls where per-scale residuals are kept during training to trade memory vs perf.
 
-   **Implementation notes & conventions (precompute residuals):**
-   - File naming & location: precompute per-image residuals to a dataset subfolder (config: `DatasetConfig.control_residuals_path`) using the convention `<basename>_residuals.pt`. Each file MUST be a dict with keys:
-     - `meta`: `{ "scales": n, "shapes": [[C,H,W], ...], "dtype": "float32", "version": 1 }`
-     - `scales`: a list/tuple of tensors ordered **coarse→fine** (i.e., smallest spatial resolution first, largest last). For example `scales[0]` corresponds to the deepest (bottleneck) residual. Each tensor may be either `[C,H,W]` or `[1,C,H,W]`; the dataloader normalizes to `[batch, C, H, W]`.
-     - `checksum`: `sha256` of the packed tensor data (for quick integrity checks).
-   - Use a small wrapper API `toolkit/residuals.py` with helpers:
-     - `pack_residuals(residuals, path)` — writes `{meta, scales, checksum}` atomically to disk.
-     - `unpack_residuals(path)` — validates checksum, dtype and shapes and returns normalized tensors.
-     - `validate_residuals_format(path, expected_shapes)` — raises a clear error on mismatch.
-   - Ordering & semantics: explicitly document that scales are `coarse->fine` and provide a small example in the docstring / test fixtures so implementers do not disagree on ordering.
-   - Config knob: `TrainConfig.controlnet_reroute` accepts `none|precompute|always`. Use `precompute` to use residuals when present, `always` to force reroute behavior, and `none` (default) to disable.
-   - Alignment: precomputed residuals must match any augmentations applied to the corresponding image (or be generated after augmentation). If geometric augments are used, either disable them for precompute-first datasets or store augmentation metadata (seed or transform spec) and replay deterministic transforms for the control residuals; record `generated_after_augmentations` in the control manifest to simplify validation.
-   - Sanity checks: the dataloader will validate residual entries are tensors, have consistent numbers of scales and shapes, and that checksums match; mismatches should either raise informative errors or fall back to on-the-fly adapter computation depending on config.
-   - Test coverage: add `precompute_idempotence`, `precompute_manifest_test`, `residual_shapes_test`, and `swap_correctness_test` (ensures precomputed residuals and on-the-fly computation yield compatible prediction results).
+- Conversion mistakes (safetensors → diffusers): persist converter metadata and provide conversion helpers and human-run conversion scripts for maintainers.
 
-2. **Make per-scale residuals an explicit target**: ensure `compute_control_residuals` and the offload/residual API cleanly support adapters that return multi-scale residual tensors (one per UNet scale). Add `residual_shapes_test` to validate shapes against a small synthetic UNet spec and document the residual format in the code/docs.
+---
 
-3. **Add optional auxiliary losses/config**: add a small config surface under `controlnet.*` (e.g., `controlnet.aux_loss: none|masked_recon|edge_loss`) and hooks in the training loop to apply them when enabled (default off). This keeps defaults unchanged but enables reproducing LumiCtrl-style methods.
+## Interaction with literature & VideoX‑Fun
+- LumiCtrl: add `controlnet.aux_loss` hook (masked reconstruction) to support experiments.
+- DEMIST: support multi-scale residual formats via `compute_control_residuals` and per-scale storage policies.
+- FrameDiffuser/GLYPH‑SR: add `control_training_schedule` to support multi-stage and ping-pong strategies for experiments.
+- VideoX‑Fun: follow their pragmatic pattern: accept safetensors, use resampling & channel projection, and prefer distilled 8-step control variants for Z-Image pairing.
 
-4. **Support ControlLoRA and training schedules**: ensure `AdapterConfig` clearly supports `control_lora` and add `control_training_schedule` config (values like `standard|ping_pong|alternate`) to facilitate experiments like GLYPH-SR and FrameDiffuser. Keep defaults conservative (standard).
+---
 
-5. **Benchmarks and profiling**: add per-scale transfer & compute timing to `tools/benchmark_offload.py` to help decide whether per-scale residuals should be stored on GPU or pinned-CPU (useful when residuals are large).
+## Input tensor contract (high priority) 🔧
+
+- **Shapes & Dtypes:**
+  - Image tensors (model inputs / controls): **[B, C, H, W]**, dtype **float32**, channel order **RGB**, values **normalized to [0.0, 1.0]**. Implementations MUST accept `torch.FloatTensor` with `dtype=torch.float32` by default and assert ranges on debug builds.
+  - Video tensors: **[B, C, T, H, W]**, dtype **float32**, values in **[0.0, 1.0]**. Time axis `T` is explicit and stable across pipeline helpers.
+  - Control tensors: when produced by `make_openpose_map` or `tools/gen_control.py` they may be written as uint8 images on-disk but **the dataloader must convert and expose them as normalized float tensors in [0,1]** before feeding the model.
+
+- **Indexing & latent helpers:**
+  - Some helper functions used across internal examples (VideoX‑Fun) expose helpers like `get_image_latent(...)` and `get_video_to_video_latent(...)`. In the VideoX‑Fun examples, single-frame extraction is commonly performed via `get_image_latent(...)[..., 0]` (or `[..., 0, :, :]` depending on the return shape) to produce a single-frame latent from an image->video conversion. Document the function contract in `ControlTrain-Design2.md` (exact returned shapes and how slicing should be performed). Consumers must never assume implicit singleton dimensions; always use explicit indexing with documented axis order.
+
+- **Contract enforcement:**
+  - **Dataloader (`toolkit/dataloader_mixins.py`)** MUST validate incoming controls and images: check tensor dims, dtype or cast to `torch.float32`, and normalize values to [0,1]. Fail-fast on unexpected ranks (e.g., 2D images where 4D expected) with clear error messages referencing `ControlTrain-Design2.md`.
+  - **`tools/gen_control.py`** must emit on-disk artifacts with a manifest that includes `format` (`uint8` or `float32`) and a clear conversion path for the dataloader to follow. Add tests that exercise mis-typed/unaligned control inputs to ensure deterministic errors and clear remediation steps.
+
+## Multi-control fusion semantics (high priority) 🔀
+
+- **Per-control vs concatenation**
+  - The **Union** control model supports **per-control inputs** (preferred): the pipeline delivers controls as a list of tensors `controls: List[Tensor]` where each `Tensor` is shaped `[B, C, H, W]`. This preserves per-control semantics (different modalities, channel semantics, or per-control normalization).
+  - When a model expects concatenated channels instead, the pipeline should perform an explicit, documented `torch.cat(controls, dim=1)` and record the concatenation ordering (control[0]||control[1]||...). Never implicitly reorder controls.
+
+- **Channel ordering & conventions**
+  - Each control retains its per-control channel order (e.g., heatmaps may be single-channel, RGB references are 3-channel). The loader or `compose_union_controls` helper must be explicit about channel projection rules when controls have differing channel counts.
+
+- **Per-control weighting / scaling**
+  - Accept `control_context_scale` as either a `float` or `List[float]` with length equal to `len(controls)`. When a single float is provided, apply the same scale to all controls. Apply scaling **after** any channel projection but **before** the union model forward pass.
+
+- **Pipeline symbol**
+  - Provide a clear helper API: `def compose_union_controls(controls: List[Tensor], weights: Optional[List[float]] = None) -> Tensor:`. Document whether this returns a list (per-control) or a single concatenated tensor based on `union_model.expected_input` flag.
+
+- **Cross-references & examples**
+  - Cross-reference `toolkit/dataloader_mixins.py` (where batch-level controls are attached) and `tools/gen_control.py` (where control sources originate). Reference VideoX‑Fun per-control passing examples (see `examples/predict_t2i_control_2.1.py` and `examples/*predict_video*`) for a concrete usage that shows `controls=[control_a, control_b]` with `control_context_scale=[0.8, 0.7]`.
+
+## Checkpoint & inference rules (high priority) ⚙️
+
+- **Exact checkpoint name pattern (recorded convention):** `Z-Image-Turbo-Fun-Controlnet-Union-2.1*.safetensors` — use this pattern in tooling and discovery helpers to detect compatible union-control checkpoints.
+
+- **Recommended inference defaults:**
+  - Prefer the **8-step distilled** checkpoint when available. Set `num_inference_steps=8` for the distilled variants.
+  - Recommended `control_context_scale` tuning range: **~0.65 – 0.90** (start near 0.75 and tune per-dataset). Distilled variants tend to be stable at the lower end (0.65–0.80); non-distilled checkpoints may need more steps (>=25) and different scaling.
+  - Document clearly: *non-distilled* checkpoints typically require more timesteps and re-tuning of `control_context_scale` and guidance scale.
+
+- **Quickstart snippet**
+  - Add a short quickstart in `ControlTrain-Design2.md` pointing to `examples/predict_t2i_control_2.1.py` showing: load `Z-Image-Turbo-Fun-Controlnet-Union-2.1.safetensors` → `pipe.load_checkpoint(...)` → `pipe.num_inference_steps=8` → `pipe.control_context_scale=0.75` → `pipe.predict(...)`.
+
+## Tests & examples (medium priority) ✅
+
+- Add `examples/predict_t2i_control_2.1.py` (minimal doc-snippet) and a unit test file `testing/test_controlnet_union.py` that checks:
+  - Input shape validation for image/video/control tensors
+  - Basic forward pass with synthetic controls (per-control and concatenated modes)
+  - 8-step inference path runs without errors and yields deterministic shape/format results
+
+## Loader robustness & metadata (medium priority) 🧰
+
+- **Strict=False & metadata:**
+  - Loaders **must** support `strict=False` when loading safetensors/state_dicts to allow missing keys (backcompat). If `strict==False` is used to tolerate size/key differences, the loader **MUST** emit converter metadata in the model artifact or `state_dict` metadata (e.g., `converter_version`, `converter_filename`, `original_format`) and persist that alongside the model/checkpoint so traces are reproducible.
+
+- **Traceability:**
+  - All conversions (channel projection, resampling, safetensors->diffusers conversion) MUST record metadata including `{ 'converter_version', 'converter_cmd', 'source_filename' }` to aid debugging and reproduce the state that produced a checkpoint.
+
+---
+
+## Prioritized implementation checklist
+1. Add `toolkit/pose.py` canonical helper + docs + unit test (low)
+2. Add `tools/gen_control.py` + `tools/apply_control_manifest.py` CLI stubs + cache manifest schema (low)
+3. Implement `toolkit/controlnet_compat.py` (safetensors loader, resampler, `normalize_control_channels`) (medium)
+4. Wire dataloader to call `make_openpose_map` at canonical point and add batch field (medium)
+5. Add UI fields + `/api/control_gen` endpoint + worker (high)
+6. Add Accelerate-based offload & residual helpers + manual GPU tests (high)
+
+---
+
+## Acceptance criteria ✅
+- Controls are generated deterministically from the post-augmentation image and produce `batch.control_tensor` for each batch, and `batch.control_image_path` is populated when a cached control is used (traceability).
+- Manifest validator enforces augmentation-replay metadata when `generated_after_augmentations==false` and geometric augmentations are used; precompute is rejected unless replay metadata present or cache is regenerated.
+- Two-way idempotence checks are available (`validate_manifest(..., verify_idempotence=...)`) and tests assert cached controls match canonical on-the-fly generation for sampled files.
+- Cache manifests are atomic and idempotent; dataset onboarding validates sample bit-identity and idempotence checks.
+- `tools/gen_control.py` supports chunked precompute with resume/cancel semantics and workers expose progress; `tools/gen_control.py` prints machine-readable JSON on success.
+- Preview API (`POST /api/control_gen/preview`) returns a single sample control for quick parameter tuning.
+- Non-diffusers controlnets (safetensors) can be loaded and adapted with projector/resample patterns documented; metadata keys and projector weights are persisted.
+- Checkpoint metadata records `controlnet_finetuned` and persisted projector paths when finetuning is performed so downstream runs are traceable.
+- UI can enqueue & apply control generation jobs and persist the necessary job metadata; the `/api/control_gen/{id}/apply` endpoint validates manifests and applies them atomically.
+
+

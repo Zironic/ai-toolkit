@@ -804,11 +804,36 @@ class ImageProcessingDTOMixin:
                         else:
                             # unsupported control type for generation - skip
                             continue
+                    # Normalize & validate control tensors to match contract:
+                    # - per-control tensor: [C, H, W], dtype float32, values in [0,1]
+                    for i, t in enumerate(control_tensors):
+                        # ensure float
+                        if not isinstance(t, torch.FloatTensor):
+                            t = t.float()
+                        # common case: PIL->ToTensor already yields [0,1], but tolerate 0-255 as well
+                        try:
+                            if t.max() > 1.5:
+                                t = t / 255.0
+                        except Exception:
+                            # if unable to compute max (e.g., empty), raise for visibility
+                            raise ValueError('Control tensor appears invalid or empty')
+                        # ensure channel dim exists
+                        if t.ndim == 2:  # (H, W) -> (1, H, W)
+                            t = t.unsqueeze(0)
+                        # clamp to [0,1]
+                        t = t.clamp(0.0, 1.0)
+                        control_tensors[i] = t
+
+                    # persist both list and compact representation for downstream code
+                    self.control_tensor_list = control_tensors
                     if len(control_tensors) == 0:
                         self.control_tensor = None
                     elif len(control_tensors) == 1:
+                        # single control: keep as [C, H, W]
                         self.control_tensor = control_tensors[0]
                     else:
+                        # multi-control: keep list in `control_tensor_list` and also expose a stacked view
+                        # stacked shape: [N_controls, C, H, W]
                         self.control_tensor = torch.stack(control_tensors, dim=0)
             if self.has_inpaint_image:
                 self.load_inpaint_image()

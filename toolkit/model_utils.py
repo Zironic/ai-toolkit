@@ -5,6 +5,19 @@ in a restricted, inference-only mode. The goal is to reuse the same
 resolution and loading behavior used by training, but avoid the heavy or
 stateful operations (LoRA fusion, persistent saves, conversion side-effects)
 that are unnecessary or undesired during short-lived evaluation runs.
+
+Loader robustness & metadata guidance:
+- Loaders SHOULD accept safetensors/state_dicts with `strict=False` when
+  performing best-effort compatibility loads. This allows forward/backward
+  compatible keys across revisions and conversion helpers.
+- When performing tolerant loads or performing conversions (e.g., safetensors
+  -> diffusers, channel projection, projector creation), the loader MUST emit
+  converter/filename metadata (for example: `converter_version`,
+  `converter_command`, `source_filename`) and persist it on the returned
+  object or alongside the artifact for traceability.
+
+This guidance ensures that model loading remains resilient to small schema
+changes and that any conversion/compatibility action is fully auditable.
 """
 from typing import Optional, Dict, Any
 import os
