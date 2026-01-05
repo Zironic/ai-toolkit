@@ -1039,62 +1039,71 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     metadata=save_meta,
                 )
 
-            if self.adapter is not None and self.adapter_config.train:
-                adapter_name = self.job.name
-                if self.network_config is not None or self.embedding is not None:
-                    # add _lora to name
-                    if self.adapter_config.type == 't2i':
-                        adapter_name += '_t2i'
-                    elif self.adapter_config.type == 'control_net':
-                        adapter_name += '_cn'
-                    elif self.adapter_config.type == 'clip':
-                        adapter_name += '_clip'
-                    elif self.adapter_config.type.startswith('ip'):
-                        adapter_name += '_ip'
-                    else:
-                        adapter_name += '_adapter'
-
-                filename = f'{adapter_name}{step_num}.safetensors'
-                file_path = os.path.join(self.save_root, filename)
-                # save adapter
-                state_dict = self.adapter.state_dict()
-                if self.adapter_config.type == 't2i':
-                    save_t2i_from_diffusers(
-                        state_dict,
-                        output_file=file_path,
-                        meta=save_meta,
-                        dtype=get_torch_dtype(self.save_config.dtype)
-                    )
-                elif self.adapter_config.type == 'control_net':
-                    # save in diffusers format
-                    name_or_path = file_path.replace('.safetensors', '')
-                    # move it to the new dtype and cpu
-                    orig_device = self.adapter.device
-                    orig_dtype = self.adapter.dtype
-                    self.adapter = self.adapter.to(torch.device('cpu'), dtype=get_torch_dtype(self.save_config.dtype))
-                    self.adapter.save_pretrained(
-                        name_or_path,
-                        dtype=get_torch_dtype(self.save_config.dtype),
-                        safe_serialization=True
-                    )
-                    meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
-                    with open(meta_path, 'w') as f:
-                        yaml.dump(self.meta, f)
-                    # move it back
-                    self.adapter = self.adapter.to(orig_device, dtype=orig_dtype)
+            # Save adapter: only when adapter exists, the adapter config exists, and the adapter
+            # is explicitly marked trainable. Additionally, frozen ControlNet adapters are never
+            # saved unless `adapter_config.train=True` to avoid saving large frozen model blobs.
+            adapter_cfg = getattr(self, 'adapter_config', None)
+            if getattr(self, 'adapter', None) is not None and adapter_cfg is not None and getattr(adapter_cfg, 'train', False):
+                # If it's a control_net and not explicitly trainable, skip saving entirely
+                if getattr(adapter_cfg, 'type', None) == 'control_net' and not getattr(adapter_cfg, 'train', False):
+                    # explicit opt-out for frozen ControlNet adapters
+                    print_acc("Skipping save for frozen ControlNet adapter (adapter_config.train=False)")
                 else:
-                    direct_save = False
-                    if self.adapter_config.train_only_image_encoder:
-                        direct_save = True
-                    elif isinstance(self.adapter, CustomAdapter):
-                        direct_save = self.adapter.do_direct_save
-                    save_ip_adapter_from_diffusers(
-                        state_dict,
-                        output_file=file_path,
-                        meta=save_meta,
-                        dtype=get_torch_dtype(self.save_config.dtype),
-                        direct_save=direct_save
-                    )
+                    adapter_name = self.job.name
+                    if self.network_config is not None or self.embedding is not None:
+                        # add _lora to name
+                        if adapter_cfg.type == 't2i':
+                            adapter_name += '_t2i'
+                        elif adapter_cfg.type == 'control_net':
+                            adapter_name += '_cn'
+                        elif adapter_cfg.type == 'clip':
+                            adapter_name += '_clip'
+                        elif adapter_cfg.type.startswith('ip'):
+                            adapter_name += '_ip'
+                        else:
+                            adapter_name += '_adapter'
+
+                    filename = f'{adapter_name}{step_num}.safetensors'
+                    file_path = os.path.join(self.save_root, filename)
+                    # save adapter
+                    state_dict = self.adapter.state_dict()
+                    if adapter_cfg.type == 't2i':
+                        save_t2i_from_diffusers(
+                            state_dict,
+                            output_file=file_path,
+                            meta=save_meta,
+                            dtype=get_torch_dtype(self.save_config.dtype)
+                        )
+                    elif adapter_cfg.type == 'control_net':
+                        # save in diffusers format
+                        name_or_path = file_path.replace('.safetensors', '')
+                        # move it to the new dtype and cpu
+                        orig_device = self.adapter.device
+                        orig_dtype = self.adapter.dtype
+                        self.adapter = self.adapter.to(torch.device('cpu'), dtype=get_torch_dtype(self.save_config.dtype))
+                        self.adapter.save_pretrained(
+                            name_or_path,
+                            dtype=get_torch_dtype(self.save_config.dtype),
+                            safe_serialization=True
+                        )
+                        meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
+                        with open(meta_path, 'w') as f:
+                            yaml.dump(self.meta, f)
+                        # move it back
+                        self.adapter = self.adapter.to(orig_device, dtype=orig_dtype)
+                    else:
+                        direct_save = False
+                        if getattr(adapter_cfg, 'train_only_image_encoder', False):
+                            direct_save = True
+                        elif isinstance(self.adapter, CustomAdapter):
+                            direct_save = self.adapter.do_direct_save
+                        save_ip_adapter_from_diffusers(
+                            state_dict,
+                            output_file=file_path,
+                            meta=save_meta,
+                            dtype=get_torch_dtype(self.save_config.dtype),
+                            direct_save=direct_save
+                        )
         else:
             if self.save_config.save_format == "diffusers":
                 # saving as a folder path
@@ -1280,7 +1289,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.sd.network is not None:
             self.sd.network = self.accelerator.prepare(self.sd.network)
             self.modules_being_trained.append(self.sd.network)
-        if self.adapter is not None and self.adapter_config.train:
+        if getattr(self, 'adapter', None) is not None and getattr(self, 'adapter_config', None) is not None and getattr(self.adapter_config, 'train', False):
             # todo adapters may not be a module. need to check
             self.adapter = self.accelerator.prepare(self.adapter)
             self.modules_being_trained.append(self.adapter)
@@ -1974,9 +1983,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             adapter_name = f"{adapter_name}_{suffix}"
         latest_save_path = self.get_latest_save_path(adapter_name)
         
-        if latest_save_path is not None and not self.adapter_config.train:
-            # the save path is for something else since we are not training
-            latest_save_path = self.adapter_config.name_or_path
+        # If we did not find a checkpoint, prefer the explicit `name_or_path` from the adapter config
+        # (do not override an existing latest_save_path). This avoids overwriting a discovered save
+        # with config values and reduces unexpected save/load behavior for frozen adapters.
+        if latest_save_path is None:
+            latest_save_path = getattr(getattr(self, 'adapter_config', None), 'name_or_path', None)
 
         dtype = get_torch_dtype(self.train_config.dtype)
         if is_t2i:
@@ -2045,7 +2056,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # Log this to make the behavior explicit. If finetuning is desired, set
                 # `adapter.train = True` in the adapter config.
                 try:
-                    if not self.adapter_config.train:
+                    if not getattr(getattr(self, 'adapter_config', None), 'train', False):
                         print_acc(f"[CONTROLNET] Loaded ControlNet adapter (frozen). To finetune, set adapter.train = True in your config.")
                     else:
                         print_acc(f"[CONTROLNET] Loaded ControlNet adapter (finetuning enabled). Watch memory usage when training ControlNet weights.")
@@ -2102,7 +2113,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     dtype=dtype
                 )
                 self.adapter.load_state_dict(loaded_state_dict)
-        if latest_save_path is not None and self.adapter_config.train:
+        if latest_save_path is not None and getattr(getattr(self, 'adapter_config', None), 'train', False):
             self.load_training_state_from_metadata(latest_save_path)
         # set trainable params
         self.sd.adapter = self.adapter

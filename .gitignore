@@ -186,3 +186,5 @@ aitk_db.db
 controlnet_diag*
 controlnet_sample*
 .gitignore
+ui/test-results/*
+

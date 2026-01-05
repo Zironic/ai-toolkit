@@ -66,6 +66,10 @@ def tag_tensor(t: torch.Tensor, op: str):
     """Attach a small provenance record for `t` with operation `op`.
 
     Records the calling site (file, line, function), timestamp, and tensor shape/dtype/device.
+    If the tensor already has a provenance op indicating a "precompute" or an assembled
+    context, preserve that original op as the authoritative origin and add the new
+    op under `op_latest` so downstream consumers can detect precomputed latents even
+    if later instrumentation tags the tensor as an input.
     """
     if not isinstance(t, torch.Tensor):
         return
@@ -74,17 +78,36 @@ def tag_tensor(t: torch.Tensor, op: str):
         stack = inspect.stack()
         # prefer the frame two levels up (the immediate caller of the helper)
         frame_info = stack[1]
-        meta = {
-            'op': op,
-            'file': frame_info.filename if frame_info is not None else None,
-            'line': frame_info.lineno if frame_info is not None else None,
-            'func': frame_info.function if frame_info is not None else None,
-            'time': time.time(),
-            'shape': tuple(t.shape),
-            'dtype': str(getattr(t, 'dtype', None)),
-            'device': str(getattr(t, 'device', None)),
-            'stack': traceback.format_list(traceback.extract_stack(limit=6)[:-1])
-        }
+        # Check for existing metadata and preserve precompute/assemble ops when present
+        existing = _tensor_meta.get(id(t))
+        existing_meta = existing[1] if existing is not None else None
+        # Decide which op to record as the authoritative origin
+        if existing_meta is not None and isinstance(existing_meta.get('op'), str) and (existing_meta.get('op').startswith('precompute:') or existing_meta.get('op') == 'assemble_zimage_control_context'):
+            # Preserve original op as authoritative and record latest op
+            meta = {
+                'op': existing_meta.get('op'),
+                'op_latest': op,
+                'file': existing_meta.get('file'),
+                'line': existing_meta.get('line'),
+                'func': existing_meta.get('func'),
+                'time': existing_meta.get('time'),
+                'shape': tuple(t.shape),
+                'dtype': str(getattr(t, 'dtype', None)),
+                'device': str(getattr(t, 'device', None)),
+                'stack': existing_meta.get('stack')
+            }
+        else:
+            meta = {
+                'op': op,
+                'file': frame_info.filename if frame_info is not None else None,
+                'line': frame_info.lineno if frame_info is not None else None,
+                'func': frame_info.function if frame_info is not None else None,
+                'time': time.time(),
+                'shape': tuple(t.shape),
+                'dtype': str(getattr(t, 'dtype', None)),
+                'device': str(getattr(t, 'device', None)),
+                'stack': traceback.format_list(traceback.extract_stack(limit=6)[:-1])
+            }
         _record_meta(t, meta)
     except Exception as e:
         raise RuntimeError(f"Failed to tag tensor metadata: {e}") from e

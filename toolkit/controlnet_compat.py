@@ -259,10 +259,211 @@ class VideoXControlnetWrapper(torch.nn.Module):
             # expected channel count using the central helper. This ensures consistent
             # behavior (padding/slicing/grouped-mean) regardless of whether inputs look
             # like pixel images or already formed control latents.
-            if expected_in is None:
+            # If the caller supplied a precomputed, assembled Z-Image control_context
+            # (either explicitly tagged via `assemble_zimage_control_context` or via a
+            # high channel-count tensor that does not look like pixel images), bypass the
+            # generic `adapt_control_images` path and treat the supplied tensor as the
+            # authoritative assembled control_context. This avoids accidental re-adaptation
+            # or trimming that can corrupt precomputed contexts.
+            skip_trim = False
+            is_precomputed_ctx = False
+            precomputed_latents = False
+            try:
+                from toolkit.control_channels import get_tensor_origin
+                if isinstance(control_context, torch.Tensor):
+                    meta = get_tensor_origin(control_context)
+                    if meta is not None:
+                        op = meta.get('op')
+                        if op == 'assemble_zimage_control_context':
+                            is_precomputed_ctx = True
+                        elif isinstance(op, str) and op.startswith('precompute:control_latents'):
+                            # Explicit signal that these latents were precomputed by the trainer
+                            precomputed_latents = True
+            except Exception:
+                # metadata lookups are best-effort; continue to heuristic checks
+                pass
+
+            # Heuristic fallback and consumer-side assembly: if the incoming `control_context`
+            # looks like precomputed raw latents (packed frames or multi-frame tensors), perform
+            # deterministic assembly here so the adapter gets an authoritative control_context
+            # matching its expected `control_in_dim` (e.g., VideoX 33-channel contexts).
+            if not is_precomputed_ctx:
+                try:
+                    # If we have an explicit precompute tag, prefer deterministic assembly behavior
+                    if precomputed_latents:
+                        try:
+                            from toolkit.control_channels import assemble_zimage_control_context, tag_tensor
+                            # Normalize 3D single-sample to 4D
+                            t = control_context
+                            if isinstance(t, torch.Tensor) and t.ndim == 3:
+                                t = t.unsqueeze(0)
+                                tag_tensor(t, 'precomputed:unsqueezed_single_sample')
+                            if isinstance(t, torch.Tensor) and getattr(t, 'ndim', 0) == 5:
+                                # collapse frames prior to assembly (mean)
+                                t = t.mean(dim=2)
+                            # At this point `t` should be 4D latents (B, C, H, W)
+                            if isinstance(t, torch.Tensor) and t.ndim == 4:
+                                # attempt to assemble into VideoX control_context (33) when adapter expects 33
+                                from toolkit.control_util import infer_expected_in_ch
+                                expected = infer_expected_in_ch(self.inner) or None
+                                if expected is None and getattr(self.inner, 'name_or_path', None) is not None:
+                                    # prefer to coerce to 33 for VideoX-like adapters
+                                    from toolkit.control_util import adapter_uses_zimage
+                                    if adapter_uses_zimage(self.inner, None):
+                                        expected = 33
+                                if expected == 33:
+                                    base = 4
+                                    C = int(t.shape[1])
+                                    if C == base:
+                                        assembled = assemble_zimage_control_context(t, control_in_dim=expected, mask_from=None)
+                                        tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                        control_context = assembled
+                                        is_precomputed_ctx = True
+                                    elif C % base == 0:
+                                        # If packed channels already correspond to frames that when assembled
+                                        # would yield the expected channel count (e.g., C=16 -> 2*C+1=33),
+                                        # assemble directly from the packed channels. Otherwise collapse
+                                        # to the base latent channels and assemble from there.
+                                        if 2 * C + 1 == expected:
+                                            assembled = assemble_zimage_control_context(t, control_in_dim=expected, mask_from=None)
+                                            tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                            control_context = assembled
+                                            is_precomputed_ctx = True
+                                        else:
+                                            B, C2, H, W = t.shape
+                                            F = C2 // base
+                                            try:
+                                                t3 = t.reshape(B, base, F, H, W).mean(dim=2)
+                                            except Exception:
+                                                try:
+                                                    from toolkit.print import print_acc
+                                                    print_acc(f"[CONTROLNET] Failed to reshape packed latents for assembly: shape={tuple(t.shape)}")
+                                                except Exception:
+                                                    pass
+                                                raise
+                                            assembled = assemble_zimage_control_context(t3, control_in_dim=expected, mask_from=None)
+                                            tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                            control_context = assembled
+                                            is_precomputed_ctx = True
+                                else:
+                                    # If adapter expects latent base channels (e.g., 4), collapse frames to base
+                                    if expected is not None:
+                                        C = int(t.shape[1])
+                                        if C % expected == 0:
+                                            B, C2, H, W = t.shape
+                                            F = C2 // expected
+                                            t3 = t.view(B, expected, F, H, W).mean(dim=2)
+                                            tag_tensor(t3, 'precomputed:collapsed_latents')
+                                            control_context = t3
+                                            is_precomputed_ctx = True
+                        except Exception:
+                            # If deterministic assembly fails, fall back to heuristics below
+                            pass
+                        # End precomputed handling
+                        if is_precomputed_ctx:
+                            # proceed to regular flow but skip heuristic assembly
+                            pass
+                    # Infer expected input channels (may be None)
+                    expected = expected_in
+                    # If adapter looks like a VideoX adapter and expected is unknown, default to 33
+                    if expected is None:
+                        try:
+                            from toolkit.control_util import adapter_uses_zimage
+                            if adapter_uses_zimage(self.inner, None):
+                                expected = 33
+                        except Exception:
+                            pass
+
+                    # Normalize 3D single-sample to 4D
+                    t = control_context
+                    if isinstance(t, torch.Tensor) and t.ndim == 3:
+                        try:
+                            t = t.unsqueeze(0)
+                            from toolkit.control_channels import tag_tensor
+                            tag_tensor(t, 'precomputed:unsqueezed_single_sample')
+                            control_context = t
+                        except Exception:
+                            pass
+
+                    if isinstance(control_context, torch.Tensor) and getattr(control_context, 'ndim', 0) in (4, 5):
+                        C = int(control_context.shape[1])
+                        looks_like_pixel = (control_context.ndim == 4 and C in (1, 3, 4) and max(control_context.shape[-2:]) >= 64)
+                        # If it doesn't look like a pixel image and channels indicate packed latents,
+                        # attempt deterministic assembly based on the adapter's expectation
+                        if not looks_like_pixel and C > 4:
+                            from toolkit.control_channels import assemble_zimage_control_context, tag_tensor
+                            # Collapse explicit frame dim if present
+                            t2 = control_context
+                            if t2.ndim == 5:
+                                t2 = t2.mean(dim=2)
+                            # If adapter expects VideoX assembled context (33), unpack packed frames
+                            # and collapse them to base VAE latents (base=4) before assembly
+                            if expected == 33:
+                                base = 4
+                                if int(t2.shape[1]) == base:
+                                    # already base latents, just assemble
+                                    assembled = assemble_zimage_control_context(t2, control_in_dim=expected, mask_from=None)
+                                    tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                    control_context = assembled
+                                    is_precomputed_ctx = True
+                                elif int(t2.shape[1]) % base == 0:
+                                    C = int(t2.shape[1])
+                                    # If packed channels already correspond to frames that when assembled
+                                    # would yield the expected channel count (e.g., C=16 -> 2*C+1=33),
+                                    # assemble directly from the packed channels. Otherwise attempt to
+                                    # collapse to base channels and assemble.
+                                    if 2 * C + 1 == expected:
+                                        assembled = assemble_zimage_control_context(t2, control_in_dim=expected, mask_from=None)
+                                        tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                        control_context = assembled
+                                        is_precomputed_ctx = True
+                                    else:
+                                        B, C2, H, W = t2.shape
+                                        F = C2 // base
+                                        try:
+                                            t3 = t2.reshape(B, base, F, H, W).mean(dim=2)
+                                            assembled = assemble_zimage_control_context(t3, control_in_dim=expected, mask_from=None)
+                                            tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                            control_context = assembled
+                                            is_precomputed_ctx = True
+                                        except Exception:
+                                            try:
+                                                from toolkit.print import print_acc
+                                                print_acc(f"[CONTROLNET] Failed to reshape packed latents for assembly: shape={tuple(t2.shape)}")
+                                            except Exception:
+                                                pass
+                                            # Fall back to treating as assembled context if we cannot reshape
+                                            pass
+                            else:
+                                # If adapter expects base latent channels (e.g., 4), collapse packed frames
+                                # into base latents using mean across frames
+                                if expected is not None and C % expected == 0:
+                                    B, C2, H, W = t2.shape
+                                    F = C2 // expected
+                                    try:
+                                        t3 = t2.view(B, expected, F, H, W).mean(dim=2)
+                                        tag_tensor(t3, 'precomputed:collapsed_latents')
+                                        control_context = t3
+                                        is_precomputed_ctx = True
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
+
+            if is_precomputed_ctx:
+                try:
+                    from toolkit.control_channels import tag_tensor
+                    tag_tensor(control_context, 'precomputed:control_context_passthrough')
+                except Exception:
+                    pass
                 adapted_control_context = control_context
+                # Do not trim or adapt precomputed assembled contexts; they are authoritative
+                skip_trim = True
             else:
-                adapted_control_context, _ = adapt_control_images(control_context, self.inner, expected_in)
+                if expected_in is None:
+                    adapted_control_context = control_context
+                else:
+                    adapted_control_context, _ = adapt_control_images(control_context, self.inner, expected_in)
 
             # Do NOT attempt to adapt noisy latents based on the control image channel count.
             # `expected_in` is the control_context channel expectation, not the latent channels.

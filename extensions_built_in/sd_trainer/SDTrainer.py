@@ -1506,7 +1506,42 @@ class SDTrainer(BaseSDTrainProcess):
                     except Exception:
                         sizes = None
                     if sizes is None or len(sizes) == 0:
-                        sizes = [512]
+                        # If the dataset provides full-size control images, prefer the dataset's
+                        # crop/scale size so precompute matches the training pipeline (avoids
+                        # accidental default to 512 which can cause spatial mismatches).
+                        derived_size = None
+                        try:
+                            if getattr(fi, 'full_size_control_images', False):
+                                c_w = getattr(fi, 'crop_width', None)
+                                c_h = getattr(fi, 'crop_height', None)
+                                s_w = getattr(fi, 'scale_to_width', None)
+                                s_h = getattr(fi, 'scale_to_height', None)
+                                if c_w and c_h:
+                                    derived_size = max(int(c_w), int(c_h))
+                                elif s_w and s_h:
+                                    derived_size = max(int(s_w), int(s_h))
+                                else:
+                                    derived_size = max(int(getattr(fi, 'width', 0)), int(getattr(fi, 'height', 0)))
+                        except Exception:
+                            derived_size = None
+
+                        if derived_size is not None and int(derived_size) > 0:
+                            sizes = [int(derived_size)]
+                        else:
+                            sizes = [512]
+
+                    # Ensure that if dataset provides processed control images (full-size mode),
+                    # we use the same processing as the dataloader to avoid mismatches.
+                    # Call `fi.load_control_image()` if we have a control image but haven't loaded it.
+                    try:
+                        if getattr(fi, 'has_control_image', False) and getattr(fi, 'control_tensor', None) is None:
+                            try:
+                                fi.load_control_image()
+                            except Exception:
+                                # best-effort: continue with whatever tensor we have
+                                pass
+                    except Exception:
+                        pass
 
                     # Normalize to batch shape for helper and precompute per size
                     for size in sizes:
@@ -1514,16 +1549,51 @@ class SDTrainer(BaseSDTrainProcess):
                             batch_imgs = imgs.unsqueeze(0)
                         else:
                             batch_imgs = imgs
-                        # resize to target size if necessary
+
+                        # If the dataset explicitly uses full-size control images, prefer the
+                        # dataset-processed control tensor and only rescale/pad *if* the caller
+                        # requested a different target long-side; otherwise keep dataset dims.
                         try:
                             # batch_imgs shape [B,C,H,W]
                             _, C, H, W = batch_imgs.shape
-                            if H != size or W != size:
-                                batch_resized = torch.nn.functional.interpolate(batch_imgs.to(torch.float32), size=(size, size), mode='bilinear', align_corners=False)
+
+                            def _pad_to_mult(x, m=16):
+                                return ((x + m - 1) // m) * m
+
+                            if getattr(fi, 'full_size_control_images', False):
+                                # If requested `size` equals the current long side, keep as-is.
+                                current_long = max(H, W)
+                                        if int(size) == int(current_long) and (H % 16 == 0 and W % 16 == 0):
+                                        batch_resized = batch_imgs.to(torch.float32)
+                                        used_dataset_control = True
+                                    else:
+                                        # Rescale preserving aspect so long side == size, then pad to multiple of 16.
+                                        scale = float(size) / float(current_long) if current_long > 0 else 1.0
+                                        new_h = max(1, int(round(H * scale)))
+                                        new_w = max(1, int(round(W * scale)))
+                                        scaled = torch.nn.functional.interpolate(batch_imgs.to(torch.float32), size=(new_h, new_w), mode='bilinear', align_corners=False)
+                                        pad_h = _pad_to_mult(new_h, 16)
+                                        pad_w = _pad_to_mult(new_w, 16)
+                                        # Center-pad symmetrically to better match dataset behavior
+                                        if pad_h != new_h or pad_w != new_w:
+                                            pad_right = pad_w - new_w
+                                            pad_bottom = pad_h - new_h
+                                            pad_left = pad_right // 2
+                                            pad_top = pad_bottom // 2
+                                            pad_right = pad_right - pad_left
+                                            pad_bottom = pad_bottom - pad_top
+                                            # pad format: (left, right, top, bottom)
+                                            batch_resized = torch.nn.functional.pad(scaled, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0.0)
+                                        else:
+                                            batch_resized = scaled
                             else:
-                                batch_resized = batch_imgs.to(torch.float32)
+                                # Legacy behavior for non-full-size control images: force square to requested size
+                                if H != size or W != size:
+                                    batch_resized = torch.nn.functional.interpolate(batch_imgs.to(torch.float32), size=(size, size), mode='bilinear', align_corners=False)
+                                else:
+                                    batch_resized = batch_imgs.to(torch.float32)
                         except Exception:
-                            batch_resized = batch_imgs
+                            batch_resized = batch_imgs.to(torch.float32)
 
                         try:
                             print_acc(f"[PRECOMPUTE] calling encode for {fi.path} size={size}")
@@ -1572,8 +1642,44 @@ class SDTrainer(BaseSDTrainProcess):
                         # store per-size raw latents (4D: [B, C, H, W]) — runtime-only, in-memory only (no disk persistence)
                         if not hasattr(fi, '_preencoded_zimage_control_contexts') or fi._preencoded_zimage_control_contexts is None:
                             fi._preencoded_zimage_control_contexts = {}
-                        # squeeze batch dim
-                        fi._preencoded_zimage_control_contexts[int(size)] = control_latents.squeeze(0).to('cpu')
+                        # squeeze batch dim and move to CPU for sharing
+                        stored = control_latents.squeeze(0).to('cpu')
+                        # Tag the tensor with a precompute origin so consumers can deterministically
+                        # detect precomputed latents and assemble them correctly.
+                        try:
+                            from toolkit.control_channels import tag_tensor
+                            # Record provenance including original and padded spatial sizes for diagnosability
+                            try:
+                                # compute padding metadata (best-effort: if batch_resized exists)
+                                if 'batch_resized' in locals() and isinstance(batch_resized, torch.Tensor):
+                                    B2, C2, H2, W2 = batch_resized.shape
+                                    tag_tensor(stored, f'precompute:control_latents:size={int(size)}:orig={H}x{W}:padded={H2}x{W2}')
+                                # Mark when we used the dataset-processed image unmodified (exact match)
+                                try:
+                                    if locals().get('used_dataset_control', False):
+                                        tag_tensor(stored, 'precompute:used_dataset_image')
+                                except Exception:
+                                    pass
+                                else:
+                                    pass
+                                
+                            else:
+                                tag_tensor(stored, f'precompute:control_latents:size={int(size)}:orig={H}x{W}')
+                                try:
+                                    if locals().get('used_dataset_control', False):
+                                        tag_tensor(stored, 'precompute:used_dataset_image')
+                                except Exception:
+                                    pass
+                            except Exception:
+                                tag_tensor(stored, f'precompute:control_latents:size={int(size)}')
+                                try:
+                                    if locals().get('used_dataset_control', False):
+                                        tag_tensor(stored, 'precompute:used_dataset_image')
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        fi._preencoded_zimage_control_contexts[int(size)] = stored
 
                     fi.is_control_context_cached = True
                 except Exception as e:

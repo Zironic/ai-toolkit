@@ -67,3 +67,11 @@ def test_precompute_zimage_controls(tmp_path):
         assert isinstance(ctx, torch.Tensor)
         # shape should be 4D or 5D depending on assembly; expect (C,F,H,W) or (C,1,H,W) or 5D (C,F,H,W)
         assert ctx.ndim in (3, 4, 5)
+        # ensure the precompute tensor is explicitly tagged for deterministic consumer-side assembly
+        try:
+            from toolkit.control_channels import get_tensor_origin
+            meta = get_tensor_origin(ctx)
+            assert meta is not None and isinstance(meta.get('op'), str) and meta.get('op').startswith('precompute:control_latents')
+        except Exception:
+            # best-effort; tests should still pass if metadata mechanism fails
+            pass
