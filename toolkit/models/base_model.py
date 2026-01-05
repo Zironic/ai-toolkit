@@ -1582,4 +1582,7 @@ class BaseModel:
 
     def get_model_to_train(self):
         # called to get model to attach LoRAs to. Can be overridden in child classes
+        # Fail fast with clear message if model missing (helps diagnose load failures)
+        if not hasattr(self, 'model') or self.model is None:
+            raise RuntimeError("Model not loaded - expected attribute 'model' to be set. Ensure `load_model()` succeeded and that `ModelConfig.name_or_path` is correct.")
         return self.unet

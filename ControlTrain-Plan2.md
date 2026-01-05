@@ -819,8 +819,9 @@ def load_model_with_controlnet(model_config: 'ModelConfig'):
 
     # Step 3: Load ControlNet if enabled (FAIL-FAST semantics)
     if model_config.controlnet_enabled:
-        if not model_config.controlnet_name_or_path or not model_config.controlnet_file:
-            raise RuntimeError("controlnet_enabled=True but controlnet_name_or_path or controlnet_file is missing in ModelConfig. Aborting.")
+        # Accept either a repo/folder path or a checkpoint file. Require at least one.
+        if not (model_config.controlnet_name_or_path or model_config.controlnet_file):
+            raise RuntimeError("controlnet_enabled=True but neither 'controlnet_name_or_path' nor 'controlnet_file' is set in ModelConfig. Aborting.")
 
         model.load_controlnet_transformer(
             controlnet_path=model_config.controlnet_name_or_path,

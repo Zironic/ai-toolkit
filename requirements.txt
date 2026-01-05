@@ -37,3 +37,8 @@ pytorch-wavelets==1.3.0
 matplotlib==3.10.1
 setuptools==69.5.1
 scipy==1.12.0
+
+# Optional control-type dependencies (pose, depth, line)
+onnxruntime>=1.15.0
+# easy_dwpose (pose detector) - install from git
+git+https://github.com/jaretburkett/easy_dwpose.git

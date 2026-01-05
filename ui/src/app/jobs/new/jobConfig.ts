@@ -105,6 +105,12 @@ export const defaultJobConfig: JobConfig = {
           arch: 'flex1',
           low_vram: false,
           model_kwargs: {},
+          // ControlNet defaults
+          controlnet_enabled: false,
+          controlnet_name_or_path: null,
+          controlnet_file: null,
+          controlnet_streaming: false,
+          controlnet_offload_strategy: 'none',
         },
         sample: {
           sampler: 'flowmatch',
@@ -199,5 +205,23 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
       use_ui_logger: true,
     };
   }
+
+  // Back-compat: some UI forms stored ControlNet under train.controlnet_model.
+  // Migrate it to model.controlnet_name_or_path which is what the loader expects.
+  try {
+    const train = jobConfig.config.process[0].train as any;
+    const model = jobConfig.config.process[0].model as any;
+    if (train && train.controlnet_model && (!model.controlnet_name_or_path || model.controlnet_name_or_path === null)) {
+      const val = typeof train.controlnet_model === 'string' ? train.controlnet_model.trim() : train.controlnet_model;
+      if (val && val !== '') {
+        model.controlnet_name_or_path = val;
+        model.controlnet_enabled = true;
+      }
+    }
+  } catch (e) {
+    // non-fatal
+    console.warn('ControlNet migration skipped due to error', e);
+  }
+
   return jobConfig;
 };

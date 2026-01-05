@@ -98,6 +98,10 @@ class SampleConfig:
             print("Changing sample extention to animated webp")
             self.ext = 'webp'
         
+        # ControlNet sampling options
+        self.control_conditioning_scale: float = kwargs.get('control_conditioning_scale', 1.0)
+        self.control_images = kwargs.get('control_images', None)  # optional per-sample control images
+
         prompts: list[str] = kwargs.get('prompts', [])
         
         self.samples: Optional[List[SampleItem]] = None
@@ -318,6 +322,10 @@ class AdapterConfig:
         self.control_image_dropout: float = kwargs.get('control_image_dropout', 0.0)
         self.has_inpainting_input: bool = kwargs.get('has_inpainting_input', False)
         self.invert_inpaint_mask_chance: float = kwargs.get('invert_inpaint_mask_chance', 0.0)
+        # Explicit controlnet routing mode: None or 'zimage' (VideoX-style). When set to 'zimage', the
+        # trainer will route control inputs via the zimage path (passes `zimage_controlnet` and
+        # `zimage_control_images` into `sd.predict_noise`) instead of precomputing per-block residuals.
+        self.controlnet_mode: Optional[str] = kwargs.get('controlnet_mode', None)
         
         # for subpixel adapter
         self.subpixel_downscale_factor: int = kwargs.get('subpixel_downscale_factor', 8)
@@ -618,6 +626,19 @@ class ModelConfig:
         self.inference_lora_path = kwargs.get('inference_lora_path', None)
         self.latent_space_version = kwargs.get('latent_space_version', None)
 
+        # ControlNet configuration
+        self.controlnet_enabled: bool = kwargs.get('controlnet_enabled', False)
+        self.controlnet_name_or_path: Optional[str] = kwargs.get('controlnet_name_or_path', None)
+        self.controlnet_file: Optional[str] = kwargs.get('controlnet_file', None)
+        # If true, use safetensors.safe_open streaming mode to avoid large RAM spikes
+        self.controlnet_streaming: bool = kwargs.get('controlnet_streaming', False)
+        # Offload strategy: 'none' | 'cpu' | 'sequential'
+        self.controlnet_offload_strategy: str = kwargs.get('controlnet_offload_strategy', 'none')
+        # Control image encoding options
+        self.control_use_tiling: bool = kwargs.get('control_use_tiling', False)
+        self.control_tiling_size: int = kwargs.get('control_tiling_size', 256)
+        self.control_tiling_overlap: int = kwargs.get('control_tiling_overlap', 32)
+
         # only for SDXL models for now
         self.use_text_encoder_1: bool = kwargs.get('use_text_encoder_1', True)
         self.use_text_encoder_2: bool = kwargs.get('use_text_encoder_2', True)
@@ -689,6 +710,10 @@ class ModelConfig:
         
         # path to an accuracy recovery adapter, either local or remote
         self.accuracy_recovery_adapter = kwargs.get("accuracy_recovery_adapter", None)
+
+        # ZImage tokenizer handling: expect tokenizer to be provided in the
+        # model's `tokenizer/` subfolder; do not provide a dummy-tokenizer fallback
+        # here in order to match upstream behavior and fail-fast on missing tokenizers.
         
         # parse ARA from qtype
         if self.qtype is not None and "|" in self.qtype:
@@ -899,6 +924,17 @@ class DatasetConfig:
         # expected format: files named <basename>_residuals.pt containing a tuple/list of tensors
         self.control_residuals_path: Union[str, List[str], None] = kwargs.get('control_residuals_path', None)
         
+        # control type and control cache/backward compatible kwargs
+        self.control_type: Optional[str] = kwargs.get('control_type', None)
+        # back-compat: support both control_generate_on_the_fly and generate_control_on_the_fly
+        # Default to True so controls are generated on-the-fly unless explicitly disabled.
+        self.control_generate_on_the_fly: bool = kwargs.get('control_generate_on_the_fly', kwargs.get('generate_control_on_the_fly', True))
+        self.generate_control_on_the_fly: bool = bool(self.control_generate_on_the_fly)
+        # support legacy/alt keys for precompute control at dataset level (control_precompute_control)
+        self.control_precompute_control: bool = kwargs.get('control_precompute_control', kwargs.get('controlnet_precompute_control', False))
+        # path to a precomputed control image cache
+        self.control_cache_path: Optional[str] = kwargs.get('control_cache_path', None)
+
         # handle multi control inputs from the ui. It is just easier to handle it here for a cleaner ui experience
         control_path_1 = kwargs.get('control_path_1', None)
         control_path_2 = kwargs.get('control_path_2', None)
@@ -996,8 +1032,15 @@ class DatasetConfig:
         self.controls: List[ControlTypes] = kwargs.get('controls', [])
         if isinstance(self.controls, str):
             self.controls = [self.controls]
-        # remove empty strings
-        self.controls = [control for control in self.controls if control.strip() != '']
+        # normalize: strip whitespace and lower-case control names; remove empty strings
+        normalized_controls = []
+        for control in self.controls:
+            if not isinstance(control, str):
+                continue
+            c = control.strip().lower()
+            if c != '':
+                normalized_controls.append(c)
+        self.controls = normalized_controls
         # Dataset-level control generation defaults (can be overridden per-dataset)
         # If `control_generate_on_the_fly` is None, the train-level setting will be consulted when available.
         self.control_generate_on_the_fly: Union[bool, None] = kwargs.get('control_generate_on_the_fly', None)

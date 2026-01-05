@@ -662,6 +662,8 @@ class CustomAdapter(torch.nn.Module):
                 # 4th channel is the mask with 1 being keep area and 0 being area to inpaint.
                 sd: StableDiffusion = self.sd_ref()
                 inpainting_latent = None
+                # initialize control_tensor to avoid UnboundLocalError in downstream checks
+                control_tensor = None
                 if self.config.has_inpainting_input:
                     do_dropout = random.random() < self.config.control_image_dropout
                     # do random mask if we dont have one
@@ -721,7 +723,7 @@ class CustomAdapter(torch.nn.Module):
                         latents = torch.cat((latents, control_latent), dim=1)
                         return latents.detach()
                     
-                if control_tensor is None:
+                if getattr(batch, 'control_tensor', None) is None:
                     # concat zeros onto the latents
                     ctrl = torch.zeros(
                         latents.shape[0], # bs
@@ -771,7 +773,17 @@ class CustomAdapter(torch.nn.Module):
                             control_tensor = F.interpolate(control_tensor, size=(batch.tensor.shape[2], batch.tensor.shape[3]), mode='bicubic')
                         
                         # encode it
-                        control_latent = sd.encode_images(control_tensor).to(latents.device, latents.dtype)
+                        # Use the SD helper that supports tiled-control encoding when available
+                        if getattr(sd.model_config, 'control_use_tiling', False):
+                            # Only pass the `tile` flag; let model implementations choose defaults
+                            ctl = sd.encode_control_images(control_tensor, tile=True)
+                        else:
+                            ctl = sd.encode_control_images(control_tensor, tile=False)
+                        # Normalize result to tensor
+                        if isinstance(ctl, list):
+                            # if it's a list of tensors, take the first (per-image result)
+                            ctl = ctl[0]
+                        control_latent = ctl.to(latents.device, latents.dtype)
                         control_latent_list.append(control_latent)
                 # stack them on the channel dimension
                 control_latent = torch.cat(control_latent_list, dim=1)

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Union
 import cv2
 import torch
 import random
+import copy
 
 from PIL import Image
 from PIL.ImageOps import exif_transpose
@@ -123,6 +124,28 @@ class FileItemDTO(
         self.is_reg = self.dataset_config.is_reg
         self.prior_reg = self.dataset_config.prior_reg
         self.tensor: Union[torch.Tensor, None] = None
+
+    def __deepcopy__(self, memo):
+        """Custom deepcopy to avoid copying non-picklable attributes.
+        Some attributes (like dataset_config, sd, open file handles or loggers)
+        are not safe to deepcopy. We keep references to those and deepcopy
+        the rest. This avoids "cannot pickle 'TextIOWrapper' instances" errors
+        when datasets are used with multiprocessing.
+        """
+        cls = self.__class__
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        exclude_deepcopy = {'dataset_config', 'sd', 'dataloader_transforms', 'size_database'}
+        for k, v in self.__dict__.items():
+            if k in exclude_deepcopy:
+                setattr(new, k, v)
+            else:
+                try:
+                    setattr(new, k, copy.deepcopy(v, memo))
+                except Exception:
+                    # fallback to reference assignment if deepcopy fails
+                    setattr(new, k, v)
+        return new
 
     def cleanup(self):
         self.tensor = None

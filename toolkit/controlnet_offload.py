@@ -71,7 +71,17 @@ def offload_adapter(adapter: torch.nn.Module, strategy: str = "none") -> None:
 
 
     if strategy == "memory_manager":
-        raise NotImplementedError("memory_manager-based offload is not yet implemented")
+        try:
+            from toolkit.memory_management.manager import MemoryManager
+            _debug("Attaching MemoryManager to adapter for memory-managed offload")
+            # Attach with default device CPU (MemoryManager will manage modules)
+            MemoryManager.attach(adapter, torch.device('cpu'))
+            _debug("MemoryManager attached successfully")
+            return
+        except Exception as e:
+            _debug("MemoryManager offload failed: %s", str(e))
+            raise
+
 
     raise ValueError(f"Unknown offload strategy: {strategy}")
 
@@ -106,7 +116,26 @@ def bring_adapter(adapter: torch.nn.Module, device: torch.device, strategy: str 
             raise
 
     if strategy == "memory_manager":
-        raise NotImplementedError(f"bring_adapter for strategy {strategy} must be implemented separately")
+        try:
+            # Attach MemoryManager if not already attached and set process device
+            from toolkit.memory_management.manager import MemoryManager
+
+            if not hasattr(adapter, "_memory_manager"):
+                _debug("Attaching MemoryManager to adapter for device %s", device)
+                MemoryManager.attach(adapter, device)
+            # Ensure the memory manager knows the target device
+            try:
+                adapter._memory_manager.process_device = device
+            except Exception:
+                _debug("Failed to set process_device on MemoryManager; continuing")
+            # Use the memory-managed to() to move unmanaged modules as needed
+            t0 = time.time()
+            adapter.to(device)
+            _debug("Brought memory-managed adapter to %s in %.3fs", device, time.time() - t0)
+            return
+        except Exception as e:
+            _debug("Failed to bring adapter via MemoryManager: %s", str(e))
+            raise
 
     raise ValueError(f"Unknown offload strategy: {strategy}")
 
@@ -179,3 +208,50 @@ def compute_control_residuals(
 
     _debug("Computed %d residual tensors", len(residuals))
     return residuals
+
+
+# Offload manager helper
+class ControlnetOffloadManager:
+    """Simple offload manager that provides a `control_forward` context manager.
+
+    Usage:
+        mgr = setup_controlnet_offload(adapter, strategy='manual_swap')
+        with mgr.control_forward(device=torch.device('cuda:0')):
+            # run control forward (adapter should be on device)
+            ...
+    On exit the adapter is offloaded according to `strategy`.
+    """
+
+    def __init__(self, adapter: torch.nn.Module, strategy: str = 'none'):
+        self.adapter = adapter
+        self.strategy = strategy
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def control_forward(self, device: Optional[torch.device] = None):
+        """Bring adapter to `device` for the duration of the context and offload on exit."""
+        if device is None:
+            # default to CPU if device unspecified (tests run on CPU)
+            device = torch.device('cpu')
+        _debug("control_forward: bringing adapter to %s (strategy=%s)", device, self.strategy)
+        try:
+            bring_adapter(self.adapter, device, strategy=self.strategy)
+        except Exception as e:
+            _debug("Failed to bring adapter to device: %s", str(e))
+            raise
+        try:
+            yield
+        finally:
+            try:
+                offload_adapter(self.adapter, strategy=self.strategy)
+                _debug("control_forward: offloaded adapter (strategy=%s)", self.strategy)
+            except Exception as e:
+                _debug("control_forward: offload failed: %s", str(e))
+                # Do not override original exceptions
+
+
+def setup_controlnet_offload(adapter: torch.nn.Module, strategy: str = 'none') -> ControlnetOffloadManager:
+    """Factory to create a ControlnetOffloadManager for a given adapter and strategy."""
+    return ControlnetOffloadManager(adapter, strategy=strategy)
+

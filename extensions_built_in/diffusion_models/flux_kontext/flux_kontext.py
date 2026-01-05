@@ -411,7 +411,17 @@ class FluxKontextModel(BaseModel):
                 if control_tensor.shape[2] != target_h or control_tensor.shape[3] != target_w:
                     control_tensor = F.interpolate(control_tensor, size=(target_h, target_w), mode='bilinear')
                     
-                control_latent = self.encode_images(control_tensor).to(latents.device, latents.dtype)
+                # use tiled control encoding when available
+                if getattr(self, 'model_config', None) is not None and getattr(self.model_config, 'control_use_tiling', False) and hasattr(self, 'encode_control_images'):
+                    # Only pass the `tile` flag; let model implementations use their own defaults
+                    ctl = self.encode_control_images(control_tensor, tile=True)
+                elif hasattr(self, 'encode_control_images'):
+                    ctl = self.encode_control_images(control_tensor, tile=False)
+                else:
+                    ctl = self.encode_images(control_tensor)
+                if isinstance(ctl, list):
+                    ctl = ctl[0]
+                control_latent = ctl.to(latents.device, latents.dtype)
                 latents = torch.cat((latents, control_latent), dim=1)
 
         return latents.detach() 

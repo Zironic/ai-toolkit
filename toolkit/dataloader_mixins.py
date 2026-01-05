@@ -108,6 +108,67 @@ def clean_caption(caption):
     return caption
 
 
+# --- Tiling helpers used when encoding large images via VAE ---
+from torchvision.transforms.functional import to_tensor, to_pil_image
+
+def tile_image(img, tile_size: int = 256, overlap: int = 32):
+    """Split an image (PIL Image or numpy array) into overlapping square tiles.
+
+    Returns list of (tile, (x, y)) where x,y are top-left coords in the original image.
+    """
+    if hasattr(img, 'size'):
+        width, height = img.size
+    else:
+        # assume numpy array HWC
+        height, width = img.shape[:2]
+    tiles = []
+    y = 0
+    while y < height:
+        x = 0
+        h = min(tile_size, height - y)
+        while x < width:
+            w = min(tile_size, width - x)
+            if hasattr(img, 'crop'):
+                tile = img.crop((x, y, x + w, y + h))
+            else:
+                tile = img[y:y+h, x:x+w]
+            tiles.append((tile, (x, y)))
+            if x + tile_size >= width:
+                break
+            x += tile_size - overlap
+        if y + tile_size >= height:
+            break
+        y += tile_size - overlap
+    return tiles
+
+
+def verify_tile_alignment(tiles, original_shape, tile_size: int = 256, overlap: int = 32):
+    """Verify that tiled pieces reassemble into the original shape without gaps.
+
+    original_shape: (width, height)
+    Returns True if coverage is complete (simple grid coverage check).
+    """
+    try:
+        width, height = original_shape
+    except Exception:
+        raise ValueError("original_shape must be a (width, height) tuple")
+
+    coverage = [[False] * (width) for _ in range(height)]
+    for tile, (x, y) in tiles:
+        if hasattr(tile, 'size'):
+            w, h = tile.size
+        else:
+            h, w = tile.shape[:2]
+        for yy in range(y, min(y + h, height)):
+            for xx in range(x, min(x + w, width)):
+                coverage[yy][xx] = True
+    # if any position not covered, return False
+    for row in coverage:
+        if not all(row):
+            return False
+    return True
+
+
 class CaptionMixin:
     def get_caption_item(self: 'AiToolkitDataset', index):
         if not hasattr(self, 'caption_type'):
@@ -290,6 +351,92 @@ class BucketsMixin:
             for key, bucket in self.buckets.items():
                 print_acc(f'{key}: {len(bucket.file_list_idx)} files')
             print_acc(f'{len(self.buckets)} buckets made')
+
+        # Dataset-level fail-fast checks for ControlNet
+        try:
+            self.validate_control_dataset()
+        except Exception as e:
+            # Validation failures should abort dataset setup early with a clear message
+            raise
+
+    def validate_control_dataset(self: 'AiToolkitDataset'):
+        """Validate control dataset preconditions and fail-fast on errors.
+
+        Checks:
+        - If dataset.config.control_type is set and generate_control_on_the_fly is False, ensure control cache exists and contains files.
+        - If control_type == 'openpose', ensure `controlnet_aux` is importable.
+        - If host RAM appears low and control cache or control pipeline requires large memory, suggest streaming.
+        """
+        config: 'DatasetConfig' = self.dataset_config
+
+        # If no control conditioning for this dataset, nothing to validate
+        has_control = bool(getattr(config, 'control_type', None) or (getattr(config, 'controls', None) and len(getattr(config, 'controls', [])) > 0))
+        if not has_control:
+            return True
+
+        # If using cached control images, ensure cache path exists and contains control files.
+        # If the dataset is configured to precompute controls (`control_precompute_control=True`) and
+        # no cache path was supplied, create a sensible default under the dataset folder and allow
+        # precompute to populate it (do not fail immediately).
+        if not config.generate_control_on_the_fly:
+            cache_path = config.control_cache_path
+            precompute = getattr(config, 'control_precompute_control', False)
+
+            # If there's no explicit cache path but precompute is enabled, create a default cache dir
+            # next to the dataset (dataset_path/_controls or dataset_path/control_cache)
+            if not cache_path:
+                if precompute:
+                    default_cache = os.path.join(self.dataset_path, 'control_cache')
+                    config.control_cache_path = default_cache
+                    cache_path = default_cache
+                    os.makedirs(cache_path, exist_ok=True)
+                    print_acc(f"Info: No control_cache_path set — created default at {cache_path} because control_precompute_control=True")
+                    # Note: SDTrainer's Z-Image precompute caches encoder latents **in memory only** on FileItemDTO
+                    # objects for the process lifetime and does NOT write these latents to `control_cache_path`.
+                    # The `control_cache_path` is available for other workflows or optional persistence but
+                    # SDTrainer does not persist precomputed latents by default.
+                else:
+                    raise RuntimeError(
+                        f"Dataset {getattr(config, 'name', self.dataset_path)}: control_cache_path is not set but generate_control_on_the_fly=False. "
+                        "Set `control_cache_path` in your dataset config or enable on-the-fly generation by setting `generate_control_on_the_fly=True`. "
+                        "Alternatively, set `control_precompute_control=True` to allow creating a default cache directory. Aborting setup.")
+
+            # If the cache path does not exist, create it if precompute is enabled, otherwise error
+            if not os.path.isdir(cache_path):
+                if precompute:
+                    os.makedirs(cache_path, exist_ok=True)
+                    print_acc(f"Info: Created control cache directory {cache_path} for precompute.")
+                else:
+                    raise RuntimeError(f"Control cache path does not exist: {cache_path}. Aborting setup.")
+
+            # If there are no control files yet and precompute is enabled, do not fail — precompute will generate them.
+            control_files = glob.glob(os.path.join(cache_path, '**', '*_control.*'), recursive=True)
+            if len(control_files) == 0:
+                if precompute:
+                    print_acc(f"Info: Control cache path {cache_path} contains no control files yet; precompute (control_precompute_control=True) will generate them.")
+                else:
+                    raise RuntimeError(f"Control cache path {cache_path} contains no control files. Aborting setup.")
+
+        # If control_type is openpose/pose, ensure controlnet_aux is available
+        if str(getattr(config, 'control_type', '')).lower() in ('openpose', 'pose'):
+            try:
+                import controlnet_aux  # noqa: F401
+            except Exception:
+                raise RuntimeError("`controlnet_aux` is required for openpose control preprocessing. Install with `pip install controlnet-aux`.")
+
+        # Memory guidance: if host RAM < 64GB and caller hasn't opted in for streaming, warn (not fatal here)
+        try:
+            import psutil
+            ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+            if ram_gb < 64:
+                # If dataset expects pre-generated huge control cache, advise streaming
+                if not getattr(config, 'generate_control_on_the_fly', True) and not getattr(config, 'allow_streaming_warning_shown', False):
+                    print_acc(f"Warning: Host RAM ({ram_gb:.1f}GB) is small; consider enabling streaming or using smaller control images.")
+        except Exception:
+            # psutil may not be available; ignore
+            pass
+
+        return True
 
 
 class CaptionProcessingDTOMixin:
@@ -912,6 +1059,8 @@ class ControlFileItemDTOMixin:
         self.control_tensor: Union[torch.Tensor, None] = None
         self.control_tensor_list: Union[List[torch.Tensor], None] = None
         sd = kwargs.get('sd', None)
+        # retain a reference to the sd object so we can consult model hints (eg. expected control channels)
+        self.sd = sd
         self.use_raw_control_images = sd is not None and sd.use_raw_control_images
         # prefer self.dataset_config (set by FileItemDTO) over kwargs to be robust
         dataset_config: 'DatasetConfig' = getattr(self, 'dataset_config', kwargs.get('dataset_config', None))
@@ -929,8 +1078,16 @@ class ControlFileItemDTOMixin:
             found_control_images = []
             for control_path in control_path_list:
                 for ext in img_ext_list:
-                    if os.path.exists(os.path.join(control_path, file_name_no_ext + ext)):
-                        found_control_images.append(os.path.join(control_path, file_name_no_ext + ext))
+                    candidate_plain = os.path.join(control_path, file_name_no_ext + ext)
+                    candidate_with_type = None
+                    if getattr(dataset_config, 'control_type', None):
+                        candidate_with_type = os.path.join(control_path, f"{file_name_no_ext}.{dataset_config.control_type}" + ext)
+                    if os.path.exists(candidate_plain):
+                        found_control_images.append(candidate_plain)
+                        self.has_control_image = True
+                        break
+                    if candidate_with_type is not None and os.path.exists(candidate_with_type):
+                        found_control_images.append(candidate_with_type)
                         self.has_control_image = True
                         break
             self.control_path = found_control_images
@@ -1023,6 +1180,38 @@ class ControlFileItemDTOMixin:
                 tensor = self.augment_spatial_control(img, transform=transform)
             else:
                 tensor = transform(img)
+
+            # If the ControlNet model expects an extra mask/alpha channel (common for RGB+mask inputs),
+            # and the loaded control is 3-channel, pad a zero alpha channel so the loader produces a 4-channel tensor.
+            try:
+                expected = None
+                if getattr(self, 'sd', None) is not None:
+                    controlnet = getattr(self.sd, 'controlnet', None)
+                    if controlnet is not None:
+                        # Use the centralized helper which applies the same deterministic logic
+                        # used elsewhere (trainer, wrapper) to infer expected channels.
+                        try:
+                            from toolkit.control_util import infer_expected_in_ch
+
+                            expected = infer_expected_in_ch(controlnet)
+                        except Exception:
+                            # fall back to minimal checks if infer fails
+                            # Only use explicit `control_in_dim` when available. Do not fall back to
+                            # `in_channels` which can cause accidental non-33 expectations.
+                            expected = getattr(controlnet, 'control_in_dim', None)
+                            if expected is None:
+                                conv_in = getattr(controlnet, 'conv_in', None)
+                                if conv_in is not None and hasattr(conv_in, 'weight'):
+                                    expected = conv_in.weight.shape[1]
+                # Do NOT auto-pad control images to 4 channels here.
+                # Channel adaptation is centralized in `toolkit.control_channels` and will be
+                # applied at model-forward time. Silently padding in the dataloader caused
+                # confusing channel flip-flops; keep the raw tensor as provided by the dataset.
+                pass
+            except Exception:
+                # Best-effort padding; do not fail dataloader on diagnostic code
+                pass
+
             control_tensors.append(tensor)
             
         if len(control_tensors) == 0:

@@ -34,6 +34,25 @@ Use the convenience scripts in the repository root to run UI npm scripts without
 
 These scripts forward the command to the `ui` project so you don't have to `cd ui` first; when used without arguments they will run `npm run build_and_start` which installs, updates the DB, builds, and starts the UI.
 
+## Running tests (fast) 🔬
+
+- Run a focused unit test (LoRA integration):
+  - `python -m pytest testing/test_lora_integration.py -q`
+- Run the CPU smoke test for LoRA:
+  - `python -m pytest testing/test_lora_smoke_cpu.py -q`
+- Run ControlNet loader tests (fixes related to dtype handling and freeze checks):
+  - `python -m pytest testing/test_controlnet_loading.py -q`
+- Quick check for timestep dtype mismatch fix (Float/BFloat16 matmul errors):
+  - `python -m pytest testing/test_controlnet_time_dtype_priority.py -q`
+
+If you hit an error like `RuntimeError: mat1 and mat2 must have the same dtype, but got Float and BFloat16`, run the test above and check whether your ControlNet adapter has mixed dtypes (LoRA params in `bfloat16` but time modules in `float32`). The trainer now prefers the time-module dtype for timesteps when present to avoid this mismatch.
+- Run the full (fast) unit test suite:
+  - `python -m pytest testing -q`
+
+Note: CI runs only fast unit tests and excludes long GPU-based experiments. Do not add GPU-reliant tests to CI without explicit maintainers' approval.
+
+Troubleshooting: if you see `ZImage generation pipeline requires a tokenizer implementing `apply_chat_template`` during model load, prefer adding a compatible tokenizer to the model repo or set `te_name_or_path`/`extras_name_or_path` to a repo with the tokenizer. We now follow upstream behavior and do not provide a dummy-tokenizer fallback; missing tokenizers will cause model loading to fail fast so you can correct the model repository.
+
 
 <p align="center">
 <a href="https://x.com/NuxZoe" target="_blank" rel="noopener noreferrer"><img src="https://pbs.twimg.com/profile_images/1919488160125616128/QAZXTMEj_400x400.png" alt="a16z" width="280" height="280" style="border-radius:8px;margin:5px;display: inline-block;"></a>

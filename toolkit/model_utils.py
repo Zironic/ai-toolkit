@@ -58,11 +58,13 @@ def resolve_local_model_path(name_or_path: str) -> Optional[str]:
         os.path.join(ORIG_CONFIGS_ROOT, name_or_path.split('/')[-1] if '/' in name_or_path else name_or_path),
     ])
 
+    from .print import print_acc
     for c in candidates:
         try:
             if c and os.path.exists(c):
                 return c
-        except Exception:
+        except OSError as e:
+            print_acc(f"[MODEL_UTILS] skipping candidate {c} due to OS error: {e}")
             continue
     return None
 
@@ -163,21 +165,24 @@ def load_model_for_inference(model_or_name: Any, device: str = 'cpu', dtype: str
                         p.data = p.data.to(torch_dtype)
                         if p.grad is not None:
                             p.grad.data = p.grad.data.to(torch_dtype)
-                    except Exception:
-                        # best-effort; continue if something can't be cast
+                    except (RuntimeError, TypeError, AttributeError, ValueError) as e:
+                        from .print import print_acc
+                        print_acc(f"[MODEL_UTILS] failed to cast VAE parameter to {torch_dtype}: {e}")
                         continue
                 # cast buffers (eg running stats)
                 for name, buf in vae.named_buffers(recurse=True):
                     try:
                         buf.data = buf.data.to(torch_dtype)
-                    except Exception:
+                    except (RuntimeError, TypeError, AttributeError) as e:
+                        from .print import print_acc
+                        print_acc(f"[MODEL_UTILS] failed to cast VAE buffer '{name}' to {torch_dtype}: {e}")
                         continue
                 # also move the module (safe no-op if already moved)
                 try:
                     vae.to(torch_dtype)
-                except Exception:
-                    # some VAEs require device arg; ignore if this fails
-                    pass
+                except (TypeError, RuntimeError) as e:
+                    from .print import print_acc
+                    print_acc(f"[MODEL_UTILS] vae.to({torch_dtype}) failed (ignored): {e}")
             except Exception as e:
                 print(f"Warning: failed to cast VAE params/buffers to dtype {dtype}: {e}")
 

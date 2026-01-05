@@ -269,6 +269,474 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         return generate_image_config_list
 
+    def setup_controlnet_training(self):
+        """Setup ControlNet-specific training configuration and run connection verification.
+
+        Will raise RuntimeError on fail-fast conditions so training does not proceed.
+        """
+        # nothing to do if controlnet not enabled on model
+        if not getattr(self.sd, 'is_controlnet_enabled', False):
+            return
+
+        if hasattr(self, 'print_and_status_update'):
+            self.print_and_status_update("Setting up ControlNet training mode and verifying connection")
+        else:
+            try:
+                from toolkit.print import print_acc
+                print_acc("Setting up ControlNet training mode and verifying connection")
+            except Exception as e:
+                raise RuntimeError(f"Failed to emit ControlNet setup status: {e}") from e
+
+        # Ensure controlnet exists. If it's not loaded yet, attempt to lazily load it
+        if self.sd.controlnet is None:
+            # If we don't even have a ModelConfig on this object, fail as before
+            if not hasattr(self, 'model_config'):
+                raise RuntimeError("ControlNet is enabled in config but the controlnet is not loaded (sd.controlnet is None). Aborting.")
+
+            # Attempt lazy-load only when a controlnet identifier or file is configured
+            cpath = getattr(self.model_config, 'controlnet_name_or_path', None)
+            cfile = getattr(self.model_config, 'controlnet_file', None)
+            if cpath is None and cfile is None:
+                raise RuntimeError("ControlNet is enabled in config but the controlnet is not loaded (sd.controlnet is None). Aborting.")
+
+            try:
+                # Prefer file-based loader if both provided
+                if cfile:
+                    # If the model exposes a helper to load from file, call it (it will set sd.controlnet)
+                    if hasattr(self.sd, 'load_controlnet_transformer'):
+                        self.sd.load_controlnet_transformer(cpath, cfile, freeze=True, offload_strategy=getattr(self.model_config, 'controlnet_offload_strategy', 'none'))
+                    else:
+                        raise RuntimeError("ControlNet file specified but model does not support file-based loading.")
+                else:
+                    # Try to load by identifier using diffusers' ControlNetModel.from_pretrained
+                    try:
+                        from diffusers import ControlNetModel
+                        self.print_and_status_update(f"Attempting to lazily load ControlNet from identifier: {cpath}")
+                        self.sd.controlnet = ControlNetModel.from_pretrained(cpath, torch_dtype=getattr(self.sd, 'torch_dtype', None))
+                        # Default: keep frozen unless explicitly requested elsewhere
+                        for p in self.sd.controlnet.parameters():
+                            p.requires_grad = False
+                        self.sd.is_controlnet_enabled = True
+                        self.print_and_status_update(f"[CONTROLNET] Lazily loaded ControlNet adapter from '{cpath}' (frozen).")
+
+                        # If the process-level adapter_config is missing, synthesize one from the
+                        # ControlNet identifier so downstream routing heuristics (zimage detection)
+                        # and trainer logic have the expected config available.
+                        try:
+                            from types import SimpleNamespace
+                            if getattr(self, 'adapter_config', None) is None:
+                                self.adapter_config = SimpleNamespace()
+                                self.adapter_config.name_or_path = cpath
+                                self.adapter_config.type = 'control_net'
+                                self.adapter_config.train = False
+                                # Auto-detect zimage/video_x hints in the controlnet name
+                                nlow = str(cpath).lower() if cpath is not None else ''
+                                if any(pat in nlow for pat in ('zimage', 'z_image', 'z-image', 'videox', 'video_x', 'pipeline_z_image', 'zimage_control')):
+                                    self.adapter_config.controlnet_mode = 'zimage'
+                                    try:
+                                        self.print_and_status_update("[CONTROLNET] Auto-set adapter_config.controlnet_mode='zimage' based on controlnet identifier.")
+                                    except Exception as e:
+                                        raise RuntimeError(f"Failed to log adapter_config controlnet_mode detection: {e}") from e
+                                else:
+                                    self.adapter_config.controlnet_mode = None
+                        except Exception:
+                            # Do not let config synth failure to block training; best-effort only
+                            pass
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to lazily load ControlNet from '{cpath}': {e}")
+            except Exception as e:
+                raise RuntimeError(f"ControlNet is enabled but loading the adapter failed: {e}")
+
+            # final check
+            if self.sd.controlnet is None:
+                raise RuntimeError("ControlNet is enabled in config but the controlnet could not be loaded. Aborting.")
+
+        # Ensure controlnet parameters are frozen
+        trainable_params = sum(p.numel() for p in self.sd.controlnet.parameters() if p.requires_grad)
+        if trainable_params > 0:
+            raise RuntimeError(f"ControlNet has {trainable_params:,} trainable parameters (should be 0 for frozen ControlNet training). Aborting.")
+
+        # If the process-level adapter was not constructed (e.g., ControlNet was provided
+        # via model config and loaded into sd.controlnet), make sure trainer-visible
+        # `self.adapter` points at the ControlNet so training routing (zimage/flux)
+        # and metrics correctly detect control conditioning.
+        if getattr(self, 'adapter', None) is None:
+            self.adapter = self.sd.controlnet
+            try:
+                from toolkit.print import print_acc
+                print_acc("[CONTROLNET] Assigned model-provided controlnet to process.adapter for training routing.")
+                try:
+                    print_acc(f"[CONTROLNET] Adapter info: class={self.adapter.__class__.__name__}, name_or_path={getattr(self.adapter, 'name_or_path', None)}")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to print ControlNet adapter info: {e}") from e
+            except Exception as e:
+                raise RuntimeError(f"Failed to announce ControlNet adapter assignment: {e}") from e
+
+            # If this adapter looks like a VideoX/zimage-style adapter, wrap it with a compatibility shim.
+            # Detection: use adapter_uses_zimage helper plus dataset-level hints so wrapping is applied reliably.
+            try:
+                from toolkit.control_util import adapter_uses_zimage
+                # Prefer checking the model-provided controlnet and a cfg source (adapter_config or model_config)
+                cfg_src = getattr(self, 'adapter_config', None) or getattr(self, 'model_config', None)
+                is_zimage = adapter_uses_zimage(getattr(self.sd, 'controlnet', None), cfg_src)
+                # Also honor dataset-level controlnet_mode flags (some configs specify zimage per-dataset)
+                if not is_zimage:
+                    for ds in getattr(self, 'dataset_configs', []):
+                        if getattr(ds, 'controlnet_mode', None) and str(ds.controlnet_mode).lower() in ('zimage', 'video_x'):
+                            is_zimage = True
+                            break
+
+                if is_zimage:
+                    try:
+                        from toolkit.controlnet_compat import VideoXControlnetWrapper
+                        try:
+                            from toolkit.print import print_acc
+                            print_acc("[CONTROLNET] Attempting to apply VideoXControlnetWrapper (assignment path)")
+                        except Exception as e:
+                            raise RuntimeError(f"Failed to print VideoX wrapper assignment attempt: {e}") from e
+
+                        # If the model-provided controlnet appears to be a legacy Flux1-style
+                        # ControlNet (e.g., forward requires `encoder_hidden_states` or lacks
+                        # `control_context`) attempt to replace it with a proper VideoX loader
+                        # backed adapter from `extensions_built_in.diffusion_models.z_image_adapter`.
+                        try:
+                            import inspect
+                            target_fn = getattr(self.sd.controlnet, 'forward', self.sd.controlnet if callable(self.sd.controlnet) else None)
+                            params = inspect.signature(target_fn).parameters if target_fn is not None else {}
+                            needs_replacement = False
+                            if 'control_context' not in params:
+                                needs_replacement = True
+                            elif 'encoder_hidden_states' in params:
+                                p = params['encoder_hidden_states']
+                                if p.default is inspect._empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                                    needs_replacement = True
+                        except Exception:
+                            # If we cannot inspect the signature reliably, attempt replacement
+                            needs_replacement = True
+
+                        if needs_replacement:
+                            try:
+                                from extensions_built_in.diffusion_models.z_image_adapter import load_videox_control_adapter
+                                name_or_path = getattr(self.sd.controlnet, 'name_or_path', None) or getattr(self, 'adapter_config', None) and getattr(self.adapter_config, 'name_or_path', None)
+                                new_adapter = load_videox_control_adapter(name_or_path=name_or_path, device=self.device_torch, torch_dtype=get_torch_dtype(self.train_config.dtype))
+                                try:
+                                    from toolkit.control_util import set_adapter_name_if_missing
+                                    set_adapter_name_if_missing(new_adapter, name_or_path or '<unknown>')
+                                except Exception:
+                                    pass
+                                # Replace both sd.controlnet and process adapter for consistency
+                                self.sd.controlnet = new_adapter
+                                self.adapter = new_adapter
+                                try:
+                                    from toolkit.print import print_acc
+                                    print_acc(f"[CONTROLNET] Replaced model-provided ControlNet with VideoX/Z-Image adapter for {name_or_path}")
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                try:
+                                    from toolkit.print import print_acc
+                                    print_acc(f"[CONTROLNET] VideoX replacement attempt failed and strict parity is required: {e}")
+                                except Exception:
+                                    pass
+                                raise RuntimeError(f"Model-provided ControlNet looks like Z-Image/VideoX but replacement via VideoX loader failed: {e}") from e
+
+                    except Exception as e:
+                        # Wrapping is required for VideoX/zimage-style adapters; fail fast to avoid silently running
+                        # with an incompatible adapter which will break training/runtime assumptions.
+                        raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping failed: {e}") from e
+            except Exception as e:
+                # Detection failing indicates misconfiguration or unexpected adapter shape; fail fast.
+                raise RuntimeError(f"ControlNet zimage detection failed: {e}")
+
+            # Ensure the VideoX wrapper is applied even when `self.adapter` was already assigned earlier
+            # (some model-loading code paths pre-assign adapters before we reach the assignment branch above).
+            try:
+                from toolkit.control_util import adapter_uses_zimage
+                cfg_src = getattr(self, 'adapter_config', None) or getattr(self, 'model_config', None)
+                is_zimage = adapter_uses_zimage(getattr(self.sd, 'controlnet', None), cfg_src)
+                if not is_zimage:
+                    for ds in getattr(self, 'dataset_configs', []):
+                        if getattr(ds, 'controlnet_mode', None) and str(ds.controlnet_mode).lower() in ('zimage', 'video_x'):
+                            is_zimage = True
+                            break
+
+                if is_zimage:
+                    # don't double-wrap
+                    try:
+                        from toolkit.controlnet_compat import VideoXControlnetWrapper
+                        from toolkit.print import print_acc
+                        try:
+                            print_acc(f"[CONTROLNET] Unconditional wrapper step: current adapter class={getattr(self, 'adapter').__class__.__name__}, adapter_config_mode={getattr(self, 'adapter_config', None) and getattr(self.adapter_config, 'controlnet_mode', None)}")
+                        except Exception as e:
+                            raise RuntimeError(f"Failed to print unconditional wrapper step info: {e}") from e
+                        if not isinstance(getattr(self, 'adapter', None), VideoXControlnetWrapper):
+                            try:
+                                print_acc("[CONTROLNET] Attempting unconditional VideoXControlnetWrapper application")
+                            except Exception as e:
+                                raise RuntimeError(f"Failed to print unconditional wrapper attempt: {e}") from e
+                            try:
+                                self.adapter = VideoXControlnetWrapper(self.adapter)
+                                try:
+                                    print_acc('[CONTROLNET] Wrapped zimage controlnet with VideoXControlnetWrapper for signature compatibility.')
+                                except Exception as e:
+                                    raise RuntimeError(f"Failed to print VideoX wrapper success message: {e}") from e
+                            except Exception as e:
+                                # If the wrapper failed due to a missing `control_context` parameter
+                                # try applying a small legacy-to-videox shim which maps common
+                                # legacy kw names (e.g., `controlnet_cond`) to the required
+                                # `control_context` kw before re-wrapping. This keeps fail-fast
+                                # behavior for truly incompatible adapters but allows common
+                                # legacy ControlNetModel instances to be used without requiring
+                                # source changes upstream.
+                                msg = str(e)
+                                if "missing required parameter 'control_context'" in msg or 'missing required parameter "control_context"' in msg or 'missing required parameter' in msg:
+                                    try:
+                                        from toolkit.controlnet_compat import ControlNetLegacyAdapter
+                                        try:
+                                            print_acc('[CONTROLNET] VideoX wrapper failed due to missing `control_context`; attempting legacy shim')
+                                        except Exception:
+                                            pass
+                                        old_adapter = getattr(self, 'adapter')
+                                        self.adapter = ControlNetLegacyAdapter(old_adapter)
+                                        # Attempt to wrap again
+                                        try:
+                                            self.adapter = VideoXControlnetWrapper(self.adapter)
+                                            try:
+                                                print_acc('[CONTROLNET] Applied legacy shim and successfully wrapped adapter.')
+                                            except Exception:
+                                                pass
+                                        except Exception as se:
+                                            raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping failed after applying legacy shim: {se}") from se
+                                    except Exception as se:
+                                        raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping+shim failed: {se}") from se
+                                else:
+                                    raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping failed: {e}") from e
+                        else:
+                            try:
+                                print_acc('[CONTROLNET] Adapter already wrapped with VideoXControlnetWrapper; skipping')
+                            except Exception as e:
+                                raise RuntimeError(f"Failed to print adapter already wrapped message: {e}") from e
+                    except Exception as e:
+                        raise RuntimeError(f"ControlNet zimage detection failed during unconditional wrapper step: {e}") from e
+            except Exception as e:
+                raise RuntimeError(f"ControlNet zimage detection failed: {e}")
+
+            # Check datasets for control information (accept both legacy `control_type` and UI `controls` list)
+            has_control_data = False
+            for dataset in self.dataset_configs:
+                if (getattr(dataset, 'control_type', None) is not None and dataset.control_type != 'none') or (getattr(dataset, 'controls', None)):
+                    has_control_data = True
+                    break
+            if not has_control_data:
+                raise RuntimeError("ControlNet is enabled but no dataset has 'controls' or 'control_type' set. Aborting training.")
+
+        # If this adapter looks like a VideoX / Z-Image style ControlNet, prefer explicit
+        # zimage routing instead of attempting a model dry-run which may fail due to
+        # differing control input expectations (list vs tensor, stacked frames, etc.).
+        try:
+            from toolkit.control_util import adapter_uses_zimage
+            cfg_src = getattr(self, 'adapter_config', None) or getattr(self, 'model_config', None)
+            if adapter_uses_zimage(getattr(self.sd, 'controlnet', None), cfg_src):
+                # Use the existing print helper if available
+                if hasattr(self, 'print_and_status_update'):
+                    try:
+                        self.print_and_status_update("[CONTROLNET-REROUTE] Adapter detected as VideoX/zimage-style; skipping ControlNet dry-run and using explicit zimage routing at training time.")
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to emit CONTROLNET-REROUTE status: {e}") from e
+                else:
+                    try:
+                        from toolkit.print import print_acc
+                        print_acc("[CONTROLNET-REROUTE] Adapter detected as VideoX/zimage-style; skipping ControlNet dry-run and using explicit zimage routing at training time.")
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to print CONTROLNET-REROUTE status: {e}") from e
+                return
+        except Exception:
+            # best-effort only; fall back to dry-run behavior on error
+            pass
+
+        # Dry-run checks removed by policy: avoid signature/shape guessing in automated training.
+        try:
+            try:
+                from toolkit.print import print_acc
+                print_acc("[CONTROLNET DRY-RUN] Skipped by policy: dry-run removed")
+            except Exception:
+                pass
+        except Exception as e:
+            raise RuntimeError(f"ControlNet verification skipped due to: {e}") from e
+
+            sample_stack_flat = _flatten_frames(sample_stack)
+            cap_stack_flat = _flatten_frames(cap_stack)
+
+            # small logger used by helper functions
+            def _log(msg):
+                if hasattr(self, 'print_and_status_update'):
+                    try:
+                        self.print_and_status_update(msg)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to emit status update: {e}") from e
+                else:
+                    try:
+                        from toolkit.print import print_acc
+                        print_acc(msg)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to print status using print_acc: {e}") from e
+
+            # Use centralized helpers to adapt control images and noisy latents.
+            try:
+                from toolkit.control_channels import adapt_control_images, adapt_noisy_latents_for_adapter
+
+                # Adapt control and sample tensors (collapse frames, trim/pad channels)
+                # For Z-Image style adapters (VideoX), skip adapting raw pixel controls here
+                # and let the Z-Image pipeline perform deterministic encoding & assembly.
+                from toolkit.control_util import adapter_uses_zimage
+                cfg_src = getattr(self, 'adapter_config', None) or getattr(self, 'model_config', None)
+                is_zimage = adapter_uses_zimage(self.sd.controlnet if getattr(self, 'sd', None) is not None else None, cfg_src)
+                if is_zimage:
+                    try:
+                        from toolkit.print import print_acc
+                        print_acc("[CONTROLNET DRY-RUN] Z-Image adapter detected; skipping control_images adaptation in dry-run")
+                    except Exception:
+                        pass
+                    cap_expected = None
+                    # leave cap_tensor and cap_stack_flat as-provided; do not call adapt_control_images
+                else:
+                    cap_tensor, cap_expected = adapt_control_images(cap_tensor, self.sd.controlnet if getattr(self, 'sd', None) is not None else None)
+                    cap_stack_flat, _ = adapt_control_images(cap_stack_flat, self.sd.controlnet if getattr(self, 'sd', None) is not None else None)
+                # Do not adapt sample_stack_flat here; keep as-is for dry-run
+                sample_stack_flat = sample_stack_flat
+                # For noisy latents, prefer explicit inference from adapter
+                try:
+                    expected_in_ch = None
+                    try:
+                        from toolkit.control_util import infer_expected_in_ch as _infer
+                        expected_in_ch = _infer(self.sd.controlnet) if getattr(self, 'sd', None) is not None else None
+                    except Exception:
+                        expected_in_ch = None
+                    sample_tensor = adapt_noisy_latents_for_adapter(sample_tensor, expected_in_ch)
+                except Exception:
+                    # leave sample_tensor unchanged on failure
+                    pass
+
+                # Perform a single deterministic dry-run call and fail-fast if it's incompatible.
+                import inspect
+                call_fn = getattr(self.sd.controlnet, 'forward', getattr(self.sd.controlnet, '__call__', None))
+                if call_fn is None:
+                    raise RuntimeError("ControlNet adapter has no callable forward or __call__ method for dry-run checks")
+
+                # Map common kw names conservatively
+                sig = None
+                param_names = []
+                try:
+                    sig = inspect.signature(call_fn)
+                    param_names = list(sig.parameters.keys())
+                except Exception:
+                    param_names = []
+
+                kwargs = {}
+                for name in param_names:
+                    n = name.lower()
+                    if 'sample' in n or 'input' in n or n in ('x', 'images', 'image', 'img'):
+                        kwargs[name] = sample_tensor
+                    elif 'time' in n or n in ('t', 'timestep'):
+                        kwargs[name] = timestep
+                    elif any(h in n for h in ('control', 'cond', 'controlnet', 'cap', 'cap_feats', 'cap_feat', 'control_image', 'control_images', 'control_video', 'control_context', 'control_latents')):
+                        kwargs[name] = cap_tensor
+
+                # If no suitable kwarg names, try common positional calls with named keys as fallback
+                try:
+                    _ = call_fn(**kwargs)
+                except TypeError as e:
+                    # Before failing, run adapter diagnostics with the tensors we supplied
+                    try:
+                        from toolkit.control_diagnostics import diagnose_adapter, inspect_adapter
+                        print_acc("[CONTROLNET DRY-RUN] Dry-run TypeError; emitting diagnostics...")
+                        try:
+                            inspect_adapter(self.sd.controlnet)
+                            diagnose_adapter(self.sd.controlnet, sample_tensor, cap_tensor)
+                        except Exception as dd_e:
+                            print_acc(f"[CONTROLNET DRY-RUN] diagnostics failed: {dd_e}")
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"ControlNet dry-run forward failed with TypeError: {e}. Provided shapes: sample={getattr(sample_tensor,'shape',None)} cap={getattr(cap_tensor,'shape',None)}. Consider verifying adapter compatibility or dataset control preprocessing.") from e
+            except Exception as e:
+                try:
+                    from toolkit.control_diagnostics import diagnose_adapter, inspect_adapter
+                    print_acc("[CONTROLNET DRY-RUN] Dry-run exception; emitting diagnostics...")
+                    try:
+                        inspect_adapter(self.sd.controlnet)
+                        diagnose_adapter(self.sd.controlnet, sample_tensor, cap_tensor)
+                    except Exception as dd_e:
+                        print_acc(f"[CONTROLNET DRY-RUN] diagnostics failed: {dd_e}")
+                except Exception:
+                    pass
+                raise RuntimeError(f"ControlNet dry-run forward failed: {e}")
+
+
+                return call
+
+            candidate_meta = []
+            for s_desc, s_t in sample_variants:
+                for c_desc, c_t in cap_variants:
+                    candidate_meta.append((f"sig_kw:{s_desc}|{c_desc}", _build_call(s_t, c_t, as_list=False)))
+                    candidate_meta.append((f"sig_kw_list:{s_desc}|{c_desc}", _build_call(s_t, c_t, as_list=True)))
+                    # Also try the case where flattened versions are passed in (if available) - these are already included as variants
+                    candidate_meta.append((f"sig_kw_flat:{s_desc}|{c_desc}", _build_call(s_t, c_t, as_list=False)))
+
+            # Iterate candidates and report which variant succeeded first. Capture tracebacks for diagnostics.
+            last_exc = None
+            success_meta = None
+            for idx, (meta_desc, call) in enumerate(candidate_meta):
+                # Emit shapes/dtypes of relevant tensors for diagnostics before attempting the call
+                try:
+                    sample_stack_shape = getattr(sample_stack, 'shape', None)
+                    sample_stack_flat_shape = getattr(sample_stack_flat, 'shape', None)
+                    cap_stack_shape = getattr(cap_stack, 'shape', None)
+                    cap_stack_flat_shape = getattr(cap_stack_flat, 'shape', None)
+                    sample_tensor_shape = getattr(sample_tensor, 'shape', None)
+                    timestep_shape = getattr(timestep, 'shape', None)
+                    _log(f"[CONTROLNET DRY-RUN] Candidate {idx} ({meta_desc}): sample_tensor={sample_tensor_shape}, sample_stack={sample_stack_shape}, sample_stack_flat={sample_stack_flat_shape}, cap_stack={cap_stack_shape}, cap_stack_flat={cap_stack_flat_shape}, timestep={timestep_shape}")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to emit candidate diagnostic shapes for dry-run: {e}") from e
+
+                try:
+                    _ = call()
+                    last_exc = None
+                    success_meta = meta_desc
+                    _log(f"[CONTROLNET DRY-RUN] Candidate {idx} ({meta_desc}): succeeded")
+                    break
+                except TypeError as e:
+                    last_exc = e
+                    _log(f"[CONTROLNET DRY-RUN] Candidate {idx} ({meta_desc}): TypeError: {e}\n{traceback.format_exc().splitlines()[-1]}")
+                    continue
+                except AttributeError as e:
+                    last_exc = e
+                    _log(f"[CONTROLNET DRY-RUN] Candidate {idx} ({meta_desc}): AttributeError: {e}\n{traceback.format_exc().splitlines()[-1]}")
+                    continue
+                except Exception as e:
+                    last_exc = e
+                    _log(f"[CONTROLNET DRY-RUN] Candidate {idx} ({meta_desc}): Exception: {type(e).__name__}: {e}\n{traceback.format_exc().splitlines()[-1]}")
+                    continue
+
+            if success_meta is not None:
+                _log(f"[CONTROLNET DRY-RUN] Forward succeeded with variant: {success_meta}")
+
+            # After a single deterministic attempt, fail fast and provide a clear error message.
+            if last_exc is not None:
+                raise RuntimeError(f"ControlNet dry-run forward failed after deterministic attempt: {last_exc}. Aborting dry-run to avoid guessing and potentially corrupt training behavior.") from last_exc
+
+
+        except Exception as e:
+            raise RuntimeError(f"ControlNet dry-run forward failed: {e}")
+
+        if hasattr(self, 'print_and_status_update'):
+            self.print_and_status_update("ControlNet training setup verified")
+        else:
+            try:
+                from toolkit.print import print_acc
+                print_acc("ControlNet training setup verified")
+            except Exception as e:
+                raise RuntimeError(f"Failed to emit ControlNet verification message: {e}") from e
+
     def sample(self, step=None, is_first=False):
         if not self.accelerator.is_main_process:
             return
@@ -716,6 +1184,71 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return params
 
     def hook_before_train_loop(self):
+        # Fail-fast preflight checks for ControlNet and datasets (run BEFORE any accelerator/model preps)
+        # 1) If controlnet enabled in the model config, ensure at least one dataset has a control_type
+        try:
+            if getattr(self.model_config, 'controlnet_enabled', False):
+                # Support both legacy 'control_type' and newer 'controls' list on DatasetConfig
+                def dataset_has_controls(ds):
+                    if getattr(ds, 'controls', None):
+                        return True
+                    return bool(getattr(ds, 'control_type', None))
+
+                has_control_dataset = any(dataset_has_controls(ds) for ds in self.dataset_configs)
+                if not has_control_dataset:
+                    raise RuntimeError("ControlNet is enabled but no dataset has 'controls' or 'control_type' set. Aborting training.")
+
+                # Ensure at least one of controlnet_name_or_path or controlnet_file is present
+                if not (getattr(self.model_config, 'controlnet_name_or_path', None) or getattr(self.model_config, 'controlnet_file', None)):
+                    raise RuntimeError("controlnet_enabled=True but neither 'controlnet_name_or_path' nor 'controlnet_file' is set in ModelConfig. Aborting training.")
+
+                # Validate that required optional libs exist for heavy-weight control types
+                heavy_controls = {'pose', 'openpose', 'depth'}
+                for ds in self.dataset_configs:
+                    controls = []
+                    if getattr(ds, 'controls', None):
+                        controls = list(getattr(ds, 'controls'))
+                    elif getattr(ds, 'control_type', None):
+                        controls = [getattr(ds, 'control_type')]
+                    for ctrl in controls:
+                        if ctrl and str(ctrl).lower() in heavy_controls:
+                            # these control types require optional packages; prefer explicit errors
+                            try:
+                                # try light-weight detection: controlnet_aux is a common provider
+                                import controlnet_aux  # type: ignore
+                            except Exception:
+                                raise RuntimeError(
+                                    f"Dataset requests control type '{ctrl}' which requires optional packages (e.g., 'controlnet-aux' or 'easy_dwpose'). "
+                                    "Install with 'pip install controlnet-aux' or provide precomputed control images, or change the dataset 'controls' to a supported lighter type (e.g., 'canny'). Aborting training."
+                                )
+
+                # RAM check: recommend streaming if host RAM < 64GB
+                try:
+                    import psutil
+                    ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+                    if ram_gb < 64 and not getattr(self.model_config, 'controlnet_streaming', False):
+                        # Previously we aborted here; prefer a clear, actionable message but allow loader to auto-fallback.
+                        raise RuntimeError("Host RAM appears to be <64GB and controlnet_streaming is not enabled in ModelConfig. Set controlnet_streaming=True or use a host with more RAM. Aborting training.")
+
+                    # If the ControlNet checkpoint file exists locally, check its size relative to available RAM
+                    try:
+                        if getattr(self.model_config, 'controlnet_name_or_path', None) and getattr(self.model_config, 'controlnet_file', None):
+                            candidate = os.path.join(self.model_config.controlnet_name_or_path, self.model_config.controlnet_file)
+                            if os.path.exists(candidate):
+                                file_bytes = os.path.getsize(candidate)
+                                avail = psutil.virtual_memory().available
+                                if file_bytes > (avail * 0.6) and not getattr(self.model_config, 'controlnet_streaming', False):
+                                    # Warn proactively: loader will fall back to streaming if needed
+                                    self.print_and_status_update("ControlNet checkpoint is large compared to available RAM. The loader will auto-fallback to streaming to avoid OOM; consider setting `controlnet_streaming=True` explicitly.")
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to assess ControlNet checkpoint file size vs RAM: {e}") from e
+                except Exception:
+                    # psutil not available; skip strict RAM check, but recommend setting streaming
+                    raise RuntimeError("Required system library 'psutil' not available for RAM checks; install it or set controlnet_streaming=True")
+        except Exception as e:
+            # Ensure we fail early with a clear message
+            raise
+
         if self.accelerator.is_main_process:
             self.logger.start()
         self.prepare_accelerator()
@@ -1470,21 +2003,54 @@ class BaseSDTrainProcess(BaseTrainProcess):
             load_from_path = self.adapter_config.name_or_path
             if latest_save_path is not None:
                 load_from_path = latest_save_path
-            self.adapter = ControlNetModel.from_pretrained(
-                load_from_path,
-                torch_dtype=get_torch_dtype(self.train_config.dtype),
-            )
-            # Default behavior: ControlNet adapters are frozen by default to provide
-            # stable spatial conditioning while lightweight adapters (LoRA/LoKr) train.
-            # Log this to make the behavior explicit. If finetuning is desired, set
-            # `adapter.train = True` in the adapter config.
+
+            # If this adapter is Z-Image/VideoX-style (explicit opt-in or name hints),
+            # prefer the VideoX loader which instantiates a proper Flux2/Z-Image adapter
+            # rather than loading a legacy `ControlNetModel` that expects `controlnet_cond`.
             try:
-                if not self.adapter_config.train:
-                    print_acc(f"[CONTROLNET] Loaded ControlNet adapter (frozen). To finetune, set adapter.train = True in your config.")
-                else:
-                    print_acc(f"[CONTROLNET] Loaded ControlNet adapter (finetuning enabled). Watch memory usage when training ControlNet weights.")
+                from toolkit.control_util import adapter_uses_zimage
             except Exception:
-                pass
+                adapter_uses_zimage = lambda a, b: False
+
+            loaded_videox = False
+            if adapter_uses_zimage(None, self.adapter_config):
+                # Detection says Z-Image; we must construct a proper VideoX adapter.
+                from extensions_built_in.diffusion_models.z_image_adapter import load_videox_control_adapter
+                self.adapter = load_videox_control_adapter(name_or_path=load_from_path, device=self.device_torch, torch_dtype=get_torch_dtype(self.train_config.dtype))
+                # ensure adapter has a name for diagnostics
+                try:
+                    from toolkit.control_util import set_adapter_name_if_missing
+                    set_adapter_name_if_missing(self.adapter, load_from_path)
+                except Exception:
+                    pass
+                try:
+                    print_acc(f"[CONTROLNET] Loaded VideoX/Z-Image adapter via dedicated loader for {load_from_path}")
+                except Exception:
+                    pass
+                # Keep sd.controlnet in sync with the loaded adapter when model repo
+                try:
+                    self.sd.controlnet = self.adapter
+                except Exception:
+                    pass
+                loaded_videox = True
+
+            if not loaded_videox:
+                # Fallback: load standard ControlNetModel from diffusers
+                self.adapter = ControlNetModel.from_pretrained(
+                    load_from_path,
+                    torch_dtype=get_torch_dtype(self.train_config.dtype),
+                )
+                # Default behavior: ControlNet adapters are frozen by default to provide
+                # stable spatial conditioning while lightweight adapters (LoRA/LoKr) train.
+                # Log this to make the behavior explicit. If finetuning is desired, set
+                # `adapter.train = True` in the adapter config.
+                try:
+                    if not self.adapter_config.train:
+                        print_acc(f"[CONTROLNET] Loaded ControlNet adapter (frozen). To finetune, set adapter.train = True in your config.")
+                    else:
+                        print_acc(f"[CONTROLNET] Loaded ControlNet adapter (finetuning enabled). Watch memory usage when training ControlNet weights.")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to print ControlNet adapter load status: {e}") from e
         elif self.adapter_config.type == 'clip':
             self.adapter = ClipVisionAdapter(
                 sd=self.sd,
@@ -1540,6 +2106,53 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.load_training_state_from_metadata(latest_save_path)
         # set trainable params
         self.sd.adapter = self.adapter
+
+    def _format_progress_bar(self, learning_rate, loss_dict):
+        """Return a safe, compact string describing learning rate and loss metrics suitable for progress bar.
+        Handles numbers, torch tensors, and nested dicts gracefully.
+        """
+        import numbers
+        s = f"lr: {learning_rate:.1e}"
+        if loss_dict is None:
+            return s
+        for key, value in loss_dict.items():
+            # Detect torch tensors without requiring torch import at top-level
+            try:
+                from torch import Tensor as _Tensor
+                is_tensor = isinstance(value, _Tensor)
+            except Exception:
+                is_tensor = False
+            if is_tensor:
+                try:
+                    if value.numel() == 1:
+                        s += f" {key}: {float(value.item()):.3e}"
+                    else:
+                        s += f" {key}: tensor{tuple(value.shape)}"
+                except Exception:
+                    s += f" {key}: {repr(value)}"
+            elif isinstance(value, numbers.Number):
+                s += f" {key}: {value:.3e}"
+            elif isinstance(value, dict):
+                for k2, v2 in value.items():
+                    try:
+                        is_tensor2 = isinstance(v2, _Tensor)
+                    except Exception:
+                        is_tensor2 = False
+                    if is_tensor2:
+                        try:
+                            if v2.numel() == 1:
+                                s += f" {key}.{k2}: {float(v2.item()):.3e}"
+                            else:
+                                s += f" {key}.{k2}: tensor{tuple(v2.shape)}"
+                        except Exception:
+                            s += f" {key}.{k2}: {repr(v2)}"
+                    elif isinstance(v2, numbers.Number):
+                        s += f" {key}.{k2}: {v2:.3e}"
+                    else:
+                        s += f" {key}.{k2}: {v2}"
+            else:
+                s += f" {key}: {value}"
+        return s
 
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
@@ -1600,6 +2213,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         
         self.hook_after_sd_init_before_load()
         # run base sd process run
+        # Load the model (match upstream behavior: fail fast if tokenizer is missing).
         self.sd.load_model()
         
         # compile the model if needed
@@ -1617,6 +2231,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # model is loaded from BaseSDProcess
         unet = self.sd.unet
         vae = self.sd.vae
+        # Fail-fast guard: VAE is required for encoding/decoding latents used in training
+        if vae is None:
+            raise RuntimeError("VAE not loaded; cannot proceed with training. Ensure the model provides a VAE (set model_config.vae_path if needed)")
         tokenizer = self.sd.tokenizer
         text_encoder = self.sd.text_encoder
         noise_scheduler = self.sd.noise_scheduler
@@ -2194,7 +2811,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.torch_profiler is not None:
                 self.torch_profiler.start()
             did_oom = False
-            loss_dict = None9
+            loss_dict = None
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
@@ -2253,9 +2870,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
-                    prog_bar_string = f"lr: {learning_rate:.1e}"
-                    for key, value in loss_dict.items():
-                        prog_bar_string += f" {key}: {value:.3e}"
+                    prog_bar_string = self._format_progress_bar(learning_rate, loss_dict)
 
                     if self.progress_bar is not None:
                         self.progress_bar.set_postfix_str(prog_bar_string)

@@ -517,8 +517,17 @@ class Flex2(BaseModel):
                 if control_tensor.shape[2] != batch.tensor.shape[2] or control_tensor.shape[3] != batch.tensor.shape[3]:
                     control_tensor = F.interpolate(control_tensor, size=(batch.tensor.shape[2], batch.tensor.shape[3]), mode='bilinear')
                 
-                # encode it
-                control_latent = self.encode_images(control_tensor).to(latents.device, latents.dtype)
+                # encode it (use tiled control encoding when available)
+                if getattr(self, 'model_config', None) is not None and getattr(self.model_config, 'control_use_tiling', False) and hasattr(self, 'encode_control_images'):
+                    # Only pass the `tile` flag; size/overlap are model-specific and should use defaults
+                    ctl = self.encode_control_images(control_tensor, tile=True)
+                elif hasattr(self, 'encode_control_images'):
+                    ctl = self.encode_control_images(control_tensor, tile=False) 
+                else:
+                    ctl = self.encode_images(control_tensor)
+                if isinstance(ctl, list):
+                    ctl = ctl[0]
+                control_latent = ctl.to(latents.device, latents.dtype)
                 
             # inpainting always comes first
             control_latent = torch.cat((inpainting_latent, control_latent), dim=1)

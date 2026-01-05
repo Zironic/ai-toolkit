@@ -205,6 +205,74 @@ export default function SimpleJob({
               placeholder=""
               required
             />
+
+            {/* ControlNet repo or path for model-level ControlNet loading */}
+            <TextInput
+              label="ControlNet (Name or Path)"
+              value={jobConfig.config.process[0].model.controlnet_name_or_path ?? ''}
+              docKey="config.process[0].model.controlnet_name_or_path"
+              onChange={(value: string | null) => {
+                if (value?.trim() === '') {
+                  value = null;
+                }
+                setJobConfig(value, 'config.process[0].model.controlnet_name_or_path');
+                // also ensure the flag is enabled for convenience
+                if (value && value !== '') {
+                  setJobConfig(true, 'config.process[0].model.controlnet_enabled');
+                }
+              }}
+              placeholder="eg. C:\\path\\to\\controlnet_repo or owner/repo"
+            />
+
+            {/* Explicit enable toggle for ControlNet (previously implicit) */}
+            <FormGroup label="ControlNet">
+              <Checkbox
+                label="Enable ControlNet"
+                checked={jobConfig.config.process[0].model.controlnet_enabled || false}
+                onChange={value => setJobConfig(value, 'config.process[0].model.controlnet_enabled')}
+                docKey="config.process[0].model.controlnet_enabled"
+              />
+
+              {/* Reveal additional ControlNet options when enabled */}
+              {jobConfig.config.process[0].model.controlnet_enabled && (
+                <div className="pt-2">
+                  <TextInput
+                    label="ControlNet File (optional)"
+                    value={jobConfig.config.process[0].model.controlnet_file ?? ''}
+                    docKey="config.process[0].model.controlnet_file"
+                    onChange={(value: string | null) => {
+                      if (value?.trim() === '') {
+                        value = null;
+                      }
+                      setJobConfig(value, 'config.process[0].model.controlnet_file');
+                    }}
+                    placeholder="e.g., ckpt.safetensors (optional when using repo path)"
+                  />
+
+                  <Checkbox
+                    label="Use streaming load (recommended for low RAM)"
+                    checked={jobConfig.config.process[0].model.controlnet_streaming || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].model.controlnet_streaming')}
+                    docKey="config.process[0].model.controlnet_streaming"
+                  />
+
+                  <SelectInput
+                    label="Offload Strategy"
+                    value={jobConfig.config.process[0].model.controlnet_offload_strategy || 'none'}
+                    onChange={value => setJobConfig(value, 'config.process[0].model.controlnet_offload_strategy')}
+                    options={[{ value: 'none', label: 'none' }, { value: 'cpu', label: 'cpu' }, { value: 'sequential', label: 'sequential' }]}
+                    docKey="config.process[0].model.controlnet_offload_strategy"
+                  />
+
+                  <Checkbox
+                    label="Auto Output Shim (train.set)"
+                    checked={jobConfig.config.process[0].train.controlnet_auto_output_shim || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.controlnet_auto_output_shim')}
+                    docKey="config.process[0].train.controlnet_auto_output_shim"
+                  />
+                </div>
+              )}
+            </FormGroup>
             {modelArch?.additionalSections?.includes('model.assistant_lora_path') && (
               <TextInput
                 label="Training Adapter Path"
@@ -748,7 +816,7 @@ export default function SimpleJob({
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].folder_path`)}
                         options={datasetOptions}
                       />
-                      {modelArch?.additionalSections?.includes('datasets.control_path') && (
+                      {(jobConfig.config.process[0].model.controlnet_enabled || modelArch?.additionalSections?.includes('datasets.control_path')) && (
                         <SelectInput
                           label="Control Dataset"
                           docKey="datasets.control_path"
@@ -760,7 +828,7 @@ export default function SimpleJob({
                           options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
                         />
                       )}
-                      {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (
+                      {(jobConfig.config.process[0].model.controlnet_enabled || modelArch?.additionalSections?.includes('datasets.multi_control_paths')) && (
                         <>
                           <SelectInput
                             label="Control Dataset 1"
@@ -827,6 +895,25 @@ export default function SimpleJob({
                         min={0}
                         required
                       />
+
+                      {/* Dataset Controls: visible when ControlNet is enabled */}
+                      {jobConfig.config.process[0].model.controlnet_enabled && (
+                        <FormGroup label="Controls" className="pt-2">
+                          {(modelArch?.controls ?? ['canny', 'depth', 'line', 'pose', 'inpaint']).map(ctrl => (
+                            <Checkbox
+                              key={ctrl}
+                              label={ctrl}
+                              checked={(dataset.controls || []).includes(ctrl)}
+                              onChange={value => {
+                                const current = new Set(dataset.controls || []);
+                                if (value) current.add(ctrl);
+                                else current.delete(ctrl);
+                                setJobConfig(Array.from(current), `config.process[0].datasets[${i}].controls`);
+                              }}
+                            />
+                          ))}
+                        </FormGroup>
+                      )}
                       {modelArch?.additionalSections?.includes('datasets.num_frames') && (
                         <NumberInput
                           label="Num Frames"
@@ -918,7 +1005,7 @@ export default function SimpleJob({
                 onClick={() => {
                   const newDataset = objectCopy(defaultDatasetConfig);
                   // automaticallt add the controls for a new dataset
-                  const controls = modelArch?.controls ?? [];
+                  const controls = modelArch?.controls ?? (jobConfig.config.process[0].model.controlnet_enabled ? ['canny','depth','line','pose','inpaint'] : []);
                   newDataset.controls = controls;
                   setJobConfig([...jobConfig.config.process[0].datasets, newDataset], 'config.process[0].datasets');
                 }}
@@ -1206,7 +1293,7 @@ export default function SimpleJob({
                           />
                         </div>
                       </div>
-                      {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (
+                      {(jobConfig.config.process[0].model.controlnet_enabled || modelArch?.additionalSections?.includes('datasets.multi_control_paths')) && (
                         <FormGroup label="Control Images" className="pt-2 ml-4">
                           <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mt-2 mt-2">
                             {['ctrl_img_1', 'ctrl_img_2', 'ctrl_img_3'].map((ctrlKey, ctrl_idx) => (
@@ -1229,7 +1316,7 @@ export default function SimpleJob({
                           </div>
                         </FormGroup>
                       )}
-                      {modelArch?.additionalSections?.includes('sample.ctrl_img') && (
+                      {(jobConfig.config.process[0].model.controlnet_enabled || modelArch?.additionalSections?.includes('sample.ctrl_img')) && (
                         <SampleControlImage
                           className="mt-6 ml-4"
                           src={sample.ctrl_img}
