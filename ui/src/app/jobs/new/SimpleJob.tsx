@@ -666,6 +666,89 @@ export default function SimpleJob({
                     }}
                   />
                 </FormGroup>
+
+                <FormGroup label="Masked Reconstruction" className="pt-2">
+                  <NumberInput
+                    label="Masked Recon Weight"
+                    value={jobConfig.config.process[0].train.masked_recon_weight ?? 0.5}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.masked_recon_weight')}
+                    min={0}
+                    step={0.01}
+                  />
+                  <SelectInput
+                    label="Mask Type"
+                    className="pt-2"
+                    value={jobConfig.config.process[0].train.masked_recon_type || 'illum'}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.masked_recon_type')}
+                    options={[
+                      { value: 'illum', label: 'Illumination (default)' },
+                      { value: 'edge', label: 'Edge-aware' },
+                      { value: 'control', label: 'Control-derived (OpenPose)' },
+                      { value: 'custom', label: 'Custom (dataset-provided mask)' },
+                    ]}
+                  />
+                  <TextInput
+                    label="Custom Mask Key"
+                    className="pt-2"
+                    value={jobConfig.config.process[0].train.masked_recon_mask_key ?? ''}
+                    onChange={(value: string | null) => {
+                      if (value?.trim() === '') {
+                        value = null;
+                      }
+                      setJobConfig(value, 'config.process[0].train.masked_recon_mask_key');
+                    }}
+                    placeholder="FileItemDTO attribute name (for custom)"
+                  />
+                  <Checkbox
+                    label="Freeze ControlNet"
+                    className="pt-2"
+                    checked={jobConfig.config.process[0].train.controlnet_frozen || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.controlnet_frozen')}
+                    docKey="train.controlnet_frozen"
+                  />
+                  <FormGroup label="Mask Preview (debug)">
+                    <Checkbox
+                      label="Enable Mask Preview"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].train.mask_preview_enabled || false}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.mask_preview_enabled')}
+                    />
+                    <NumberInput
+                      label="Max Steps to Save"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.mask_preview_max_steps || 10}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.mask_preview_max_steps')}
+                      min={1}
+                      step={1}
+                    />
+                    <NumberInput
+                      label="Samples per Step"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.mask_preview_samples_per_step || 2}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.mask_preview_samples_per_step')}
+                      min={1}
+                      step={1}
+                    />
+                    <TextInput
+                      label="Save Path Template"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.mask_preview_save_path || 'output/{job_name}/masks'}
+                      onChange={(value: string | null) => {
+                        if (value?.trim() === '') {
+                          value = null;
+                        }
+                        setJobConfig(value, 'config.process[0].train.mask_preview_save_path');
+                      }}
+                      placeholder="output/{job_name}/masks"
+                    />
+                    <Checkbox
+                      label="Overwrite Existing"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].train.mask_preview_overwrite || false}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.mask_preview_overwrite')}
+                    />
+                  </FormGroup>
+                </FormGroup>
               </div>
               <div>
                 {disableSections.includes('train.diff_output_preservation') ||

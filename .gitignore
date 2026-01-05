@@ -188,3 +188,4 @@ controlnet_sample*
 .gitignore
 ui/test-results/*
 
+tmp*

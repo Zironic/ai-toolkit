@@ -1954,9 +1954,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if noisy_latent_multiplier != 1.0:
                 noisy_latents = noisy_latents * noisy_latent_multiplier
 
-            # remove grads for these
-            noisy_latents.requires_grad = False
-            noisy_latents = noisy_latents.detach()
+            # remove grads for these unless masked reconstruction (or other aux losses) require gradients
+            try:
+                mr_weight = float(getattr(self.train_config, 'masked_recon_weight', 0.0))
+            except Exception:
+                mr_weight = 0.0
+
+            if mr_weight == 0.0:
+                noisy_latents.requires_grad = False
+                noisy_latents = noisy_latents.detach()
+            else:
+                # preserve grad tracking so auxiliary losses (e.g., masked reconstruction) can backprop
+                noisy_latents.requires_grad = True
+                try:
+                    print_acc(f"[DEBUG-FIX] preserving noisy_latents.grad because masked_recon_weight={mr_weight}")
+                except Exception:
+                    pass
+
+            # noise itself can remain detached for now
             noise.requires_grad = False
             noise = noise.detach()
 

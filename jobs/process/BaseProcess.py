@@ -1,7 +1,7 @@
 import copy
 import json
 from collections import OrderedDict
-
+from toolkit.print import print_acc
 from toolkit.timer import Timer
 
 
@@ -21,9 +21,31 @@ class BaseProcess(object):
         self.name = self.get_conf('name', self.job.name)
         self.meta = copy.deepcopy(self.job.meta)
         self.timer: Timer = Timer(f'{self.name} Timer')
+        # Add a composite hook that prints aggregated ControlNet vs Model timings
+        # so users can quickly see how heavy ControlNet work is relative to model work.
+        self.timer.add_after_print_hook(self._print_timer_composites)
         self.performance_log_every = self.get_conf('performance_log_every', 0)
 
         print(json.dumps(self.config, indent=4))
+
+    def _print_timer_composites(self, timing_dict):
+        """Print a concise composite summary for ControlNet and Model timings.
+        timing_dict maps timer_name -> average_seconds.
+        """
+
+        control_keys = [
+            'get_adapter_images', 'encode_adapter', 'encode_adapter_embeds', 'use_precomputed_control_residuals', 'get_mask_multiplier'
+        ]
+        model_keys = [
+            'predict_unet', 'calculate_loss', 'backward', 'optimizer_step', 'ema_update'
+        ]
+        control_total = sum([timing_dict.get(k, 0.0) for k in control_keys])
+        model_total = sum([timing_dict.get(k, 0.0) for k in model_keys])
+        other_total = max(0.0, sum(timing_dict.values()) - control_total - model_total)
+        # print a single-line concise summary
+        from toolkit.logging_aitk import print_acc
+        print_acc(f"PERF SUMMARY: ControlNet: {control_total:.4f}s avg | Model: {model_total:.4f}s avg | Other: {other_total:.4f}s avg")
+
         
     def on_error(self, e: Exception):
         pass

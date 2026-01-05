@@ -419,6 +419,28 @@ class TrainConfig:
         self.controlnet_aux_loss: str = kwargs.get('controlnet_aux_loss', 'none')
         self.controlnet_aux_loss_weight: float = kwargs.get('controlnet_aux_loss_weight', 1.0)
 
+        # Masked reconstruction (LumiCtrl-style) — opt-in auxiliary loss
+        self.masked_recon_weight: float = kwargs.get('masked_recon_weight', 0.5)  # default enabled; set >0 to enable masked reconstruction
+        self.masked_recon_type: str = kwargs.get('masked_recon_type', 'illum')  # 'illum'|'edge'|'custom'
+        self.masked_recon_mask_key: Optional[str] = kwargs.get('masked_recon_mask_key', None)  # dataset-provided mask attribute name
+        # Control-derived mask tuning
+        self.masked_recon_control_threshold: float = kwargs.get('masked_recon_control_threshold', 0.05)
+        self.masked_recon_control_dilate: int = kwargs.get('masked_recon_control_dilate', 7)
+        self.masked_recon_control_blur: int = kwargs.get('masked_recon_control_blur', 9)
+        # Reference resolution used to create masks (build mask at this size then downsample to target)
+        self.masked_recon_control_ref_max_size: int = kwargs.get('masked_recon_control_ref_max_size', 1024)
+        # Auto-scale dilate based on detected control bbox fraction (useful for full-image controls)
+        self.masked_recon_control_dilate_auto: bool = kwargs.get('masked_recon_control_dilate_auto', True)
+        self.masked_recon_control_dilate_scale_factor: float = kwargs.get('masked_recon_control_dilate_scale_factor', 4.0)
+        # Mask preview/debugging options
+        self.mask_preview_enabled: bool = kwargs.get('mask_preview_enabled', False)
+        self.mask_preview_max_steps: int = kwargs.get('mask_preview_max_steps', 10)
+        self.mask_preview_samples_per_step: int = kwargs.get('mask_preview_samples_per_step', 2)
+        self.mask_preview_save_path: str = kwargs.get('mask_preview_save_path', 'output/{job_name}/masks')
+        self.mask_preview_overwrite: bool = kwargs.get('mask_preview_overwrite', False)
+        # Option to freeze ControlNet/adapter parameters during fine-tuning
+        self.controlnet_frozen: bool = kwargs.get('controlnet_frozen', False)
+
         self.noise_multiplier = kwargs.get('noise_multiplier', 1.0)
         self.target_noise_multiplier = kwargs.get('target_noise_multiplier', 1.0)
         self.random_noise_multiplier = kwargs.get('random_noise_multiplier', 0.0)

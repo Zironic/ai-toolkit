@@ -2027,16 +2027,42 @@ class SDTrainer(BaseSDTrainProcess):
             return SDTrainer.compute_adapter_multiplier(is_t2i, match_adapter_assist, self.device_torch, dtype)
 
         # Helper: compute and optionally apply masked reconstruction loss
-
+        def _apply_masked_recon_loss_local(current_loss):
+            # Lightweight wrapper to call class method; keeps local scope simple
+            try:
+                loss_out, mloss = self._compute_and_apply_masked_recon_loss(current_loss, noisy_latents, imgs, batch, dtype)
+                return loss_out, mloss
+            except Exception as e:
+                print(f"[MASKED_RECON] failed: {e}")
+                return current_loss, None
 
         # initialize masked recon logger
         masked_recon_logged = None
 
         # flush()
 
+    def _compute_and_apply_masked_recon_loss(self, current_loss, noisy_latents, imgs, batch, dtype):
+        """Thin wrapper: delegate masked reconstruction to `toolkit.masked_recon.apply_masked_recon_loss`.
+        Returns (loss, mloss_tensor_or_None)
+        """
+        try:
+            from toolkit.masked_recon import apply_masked_recon_loss
+        except Exception:
+            return current_loss, None
 
+        try:
+            return apply_masked_recon_loss(current_loss, self.train_config, self.sd, noisy_latents, imgs, batch, dtype, self.device_torch)
+        except Exception as e:
+            try:
+                print_acc(f"[MASKED_RECON] helper failure: {e}")
+            except Exception:
+                print(f"[MASKED_RECON] helper failure: {e}")
+            return current_loss, None
 
-        # enter grad setup section
+        # legacy masked-recon implementation removed; wrapper delegates to `toolkit.masked_recon`
+        return current_loss, None
+
+        # BEGIN_REMOVE
         with self.timer('grad_setup'):
             # text encoding
             grad_on_text_encoder = False
@@ -3458,6 +3484,7 @@ class SDTrainer(BaseSDTrainProcess):
                         raise RuntimeError(f"Failed to add entries to dataset aggregator: {e}") from e
                 except Exception as e:
                     raise RuntimeError(f"Unexpected error in training loop helper: {e}") from e
+        # END_REMOVE
         return entries
 
 

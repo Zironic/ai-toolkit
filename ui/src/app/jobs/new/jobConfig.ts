@@ -91,6 +91,17 @@ export const defaultJobConfig: JobConfig = {
           diff_output_preservation_class: 'person',
           switch_boundary_every: 1,
           loss_type: 'mse',
+          // Masked reconstruction defaults (enabled by default)
+          masked_recon_weight: 0.5,
+          masked_recon_type: 'illum',
+          masked_recon_mask_key: null,
+          // Mask preview/debug options
+          mask_preview_enabled: false,
+          mask_preview_max_steps: 10,
+          mask_preview_samples_per_step: 2,
+          mask_preview_save_path: 'output/{job_name}/masks',
+          mask_preview_overwrite: false,
+          controlnet_frozen: false,
         },
         logging: {
           log_every: 1,

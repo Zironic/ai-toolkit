@@ -1,6 +1,55 @@
 import torch
 from .llvae import LosslessLatentEncoder
 
+EPS = 1e-9
+
+
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+    """Compute per-pixel MSE weighted by `mask`.
+    pred/target: (B, C, H, W) or (B, H, W)
+    mask: (B, 1, H, W) or (B, H, W) in [0,1]
+    returns scalar
+    """
+    if mask is None:
+        raise ValueError("mask must not be None for masked_mse")
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    # broadcast
+    mask = mask.to(pred.device, dtype=pred.dtype)
+    denom = mask.sum(dim=[1, 2, 3]) + EPS
+    mse = ((pred - target) ** 2) * mask
+    loss = (mse.sum(dim=[1, 2, 3]) / denom).mean()
+    return loss
+
+
+def luminance_mask_from_images(img: torch.Tensor, target: torch.Tensor, blur_kernel: int = 9):
+    """Return a soft mask highlighting luminance differences between img and target.
+    img/target: torch.Tensor (B,C,H,W) in [0,1]
+    returns mask (B,1,H,W) in [0,1]
+    """
+    if img.dim() != 4 or target.dim() != 4:
+        raise ValueError("img and target must be 4D tensors (B,C,H,W)")
+
+    def luminance(x):
+        # x assumed in [0,1]
+        return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+
+    diff = (luminance(img) - luminance(target)).abs()
+
+    k = int(blur_kernel)
+    if k <= 1:
+        mask = diff
+    else:
+        # Use avg pool as a simple blur to avoid extra deps
+        pool = torch.nn.AvgPool2d(kernel_size=k, stride=1, padding=k // 2)
+        mask = pool(diff)
+
+    # normalize per-sample
+    max_per_sample = mask.view(mask.shape[0], -1).amax(dim=1).view(-1, 1, 1, 1)
+    mask = mask / (max_per_sample + 1e-9)
+    return mask.clamp(0.0, 1.0)
+
+
 
 def total_variation(image):
     """

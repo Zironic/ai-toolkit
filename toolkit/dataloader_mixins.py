@@ -1123,10 +1123,14 @@ class ControlFileItemDTOMixin:
 
     def load_control_image(self: 'FileItemDTO'):
         control_tensors = []
-        control_path_list = self.control_path
-        if not isinstance(self.control_path, list):
-            control_path_list = [self.control_path]
-        
+        # If no explicit `control_path` is set, fall back to the file path itself so
+        # tests and ad-hoc consumers that set `full_size_control_images = True`
+        # can still call `load_control_image()` and get the processed image.
+        if self.control_path is None:
+            control_path_list = [self.path]
+        else:
+            control_path_list = self.control_path if isinstance(self.control_path, list) else [self.control_path]
+
         for control_path in control_path_list:
             try:
                 img = Image.open(control_path)
