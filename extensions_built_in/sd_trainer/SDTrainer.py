@@ -1655,27 +1655,18 @@ class SDTrainer(BaseSDTrainProcess):
                                 if 'batch_resized' in locals() and isinstance(batch_resized, torch.Tensor):
                                     B2, C2, H2, W2 = batch_resized.shape
                                     tag_tensor(stored, f'precompute:control_latents:size={int(size)}:orig={H}x{W}:padded={H2}x{W2}')
-                                # Mark when we used the dataset-processed image unmodified (exact match)
-                                try:
-                                    if locals().get('used_dataset_control', False):
-                                        tag_tensor(stored, 'precompute:used_dataset_image')
-                                except Exception:
-                                    pass
                                 else:
-                                    pass
-                                
-                            else:
-                                tag_tensor(stored, f'precompute:control_latents:size={int(size)}:orig={H}x{W}')
-                                try:
-                                    if locals().get('used_dataset_control', False):
+                                    tag_tensor(stored, f'precompute:control_latents:size={int(size)}:orig={H}x{W}')
+
+                                # Mark when we used the dataset-processed image unmodified (exact match)
+                                if locals().get('used_dataset_control', False):
+                                    try:
                                         tag_tensor(stored, 'precompute:used_dataset_image')
-                                except Exception:
-                                    pass
+                                    except Exception:
+                                        pass
                             except Exception:
-                                tag_tensor(stored, f'precompute:control_latents:size={int(size)}')
                                 try:
-                                    if locals().get('used_dataset_control', False):
-                                        tag_tensor(stored, 'precompute:used_dataset_image')
+                                    tag_tensor(stored, f'precompute:control_latents:size={int(size)}')
                                 except Exception:
                                     pass
                         except Exception:
