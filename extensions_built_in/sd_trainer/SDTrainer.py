@@ -1545,6 +1545,7 @@ class SDTrainer(BaseSDTrainProcess):
 
                     # Normalize to batch shape for helper and precompute per size
                     for size in sizes:
+                        used_dataset_control = False
                         if imgs.ndim == 3:
                             batch_imgs = imgs.unsqueeze(0)
                         else:
@@ -1563,29 +1564,29 @@ class SDTrainer(BaseSDTrainProcess):
                             if getattr(fi, 'full_size_control_images', False):
                                 # If requested `size` equals the current long side, keep as-is.
                                 current_long = max(H, W)
-                                        if int(size) == int(current_long) and (H % 16 == 0 and W % 16 == 0):
-                                        batch_resized = batch_imgs.to(torch.float32)
-                                        used_dataset_control = True
+                                if int(size) == int(current_long) and (H % 16 == 0 and W % 16 == 0):
+                                    batch_resized = batch_imgs.to(torch.float32)
+                                    used_dataset_control = True
+                                else:
+                                    # Rescale preserving aspect so long side == size, then pad to multiple of 16.
+                                    scale = float(size) / float(current_long) if current_long > 0 else 1.0
+                                    new_h = max(1, int(round(H * scale)))
+                                    new_w = max(1, int(round(W * scale)))
+                                    scaled = torch.nn.functional.interpolate(batch_imgs.to(torch.float32), size=(new_h, new_w), mode='bilinear', align_corners=False)
+                                    pad_h = _pad_to_mult(new_h, 16)
+                                    pad_w = _pad_to_mult(new_w, 16)
+                                    # Center-pad symmetrically to better match dataset behavior
+                                    if pad_h != new_h or pad_w != new_w:
+                                        pad_right = pad_w - new_w
+                                        pad_bottom = pad_h - new_h
+                                        pad_left = pad_right // 2
+                                        pad_top = pad_bottom // 2
+                                        pad_right = pad_right - pad_left
+                                        pad_bottom = pad_bottom - pad_top
+                                        # pad format: (left, right, top, bottom)
+                                        batch_resized = torch.nn.functional.pad(scaled, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0.0)
                                     else:
-                                        # Rescale preserving aspect so long side == size, then pad to multiple of 16.
-                                        scale = float(size) / float(current_long) if current_long > 0 else 1.0
-                                        new_h = max(1, int(round(H * scale)))
-                                        new_w = max(1, int(round(W * scale)))
-                                        scaled = torch.nn.functional.interpolate(batch_imgs.to(torch.float32), size=(new_h, new_w), mode='bilinear', align_corners=False)
-                                        pad_h = _pad_to_mult(new_h, 16)
-                                        pad_w = _pad_to_mult(new_w, 16)
-                                        # Center-pad symmetrically to better match dataset behavior
-                                        if pad_h != new_h or pad_w != new_w:
-                                            pad_right = pad_w - new_w
-                                            pad_bottom = pad_h - new_h
-                                            pad_left = pad_right // 2
-                                            pad_top = pad_bottom // 2
-                                            pad_right = pad_right - pad_left
-                                            pad_bottom = pad_bottom - pad_top
-                                            # pad format: (left, right, top, bottom)
-                                            batch_resized = torch.nn.functional.pad(scaled, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0.0)
-                                        else:
-                                            batch_resized = scaled
+                                        batch_resized = scaled
                             else:
                                 # Legacy behavior for non-full-size control images: force square to requested size
                                 if H != size or W != size:
