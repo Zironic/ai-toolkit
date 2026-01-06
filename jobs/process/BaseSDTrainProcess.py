@@ -2965,8 +2965,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                             try:
                                                 # special-case per-example lists: optionally write histograms and sample scalars
                                                 if key == 'per_example' and (getattr(self.train_config, 'log_per_example_to_tensorboard', False) or getattr(self.logging_config, 'log_per_example_to_tensorboard', False)):
-                                                    import numpy as np
-                                                    import os
                                                     try:
                                                         # extract loss list
                                                         losses = [e.get('loss', 0.0) for e in value]
