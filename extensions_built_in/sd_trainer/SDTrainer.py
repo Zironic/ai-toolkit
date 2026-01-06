@@ -417,6 +417,25 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
+        # Attempt to load any per-dataset SplitPrompt embeddings that may have been cached during dataset preprocessing
+        try:
+            if getattr(self, 'datasets', None) is not None:
+                for ds in self.datasets:
+                    key = getattr(ds, 'folder_path', ds.dataset_path if getattr(ds, 'dataset_path', None) else None)
+                    if key is None:
+                        continue
+                    split_path = os.path.join(key, 'split_prompt.safetensors')
+                    if os.path.exists(split_path):
+                        try:
+                            sp = PromptEmbeds.load(split_path)
+                            sp = sp.to(self.device_torch, dtype=self.sd.torch_dtype).detach()
+                            self.dataset_split_prompt_embeds[key] = sp
+                            print_acc(f"[SplitPrompt] Loaded split prompt embedding for dataset {key}")
+                        except Exception as e:
+                            print_acc(f"[SplitPrompt] Failed to load split prompt for dataset {key}: {e}")
+        except Exception:
+            pass
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         if self.is_caching_text_embeddings:
@@ -1129,6 +1148,63 @@ class SDTrainer(BaseSDTrainProcess):
             # non-fatal: if anything goes wrong, don't break training
             self.last_example_losses = None
             self.last_example_loss_components = None
+
+        # --- New: compute per-example applied-noise norms and loss/noise ratios for diagnostics ---
+        try:
+            eps = 1e-12
+            # Determine per-sample sigma (scale applied to the sampled normal noise)
+            applied_sigmas = None
+            if hasattr(batch, 'sigmas') and batch.sigmas is not None:
+                # batch.sigmas may be shape (B,) or (B,1,1,1)
+                applied_sigmas = batch.sigmas.to(self.device_torch)
+                if applied_sigmas.dim() == 1:
+                    applied_sigmas = applied_sigmas.view(-1, 1, 1, 1)
+            elif hasattr(self.sd, 'noise_scheduler') and hasattr(self.sd.noise_scheduler, 'timesteps') and hasattr(self.sd.noise_scheduler, 'sigmas'):
+                try:
+                    ns = self.sd.noise_scheduler
+                    train_timesteps = ns.timesteps.clone().detach()
+                    train_sigmas = ns.sigmas.clone().detach()
+                    sigma_list = []
+                    # timesteps may be a tensor-like; iterate and match index
+                    for t in timesteps.view(-1):
+                        matches = (train_timesteps == t).nonzero(as_tuple=False)
+                        if matches.numel() == 0:
+                            # fallback to 1.0 if we couldn't find a sigma
+                            sigma_list.append(torch.tensor(1.0, device=self.device_torch, dtype=noise.dtype))
+                        else:
+                            sigma_list.append(train_sigmas[matches[0].item()].to(self.device_torch, dtype=noise.dtype))
+                    applied_sigmas = torch.stack(sigma_list).view(-1, 1, 1, 1)
+                except Exception:
+                    applied_sigmas = torch.ones((noise.shape[0], 1, 1, 1), device=self.device_torch, dtype=noise.dtype)
+            else:
+                applied_sigmas = torch.ones((noise.shape[0], 1, 1, 1), device=self.device_torch, dtype=noise.dtype)
+
+            # Compute applied noise (the actual perturbation added to latents)
+            applied_noise = noise * applied_sigmas
+            # L2 norm per-example over channels/spatial dims
+            noise_norms = torch.linalg.vector_norm(applied_noise, ord=2, dim=(1, 2, 3))
+            # per-example ratio (loss is still unreduced per-example vector)
+            per_sample_ratio = (per_sample + eps) / (noise_norms + eps)
+
+            # Attach CPU copies for external inspection and logging
+            self.last_noise_norms = noise_norms.detach().cpu()
+            # scalar sigmas per sample
+            try:
+                self.last_noise_sigmas = applied_sigmas.view(applied_sigmas.shape[0]).detach().cpu()
+            except Exception:
+                self.last_noise_sigmas = None
+            self.last_loss_over_noise = per_sample_ratio.detach().cpu()
+        except Exception as e:
+            # non-fatal: don't break training if logging diagnostics fails
+            # store None so downstream code knows diagnostics were unavailable
+            self.last_noise_norms = None
+            self.last_noise_sigmas = None
+            self.last_loss_over_noise = None
+            # record diagnostic traceback for visibility and debugging
+            # print a concise, safe diagnostic so the issue is visible in logs
+            print_acc(f"[LOSS-DIAG] Failed to compute noise diagnostics: {str(e)}")
+
+
 
         loss = loss.mean()
 
@@ -3438,6 +3514,29 @@ class SDTrainer(BaseSDTrainProcess):
                     self._control_batch_count += 1
                 self._total_batch_count += 1
                 self._last_batch_has_control = batch_has_control
+
+                # Determine whether this batch uses a per-dataset SplitPrompt embedding
+                try:
+                    batch_has_splitprompt = False
+                    batch_splitprompt_key = None
+                    for fi in batch.file_items:
+                        ds_cfg = getattr(fi, 'dataset_config', None)
+                        if ds_cfg is None:
+                            continue
+                        key = getattr(ds_cfg, 'dataset_path', None) or getattr(ds_cfg, 'folder_path', None)
+                        if key is None:
+                            continue
+                        if getattr(ds_cfg, 'split_prompt_enabled', False):
+                            # Confirm we have a cached embedding for that dataset (loaded or saved earlier)
+                            if key in getattr(self, 'dataset_split_prompt_embeds', {}):
+                                batch_has_splitprompt = True
+                                batch_splitprompt_key = key
+                                break
+                    self._last_batch_has_splitprompt = batch_has_splitprompt
+                    self._last_batch_splitprompt_key = batch_splitprompt_key
+                except Exception:
+                    self._last_batch_has_splitprompt = False
+                    self._last_batch_splitprompt_key = None
                 
                 if self.train_config.do_guidance_loss and isinstance(self.train_config.guidance_loss_target, list):
                     batch_size = noisy_latents.shape[0]
@@ -3849,20 +3948,76 @@ class SDTrainer(BaseSDTrainProcess):
 
         # Control-related metrics (diagnostics & monitoring)
         try:
-            loss_dict['train/controlnet_enabled'] = 1.0 if getattr(self.sd, 'is_controlnet_enabled', False) else 0.0
-            # last_batch_has_control reflects the most recent processed batch
-            loss_dict['train/batch_has_control'] = float(getattr(self, '_last_batch_has_control', False))
-            loss_dict['train/control_usage_rate'] = float(self._control_batch_count) / max(1.0, float(self._total_batch_count))
-            loss_dict['train/controlnet_offload_active'] = 1.0 if getattr(self, '_last_batch_offload_active', False) else 0.0
-            # Report masked reconstruction metric if present
+            # Build debug flags as strings (so they are not treated as numeric loss scalars)
+            debug_flags = {}
             try:
-                if 'masked_recon_logged' in locals() and masked_recon_logged is not None:
-                    loss_dict['masked_recon'] = float(masked_recon_logged)
+                # Report whether any control usage occurred as a debug boolean (true/false)
+                control_usage = float(getattr(self, '_control_batch_count', 0.0)) / max(1.0, float(getattr(self, '_total_batch_count', 0.0)))
+                debug_flags['control_usage_rate'] = 'true' if control_usage > 0.0 else 'false'
+
+                debug_flags['controlnet_enabled'] = 'true' if getattr(self.sd, 'is_controlnet_enabled', False) else 'false'
+                debug_flags['batch_has_control'] = 'true' if getattr(self, '_last_batch_has_control', False) else 'false'
+                debug_flags['controlnet_offload_active'] = 'true' if getattr(self, '_last_batch_offload_active', False) else 'false'
+                debug_flags['splitprompt'] = 'true' if getattr(self, '_last_batch_has_splitprompt', False) else 'false'
+                debug_flags['splitprompt_dataset'] = str(getattr(self, '_last_batch_splitprompt_key', '') or '')
+                # expose whether noise diagnostics failed so it doesn't silently vanish
+                debug_flags['loss_over_noise_failed'] = 'true' if getattr(self, '_last_noise_diag_exc', None) is not None else 'false'
+            except Exception:
+                debug_flags = {'control_usage_rate': 'false', 'controlnet_enabled': 'false', 'batch_has_control': 'false', 'controlnet_offload_active': 'false', 'splitprompt': 'false', 'splitprompt_dataset': '', 'loss_over_noise_failed': 'false'}
+
+            # Attach debug flags as a dictionary (strings) for diagnostics
+            loss_dict['debug_flags'] = debug_flags
+
+            # Also emit a concise, separate log line for these flags
+            try:
+                flags_msg = ' '.join([f"{k}={v}" for k, v in debug_flags.items() if v != ''])
+                print_acc(f"[FLAGS] {flags_msg}")
+            except Exception:
+                pass
+
+            # Expose noise diagnostics if available (mean values)
+            try:
+                self._attach_noise_metrics_to_loss_dict(loss_dict)
             except Exception:
                 pass
         except Exception:
-            # Do not let metrics logging break training
+            # non-fatal: metrics/debug flag assembly failed
             pass
+
+    def _attach_noise_metrics_to_loss_dict(self, loss_dict: dict):
+        """Attach aggregated noise diagnostics into loss_dict if per-sample diagnostics exist."""
+        try:
+            if getattr(self, 'last_noise_norms', None) is not None:
+                mean_noise = float(self.last_noise_norms.mean().item())
+                loss_over_noise_mean = float(self.last_loss_over_noise.mean().item()) if getattr(self, 'last_loss_over_noise', None) is not None else None
+                loss_dict['train/noise_mean'] = mean_noise
+                if loss_over_noise_mean is not None:
+                    loss_dict['train/loss_over_noise'] = loss_over_noise_mean
+                # optional: include sigma mean if it exists
+                if getattr(self, 'last_noise_sigmas', None) is not None:
+                    try:
+                        loss_dict['train/noise_sigma_mean'] = float(self.last_noise_sigmas.mean().item())
+                    except Exception:
+                        pass
+                # concise log line
+                try:
+                    lmsg = f"mean_noise={mean_noise:.6g}"
+                    if loss_over_noise_mean is not None:
+                        lmsg = lmsg + f" mean_loss_over_noise={loss_over_noise_mean:.6g}"
+                    print_acc(f"[NOISE] {lmsg}")
+                except Exception:
+                    pass
+            # If earlier diagnostic failed, expose a sentinel and short error to help debugging
+            if getattr(self, '_last_noise_diag_exc', None) is not None:
+                loss_dict['train/loss_over_noise_status'] = 'failed'
+                # add a short excerpt of the traceback to avoid spamming logs
+                try:
+                    loss_dict['train/loss_over_noise_err'] = str(getattr(self, '_last_noise_diag_exc'))[:200]
+                except Exception:
+                    loss_dict['train/loss_over_noise_err'] = 'failed (no message)'
+        except Exception as e:
+            # non-fatal: log the error for diagnostics but do not abort training
+            print_acc(f"[METRICS-ERR] failed to attach noise diagnostics: {e}")
 
         # collect per-example losses from the processed batches if available
         per_example = []
@@ -3870,6 +4025,30 @@ class SDTrainer(BaseSDTrainProcess):
             # Use helper that only logs per-example entries for simple runs (batch=1 and no accumulation)
             entries = self._maybe_log_per_example(batch, len(batch_list))
             if entries:
+                # Augment entries with noise diagnostics if available and lengths match
+                try:
+                    lon = getattr(self, 'last_loss_over_noise', None)
+                    lnn = getattr(self, 'last_noise_norms', None)
+                    lsig = getattr(self, 'last_noise_sigmas', None)
+                    # If these diagnostics exist and align with entries, attach per-entry values
+                    if lon is not None and lnn is not None and len(entries) == len(lon):
+                        for i, e in enumerate(entries):
+                            try:
+                                e['loss_over_noise'] = float(lon[i])
+                            except Exception:
+                                e['loss_over_noise'] = None
+                            try:
+                                e['noise_norm'] = float(lnn[i])
+                            except Exception:
+                                e['noise_norm'] = None
+                            try:
+                                e['noise_sigma'] = float(lsig[i]) if lsig is not None else None
+                            except Exception:
+                                e['noise_sigma'] = None
+                except Exception as e:
+                    # don't fail per-example collection if annotation fails
+                    print_acc(f"[METRICS-ERR] failed to attach per-example losses noise diagnostics: {e}")
+
                 per_example.extend(entries)
 
             from toolkit.util.loss_utils import aggregate_by_dataset, flag_bad_captions

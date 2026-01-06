@@ -2960,9 +2960,51 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             if self.accelerator.is_main_process:
                                 if self.writer is not None:
                                     if loss_dict is not None:
+                                        # standard scalar entries
                                         for key, value in loss_dict.items():
-                                            self.writer.add_scalar(f"{key}", value, self.step_num)
-                                        self.writer.add_scalar(f"lr", learning_rate, self.step_num)
+                                            try:
+                                                # special-case per-example lists: optionally write histograms and sample scalars
+                                                if key == 'per_example' and (getattr(self.train_config, 'log_per_example_to_tensorboard', False) or getattr(self.logging_config, 'log_per_example_to_tensorboard', False)):
+                                                    import numpy as np
+                                                    import os
+                                                    try:
+                                                        # extract loss list
+                                                        losses = [e.get('loss', 0.0) for e in value]
+                                                        if getattr(self.train_config, 'log_per_example_histogram', True):
+                                                            try:
+                                                                self.writer.add_histogram('per_example/loss', np.array(losses), self.step_num)
+                                                            except Exception:
+                                                                pass
+                                                        # write a small set of sample per-example scalars (stable by index)
+                                                        max_n = getattr(self.train_config, 'max_per_example_to_tb', 10)
+                                                        for idx, e in enumerate(value[:max_n]):
+                                                            tag = f"per_example_samples/{idx}_{os.path.basename(e.get('path',''))}"
+                                                            try:
+                                                                self.writer.add_scalar(tag, float(e.get('loss', 0.0)), self.step_num)
+                                                            except Exception:
+                                                                pass
+                                                        # also write loss_over_noise mean if present
+                                                        lon = [e.get('loss_over_noise') for e in value if e.get('loss_over_noise') is not None]
+                                                        if len(lon) > 0:
+                                                            try:
+                                                                self.writer.add_scalar('per_example/loss_over_noise_mean', float(sum(lon) / len(lon)), self.step_num)
+                                                            except Exception:
+                                                                pass
+                                                    except Exception:
+                                                        pass
+                                                else:
+                                                    try:
+                                                        self.writer.add_scalar(f"{key}", value, self.step_num)
+                                                    except Exception:
+                                                        pass
+                                            except Exception:
+                                                # ensure one bad metric doesn't break logging
+                                                pass
+                                        # always log lr
+                                        try:
+                                            self.writer.add_scalar(f"lr", learning_rate, self.step_num)
+                                        except Exception:
+                                            pass
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
                         

@@ -530,6 +530,10 @@ class TrainConfig:
 
         # Loss logging and caption checking
         self.log_per_example: bool = kwargs.get('log_per_example', False)
+        # Per-example TensorBoard logging: optional and off by default because it can be heavy
+        self.log_per_example_to_tensorboard: bool = kwargs.get('log_per_example_to_tensorboard', False)
+        self.max_per_example_to_tb: int = kwargs.get('max_per_example_to_tb', 10)
+        self.log_per_example_histogram: bool = kwargs.get('log_per_example_histogram', True)
         self.max_examples_print: int = kwargs.get('max_examples_print', 50)
         self.log_per_dataset: bool = kwargs.get('log_per_dataset', True)
         self.flag_bad_captions: bool = kwargs.get('flag_bad_captions', True)
@@ -927,6 +931,9 @@ class DatasetConfig:
         self.dataset_path: str = kwargs.get('dataset_path', None)
 
         self.default_caption: str = kwargs.get('default_caption', None)
+        # SplitPrompt - optional per-dataset style prompt used for SplitPrompt routing
+        self.split_prompt: str = kwargs.get('split_prompt', None)
+        self.split_prompt_enabled: bool = kwargs.get('split_prompt_enabled', False)
         # trigger word for just this dataset
         self.trigger_word: str = kwargs.get('trigger_word', None)
         random_triggers = kwargs.get('random_triggers', [])

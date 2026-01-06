@@ -2198,6 +2198,33 @@ class TextEmbeddingCachingMixin:
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
             print_acc(" - Saving text embeddings to disk")
             
+            # If a per-dataset SplitPrompt is configured, encode and save it now (so the trainer or later stages can load it)
+            try:
+                ds_cfg = self.dataset_config
+                sp_enabled = bool(getattr(ds_cfg, 'split_prompt_enabled', False))
+                sp_text = getattr(ds_cfg, 'split_prompt', None)
+                if sp_enabled and sp_text and str(sp_text).strip() != '':
+                    try:
+                        encode_kwargs = {}
+                        if self.sd.encode_control_in_text_embeddings:
+                            # use a blank control image placeholder similar to generator
+                            control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            if self.sd.has_multiple_control_images:
+                                control_image = [control_image]
+                            encode_kwargs['control_images'] = control_image
+                        sp_emb = self.sd.encode_prompt(sp_text, **encode_kwargs)
+                        sp_emb = sp_emb.to('cpu')
+                        split_path = os.path.join(self.dataset_path, 'split_prompt.safetensors')
+                        sp_emb.save(split_path)
+                        # also cache in-memory on the dataset object for immediate use
+                        self.split_prompt_embeds = sp_emb
+                        print_acc(f"[SplitPrompt] Saved split prompt embedding to {split_path}")
+                    except Exception as e:
+                        print_acc(f"[SplitPrompt] Failed to save split prompt for dataset {self.dataset_path}: {e}")
+            except Exception:
+                # do not fail caching for other datasets if this check fails
+                pass
+
             did_move = False
 
             # use tqdm to show progress
