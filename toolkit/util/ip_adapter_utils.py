@@ -23,8 +23,20 @@ class AttnProcessor(nn.Module):
         encoder_hidden_states=None,
         attention_mask=None,
         temb=None,
+        block_idx: int | None = None,
+        per_block_prompt_embeds: dict | None = None,
     ):
         residual = hidden_states
+
+        # allow falling back to attn.block_idx or processor attribute if not explicitly passed
+        if block_idx is None:
+            block_idx = getattr(attn, 'block_idx', None)
+        if block_idx is None:
+            block_idx = getattr(self, 'block_idx', None)
+
+        # allow per_block_prompt_embeds to be attached to the attention module or the processor for convenience
+        if per_block_prompt_embeds is None:
+            per_block_prompt_embeds = getattr(attn, 'per_block_prompt_embeds', None) or getattr(self, 'per_block_prompt_embeds', None)
 
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
@@ -53,6 +65,31 @@ class AttnProcessor(nn.Module):
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(
                 encoder_hidden_states)
+
+        # per-block PromptEmbeds override (Option A)
+        # If provided, override encoder_hidden_states for this block with the per-block PromptEmbeds
+        if block_idx is not None:
+            if per_block_prompt_embeds is not None:
+                try:
+                    pe = per_block_prompt_embeds.get(int(block_idx))
+                except Exception:
+                    pe = None
+                if pe is not None:
+                    enc_override = getattr(pe, 'text_embeds', None)
+                    if enc_override is None:
+                        raise RuntimeError(f"Per-block PromptEmbeds for block {block_idx} missing text_embeds")
+                    # Handle classifier-free guidance doubling if necessary
+                    if encoder_hidden_states is not None and hasattr(encoder_hidden_states, 'shape') and hasattr(enc_override, 'shape'):
+                        enc_bs = encoder_hidden_states.shape[0]
+                        override_bs = enc_override.shape[0]
+                        if enc_bs == override_bs:
+                            encoder_hidden_states = enc_override
+                        elif enc_bs == override_bs * 2:
+                            encoder_hidden_states = torch.cat([enc_override, enc_override], dim=0)
+                        else:
+                            raise RuntimeError(f"Per-block PromptEmbeds batch mismatch for block {block_idx}: override {override_bs} vs expected {enc_bs}")
+                    else:
+                        encoder_hidden_states = enc_override
 
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
@@ -116,8 +153,43 @@ class IPAttnProcessor(nn.Module):
         encoder_hidden_states=None,
         attention_mask=None,
         temb=None,
+        block_idx: int | None = None,
+        per_block_prompt_embeds: dict | None = None,
     ):
         residual = hidden_states
+
+        # allow falling back to attn.block_idx or processor attribute if not explicitly passed
+        if block_idx is None:
+            block_idx = getattr(attn, 'block_idx', None)
+        if block_idx is None:
+            block_idx = getattr(self, 'block_idx', None)
+
+        # per-block PromptEmbeds override (Option A)
+        # If provided, override encoder_hidden_states for this block with the per-block PromptEmbeds
+        if block_idx is not None:
+            if per_block_prompt_embeds is None:
+                per_block_prompt_embeds = getattr(attn, 'per_block_prompt_embeds', None) or getattr(self, 'per_block_prompt_embeds', None)
+            if per_block_prompt_embeds is not None:
+                try:
+                    pe = per_block_prompt_embeds.get(int(block_idx))
+                except Exception:
+                    pe = None
+                if pe is not None:
+                    enc_override = getattr(pe, 'text_embeds', None)
+                    if enc_override is None:
+                        raise RuntimeError(f"Per-block PromptEmbeds for block {block_idx} missing text_embeds")
+                    # If encoder_hidden_states is present, we will replace it similarly to AttnProcessor
+                    if encoder_hidden_states is not None and hasattr(encoder_hidden_states, 'shape') and hasattr(enc_override, 'shape'):
+                        enc_bs = encoder_hidden_states.shape[0]
+                        override_bs = enc_override.shape[0]
+                        if enc_bs == override_bs:
+                            encoder_hidden_states = enc_override
+                        elif enc_bs == override_bs * 2:
+                            encoder_hidden_states = torch.cat([enc_override, enc_override], dim=0)
+                        else:
+                            raise RuntimeError(f"Per-block PromptEmbeds batch mismatch for block {block_idx}: override {override_bs} vs expected {enc_bs}")
+                    else:
+                        encoder_hidden_states = enc_override
 
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
@@ -218,8 +290,16 @@ class AttnProcessor2_0(torch.nn.Module):
         encoder_hidden_states=None,
         attention_mask=None,
         temb=None,
+        block_idx: int | None = None,
+        per_block_prompt_embeds: dict | None = None,
     ):
         residual = hidden_states
+
+        # allow falling back to attn.block_idx or processor attribute if not explicitly passed
+        if block_idx is None:
+            block_idx = getattr(attn, 'block_idx', None)
+        if block_idx is None:
+            block_idx = getattr(self, 'block_idx', None)
 
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
@@ -254,6 +334,33 @@ class AttnProcessor2_0(torch.nn.Module):
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(
                 encoder_hidden_states)
+
+        # per-block PromptEmbeds override (Option A)
+        # If provided, override encoder_hidden_states for this block with the per-block PromptEmbeds
+        if block_idx is not None:
+            if per_block_prompt_embeds is None:
+                per_block_prompt_embeds = getattr(attn, 'per_block_prompt_embeds', None) or getattr(self, 'per_block_prompt_embeds', None)
+            if per_block_prompt_embeds is not None:
+                try:
+                    pe = per_block_prompt_embeds.get(int(block_idx))
+                except Exception:
+                    pe = None
+                if pe is not None:
+                    enc_override = getattr(pe, 'text_embeds', None)
+                    if enc_override is None:
+                        raise RuntimeError(f"Per-block PromptEmbeds for block {block_idx} missing text_embeds")
+                    # Handle classifier-free guidance doubling if necessary
+                    if encoder_hidden_states is not None and hasattr(encoder_hidden_states, 'shape') and hasattr(enc_override, 'shape'):
+                        enc_bs = encoder_hidden_states.shape[0]
+                        override_bs = enc_override.shape[0]
+                        if enc_bs == override_bs:
+                            encoder_hidden_states = enc_override
+                        elif enc_bs == override_bs * 2:
+                            encoder_hidden_states = torch.cat([enc_override, enc_override], dim=0)
+                        else:
+                            raise RuntimeError(f"Per-block PromptEmbeds batch mismatch for block {block_idx}: override {override_bs} vs expected {enc_bs}")
+                    else:
+                        encoder_hidden_states = enc_override
 
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)

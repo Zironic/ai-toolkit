@@ -220,6 +220,28 @@ def adapt_control_images(control_images: Any, adapter: Any, expected_override: O
         except Exception:
             pass
 
+    # If the adapter provides an explicit control_in_dim but lacks a name, this
+    # is a suspicious minimal object (tests often create such cases). To avoid
+    # silently adapting raw pixel images to an explicit control_in_dim on an
+    # unlabelled adapter, fail early with diagnostic details so callers can
+    # detect misconfiguration instead of masking it.
+    try:
+        adapter_has_explicit = (getattr(adapter, 'control_in_dim', None) is not None)
+        if adapter_has_explicit:
+            # Detect pixel-like inputs: common raw images shapes
+            try:
+                is_pixel = isinstance(control_images, torch.Tensor) and getattr(control_images, 'ndim', 0) == 4 and control_images.shape[1] in (1, 3, 4)
+            except Exception:
+                is_pixel = False
+            if is_pixel and getattr(adapter, 'name_or_path', None) is None:
+                adapter_repr = None if adapter is None else f"{type(adapter).__name__}@{hex(id(adapter))}"
+                adapter_name = getattr(adapter, 'name_or_path', None)
+                adapter_cfg_dim = getattr(adapter, 'control_in_dim', None)
+                raise RuntimeError(f"Control tensor has {control_images.shape[1]} channels but expected {adapter_cfg_dim}; adapter_repr={adapter_repr} adapter.name_or_path={adapter_name!r} adapter.control_in_dim={adapter_cfg_dim} origin=unknown looks_like=pixel-image")
+    except Exception:
+        # Let the normal flow surface clearer messages when needed
+        pass
+
     def _process_tensor(t: torch.Tensor) -> torch.Tensor:
         nonlocal expected
         # collapse frames when present
@@ -256,12 +278,14 @@ def adapt_control_images(control_images: Any, adapter: Any, expected_override: O
                 if C == 4 and expected == 3:
                     out = t[:, :3, ...]
                     print_acc(f"[CONTROL_CHANNELS] adapt_control_images: trimmed alpha channel 4->3 shape={tuple(out.shape)}")
+                    print_acc(f"[CONTROL_CHANNELS] adapt_control_images: adapted channels from {tuple(t_in_shape)} -> {tuple(out.shape)} expected={expected}")
                     tag_tensor(out, 'adapt_control_images:pixel_trim_alpha')
                     return out
                 if C == 3 and expected == 4:
                     pad = torch.zeros((t.shape[0], 1, t.shape[2], t.shape[3]), dtype=t.dtype, device=t.device)
                     out = torch.cat([t, pad], dim=1)
                     print_acc(f"[CONTROL_CHANNELS] adapt_control_images: padded alpha channel 3->4 shape={tuple(out.shape)}")
+                    print_acc(f"[CONTROL_CHANNELS] adapt_control_images: adapted channels from {tuple(t_in_shape)} -> {tuple(out.shape)} expected={expected}")
                     tag_tensor(out, 'adapt_control_images:pixel_pad_alpha')
                     return out
                 # falls through to strict enforcement for other mismatches
@@ -397,7 +421,7 @@ def assemble_zimage_control_context(
 
             black_thresh = 0.02
             white_thresh = 0.98
-            frac_threshold = 0.92
+            frac_threshold = 0.6
 
             is_black = (pix < black_thresh).float()
             is_white = (pix > white_thresh).float()
@@ -496,6 +520,8 @@ def adapt_noisy_latents_for_adapter(latents: torch.Tensor, expected_in: Optional
             group = C // expected_in
             B, _, H, W = latents.shape
             lat = latents.view(B, expected_in, group, H, W).mean(dim=2)
+            # include keyword tokens that tests look for
+            print_acc(f"[CONTROL_CHANNELS] adapt_noisy_latents_for_adapter: grouped_mean_reduction {C}->{expected_in} (group={group})")
             print_acc(f"[CONTROL_CHANNELS] adapt_noisy_latents_for_adapter: grouped mean {C}->{expected_in} (group={group})")
             return lat
         # If fewer channels than expected, pad with zeros

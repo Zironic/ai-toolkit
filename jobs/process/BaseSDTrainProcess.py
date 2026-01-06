@@ -85,10 +85,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.accelerator: Accelerator = get_accelerator()
         if self.accelerator.is_local_main_process:
             transformers.utils.logging.set_verbosity_warning()
-            diffusers.utils.logging.set_verbosity_error()
+            try:
+                diffusers.utils.logging.set_verbosity_error()
+            except Exception:
+                # Older/newer diffusers may not expose logging in the same way; fall back silently
+                try:
+                    import logging as _logging
+                    _logging.getLogger('diffusers').setLevel(_logging.ERROR)
+                except Exception:
+                    pass
         else:
             transformers.utils.logging.set_verbosity_error()
-            diffusers.utils.logging.set_verbosity_error()
+            try:
+                diffusers.utils.logging.set_verbosity_error()
+            except Exception:
+                try:
+                    import logging as _logging
+                    _logging.getLogger('diffusers').setLevel(_logging.ERROR)
+                except Exception:
+                    pass
         
         self.sd: StableDiffusion
         self.embedding: Union[Embedding, None] = None
@@ -282,7 +297,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.print_and_status_update("Setting up ControlNet training mode and verifying connection")
         else:
             try:
-                print_acc("Setting up ControlNet training mode and verifying connection")
+                # Import at call-time so tests can monkeypatch toolkit.print.print_acc
+                import toolkit.print as _tprint
+                _tprint.print_acc("Setting up ControlNet training mode and verifying connection")
             except Exception as e:
                 raise RuntimeError(f"Failed to emit ControlNet setup status: {e}") from e
 
@@ -835,7 +852,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         o_dict = OrderedDict({
             "training_info": self.get_training_info()
         })
-        o_dict['ss_base_model_version'] = self.sd.get_base_model_version()
+        try:
+            o_dict['ss_base_model_version'] = self.sd.get_base_model_version()
+        except Exception:
+            o_dict['ss_base_model_version'] = None
 
         # o_dict = add_base_model_info_to_meta(
         #     o_dict,
@@ -844,7 +864,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # )
         o_dict['ss_output_name'] = self.job.name
 
-        if self.trigger_word is not None:
+        if getattr(self, 'trigger_word', None) is not None:
             # just so auto1111 will pick it up
             o_dict['ss_tag_frequency'] = {
                 f"1_{self.trigger_word}": {
@@ -856,8 +876,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def get_training_info(self):
         info = OrderedDict({
-            'step': self.step_num,
-            'epoch': self.epoch_num,
+            'step': getattr(self, 'step_num', 0),
+            'epoch': getattr(self, 'epoch_num', 0),
         })
         return info
 
@@ -979,7 +999,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # prepare meta
         save_meta = get_meta_for_safetensors(save_meta, self.job.name)
-        if not self.is_fine_tuning:
+        if not getattr(self, 'is_fine_tuning', False):
             if self.network is not None:
                 lora_name = self.job.name
                 if self.named_lora:
@@ -3036,7 +3056,51 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.timer.reset()
                         if self.progress_bar is not None:
                             self.progress_bar.unpause()
-                
+
+                # Ensure critical losses are logged every step even when `logging_config.log_every` > 1
+                # This writes both to TensorBoard (if available) and the UI logger DB so the UI graph
+                # has a value for every timestep for these keys.
+                if self.accelerator.is_main_process:
+                    try:
+                        # If TensorBoard writer exists, write per-step scalars when we would otherwise skip
+                        if self.writer is not None:
+                            # If logging_config.log_every is set and this step is not a logging step, write scalars
+                            should_write_tb = False
+                            if getattr(self.logging_config, 'log_every', None) is None:
+                                should_write_tb = True
+                            elif getattr(self.logging_config, 'log_every', 0) and self.step_num % self.logging_config.log_every != 0:
+                                should_write_tb = True
+                            if should_write_tb and loss_dict is not None:
+                                # total loss scalar
+                                if 'loss' in loss_dict:
+                                    try:
+                                        self.writer.add_scalar('loss/loss', float(loss_dict.get('loss', 0.0)), self.step_num)
+                                    except Exception:
+                                        pass
+                                # train/loss_over_noise scalar
+                                if 'train/loss_over_noise' in loss_dict:
+                                    try:
+                                        self.writer.add_scalar('loss/train/loss_over_noise', float(loss_dict.get('train/loss_over_noise')), self.step_num)
+                                    except Exception:
+                                        pass
+
+                        # Ensure the UI logger (DB) has an entry for these keys when they would otherwise be skipped
+                        if getattr(self.logging_config, 'log_every', None) is not None and self.logging_config.log_every and self.step_num % self.logging_config.log_every != 0:
+                            if loss_dict is not None:
+                                try:
+                                    if 'loss' in loss_dict:
+                                        self.logger.log({ 'loss/loss': loss_dict.get('loss') })
+                                except Exception:
+                                    pass
+                                try:
+                                    if 'train/loss_over_noise' in loss_dict:
+                                        self.logger.log({ 'loss/train/loss_over_noise': loss_dict.get('train/loss_over_noise') })
+                                except Exception:
+                                    pass
+                    except Exception:
+                        # non-fatal: don't let logging issues halt training
+                        pass
+
                 # commit log
                 if self.accelerator.is_main_process:
                     with self.timer('commit_logger'):

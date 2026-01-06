@@ -239,8 +239,11 @@ class VideoXControlnetWrapper(torch.nn.Module):
                 return False
 
             if _looks_like_pixel_images_for_wrapper(control_context):
-                # Provide an actionable message including adapter identity to help
-                # diagnose misrouting in training jobs.
+                # If inputs look like raw pixel images and we were not able to infer
+                # an explicit expected_in for the adapter, pass them through as-is.
+                # Under the current policy the Z-Image pipeline should perform
+                # auto-encoding/assembly when needed; the wrapper should not silently
+                # promote 3->4 channels or perform encoding on behalf of the caller.
                 try:
                     from toolkit.control_channels import format_origin
                     origin = format_origin(control_context) if isinstance(control_context, torch.Tensor) else 'list-of-tensors'
@@ -248,12 +251,16 @@ class VideoXControlnetWrapper(torch.nn.Module):
                     origin = 'pixel-images'
                 adapter_name = getattr(self.inner, 'name_or_path', None)
                 adapter_cfg_dim = getattr(self.inner, 'control_in_dim', None)
-                raise RuntimeError(
-                    f"VideoXControlnetWrapper received raw pixel images (origin={origin}). "
-                    f"This wrapper expects VAE-encoded control latents or assembled control_contexts. "
-                    f"Adapter: name_or_path={adapter_name!r} control_in_dim={adapter_cfg_dim}. "
-                    "Ensure you call SDModel.predict_noise with `zimage_control_images` so the model can encode them, "
-                    "or pass pre-encoded latents via `zimage_control_images`.")
+                # If the adapter explicitly declared expected channels, allow adaptation
+                # below; otherwise preserve raw pixel images and continue.
+                if adapter_cfg_dim is None:
+                    try:
+                        from toolkit.print import print_acc
+                        print_acc(f"[CONTROLNET] VideoX wrapper received raw pixel images (origin={origin}); passing through unchanged since adapter expected channels unknown (adapter.name_or_path={adapter_name!r})")
+                    except Exception:
+                        pass
+                    adapted_control_context = control_context
+                # else: allow the normal adaptation flow below to adapt to adapter_cfg_dim
 
             # When we know the expected input channels, adapt the control images to that
             # expected channel count using the central helper. This ensures consistent

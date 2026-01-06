@@ -735,6 +735,15 @@ class IPAdapter(torch.nn.Module):
             for i, module in transformer.transformer_blocks.named_children():
                 module.attn1.processor = attn_procs[f"transformer_blocks.{i}.attn1"]
                 module.attn2.processor = attn_procs[f"transformer_blocks.{i}.attn2"]
+                # annotate with block index
+                try:
+                    module.attn1.processor.block_idx = int(i)
+                except Exception:
+                    pass
+                try:
+                    module.attn2.processor.block_idx = int(i)
+                except Exception:
+                    pass
             self.adapter_modules = torch.nn.ModuleList(
                 [
                     transformer.transformer_blocks[i].attn2.processor for i in
@@ -745,10 +754,18 @@ class IPAdapter(torch.nn.Module):
             transformer: FluxTransformer2DModel = sd.unet
             for i, module in transformer.transformer_blocks.named_children():
                 module.attn.processor = attn_procs[f"transformer_blocks.{i}.attn"]
+                try:
+                    module.attn.processor.block_idx = int(i)
+                except Exception:
+                    pass
 
             # do single blocks too even though they dont have cross attn
             for i, module in transformer.single_transformer_blocks.named_children():
                 module.attn.processor = attn_procs[f"single_transformer_blocks.{i}.attn"]
+                try:
+                    module.attn.processor.block_idx = int(i)
+                except Exception:
+                    pass
 
             self.adapter_modules = torch.nn.ModuleList(
                 [
@@ -760,6 +777,18 @@ class IPAdapter(torch.nn.Module):
                 ]
             )
         else:
+            # Annotate processors with block_idx when possible so they can apply per-block overrides
+            from toolkit.splitflux import _module_name_matches_block
+            from toolkit.kohya_lora import LoRANetwork
+            for name, proc in attn_procs.items():
+                block_idx = None
+                for bi in range(LoRANetwork.NUM_OF_BLOCKS * 2 + 1):
+                    if _module_name_matches_block(name, bi):
+                        block_idx = bi
+                        break
+                if block_idx is not None:
+                    setattr(proc, 'block_idx', block_idx)
+
             sd.unet.set_attn_processor(attn_procs)
             self.adapter_modules = torch.nn.ModuleList(sd.unet.attn_processors.values())
 

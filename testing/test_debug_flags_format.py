@@ -25,9 +25,15 @@ def test_debug_flags_are_strings():
         'batch_has_control': 'false',
         'controlnet_offload_active': 'false',
         'splitprompt': 'true',
-        'splitprompt_dataset': 'my_ds'
+        'splitprompt_dataset': 'my_ds',
+        'splitprompt_file': 'split_prompt.safetensors',
+        'splitprompt_content_blocks': '20,21,22',
+        'splitprompt_style_blocks': '30,31'
     }
     flags_msg = ' '.join([f"{k}={v}" for k, v in debug_flags.items() if v != ''])
     assert 'control_usage_rate=true' in flags_msg
     assert 'controlnet_enabled=true' in flags_msg
     assert 'splitprompt_dataset=my_ds' in flags_msg
+    assert 'splitprompt_file=split_prompt.safetensors' in flags_msg
+    assert 'splitprompt_content_blocks=20,21,22' in flags_msg
+    assert 'splitprompt_style_blocks=30,31' in flags_msg

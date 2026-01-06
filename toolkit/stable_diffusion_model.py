@@ -1864,6 +1864,7 @@ class StableDiffusion:
             guidance_embedding_scale=1.0,
             bypass_guidance_embedding=False,
             batch: Union[None, 'DataLoaderBatchDTO'] = None,
+            per_block_prompt_embeds: dict | None = None,
             **kwargs,
     ):
         conditional_pred = None
@@ -1891,6 +1892,31 @@ class StableDiffusion:
         latents = latents.to(self.device_torch)
         text_embeddings = text_embeddings.to(self.device_torch)
         timestep = timestep.to(self.device_torch)
+
+        # Attach per_block_prompt_embeds onto UNet processor instances so attention processors can pick it up
+        per_block_prompt_attached = False
+        if per_block_prompt_embeds is not None:
+            try:
+                # common HF unet mapping
+                if hasattr(self.unet, 'attn_processors'):
+                    for proc in getattr(self.unet, 'attn_processors').values():
+                        try:
+                            proc.per_block_prompt_embeds = per_block_prompt_embeds
+                        except Exception:
+                            pass
+                # also attach to transformer blocks if present
+                transformer = getattr(self.unet, 'transformer_blocks', None)
+                if transformer is not None:
+                    for i, module in transformer.named_children():
+                        for attr in ('attn', 'attn1', 'attn2'):
+                            try:
+                                proc = getattr(module, attr).processor
+                                proc.per_block_prompt_embeds = per_block_prompt_embeds
+                            except Exception:
+                                pass
+                per_block_prompt_attached = True
+            except Exception:
+                per_block_prompt_attached = False
 
         # if timestep is zero dim, unsqueeze it
         if len(timestep.shape) == 0:
@@ -1994,6 +2020,7 @@ class StableDiffusion:
                             "text_embeds": added_cond_kwargs_chunked['text_embeds'][0],
                             "time_ids": added_cond_kwargs_chunked['time_ids'][0],
                         },
+                        per_block_prompt_embeds=per_block_prompt_embeds,
                         **kwargs,
                     ).sample
 
@@ -2007,6 +2034,7 @@ class StableDiffusion:
                             # "time_ids": added_cond_kwargs_chunked['time_ids'][1],
                             "time_ids": self.get_time_ids_from_latents(input_chunks[1], requires_aesthetic_score=True),
                         },
+                        per_block_prompt_embeds=per_block_prompt_embeds,
                         **kwargs,
                     ).sample
 
@@ -2033,6 +2061,7 @@ class StableDiffusion:
                     timestep,
                     encoder_hidden_states=text_embeddings.text_embeds,
                     added_cond_kwargs=added_cond_kwargs,
+                    per_block_prompt_embeds=per_block_prompt_embeds,
                     **kwargs,
                 ).sample
 
@@ -2279,7 +2308,59 @@ class StableDiffusion:
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
         if return_conditional_pred:
+            # cleanup per_block_prompt_embeds from processors
+            if per_block_prompt_attached:
+                try:
+                    if hasattr(self.unet, 'attn_processors'):
+                        for proc in getattr(self.unet, 'attn_processors').values():
+                            try:
+                                delattr(proc, 'per_block_prompt_embeds')
+                            except Exception:
+                                try:
+                                    proc.per_block_prompt_embeds = None
+                                except Exception:
+                                    pass
+                    transformer = getattr(self.unet, 'transformer_blocks', None)
+                    if transformer is not None:
+                        for i, module in transformer.named_children():
+                            for attr in ('attn', 'attn1', 'attn2'):
+                                try:
+                                    proc = getattr(module, attr).processor
+                                    delattr(proc, 'per_block_prompt_embeds')
+                                except Exception:
+                                    try:
+                                        proc.per_block_prompt_embeds = None
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
             return noise_pred, conditional_pred
+        # cleanup per_block_prompt_embeds from processors
+        if per_block_prompt_attached:
+            try:
+                if hasattr(self.unet, 'attn_processors'):
+                    for proc in getattr(self.unet, 'attn_processors').values():
+                        try:
+                            delattr(proc, 'per_block_prompt_embeds')
+                        except Exception:
+                            try:
+                                proc.per_block_prompt_embeds = None
+                            except Exception:
+                                pass
+                transformer = getattr(self.unet, 'transformer_blocks', None)
+                if transformer is not None:
+                    for i, module in transformer.named_children():
+                        for attr in ('attn', 'attn1', 'attn2'):
+                            try:
+                                proc = getattr(module, attr).processor
+                                delattr(proc, 'per_block_prompt_embeds')
+                            except Exception:
+                                try:
+                                    proc.per_block_prompt_embeds = None
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
         return noise_pred
 
     def _predict_noise_zimage(

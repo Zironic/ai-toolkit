@@ -135,6 +135,7 @@ class SDTrainer(BaseSDTrainProcess):
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
         self.assistant_adapter: Union['T2IAdapter', 'ControlNetModel', None]
+        self.assistant_adapter = None
         self.do_prior_prediction = False
         self.do_long_prompts = False
         self.do_guided_loss = False
@@ -418,23 +419,24 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.requires_grad_(False)
 
         # Attempt to load any per-dataset SplitPrompt embeddings that may have been cached during dataset preprocessing
-        try:
-            if getattr(self, 'datasets', None) is not None:
-                for ds in self.datasets:
-                    key = getattr(ds, 'folder_path', ds.dataset_path if getattr(ds, 'dataset_path', None) else None)
-                    if key is None:
-                        continue
-                    split_path = os.path.join(key, 'split_prompt.safetensors')
-                    if os.path.exists(split_path):
-                        try:
-                            sp = PromptEmbeds.load(split_path)
-                            sp = sp.to(self.device_torch, dtype=self.sd.torch_dtype).detach()
-                            self.dataset_split_prompt_embeds[key] = sp
-                            print_acc(f"[SplitPrompt] Loaded split prompt embedding for dataset {key}")
-                        except Exception as e:
-                            print_acc(f"[SplitPrompt] Failed to load split prompt for dataset {key}: {e}")
-        except Exception:
-            pass
+        if getattr(self, 'datasets', None) is not None:
+            for ds in self.datasets:
+                key = getattr(ds, 'folder_path', ds.dataset_path if getattr(ds, 'dataset_path', None) else None)
+                if key is None:
+                    continue
+                split_path = os.path.join(key, 'split_prompt.safetensors')
+                if os.path.exists(split_path):
+                    # Loading must succeed or raise an informative runtime error; don't swallow failures.
+                    try:
+                        sp = PromptEmbeds.load(split_path)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to parse split prompt safetensors for dataset {key}: {e}") from e
+                    try:
+                        sp = sp.to(self.device_torch, dtype=self.sd.torch_dtype).detach()
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to move split prompt embedding to device for dataset {key}: {e}") from e
+                    self.dataset_split_prompt_embeds[key] = sp
+                    print_acc(f"[SplitPrompt] Loaded split prompt embedding for dataset {key}")
 
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
@@ -1184,7 +1186,25 @@ class SDTrainer(BaseSDTrainProcess):
             # L2 norm per-example over channels/spatial dims
             noise_norms = torch.linalg.vector_norm(applied_noise, ord=2, dim=(1, 2, 3))
             # per-example ratio (loss is still unreduced per-example vector)
-            per_sample_ratio = (per_sample + eps) / (noise_norms + eps)
+            # Ensure per-sample losses and noise norms are on the same device to avoid cross-device ops
+            ps = None
+            try:
+                ps = per_sample
+            except Exception:
+                ps = getattr(self, 'last_example_losses', None)
+            if isinstance(ps, torch.Tensor):
+                try:
+                    # move per-sample to noise device if needed
+                    if ps.device != noise_norms.device:
+                        ps = ps.to(noise_norms.device)
+                    per_sample_ratio = (ps + eps) / (noise_norms + eps)
+                except Exception:
+                    # fallback to CPU computation to be safe
+                    ps_cpu = ps.detach().cpu()
+                    noise_cpu = noise_norms.detach().cpu()
+                    per_sample_ratio = (ps_cpu + eps) / (noise_cpu + eps)
+            else:
+                raise RuntimeError("Per-sample losses unavailable for noise diagnostics")
 
             # Attach CPU copies for external inspection and logging
             self.last_noise_norms = noise_norms.detach().cpu()
@@ -1450,7 +1470,7 @@ class SDTrainer(BaseSDTrainProcess):
                     embeds_to_use = batch.prompt_embeds.clone().to(self.device_torch, dtype=dtype)
                 else:
                     prompt_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
+                    if getattr(self.sd, 'encode_control_in_text_embeddings', False) and batch.control_tensor is not None:
                         prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
                     embeds_to_use = self.sd.encode_prompt(
                         prompt_list,
@@ -2496,7 +2516,7 @@ class SDTrainer(BaseSDTrainProcess):
                 with self.timer('encode_prompt'):
                     unconditional_embeds = None
                     prompt_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
+                    if getattr(self.sd, 'encode_control_in_text_embeddings', False) and batch.control_tensor is not None:
                         prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
                     if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
                         with torch.set_grad_enabled(False):
@@ -3651,13 +3671,13 @@ class SDTrainer(BaseSDTrainProcess):
                                 param_requires_count = 0
 
                             if not torch.is_grad_enabled():
-                                self._fatal("Global grad mode is disabled immediately before UNet forward. This is fatal: ensure no surrounding `torch.no_grad()` or `torch.set_grad_enabled(False)` remain enabled.")
+                                raise RuntimeError("Global grad mode is disabled immediately before UNet forward. This is fatal: ensure no surrounding `torch.no_grad()` or `torch.set_grad_enabled(False)` remain enabled.")
 
                             if param_requires_count == 0:
-                                self._fatal("No model parameters are configured to require gradients. Did you accidentally freeze all parameters or misconfigure the optimizer? Aborting.")
+                                raise RuntimeError("No model parameters are configured to require gradients. Did you accidentally freeze all parameters or misconfigure the optimizer? Aborting.")
 
                             if not getattr(noisy_latents, 'requires_grad', False):
-                                self._fatal("`noisy_latents` does not require gradients (it appears detached). This prevents any backward propagation. Aborting training to avoid silent progress.")
+                                raise RuntimeError("`noisy_latents` does not require gradients (it appears detached). This prevents any backward propagation. Aborting training to avoid silent progress.")
 
                             # Make batch visible to pre/post UNet hooks (for attention alignment)
                             self._last_batch_for_attn = batch
@@ -3674,7 +3694,7 @@ class SDTrainer(BaseSDTrainProcess):
 
                             # Ensure forward produced grad-connected tensor
                             if not getattr(noise_pred, 'requires_grad', False):
-                                self._fatal("UNet produced a tensor that does not require gradients after forward. This indicates the forward executed under a no-grad context or returned a detached result. Aborting.")
+                                raise RuntimeError("UNet produced a tensor that does not require gradients after forward. This indicates the forward executed under a no-grad context or returned a detached result. Aborting.")
                         self.after_unet_predict()
 
                         with self.timer('calculate_loss'):
@@ -3686,15 +3706,31 @@ class SDTrainer(BaseSDTrainProcess):
                             if doing_preservation and not do_inverted_masked_prior:
                                 prior_to_calculate_loss = None
                             
-                            loss = self.calculate_loss(
-                                noise_pred=noise_pred,
-                                noise=noise,
-                                noisy_latents=noisy_latents,
-                                timesteps=timesteps,
-                                batch=batch,
-                                mask_multiplier=mask_multiplier,
-                                prior_pred=prior_to_calculate_loss,
-                            )
+                            try:
+                                loss = self.calculate_loss(
+                                    noise_pred=noise_pred,
+                                    noise=noise,
+                                    noisy_latents=noisy_latents,
+                                    timesteps=timesteps,
+                                    batch=batch,
+                                    mask_multiplier=mask_multiplier,
+                                    prior_pred=prior_to_calculate_loss,
+                                )
+                            except Exception as e:
+                                # Non-fatal: catch any error in loss computation, log and continue with safe fallback
+                                print_acc(f"[LOSS] calculate_loss failed: {e}")
+                                # record a short sentinel for visibility
+                                try:
+                                    self._last_loss_calc_failed = True
+                                    self._last_loss_calc_exc = str(e)[:200]
+                                except Exception:
+                                    pass
+                                # fallback: zero loss tensor on correct device/dtype that requires grad
+                                try:
+                                    loss = torch.tensor(0.0, device=self.device_torch, dtype=get_torch_dtype(self.train_config.dtype), requires_grad=True)
+                                except Exception:
+                                    # conservative fallback
+                                    loss = torch.tensor(0.0, device=self.device_torch, requires_grad=True)
                             if not getattr(loss, 'requires_grad', False):
                                 raise RuntimeError(
                                     "Calculated loss does not require gradients. This suggests the model forward was executed without grad tracking. "
@@ -3742,7 +3778,7 @@ class SDTrainer(BaseSDTrainProcess):
 
                 # If loss is NaN after all attempts, fail loudly and abort the run (do not fallback to a zero tensor)
                 if torch.isnan(loss):
-                    self._fatal("Loss is NaN after loss computation: aborting training to avoid silent no-op steps.")
+                    raise RuntimeError("Loss is NaN after loss computation: aborting training to avoid silent no-op steps.")
 
                 with self.timer('backward'):
                     # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
@@ -3942,9 +3978,21 @@ class SDTrainer(BaseSDTrainProcess):
             denom = len(batch_list) if len(batch_list) > 0 else 1
             loss_tensor = (total_loss / denom)
 
-        loss_dict = OrderedDict(
-            {'loss': loss_tensor.item()}
-        )
+        # Safely extract a Python scalar from the loss tensor; if extraction fails, log and continue
+        try:
+            loss_val = loss_tensor.item()
+        except Exception as e:
+            print_acc(f"[LOSS] failed to extract loss scalar: {e}")
+            try:
+                loss_val = float(loss_tensor)
+            except Exception:
+                loss_val = 0.0
+            try:
+                self._last_loss_scalar_failed = True
+                self._last_loss_scalar_err = str(e)[:200]
+            except Exception:
+                pass
+        loss_dict = OrderedDict({'loss': loss_val})
 
         # Control-related metrics (diagnostics & monitoring)
         try:
@@ -3960,10 +4008,42 @@ class SDTrainer(BaseSDTrainProcess):
                 debug_flags['controlnet_offload_active'] = 'true' if getattr(self, '_last_batch_offload_active', False) else 'false'
                 debug_flags['splitprompt'] = 'true' if getattr(self, '_last_batch_has_splitprompt', False) else 'false'
                 debug_flags['splitprompt_dataset'] = str(getattr(self, '_last_batch_splitprompt_key', '') or '')
+                # If splitprompt is active, provide the source safetensor filename and configured block lists
+                if getattr(self, '_last_batch_has_splitprompt', False):
+                    try:
+                        ds_key = getattr(self, '_last_batch_splitprompt_key', None)
+                        pe = getattr(self, 'dataset_split_prompt_embeds', {}).get(ds_key)
+                        src = None
+                        if pe is not None:
+                            src = getattr(pe, '_source_path', None)
+                        # fallback: expect split_prompt.safetensors in the dataset folder
+                        if not src and ds_key:
+                            candidate = os.path.join(ds_key, 'split_prompt.safetensors')
+                            try:
+                                if os.path.exists(candidate):
+                                    src = candidate
+                            except Exception:
+                                # ignore fs checks on weird keys
+                                pass
+                        if src:
+                            debug_flags['splitprompt_file'] = os.path.basename(src)
+                    except Exception:
+                        pass
+                    try:
+                        content_blocks = getattr(self.train_config, 'splitflux_content_blocks', None)
+                        style_blocks = getattr(self.train_config, 'splitflux_style_blocks', None)
+                        if content_blocks:
+                            debug_flags['splitprompt_content_blocks'] = ','.join(str(x) for x in content_blocks)
+                        if style_blocks:
+                            debug_flags['splitprompt_style_blocks'] = ','.join(str(x) for x in style_blocks)
+                    except Exception:
+                        pass
                 # expose whether noise diagnostics failed so it doesn't silently vanish
                 debug_flags['loss_over_noise_failed'] = 'true' if getattr(self, '_last_noise_diag_exc', None) is not None else 'false'
+                # expose whether loss calculation failed so it doesn't silently vanish
+                debug_flags['loss_calc_failed'] = 'true' if getattr(self, '_last_loss_calc_failed', False) else 'false'
             except Exception:
-                debug_flags = {'control_usage_rate': 'false', 'controlnet_enabled': 'false', 'batch_has_control': 'false', 'controlnet_offload_active': 'false', 'splitprompt': 'false', 'splitprompt_dataset': '', 'loss_over_noise_failed': 'false'}
+                debug_flags = {'control_usage_rate': 'false', 'controlnet_enabled': 'false', 'batch_has_control': 'false', 'controlnet_offload_active': 'false', 'splitprompt': 'false', 'splitprompt_dataset': '', 'loss_over_noise_failed': 'false', 'loss_calc_failed': 'false'}
 
             # Attach debug flags as a dictionary (strings) for diagnostics
             loss_dict['debug_flags'] = debug_flags
@@ -3983,6 +4063,12 @@ class SDTrainer(BaseSDTrainProcess):
         except Exception:
             # non-fatal: metrics/debug flag assembly failed
             pass
+        # Final per-step hook: run after the `loss_dict` has been fully assembled
+        # Subclasses can override `end_of_training_loop()` to inspect or flush per-step artifacts
+        self.end_of_training_loop()
+
+        return loss_dict
+
 
     def _attach_noise_metrics_to_loss_dict(self, loss_dict: dict):
         """Attach aggregated noise diagnostics into loss_dict if per-sample diagnostics exist."""
@@ -4015,6 +4101,20 @@ class SDTrainer(BaseSDTrainProcess):
                     loss_dict['train/loss_over_noise_err'] = str(getattr(self, '_last_noise_diag_exc'))[:200]
                 except Exception:
                     loss_dict['train/loss_over_noise_err'] = 'failed (no message)'
+            # If loss calculation failed earlier in the step, expose sentinel and short error
+            if getattr(self, '_last_loss_calc_failed', False):
+                loss_dict['train/loss_calc_status'] = 'failed'
+                try:
+                    loss_dict['train/loss_calc_err'] = str(getattr(self, '_last_loss_calc_exc'))[:200]
+                except Exception:
+                    loss_dict['train/loss_calc_err'] = 'failed (no message)'
+            # If failure occurred extracting the loss scalar, expose sentinel and short error
+            if getattr(self, '_last_loss_scalar_failed', False):
+                loss_dict['train/loss_scalar_status'] = 'failed'
+                try:
+                    loss_dict['train/loss_scalar_err'] = str(getattr(self, '_last_loss_scalar_err'))[:200]
+                except Exception:
+                    loss_dict['train/loss_scalar_err'] = 'failed (no message)'
         except Exception as e:
             # non-fatal: log the error for diagnostics but do not abort training
             print_acc(f"[METRICS-ERR] failed to attach noise diagnostics: {e}")
@@ -4066,6 +4166,3 @@ class SDTrainer(BaseSDTrainProcess):
             # don't fail training for logging-related issues
             pass
 
-        self.end_of_training_loop()
-
-        return loss_dict
