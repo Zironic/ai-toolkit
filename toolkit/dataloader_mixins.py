@@ -1187,7 +1187,7 @@ class ControlFileItemDTOMixin:
                 # final image exactly matches the bucket dimensions computed for `control_size`.
                 from toolkit.buckets import get_bucket_for_image_size
                 # default control_size to the dataset resolution when not explicitly provided
-                control_size = getattr(self.dataset_config, 'control_size', None) or getattr(self.dataset_config, 'resolution', None) or 256resolution', None) or 256
+                control_size = getattr(self.dataset_config, 'control_size', None) or getattr(self.dataset_config, 'resolution', None) or 256
                 w, h = img.size
                 bucket = get_bucket_for_image_size(w, h, resolution=control_size)
                 target_w, target_h = bucket['width'], bucket['height']

@@ -201,7 +201,7 @@ class VideoXControlnetWrapper(torch.nn.Module):
 
         # Adapt control and latents via centralized helpers
         try:
-            from toolkit.control_channels import adapt_control_images, adapt_noisy_latents_for_adapter
+            from toolkit.control_channels import adapt_noisy_latents_for_adapter
 
             def _looks_like_pixel_images_for_wrapper(obj):
                 try:
@@ -239,28 +239,14 @@ class VideoXControlnetWrapper(torch.nn.Module):
                 return False
 
             if _looks_like_pixel_images_for_wrapper(control_context):
-                # If inputs look like raw pixel images and we were not able to infer
-                # an explicit expected_in for the adapter, pass them through as-is.
-                # Under the current policy the Z-Image pipeline should perform
-                # auto-encoding/assembly when needed; the wrapper should not silently
-                # promote 3->4 channels or perform encoding on behalf of the caller.
-                try:
-                    from toolkit.control_channels import format_origin
-                    origin = format_origin(control_context) if isinstance(control_context, torch.Tensor) else 'list-of-tensors'
-                except Exception:
-                    origin = 'pixel-images'
-                adapter_name = getattr(self.inner, 'name_or_path', None)
+                # Under the strict policy, any raw pixel images reaching the wrapper
+                # indicate an upstream misroute; fail fast with an informative error
+                # including adapter identity when available.
+                adapter_name = getattr(self.inner, 'name_or_path', getattr(self.inner, 'name', None))
                 adapter_cfg_dim = getattr(self.inner, 'control_in_dim', None)
-                # If the adapter explicitly declared expected channels, allow adaptation
-                # below; otherwise preserve raw pixel images and continue.
-                if adapter_cfg_dim is None:
-                    try:
-                        from toolkit.print import print_acc
-                        print_acc(f"[CONTROLNET] VideoX wrapper received raw pixel images (origin={origin}); passing through unchanged since adapter expected channels unknown (adapter.name_or_path={adapter_name!r})")
-                    except Exception:
-                        pass
-                    adapted_control_context = control_context
-                # else: allow the normal adaptation flow below to adapt to adapter_cfg_dim
+                raise RuntimeError(
+                    f"VideoXControlnetWrapper received raw pixel images for adapter={adapter_name!r} (control_in_dim={adapter_cfg_dim!r}); provide pre-encoded control latents via sd.encode_control_images or call StableDiffusion._predict_noise_zimage"
+                )
 
             # When we know the expected input channels, adapt the control images to that
             # expected channel count using the central helper. This ensures consistent
@@ -470,7 +456,87 @@ class VideoXControlnetWrapper(torch.nn.Module):
                 if expected_in is None:
                     adapted_control_context = control_context
                 else:
-                    adapted_control_context, _ = adapt_control_images(control_context, self.inner, expected_in)
+                    # Strict policy: the wrapper must not attempt to adapt raw pixel images
+                    # or apply lossy heuristics. Upstream should either provide pre-encoded
+                    # control latents or route through StableDiffusion._predict_noise_zimage
+                    # which performs auto-encoding.
+                    if _looks_like_pixel_images_for_wrapper(control_context):
+                        adapter_name = getattr(self.inner, 'name_or_path', getattr(self.inner, 'name', None))
+                        adapter_cfg_dim = getattr(self.inner, 'control_in_dim', None)
+                        raise RuntimeError(
+                            f"VideoXControlnetWrapper received raw pixel images for adapter={adapter_name!r} (control_in_dim={adapter_cfg_dim!r}); provide pre-encoded control latents via sd.encode_control_images or call StableDiffusion._predict_noise_zimage"
+                        )
+
+                    # Helper to process a single latent tensor (3D/4D/5D allowed)
+                    def _process_latent_tensor(t: torch.Tensor):
+                        # collapse frames if present
+                        if t.ndim == 5:
+                            t_proc = t.mean(dim=2)
+                        else:
+                            t_proc = t
+                        # normalize to 4D [B,C,H,W]
+                        if t_proc.ndim == 3:
+                            t_proc = t_proc.unsqueeze(0)
+                        if t_proc.ndim != 4:
+                            raise RuntimeError(f"Unsupported control latent ndim={t_proc.ndim}")
+
+                        C = int(t_proc.shape[1])
+
+                        # If it already matches expected channels, accept it unchanged
+                        if C == expected_in:
+                            return t_proc
+
+                        # If expected is 33 (VideoX assembled context), assemble from base latents
+                        if expected_in == 33:
+                            base = 4
+                            if C == base:
+                                from toolkit.control_channels import assemble_zimage_control_context, tag_tensor
+                                assembled = assemble_zimage_control_context(t_proc, control_in_dim=expected_in, mask_from=None)
+                                tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                return assembled
+                            if C % base == 0:
+                                # If packed channels directly map to assembled channels
+                                if 2 * C + 1 == expected_in:
+                                    from toolkit.control_channels import assemble_zimage_control_context, tag_tensor
+                                    assembled = assemble_zimage_control_context(t_proc, control_in_dim=expected_in, mask_from=None)
+                                    tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                    return assembled
+                                # Otherwise, collapse to base latents then assemble
+                                B, C2, H, W = t_proc.shape
+                                F = C2 // base
+                                try:
+                                    t3 = t_proc.reshape(B, base, F, H, W).mean(dim=2)
+                                except Exception:
+                                    raise RuntimeError(f"Failed to reshape packed latents for assembly: shape={tuple(t_proc.shape)}")
+                                from toolkit.control_channels import assemble_zimage_control_context, tag_tensor
+                                assembled = assemble_zimage_control_context(t3, control_in_dim=expected_in, mask_from=None)
+                                tag_tensor(assembled, 'precomputed:assembled_control_context')
+                                return assembled
+                            raise RuntimeError(f"Control latent channels ({C}) incompatible with expected_in=33")
+
+                        # For non-33 expected channels, allow collapsing frames when channel count is multiple
+                        if C % expected_in == 0:
+                            B, C2, H, W = t_proc.shape
+                            F = C2 // expected_in
+                            t3 = t_proc.view(B, expected_in, F, H, W).mean(dim=2)
+                            from toolkit.control_channels import tag_tensor
+                            tag_tensor(t3, 'precomputed:collapsed_latents')
+                            return t3
+
+                        raise RuntimeError(f"Control latent channels ({C}) do not match expected_in={expected_in}; wrapper will not adapt control images")
+
+                    # Process tensor or lists deterministically
+                    if isinstance(control_context, torch.Tensor):
+                        adapted_control_context = _process_latent_tensor(control_context)
+                    elif isinstance(control_context, (list, tuple)):
+                        adapted_list = []
+                        for item in control_context:
+                            if not isinstance(item, torch.Tensor):
+                                raise RuntimeError("Unsupported control_context element type; expected torch.Tensor")
+                            adapted_list.append(_process_latent_tensor(item))
+                        adapted_control_context = adapted_list
+                    else:
+                        raise RuntimeError("Unsupported control_context type; expected tensor or list of tensors")
 
             # Do NOT attempt to adapt noisy latents based on the control image channel count.
             # `expected_in` is the control_context channel expectation, not the latent channels.

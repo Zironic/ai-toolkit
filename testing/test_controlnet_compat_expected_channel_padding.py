@@ -1,3 +1,4 @@
+import pytest
 import torch
 from toolkit.controlnet_compat import VideoXControlnetWrapper
 
@@ -20,7 +21,7 @@ class DummyInner(torch.nn.Module):
         return [torch.zeros(b, 16, h // 4, w // 4, dtype=latents.dtype, device=latents.device)]
 
 
-def test_video_x_wrapper_does_not_pad_3_to_4_channels():
+def test_video_x_wrapper_rejects_raw_pixel_images_when_adapter_expects_latents():
     inner = DummyInner(4)
     wrapper = VideoXControlnetWrapper(inner)
 
@@ -28,8 +29,8 @@ def test_video_x_wrapper_does_not_pad_3_to_4_channels():
     timestep = torch.tensor([10])
     control_ctx_3ch = torch.randn(1, 3, 64, 64)
 
-    # Under the new policy, the wrapper should not perform 3->4 padding; the inner
-    # will receive the original 3 channel control context and proceed (or raise if
-    # it cannot consume it). We assert that no automatic padding occurred here.
-    out = wrapper(latents, timestep, control_ctx_3ch, conditioning_scale=1.0)
-    assert out is not None
+    with pytest.raises(RuntimeError) as exc:
+        wrapper(latents, timestep, control_ctx_3ch, conditioning_scale=1.0)
+
+    msg = str(exc.value)
+    assert 'raw pixel' in msg or 'received raw pixel images' in msg

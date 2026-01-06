@@ -1,3 +1,4 @@
+import pytest
 import torch
 from toolkit.controlnet_compat import VideoXControlnetWrapper
 
@@ -17,32 +18,31 @@ class FakeInner(torch.nn.Module):
         return torch.zeros((latents.shape[0], 4, latents.shape[2], latents.shape[3]))
 
 
-def test_wrapper_skips_pixel_image_adaptation():
+def test_wrapper_rejects_raw_pixel_images_when_adapter_expects_latents():
     inner = FakeInner()
     wrapper = VideoXControlnetWrapper(inner)
 
     # control_context looks like a raw pixel image [B,C,H,W]
     ctrl = torch.zeros((1, 3, 512, 512))
     lat = torch.zeros((1, 16, 64, 64))
-    out = wrapper(lat, torch.tensor([1.0]), ctrl, conditioning_scale=1.0)
 
-    # inner should have been called with original 3-channel control image (not padded to 4)
-    assert isinstance(inner.called_with, torch.Tensor)
-    assert inner.called_with.shape[1] == 3
+    with pytest.raises(RuntimeError) as exc:
+        wrapper(lat, torch.tensor([1.0]), ctrl, conditioning_scale=1.0)
+
+    msg = str(exc.value)
+    assert 'raw pixel' in msg or 'received raw pixel images' in msg
 
 
-def test_wrapper_adapts_when_not_pixel_images():
+def test_wrapper_rejects_small_latents_with_incompatible_channels():
     inner = FakeInner()
     wrapper = VideoXControlnetWrapper(inner)
 
-    # Simulate a control_context that is small spatial dims (likely latent)
-    # Under the new policy we no longer adapt based on inner.conv_in; instead
-    # we defer deterministic assembly/adaptation to the Z-Image pipeline. Thus
-    # we expect the inner to receive the original channels when no explicit
-    # `control_in_dim` is provided on the adapter.
+    # Small spatial dims, likely latents, but channels don't match expected (3 vs 4)
     ctrl = torch.zeros((1, 3, 8, 8))
     lat = torch.zeros((1, 16, 64, 64))
-    out = wrapper(lat, torch.tensor([1.0]), ctrl, conditioning_scale=1.0)
 
-    assert isinstance(inner.called_with, torch.Tensor)
-    assert inner.called_with.shape[1] == 3
+    with pytest.raises(RuntimeError) as exc:
+        wrapper(lat, torch.tensor([1.0]), ctrl, conditioning_scale=1.0)
+
+    msg = str(exc.value)
+    assert 'do not match expected_in' in msg or 'will not adapt control images' in msg
