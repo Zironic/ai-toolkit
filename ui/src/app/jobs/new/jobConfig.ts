@@ -5,6 +5,9 @@ export const defaultDatasetConfig: DatasetConfig = {
   mask_path: null,
   mask_min_value: 0.1,
   default_caption: '',
+  // SplitPrompt options (per-dataset)
+  split_prompt: '',
+  split_prompt_enabled: false,
   caption_ext: 'txt',
   caption_dropout_rate: 0.05,
   cache_latents_to_disk: false,
@@ -95,6 +98,8 @@ export const defaultJobConfig: JobConfig = {
           masked_recon_weight: 0.5,
           masked_recon_type: 'illum',
           masked_recon_mask_key: null,
+          // RCA toggle (Rank-Constrained Adaptation)
+          rca_enabled: false,
           // Mask preview/debug options
           mask_preview_enabled: false,
           mask_preview_max_steps: 10,

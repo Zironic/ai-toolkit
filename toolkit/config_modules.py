@@ -400,6 +400,22 @@ class TrainConfig:
         self.adapter_assist_name_or_path: Optional[str] = kwargs.get('adapter_assist_name_or_path', None)
         self.adapter_assist_type: Optional[str] = kwargs.get('adapter_assist_type', 't2i')  # t2i, control_net
 
+        # SplitFlux / RCA (Rank-Constrained Adaptation) options
+        self.splitflux_enabled: bool = kwargs.get('splitflux_enabled', False)
+        # block indices follow paper numbering; default Flux splits
+        self.splitflux_content_blocks: list = kwargs.get('splitflux_content_blocks', list(range(20, 30)))
+        self.splitflux_style_blocks: list = kwargs.get('splitflux_style_blocks', list(range(30, 58)))
+        # primary/secondary ranks
+        self.splitflux_content_primary_rank: int = kwargs.get('splitflux_content_primary_rank', 64)
+        self.splitflux_content_cnt_rank: int = kwargs.get('splitflux_content_cnt_rank', 48)
+        self.splitflux_content_res_rank: int = kwargs.get('splitflux_content_res_rank', 16)
+        self.splitflux_spatial_rank: int = kwargs.get('splitflux_spatial_rank', 32)
+        self.splitflux_style_primary_rank: int = kwargs.get('splitflux_style_primary_rank', 64)
+        # fallback rank for non-target blocks
+        self.splitflux_secondary_rank: int = kwargs.get('splitflux_secondary_rank', 16)
+        # RCA convenience toggle: when enabled, apply Rank-Constrained defaults and freeze early blocks
+        self.rca_enabled: bool = kwargs.get('rca_enabled', False)
+
         # ControlNet configuration (safe defaults: opt-in / off)
         self.controlnet_use: bool = kwargs.get('controlnet_use', False)
         self.controlnet_type: str = kwargs.get('controlnet_type', 'canny')
@@ -440,6 +456,9 @@ class TrainConfig:
         self.mask_preview_overwrite: bool = kwargs.get('mask_preview_overwrite', False)
         # Option to freeze ControlNet/adapter parameters during fine-tuning
         self.controlnet_frozen: bool = kwargs.get('controlnet_frozen', False)
+
+        # Attention alignment: prefer using the masked-recon control-derived masks when available
+        self.attention_align_prefer_control_mask: bool = kwargs.get('attention_align_prefer_control_mask', True)
 
         self.noise_multiplier = kwargs.get('noise_multiplier', 1.0)
         self.target_noise_multiplier = kwargs.get('target_noise_multiplier', 1.0)

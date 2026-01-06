@@ -43,7 +43,6 @@ class BaseProcess(object):
         model_total = sum([timing_dict.get(k, 0.0) for k in model_keys])
         other_total = max(0.0, sum(timing_dict.values()) - control_total - model_total)
         # print a single-line concise summary
-        from toolkit.logging_aitk import print_acc
         print_acc(f"PERF SUMMARY: ControlNet: {control_total:.4f}s avg | Model: {model_total:.4f}s avg | Other: {other_total:.4f}s avg")
 
         

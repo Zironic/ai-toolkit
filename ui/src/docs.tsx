@@ -107,6 +107,17 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'datasets.split_prompt': {
+    title: 'Split Prompt (per-dataset)',
+    description: (
+      <>
+        Optional per-dataset prompt used for the SplitPrompt routing. When enabled, this prompt (for example
+        <code>[Trigger] style</code>) will be encoded once and cached for the dataset. The trainer will route the
+        *normal prompt* to blocks 20–29, leave blocks 30–31 without a prompt, and use the <em>Split Prompt</em> for
+        blocks 32–57. Use <code>[Trigger] style</code> as a recommended naming convention.
+      </>
+    ),
+  },
   'datasets.flip': {
     title: 'Flip X and Flip Y',
     description: (
@@ -255,6 +266,16 @@ const docs: { [key: string]: ConfigDoc } = {
         training, a prior prediction is made with a blank prompt and with the LoRA disabled. This prediction is then
         used as a target on an additional training step with a blank prompt, to preserve the model's knowledge when no
         prompt is given. This helps the model to not overfit to the prompt and retain its generalization capabilities.
+      </>
+    ),
+  },
+  'train.rca_enabled': {
+    title: 'RCA (Rank-Constrained Adaptation)',
+    description: (
+      <>
+        When enabled, RCA applies Rank-Constrained defaults and will freeze early UNet blocks (blocks 1–19) to
+        reduce interference and preserve subject appearance during LoRA training. Use this when training a single
+        LoRA to help decouple content vs. style capacity (RCA convenience toggle).
       </>
     ),
   },

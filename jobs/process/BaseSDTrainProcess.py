@@ -282,7 +282,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.print_and_status_update("Setting up ControlNet training mode and verifying connection")
         else:
             try:
-                from toolkit.print import print_acc
                 print_acc("Setting up ControlNet training mode and verifying connection")
             except Exception as e:
                 raise RuntimeError(f"Failed to emit ControlNet setup status: {e}") from e
@@ -363,7 +362,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if getattr(self, 'adapter', None) is None:
             self.adapter = self.sd.controlnet
             try:
-                from toolkit.print import print_acc
                 print_acc("[CONTROLNET] Assigned model-provided controlnet to process.adapter for training routing.")
                 try:
                     print_acc(f"[CONTROLNET] Adapter info: class={self.adapter.__class__.__name__}, name_or_path={getattr(self.adapter, 'name_or_path', None)}")
@@ -390,7 +388,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     try:
                         from toolkit.controlnet_compat import VideoXControlnetWrapper
                         try:
-                            from toolkit.print import print_acc
                             print_acc("[CONTROLNET] Attempting to apply VideoXControlnetWrapper (assignment path)")
                         except Exception as e:
                             raise RuntimeError(f"Failed to print VideoX wrapper assignment attempt: {e}") from e
@@ -428,13 +425,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 self.sd.controlnet = new_adapter
                                 self.adapter = new_adapter
                                 try:
-                                    from toolkit.print import print_acc
                                     print_acc(f"[CONTROLNET] Replaced model-provided ControlNet with VideoX/Z-Image adapter for {name_or_path}")
                                 except Exception:
                                     pass
                             except Exception as e:
                                 try:
-                                    from toolkit.print import print_acc
                                     print_acc(f"[CONTROLNET] VideoX replacement attempt failed and strict parity is required: {e}")
                                 except Exception:
                                     pass
@@ -464,7 +459,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # don't double-wrap
                     try:
                         from toolkit.controlnet_compat import VideoXControlnetWrapper
-                        from toolkit.print import print_acc
                         try:
                             print_acc(f"[CONTROLNET] Unconditional wrapper step: current adapter class={getattr(self, 'adapter').__class__.__name__}, adapter_config_mode={getattr(self, 'adapter_config', None) and getattr(self.adapter_config, 'controlnet_mode', None)}")
                         except Exception as e:
@@ -545,7 +539,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         raise RuntimeError(f"Failed to emit CONTROLNET-REROUTE status: {e}") from e
                 else:
                     try:
-                        from toolkit.print import print_acc
                         print_acc("[CONTROLNET-REROUTE] Adapter detected as VideoX/zimage-style; skipping ControlNet dry-run and using explicit zimage routing at training time.")
                     except Exception as e:
                         raise RuntimeError(f"Failed to print CONTROLNET-REROUTE status: {e}") from e
@@ -557,7 +550,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # Dry-run checks removed by policy: avoid signature/shape guessing in automated training.
         try:
             try:
-                from toolkit.print import print_acc
                 print_acc("[CONTROLNET DRY-RUN] Skipped by policy: dry-run removed")
             except Exception:
                 pass
@@ -576,7 +568,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         raise RuntimeError(f"Failed to emit status update: {e}") from e
                 else:
                     try:
-                        from toolkit.print import print_acc
                         print_acc(msg)
                     except Exception as e:
                         raise RuntimeError(f"Failed to print status using print_acc: {e}") from e
@@ -593,7 +584,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 is_zimage = adapter_uses_zimage(self.sd.controlnet if getattr(self, 'sd', None) is not None else None, cfg_src)
                 if is_zimage:
                     try:
-                        from toolkit.print import print_acc
                         print_acc("[CONTROLNET DRY-RUN] Z-Image adapter detected; skipping control_images adaptation in dry-run")
                     except Exception:
                         pass
@@ -732,7 +722,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.print_and_status_update("ControlNet training setup verified")
         else:
             try:
-                from toolkit.print import print_acc
                 print_acc("ControlNet training setup verified")
             except Exception as e:
                 raise RuntimeError(f"Failed to emit ControlNet verification message: {e}") from e
@@ -2394,6 +2383,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if hasattr(self.sd, 'target_lora_modules'):
                     network_kwargs['target_lin_modules'] = self.sd.target_lora_modules
 
+                # RCA toggle: freeze early blocks and compute combined block dims when enabled
+                rca_block_dims = None
+                if getattr(self.train_config, 'rca_enabled', False):
+                    try:
+                        from toolkit.splitflux import freeze_unet_blocks, build_rca_combined_block_dims
+                        frozen = freeze_unet_blocks(self.sd.get_model_to_train(), list(range(1, 20)))
+                        try:
+                            from toolkit.print import print_acc
+                            print_acc(f"[RCA] Enabled: frozen early blocks 1-19; frozen params: {len(frozen)}")
+                        except Exception:
+                            pass
+                        rca_block_dims = build_rca_combined_block_dims(self.train_config)
+                    except Exception as e:
+                        try:
+                            print(f"[RCA] helper failed: {e}")
+                        except Exception:
+                            pass
+                        rca_block_dims = None
+
                 self.network = NetworkClass(
                     text_encoder=text_encoder,
                     unet=self.sd.get_model_to_train(),
@@ -2404,6 +2412,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     train_text_encoder=self.train_config.train_text_encoder,
                     conv_lora_dim=self.network_config.conv,
                     conv_alpha=self.network_config.conv_alpha,
+                    block_dims=rca_block_dims,
                     is_sdxl=self.model_config.is_xl or self.model_config.is_ssd,
                     is_v2=self.model_config.is_v2,
                     is_v3=self.model_config.is_v3,

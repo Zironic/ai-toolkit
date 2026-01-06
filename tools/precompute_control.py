@@ -79,8 +79,21 @@ def precompute_dataset(
         with Image.open(src) as im:
             canny = make_canny_image(im, threshold1, threshold2, blur)
             if control_size is not None:
-                canny = canny.resize((control_size, control_size), Image.BICUBIC)
+                # Use dataloader bucket logic so precomputed canny images match bucket-resizing behavior
+                from toolkit.buckets import get_bucket_for_image_size
+                w, h = canny.size
+                bucket = get_bucket_for_image_size(w, h, resolution=control_size)
+                target_w, target_h = bucket['width'], bucket['height']
+                scale = max(target_w / w, target_h / h) if w > 0 and h > 0 else 1.0
+                new_w = max(1, int(round(w * scale)))
+                new_h = max(1, int(round(h * scale)))
+                canny = canny.resize((new_w, new_h), Image.BICUBIC)
+                left = (new_w - target_w) // 2
+                top = (new_h - target_h) // 2
+                canny = canny.crop((left, top, left + target_w, top + target_h))
+                debug(f"Processed canny for {src.name}: original=({w}x{h}) -> resized=({new_w}x{new_h}) -> target=({target_w}x{target_h})")
             canny.save(out_path)
+            debug(f"Saved canny: {out_path.name} size={canny.size}")
             manifest["files"][str(src.name)] = str(out_path.name)
 
     manifest_path = out_dir / "canny_manifest.json"

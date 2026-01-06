@@ -33,6 +33,64 @@ from jobs.process import BaseSDTrainProcess
 from torchvision import transforms
 from diffusers import EMAModel
 import math
+from toolkit.buckets import get_bucket_for_image_size
+import torch.nn.functional as F
+
+
+def _resize_batch_to_bucket(batch_imgs: torch.Tensor, size: int, full_size_control_images: bool, pad_to_mult: int = 16):
+    """Resize a batch of control images (tensor [B,C,H,W]) to either full-size or bucket target.
+
+    Returns: batch_resized (float32 tensor), used_dataset_control (bool), meta dict with sizes
+    meta keys: orig, resized, target
+    """
+    # ensure float tensor
+    batch_imgs_f = batch_imgs.to(torch.float32)
+    _, C, H, W = batch_imgs_f.shape
+    orig = (H, W)
+
+    def _pad_to_mult(x, m=16):
+        return ((x + m - 1) // m) * m
+
+    if full_size_control_images:
+        current_long = max(H, W)
+        if int(size) == int(current_long) and (H % pad_to_mult == 0 and W % pad_to_mult == 0):
+            return batch_imgs_f, True, {'orig': orig, 'resized': (H, W), 'target': (H, W)}
+        # Rescale preserving aspect so long side == size, then pad to multiple of pad_to_mult.
+        scale = float(size) / float(current_long) if current_long > 0 else 1.0
+        new_h = max(1, int(round(H * scale)))
+        new_w = max(1, int(round(W * scale)))
+        scaled = F.interpolate(batch_imgs_f, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        pad_h = _pad_to_mult(new_h, pad_to_mult)
+        pad_w = _pad_to_mult(new_w, pad_to_mult)
+        # Center-pad symmetrically
+        if pad_h != new_h or pad_w != new_w:
+            pad_right = pad_w - new_w
+            pad_bottom = pad_h - new_h
+            pad_left = pad_right // 2
+            pad_top = pad_bottom // 2
+            pad_right = pad_right - pad_left
+            pad_bottom = pad_bottom - pad_top
+            # pad format: (left, right, top, bottom)
+            batch_resized = torch.nn.functional.pad(scaled, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0.0)
+            resized = (pad_h, pad_w)
+        else:
+            batch_resized = scaled
+            resized = (new_h, new_w)
+        return batch_resized, False, {'orig': orig, 'resized': resized, 'target': (size, size)}
+    else:
+        # Use bucket-based area-preserving resize so result matches dataloader bucket output
+        bucket = get_bucket_for_image_size(W, H, resolution=size)
+        target_w, target_h = bucket['width'], bucket['height']
+        # scale preserving aspect so both dimensions >= target dims
+        scale = max(target_w / W, target_h / H) if W > 0 and H > 0 else 1.0
+        new_w = max(1, int(round(W * scale)))
+        new_h = max(1, int(round(H * scale)))
+        scaled = F.interpolate(batch_imgs_f, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        # center-crop to exact bucket dims
+        left = (new_w - target_w) // 2
+        top = (new_h - target_h) // 2
+        batch_resized = scaled[:, :, top:top + target_h, left:left + target_w]
+        return batch_resized, False, {'orig': orig, 'resized': (new_h, new_w), 'target': (target_h, target_w)}
 from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
 from toolkit.util.losses import wavelet_loss, stepped_loss
@@ -105,6 +163,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.cached_blank_embeds: Optional[PromptEmbeds] = None
         self.cached_trigger_embeds: Optional[PromptEmbeds] = None
         self.diff_output_preservation_embeds: Optional[PromptEmbeds] = None
+        # per-dataset split prompt embeddings: key -> PromptEmbeds
+        self.dataset_split_prompt_embeds: dict = {}
         
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
@@ -476,6 +536,23 @@ class SDTrainer(BaseSDTrainProcess):
                 if self.train_config.diff_output_preservation:
                     self.diff_output_preservation_embeds = self.sd.encode_prompt(self.train_config.diff_output_preservation_class)
                 
+                # Per-dataset SplitPrompt caching: encode the optional per-dataset SplitPrompt once and cache it
+                self.dataset_split_prompt_embeds = {}
+                if getattr(self, 'datasets', None) is not None:
+                    for idx, ds in enumerate(self.datasets):
+                        try:
+                            sp_enabled = bool(getattr(ds, 'split_prompt_enabled', False))
+                            sp_text = getattr(ds, 'split_prompt', None)
+                            if sp_enabled and sp_text and str(sp_text).strip() != '':
+                                emb = self.sd.encode_prompt(sp_text, **encode_kwargs)
+                                emb = emb.to(self.device_torch, dtype=self.sd.torch_dtype).detach()
+                                key = getattr(ds, 'folder_path', f'dataset_{idx}')
+                                self.dataset_split_prompt_embeds[key] = emb
+                                print_acc(f"[SplitPrompt] Cached split prompt embedding for dataset {key}")
+                        except Exception as e:
+                            key = getattr(ds, 'folder_path', f'dataset_{idx}')
+                            print_acc(f"[SplitPrompt] Failed to encode split prompt for dataset {key}: {e}")
+                
                 self.cache_sample_prompts()
                 
                 print_acc("\n***** UNLOADING TEXT ENCODER *****")
@@ -631,6 +708,18 @@ class SDTrainer(BaseSDTrainProcess):
         loss_target = self.train_config.loss_target
         is_reg = any(batch.get_is_reg_list())
         additional_loss = 0.0
+        # include attention alignment loss computed in after_unet_predict (scalar already weighted)
+        attn_loss = getattr(self, '_latest_attention_align_loss', 0.0)
+        if isinstance(attn_loss, torch.Tensor):
+            try:
+                additional_loss = additional_loss + attn_loss.to(dtype)
+            except Exception:
+                additional_loss = additional_loss + float(attn_loss)
+        else:
+            try:
+                additional_loss = additional_loss + float(attn_loss)
+            except Exception:
+                pass
 
         prior_mask_multiplier = None
         target_mask_multiplier = None
@@ -1346,7 +1435,55 @@ class SDTrainer(BaseSDTrainProcess):
         return prior_pred
 
     def before_unet_predict(self):
-        pass
+        # Setup attention hooks if attention alignment is enabled
+        try:
+            if getattr(self.train_config, 'attention_align_weight', 0.0) <= 0.0:
+                return
+            # clear previous
+            self._collected_attentions = []
+            self._attn_hook_handles = []
+            # attach forward hooks to attention-like modules
+            for name, module in self.sd.unet.named_modules():
+                cls_name = module.__class__.__name__.lower()
+                if 'attn' in cls_name or 'attention' in cls_name:
+                    if hasattr(module, 'to_q') and hasattr(module, 'to_k'):
+                        def make_hook(n):
+                            def hook(mod, inp, out):
+                                try:
+                                    # inp: (hidden_states, encoder_hidden_states, ...)
+                                    hidden = inp[0]
+                                    enc = inp[1] if len(inp) > 1 else None
+                                    if enc is None:
+                                        return
+                                    q = mod.to_q(hidden)
+                                    k = mod.to_k(enc)
+                                    # reshape: try common formats
+                                    B = q.shape[0]
+                                    q_len = q.shape[1]
+                                    Cq = q.shape[2]
+                                    # infer num_heads from module if available
+                                    num_heads = getattr(mod, 'num_heads', None)
+                                    if num_heads is None:
+                                        # try to infer
+                                        num_heads = getattr(mod, 'heads', None) or 1
+                                    head_dim = Cq // num_heads
+                                    q = q.view(B, q_len, num_heads, head_dim).permute(0,2,1,3)
+                                    k_len = k.shape[1]
+                                    k = k.view(B, k_len, num_heads, head_dim).permute(0,2,1,3)
+                                    # compute attn
+                                    att = torch.einsum('bhqd,bhkd->bhqk', q, k) / (head_dim ** 0.5)
+                                    attn = torch.softmax(att, dim=-1)
+                                    # store
+                                    self._collected_attentions.append(attn.detach())
+                                except Exception:
+                                    # best-effort; don't crash training
+                                    return
+                            return hook
+                        h = module.register_forward_hook(make_hook(name))
+                        self._attn_hook_handles.append(h)
+        except Exception:
+            # best-effort; ignore on failures
+            pass
 
     def _looks_like_pixel_images(self, x):
         # Accept both batched tensors and lists of tensors
@@ -1561,38 +1698,20 @@ class SDTrainer(BaseSDTrainProcess):
                             def _pad_to_mult(x, m=16):
                                 return ((x + m - 1) // m) * m
 
-                            if getattr(fi, 'full_size_control_images', False):
-                                # If requested `size` equals the current long side, keep as-is.
-                                current_long = max(H, W)
-                                if int(size) == int(current_long) and (H % 16 == 0 and W % 16 == 0):
-                                    batch_resized = batch_imgs.to(torch.float32)
-                                    used_dataset_control = True
-                                else:
-                                    # Rescale preserving aspect so long side == size, then pad to multiple of 16.
-                                    scale = float(size) / float(current_long) if current_long > 0 else 1.0
-                                    new_h = max(1, int(round(H * scale)))
-                                    new_w = max(1, int(round(W * scale)))
-                                    scaled = torch.nn.functional.interpolate(batch_imgs.to(torch.float32), size=(new_h, new_w), mode='bilinear', align_corners=False)
-                                    pad_h = _pad_to_mult(new_h, 16)
-                                    pad_w = _pad_to_mult(new_w, 16)
-                                    # Center-pad symmetrically to better match dataset behavior
-                                    if pad_h != new_h or pad_w != new_w:
-                                        pad_right = pad_w - new_w
-                                        pad_bottom = pad_h - new_h
-                                        pad_left = pad_right // 2
-                                        pad_top = pad_bottom // 2
-                                        pad_right = pad_right - pad_left
-                                        pad_bottom = pad_bottom - pad_top
-                                        # pad format: (left, right, top, bottom)
-                                        batch_resized = torch.nn.functional.pad(scaled, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0.0)
-                                    else:
-                                        batch_resized = scaled
-                            else:
-                                # Legacy behavior for non-full-size control images: force square to requested size
-                                if H != size or W != size:
-                                    batch_resized = torch.nn.functional.interpolate(batch_imgs.to(torch.float32), size=(size, size), mode='bilinear', align_corners=False)
-                                else:
-                                    batch_resized = batch_imgs.to(torch.float32)
+                            # Use unified helper that mirrors dataloader behavior for resizing controls
+                            try:
+                                batch_resized, used_dataset_control, _meta = _resize_batch_to_bucket(batch_imgs, size, getattr(fi, 'full_size_control_images', False))
+                                # Log final sizes for diagnosability
+                                try:
+                                    orig = _meta.get('orig')
+                                    resized = _meta.get('resized')
+                                    target = _meta.get('target')
+                                    print_acc(f"[PRECOMPUTE] calling encode for {fi.path} size={size} orig={orig[1]}x{orig[0]} resized={resized[1]}x{resized[0]} target={target[1]}x{target[0]}")
+                                except Exception:
+                                    pass
+                            except Exception:
+                                batch_resized = batch_imgs.to(torch.float32)
+                                used_dataset_control = False
                         except Exception:
                             batch_resized = batch_imgs.to(torch.float32)
 
@@ -1679,15 +1798,19 @@ class SDTrainer(BaseSDTrainProcess):
 
             # restore device state after a dataset
 
-        self.sd.restore_device_state()
+            try:
+                self.sd.restore_device_state()
+            except Exception:
+                # best-effort; don't let a missing helper or other error abort precompute
+                pass
 
-        # Defensive restore: ensure global grad mode is enabled after precompute.
-        # Some third-party encoders or buggy implementations may have called
-        # torch.set_grad_enabled(False) without restoring; be defensive.
+            # Defensive restore: ensure global grad mode is enabled after precompute.
+            # Some third-party encoders or buggy implementations may have called
+            # torch.set_grad_enabled(False) without restoring; be defensive.
 
-        if not torch.is_grad_enabled():
-            print_acc("[PRECOMPUTE] Global grad mode was disabled after precompute; re-enabling")
-            torch.set_grad_enabled(True)
+            if not torch.is_grad_enabled():
+                print_acc("[PRECOMPUTE] Global grad mode was disabled after precompute; re-enabling")
+                torch.set_grad_enabled(True)
 
         self._precomputed_zimage_controls_done = True
 
@@ -1815,7 +1938,122 @@ class SDTrainer(BaseSDTrainProcess):
         return assemble_zimage_control_context(control_latents, control_in_dim=ctl_dim)
 
     def after_unet_predict(self):
-        pass
+        # Compute attention alignment loss if hooks were active
+        try:
+            if getattr(self.train_config, 'attention_align_weight', 0.0) <= 0.0:
+                return
+            # remove hooks
+            if hasattr(self, '_attn_hook_handles') and self._attn_hook_handles is not None:
+                for h in list(self._attn_hook_handles):
+                    try:
+                        h.remove()
+                    except Exception:
+                        pass
+                self._attn_hook_handles = None
+            # if no attentions collected, skip
+            if not hasattr(self, '_collected_attentions') or len(self._collected_attentions) == 0:
+                self._latest_attention_align_loss = 0.0
+                return
+            # Prepare attentions list (list of tensors [B, H, T, S])
+            atts = self._collected_attentions
+            # get batch & masks
+            batch = getattr(self, '_last_batch_for_attn', None)
+            if batch is None:
+                self._latest_attention_align_loss = 0.0
+                return
+            # Mask selection deferred to after we compute latent spatial size
+            mask = None
+            # Average layers and heads to produce [B, T] per token (we'll aggregate across tokens for now)
+            # reuse avg_attention_maps by selecting token indices after reshaping
+            # Our collected atts are [L](B,H,T,S). Use helper to average and extract token-specific maps.
+            from toolkit.attention_align import avg_attention_maps, attention_alignment_loss
+            # select a token index heuristically per-sample: we check for configured token string presence
+            token_str = getattr(self.train_config, 'attention_align_token', None)
+            token_indices = None
+            if token_str is not None and hasattr(self.sd, 'tokenizer') and self.sd.tokenizer is not None:
+                # try to find token positions in sample prompts
+                token_ids = None
+                try:
+                    token_ids = self.sd.tokenizer.encode(token_str, add_special_tokens=False)
+                except Exception:
+                    token_ids = None
+            # For simplicity, we will average across all source tokens to get an attention mass map per target
+            # Convert collected atts to head-averaged maps [B, T] by averaging over heads and layers and source tokens
+            maps = []
+            for a in atts:
+                try:
+                    # a: [B,H,T,S]
+                    head_avg = a.mean(dim=1)  # [B,T,S]
+                    # average across source tokens to get [B,T]
+                    maps.append(head_avg.mean(dim=-1))
+                except Exception:
+                    continue
+            if len(maps) == 0:
+                self._latest_attention_align_loss = 0.0
+                return
+            stacked = torch.stack(maps, dim=0).mean(dim=0)  # [B,T]
+            B, T = stacked.shape
+            # derive target H,W from batch.latents
+            lat = getattr(batch, 'latents', None)
+            if lat is None:
+                # fallback: try noisy_latents from last forward
+                lat = getattr(self, '_last_noisy_latents', None)
+            if lat is None:
+                self._latest_attention_align_loss = 0.0
+                return
+            if lat.ndim == 5:
+                _, _, _, H_lat, W_lat = lat.shape
+            else:
+                _, _, H_lat, W_lat = lat.shape
+            # reshape stacked to [B, H_lat, W_lat]
+            att_maps_2d = stacked.view(B, H_lat, W_lat)
+            # Determine mask: prefer control-derived processed mask when configured
+            mask = None
+            try:
+                from toolkit.masked_recon import build_control_mask
+                # Prefer control-derived mask if configured and control available
+                if getattr(self.train_config, 'attention_align_prefer_control_mask', True) and getattr(batch, 'control_tensor', None) is not None:
+                    try:
+                        mask = build_control_mask(batch.control_tensor, self.train_config, target_size=(H_lat, W_lat), device_torch=self.device_torch)
+                    except Exception:
+                        mask = None
+            except Exception:
+                mask = None
+
+            # Fallback to any mask_tensor provided by dataset
+            if mask is None and getattr(batch, 'mask_tensor', None) is not None:
+                try:
+                    mask = batch.mask_tensor.to(self.device_torch)
+                except Exception:
+                    mask = None
+
+            # Final fallback: simple single-channel control extract (legacy behavior)
+            if mask is None and getattr(batch, 'control_tensor', None) is not None:
+                try:
+                    m = batch.control_tensor
+                    if isinstance(m, torch.Tensor) and m.ndim == 3:
+                        mask = m[:1, :1, ...].unsqueeze(0).to(self.device_torch)
+                except Exception:
+                    mask = None
+
+            if mask is None:
+                self._latest_attention_align_loss = 0.0
+                return
+
+            # resize mask to H_lat x W_lat (helper may already return desired size)
+            mask_resized = torch.nn.functional.interpolate(mask, size=(H_lat, W_lat), mode='bicubic')
+            # ensure mask shape [B,1,H,W]
+            if mask_resized.ndim == 4:
+                m_flat = mask_resized.view(B, 1, H_lat * W_lat)
+            elif mask_resized.ndim == 3:
+                m_flat = mask_resized.unsqueeze(1).view(B, 1, H_lat * W_lat)
+            att_flat = att_maps_2d.view(B, 1, H_lat * W_lat)
+            loss = attention_alignment_loss(att_flat, m_flat, mode=getattr(self.train_config, 'attention_align_mode', 'mse'))
+            self._latest_attention_align_loss = loss * getattr(self.train_config, 'attention_align_weight', 1.0)
+        except Exception:
+            # best-effort; do not crash training on alignment errors
+            self._latest_attention_align_loss = 0.0
+            return
 
     def end_of_training_loop(self):
         pass
@@ -2027,10 +2265,22 @@ class SDTrainer(BaseSDTrainProcess):
             return SDTrainer.compute_adapter_multiplier(is_t2i, match_adapter_assist, self.device_torch, dtype)
 
         # Helper: compute and optionally apply masked reconstruction loss
-
+        def _apply_masked_recon_loss_local(current_loss):
+            # Lightweight wrapper to call class method; keeps local scope simple
+            try:
+                loss_out, mloss = self._compute_and_apply_masked_recon_loss(current_loss, noisy_latents, imgs, batch, dtype)
+                return loss_out, mloss
+            except Exception as e:
+                try:
+                    print_acc(f"[MASKED_RECON] failed: {e}")
+                except Exception:
+                    print(f"[MASKED_RECON] failed: {e}")
+                return current_loss, None
 
         # initialize masked recon logger
         masked_recon_logged = None
+
+
 
         # flush()
 
@@ -3310,6 +3560,8 @@ class SDTrainer(BaseSDTrainProcess):
                             if not getattr(noisy_latents, 'requires_grad', False):
                                 self._fatal("`noisy_latents` does not require gradients (it appears detached). This prevents any backward propagation. Aborting training to avoid silent progress.")
 
+                            # Make batch visible to pre/post UNet hooks (for attention alignment)
+                            self._last_batch_for_attn = batch
                             # proceed to forward
                             noise_pred = self.predict_noise(
                                 noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
@@ -3407,37 +3659,39 @@ class SDTrainer(BaseSDTrainProcess):
                     # else:
                     self.accelerator.backward(loss)
 
-                    # Sanity check: ensure backward produced gradients. If not, fail fast with detailed diagnostics.
-                    try:
-                        # Build a flat params_list to inspect grads
-                        params_iter = self.params
-                        if isinstance(params_iter, list) and len(params_iter) > 0 and isinstance(params_iter[0], dict):
-                            params_list = []
-                            for p in params_iter:
-                                params_list.extend(p['params'])
-                        else:
-                            params_list = params_iter
+        return loss.detach()
+        # flush()
 
-                        any_grad = False
-                        any_requires_grad = False
-                        for p in params_list:
-                            if getattr(p, 'requires_grad', False):
-                                any_requires_grad = True
-                            if getattr(p, 'grad', None) is not None:
-                                any_grad = True
-                                break
+    def _compute_and_apply_masked_recon_loss(self, current_loss, noisy_latents, imgs, batch, dtype):
+        """Thin wrapper: delegate masked reconstruction to `toolkit.masked_recon.apply_masked_recon_loss`.
+        Returns (loss, mloss_tensor_or_None)
+        """
+        try:
+            from toolkit.masked_recon import apply_masked_recon_loss
+        except Exception:
+            return current_loss, None
 
-                        if not any_grad:
-                            # raise error with useful debugging info
-                            raise RuntimeError(
-                                f"Backward completed but no parameter gradients were produced. "
-                                f"loss.requires_grad={getattr(loss, 'requires_grad', None)}, "
-                                f"any_param_requires_grad={any_requires_grad}, "
-                                f"num_params={len(params_list) if isinstance(params_list, (list, tuple)) else 0}" 
-                            )
-                    except Exception:
-                        # Reraise so we get a trace for debugging
-                        raise
+        try:
+            return apply_masked_recon_loss(current_loss, self.train_config, self.sd, noisy_latents, imgs, batch, dtype, self.device_torch)
+        except Exception as e:
+            try:
+                print_acc(f"[MASKED_RECON] helper failure: {e}")
+            except Exception:
+                print(f"[MASKED_RECON] helper failure: {e}")
+            return current_loss, None
+
+        # legacy masked-recon implementation removed; wrapper delegates to `toolkit.masked_recon`
+        return current_loss, None
+
+    def _maybe_log_per_example(self, batch: 'DataLoaderBatchDTO', batch_list_len: int) -> list:
+        """Return per-example entries for the given batch and update streaming aggregator.
+
+        Logging is only performed when the run is simple (single-batch and no gradient accumulation)
+        to avoid misleading or partial per-example logs during accumulation or multi-batch processing.
+        """
+        entries = []
+        try:
+            # Only log when a single batch was processed and there is no gradient accumulation configured
             grad_accum = getattr(self.train_config, 'gradient_accumulation', 1)
             grad_accum_steps = getattr(self.train_config, 'gradient_accumulation_steps', 1)
             if batch_list_len != 1 or grad_accum != 1 or grad_accum_steps != 1:
@@ -3458,8 +3712,9 @@ class SDTrainer(BaseSDTrainProcess):
                         raise RuntimeError(f"Failed to add entries to dataset aggregator: {e}") from e
                 except Exception as e:
                     raise RuntimeError(f"Unexpected error in training loop helper: {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error in training loop helper: {e}") from e
         return entries
-
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
@@ -3500,6 +3755,15 @@ class SDTrainer(BaseSDTrainProcess):
                 total_loss = loss
             else:
                 total_loss += loss
+        # Add any additional scalar losses (e.g., attention alignment)
+        try:
+            if additional_loss is not None and additional_loss != 0.0:
+                if isinstance(additional_loss, torch.Tensor):
+                    total_loss = total_loss + additional_loss
+                else:
+                    total_loss = total_loss + torch.tensor(additional_loss, dtype=total_loss.dtype, device=total_loss.device)
+        except Exception:
+            pass
             if len(batch_list) > 1 and self.model_config.low_vram:
                 torch.cuda.empty_cache()
 

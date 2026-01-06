@@ -85,6 +85,10 @@ export interface DatasetConfig {
   mask_path: string | null;
   mask_min_value: number;
   default_caption: string;
+  // SplitPrompt: optional prompt text (e.g. "[Trigger] style") to route to style blocks
+  split_prompt?: string | null;
+  // Enable using the SplitPrompt for this dataset
+  split_prompt_enabled?: boolean;
   caption_ext: string;
   caption_dropout_rate: number;
   shuffle_tokens?: boolean;
@@ -102,7 +106,7 @@ export interface DatasetConfig {
   control_path_1?: string | null;
   control_path_2?: string | null;
   control_path_3?: string | null;
-}
+} 
 
 export interface EMAConfig {
   use_ema: boolean;
@@ -141,7 +145,9 @@ export interface TrainConfig {
   loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped';
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
-}
+  // RCA toggle: enable Rank-Constrained Adaptation (UI toggle)
+  rca_enabled?: boolean;
+} 
 
 export interface QuantizeKwargsConfig {
   exclude: string[];

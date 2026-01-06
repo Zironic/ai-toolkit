@@ -457,6 +457,16 @@ export default function SimpleJob({
                     max={1024}
                   />
                 )}
+                <Checkbox
+                  label={
+                    <>
+                      Enable RCA <span className="text-xs text-gray-500">(Rank-Constrained Adaptation)</span>
+                    </>
+                  }
+                  checked={jobConfig.config.process[0].train?.rca_enabled || false}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.rca_enabled')}
+                  docKey={'train.rca_enabled'}
+                />
               </>
             )}
           </Card>
@@ -977,6 +987,22 @@ export default function SimpleJob({
                         placeholder="eg. 0.05"
                         min={0}
                         required
+                      />
+
+                      <Checkbox
+                        label="Use Split Prompt"
+                        className="pt-2"
+                        checked={dataset.split_prompt_enabled || false}
+                        onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].split_prompt_enabled`)}
+                        docKey={'datasets.split_prompt'}
+                      />
+                      <TextInput
+                        label="Split Prompt"
+                        className="pt-2"
+                        value={dataset.split_prompt ?? ''}
+                        onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].split_prompt`)}
+                        placeholder="eg. [Trigger] style"
+                        disabled={!dataset.split_prompt_enabled}
                       />
 
                       {/* Dataset Controls: visible when ControlNet is enabled */}
