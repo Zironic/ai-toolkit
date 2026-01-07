@@ -279,6 +279,34 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.diff_output_preservation_every': {
+    title: 'DOP Every N steps',
+    description: (
+      <>
+        Run Differential Output Preservation only every N training steps. Set to 1 to run every step.
+        Use this to reduce the overhead of DOP by computing preservation only at intervals. Must be an integer &gt;= 1.
+      </>
+    ),
+  },
+  'train.diff_output_preservation_resolution': {
+    title: 'DOP Resolution (px long-side)',
+    description: (
+      <>
+        Optional: run DOP preservation at a reduced spatial resolution (long-side in pixels), e.g. select from presets 128 / 256 / 512 / 1024. This will downsample
+        the latents for the preservation forward pass and compute preservation loss at the reduced size to reduce compute.
+        Choose 'Full resolution' to run at full resolution. Note: practical values are multiples of 16; the UI exposes safe presets and 128 is intentionally coarse.
+      </>
+    ),
+  },
+  'train.blank_prompt_preservation_resolution': {
+    title: 'BPP Resolution (px long-side)',
+    description: (
+      <>
+        Optional: run Blank Prompt Preservation at a reduced spatial resolution (long-side in pixels), choose from presets 128 / 256 / 512 / 1024. When set, the BPP
+        preservation pass and loss will operate at the smaller resolution. Choose 'Full resolution' to run at full resolution. Note: practical values are multiples of 16; the UI exposes safe presets and 128 is intentionally coarse.
+      </>
+    ),
+  },
   'train.do_differential_guidance': {
     title: 'Differential Guidance',
     description: (

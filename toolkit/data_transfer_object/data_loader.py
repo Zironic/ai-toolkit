@@ -13,7 +13,7 @@ from PIL.ImageOps import exif_transpose
 from toolkit import image_utils
 from toolkit.basic import get_quick_signature_string
 from toolkit.dataloader_mixins import CaptionProcessingDTOMixin, ImageProcessingDTOMixin, LatentCachingFileItemDTOMixin, \
-    ControlFileItemDTOMixin, ArgBreakMixin, PoiFileItemDTOMixin, MaskFileItemDTOMixin, AugmentationFileItemDTOMixin, \
+    ControlContextFileItemDTOMixin, ControlFileItemDTOMixin, ArgBreakMixin, PoiFileItemDTOMixin, MaskFileItemDTOMixin, AugmentationFileItemDTOMixin, \
     UnconditionalFileItemDTOMixin, ClipImageFileItemDTOMixin, InpaintControlFileItemDTOMixin, TextEmbeddingFileItemDTOMixin
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 
@@ -33,6 +33,7 @@ def print_once(msg):
 
 class FileItemDTO(
     LatentCachingFileItemDTOMixin,
+    ControlContextFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -47,6 +48,21 @@ class FileItemDTO(
 ):
     def __init__(self, *args, **kwargs):
         self.path = kwargs.get('path', '')
+        # Try to populate precompute contexts from registry early so recreated FileItemDTOs can
+        # benefit from prior precompute runs in the same process.
+        try:
+            from toolkit.precompute_cache import get_preencoded_control_contexts
+            cached = get_preencoded_control_contexts(self.path)
+            if cached is not None:
+                # attach to the FileItem so later collectors will find it
+                try:
+                    self._preencoded_zimage_control_contexts = cached
+                except Exception:
+                    # best-effort; if setting fails ignore
+                    pass
+        except Exception:
+            pass
+
         self.dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
         self.is_video = self.dataset_config.num_frames > 1
         size_database = kwargs.get('size_database', {})
@@ -120,6 +136,17 @@ class FileItemDTO(
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
 
+        # If not found in in-process registry, attempt to load precomputed control contexts from disk
+        try:
+            if getattr(self, '_preencoded_zimage_control_contexts', None) is None and getattr(self.dataset_config, 'cache_control_contexts_to_disk', False):
+                if hasattr(self, 'load_control_contexts') and callable(getattr(self, 'load_control_contexts')):
+                    loaded = self.load_control_contexts()
+                    if loaded is not None:
+                        self._preencoded_zimage_control_contexts = loaded
+        except Exception:
+            # best-effort; ignore load failures
+            pass
+
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
         self.prior_reg = self.dataset_config.prior_reg
@@ -181,12 +208,59 @@ class DataLoaderBatchDTO:
             self.extra_values: Union[torch.Tensor, None] = torch.tensor([x.extra_values for x in self.file_items]) if len(self.file_items[0].extra_values) > 0 else None
             if not is_latents_cached:
                 # only return a tensor if latents are not cached
-                self.tensor: torch.Tensor = torch.cat([x.tensor.unsqueeze(0) for x in self.file_items])
+                tensors = []
+                for x in self.file_items:
+                    t = getattr(x, 'tensor', None)
+                    if t is None:
+                        # Try to eagerly load/process the image if helper exists (tests and simple runs expect this)
+                        try:
+                            if hasattr(x, 'load_and_process_image') and callable(getattr(x, 'load_and_process_image')):
+                                # Pass None to use default transforms
+                                x.load_and_process_image(None)
+                                t = getattr(x, 'tensor', None)
+                        except Exception:
+                            t = None
+                    if t is None:
+                        raise AttributeError(f"FileItem has no tensor for {getattr(x, 'path', 'unknown')}")
+                    # If we got a PIL image back (no transform applied), convert to tensor now
+                    try:
+                        from PIL import Image as _PILImage
+                        # PIL exposes the Image class as Image.Image
+                        if isinstance(t, _PILImage.Image):
+                            try:
+                                from torchvision import transforms as _tv_transforms
+                                t = _tv_transforms.ToTensor()(t)
+                                # stash back so subsequent users see a tensor
+                                x.tensor = t
+                            except Exception:
+                                # last-resort: convert via numpy
+                                import numpy as _np
+                                t = _np.array(t).astype('float32') / 255.0
+                                t = torch.from_numpy(t.transpose(2, 0, 1)).float()
+                                x.tensor = t
+                    except Exception:
+                        pass
+
+                    tensors.append(t.unsqueeze(0))
+                self.tensor: torch.Tensor = torch.cat(tensors)
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
             if is_latents_cached:
                 self.latents = torch.cat([x.get_latent().unsqueeze(0) for x in self.file_items])
             self.prompt_embeds: Union[PromptEmbeds, None] = None
+            # optional DOP (Differential Output Preservation) per-file cached prompt embeds
+            self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
+            # if any file items have dop_prompt_embeds, collate them into a batch concat
+            if any([getattr(x, 'dop_prompt_embeds', None) is not None for x in self.file_items]):
+                dop_list = []
+                # only collate if all have a dop embed
+                for x in self.file_items:
+                    if getattr(x, 'dop_prompt_embeds', None) is None:
+                        dop_list = None
+                        break
+                    dop_list.append(x.dop_prompt_embeds)
+                if dop_list is not None:
+                    self.dop_prompt_embeds = concat_prompt_embeds(dop_list)
             # if self.file_items[0].control_tensor is not None:
             # if any have a control tensor, we concatenate them
             if any([x.control_tensor is not None for x in self.file_items]):

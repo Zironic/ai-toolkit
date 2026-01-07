@@ -1255,23 +1255,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.accelerator.even_batches=False
         
         # # prepare all the models stuff for accelerator (hopefully we dont miss any)
-        self.sd.vae = self.accelerator.prepare(self.sd.vae)
-        if self.sd.unet is not None:
+        # Prepare modules safely using getattr to avoid AttributeError with minimal SD stubs
+        if getattr(self.sd, 'vae', None) is not None:
+            self.sd.vae = self.accelerator.prepare(self.sd.vae)
+        if getattr(self.sd, 'unet', None) is not None:
             self.sd.unet = self.accelerator.prepare(self.sd.unet)
             # todo always tdo it?
             self.modules_being_trained.append(self.sd.unet)
-        if self.sd.text_encoder is not None and self.train_config.train_text_encoder:
+        if getattr(self.sd, 'text_encoder', None) is not None and self.train_config.train_text_encoder:
             if isinstance(self.sd.text_encoder, list):
                 self.sd.text_encoder = [self.accelerator.prepare(model) for model in self.sd.text_encoder]
                 self.modules_being_trained.extend(self.sd.text_encoder)
             else:
                 self.sd.text_encoder = self.accelerator.prepare(self.sd.text_encoder)
                 self.modules_being_trained.append(self.sd.text_encoder)
-        if self.sd.refiner_unet is not None and self.train_config.train_refiner:
+        if getattr(self.sd, 'refiner_unet', None) is not None and self.train_config.train_refiner:
             self.sd.refiner_unet = self.accelerator.prepare(self.sd.refiner_unet)
             self.modules_being_trained.append(self.sd.refiner_unet)
         # todo, do we need to do the network or will "unet" get it?
-        if self.sd.network is not None:
+        if getattr(self.sd, 'network', None) is not None:
             self.sd.network = self.accelerator.prepare(self.sd.network)
             self.modules_being_trained.append(self.sd.network)
         if getattr(self, 'adapter', None) is not None and getattr(self, 'adapter_config', None) is not None and getattr(self.adapter_config, 'train', False):
@@ -1601,16 +1603,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 dtype = get_torch_dtype(self.train_config.dtype)
                 imgs = None
                 is_reg = any(batch.get_is_reg_list())
-                if batch.tensor is not None:
-                    imgs = batch.tensor
-                    imgs = imgs.to(self.device_torch, dtype=dtype)
-                    # dont adjust for regs.
-                    if self.train_config.img_multiplier is not None and not is_reg:
-                        # do it ad contrast
-                        imgs = reduce_contrast(imgs, self.train_config.img_multiplier)
+
+                # Group device transfers so they are measured as a single operation
+                with self.timer('to_device'):
+                    if batch.tensor is not None:
+                        imgs = batch.tensor
+                        imgs = imgs.to(self.device_torch, dtype=dtype)
+                        # dont adjust for regs.
+                        if self.train_config.img_multiplier is not None and not is_reg:
+                            # do it ad contrast
+                            imgs = reduce_contrast(imgs, self.train_config.img_multiplier)
+                    if batch.latents is not None:
+                        latents = batch.latents.to(self.device_torch, dtype=dtype)
+                        batch.latents = latents
+
                 if batch.latents is not None:
-                    latents = batch.latents.to(self.device_torch, dtype=dtype)
-                    batch.latents = latents
+                    # latents already set during to_device
+                    latents = batch.latents
                 else:
                     # normalize to
                     if self.train_config.standardize_images:
@@ -1636,7 +1645,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                         # show_tensors(imgs, 'imgs')
 
-                    latents = self.sd.encode_images(imgs)
+                    # Explicitly time image encoding
+                    with self.timer('encode_images'):
+                        latents = self.sd.encode_images(imgs)
                     batch.latents = latents
 
                 if self.train_config.standardize_latents:
@@ -1663,15 +1674,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
 
                 if batch.unconditional_tensor is not None and batch.unconditional_latents is None:
-                    unconditional_imgs = batch.unconditional_tensor
-                    unconditional_imgs = unconditional_imgs.to(self.device_torch, dtype=dtype)
-                    unconditional_latents = self.sd.encode_images(unconditional_imgs)
+                    with self.timer('to_device'):
+                        unconditional_imgs = batch.unconditional_tensor
+                        unconditional_imgs = unconditional_imgs.to(self.device_torch, dtype=dtype)
+                    with self.timer('encode_images'):
+                        unconditional_latents = self.sd.encode_images(unconditional_imgs)
                     batch.unconditional_latents = unconditional_latents * self.train_config.latent_multiplier
 
                 unaugmented_latents = None
                 if self.train_config.loss_target == 'differential_noise':
                     # we determine noise from the differential of the latents
-                    unaugmented_latents = self.sd.encode_images(batch.unaugmented_tensor)
+                    with self.timer('encode_images'):
+                        unaugmented_latents = self.sd.encode_images(batch.unaugmented_tensor)
 
             with self.timer('prepare_scheduler'):
                 
@@ -3053,26 +3067,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                         self.writer.add_scalar('loss/loss', float(loss_dict.get('loss', 0.0)), self.step_num)
                                     except Exception:
                                         pass
+                                # preservation loss scalar (if present)
+                                if 'preservation' in loss_dict:
+                                    try:
+                                        self.writer.add_scalar('loss/preservation', float(loss_dict.get('preservation', 0.0)), self.step_num)
+                                    except Exception:
+                                        pass
                                 # train/loss_over_noise scalar
                                 if 'train/loss_over_noise' in loss_dict:
                                     try:
                                         self.writer.add_scalar('loss/train/loss_over_noise', float(loss_dict.get('train/loss_over_noise')), self.step_num)
                                     except Exception:
                                         pass
-
-                        # Ensure the UI logger (DB) has an entry for these keys when they would otherwise be skipped
-                        if getattr(self.logging_config, 'log_every', None) is not None and self.logging_config.log_every and self.step_num % self.logging_config.log_every != 0:
-                            if loss_dict is not None:
-                                try:
-                                    if 'loss' in loss_dict:
-                                        self.logger.log({ 'loss/loss': loss_dict.get('loss') })
-                                except Exception:
-                                    pass
-                                try:
-                                    if 'train/loss_over_noise' in loss_dict:
-                                        self.logger.log({ 'loss/train/loss_over_noise': loss_dict.get('train/loss_over_noise') })
-                                except Exception:
-                                    pass
                     except Exception:
                         # non-fatal: don't let logging issues halt training
                         pass

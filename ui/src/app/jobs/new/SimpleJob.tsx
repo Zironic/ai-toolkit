@@ -803,6 +803,37 @@ export default function SimpleJob({
                           }
                           placeholder="eg. woman"
                         />
+                        <NumberInput
+                          label="DOP Every N steps"
+                          className="pt-2 pb-4"
+                          value={
+                            (jobConfig.config.process[0].train.diff_output_preservation_every as number) || 1
+                          }
+                          onChange={value => setJobConfig(value, 'config.process[0].train.diff_output_preservation_every')}
+                          placeholder="eg. 1"
+                          min={1}
+                        />
+                        <SelectInput
+                          label="DOP Resolution"
+                          docKey={'train.diff_output_preservation_resolution'}
+                          className="pt-2 pb-4"
+                          value={
+                            jobConfig.config.process[0].train.diff_output_preservation_resolution !== null && jobConfig.config.process[0].train.diff_output_preservation_resolution !== undefined
+                              ? String(jobConfig.config.process[0].train.diff_output_preservation_resolution)
+                              : ''
+                          }
+                          options={[
+                            { value: '', label: 'Full resolution (no downsample)' },
+                            { value: '128', label: '128 px (coarse)' },
+                            { value: '256', label: '256 px' },
+                            { value: '512', label: '512 px' },
+                            { value: '1024', label: '1024 px' },
+                          ]}
+                          onChange={value => setJobConfig(value === '' ? null : Number(value), 'config.process[0].train.diff_output_preservation_resolution')}
+                        />
+                        {jobConfig.config.process[0].train.diff_output_preservation_resolution === 128 && (
+                          <div className="text-xs text-yellow-300 pt-1">128 px is very coarse — preserves generalization but loses fine detail.</div>
+                        )
                       </>
                     )}
                   </>
@@ -836,6 +867,28 @@ export default function SimpleJob({
                           placeholder="eg. 1.0"
                           min={0}
                         />
+                        <SelectInput
+                          label="BPP Resolution"
+                          docKey={'train.blank_prompt_preservation_resolution'}
+                          className="pt-2"
+                          value={
+                            jobConfig.config.process[0].train.blank_prompt_preservation_resolution !== null &&
+                            jobConfig.config.process[0].train.blank_prompt_preservation_resolution !== undefined
+                              ? String(jobConfig.config.process[0].train.blank_prompt_preservation_resolution)
+                              : ''
+                          }
+                          options={[
+                            { value: '', label: 'Full resolution (no downsample)' },
+                            { value: '128', label: '128 px (coarse)' },
+                            { value: '256', label: '256 px' },
+                            { value: '512', label: '512 px' },
+                            { value: '1024', label: '1024 px' },
+                          ]}
+                          onChange={value => setJobConfig(value === '' ? null : Number(value), 'config.process[0].train.blank_prompt_preservation_resolution')}
+                        />
+                        {jobConfig.config.process[0].train.blank_prompt_preservation_resolution === 128 && (
+                          <div className="text-xs text-yellow-300 pt-1">128 px is very coarse — preserves generalization but loses fine detail.</div>
+                        )
                       </>
                     )}
                   </>

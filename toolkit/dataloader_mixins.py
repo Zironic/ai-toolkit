@@ -1093,7 +1093,7 @@ class ControlFileItemDTOMixin:
         sd = kwargs.get('sd', None)
         # retain a reference to the sd object so we can consult model hints (eg. expected control channels)
         self.sd = sd
-        self.use_raw_control_images = sd is not None and sd.use_raw_control_images
+        self.use_raw_control_images = bool(getattr(sd, 'use_raw_control_images', False))
         # prefer self.dataset_config (set by FileItemDTO) over kwargs to be robust
         dataset_config: 'DatasetConfig' = getattr(self, 'dataset_config', kwargs.get('dataset_config', None))
         self.full_size_control_images = False
@@ -2130,23 +2130,98 @@ class LatentCachingMixin:
             self.sd.restore_device_state()
 
 
+class ControlContextFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        # cache path for assembled control_contexts (dict size->tensor saved as safetensors)
+        self._control_contexts_path: Union[str, None] = None
+        self.is_control_context_cached: bool = False
+        self.control_context_version: int = 1
+
+    def get_control_context_info_dict(self: 'FileItemDTO'):
+        # deterministic dict describing control context parameters
+        item = OrderedDict([
+            ("filename", os.path.basename(self.path)),
+            ("scale_to_width", int(self.scale_to_width)),
+            ("scale_to_height", int(self.scale_to_height)),
+            ("crop_x", int(self.crop_x)),
+            ("crop_y", int(self.crop_y)),
+            ("crop_width", int(self.crop_width)),
+            ("crop_height", int(self.crop_height)),
+            ("control_context_version", int(self.control_context_version)),
+        ])
+        if self.flip_x:
+            item["flip_x"] = True
+        if self.flip_y:
+            item["flip_y"] = True
+        return item
+
+    def get_control_context_path(self: 'FileItemDTO', recalculate=False):
+        if self._control_contexts_path is not None and not recalculate:
+            return self._control_contexts_path
+        img_dir = os.path.dirname(self.path)
+        ctx_dir = os.path.join(img_dir, '_context_cache')
+        hash_dict = self.get_control_context_info_dict()
+        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+        hash_str = hash_str.replace('=', '')
+        path = os.path.join(ctx_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+        self._control_contexts_path = path
+        return path
+
+    def save_control_contexts(self: 'FileItemDTO', contexts: dict):
+        # contexts: dict size->tensor
+        path = self.get_control_context_path(recalculate=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        state_dict = {}
+        for size, tensor in contexts.items():
+            state_dict[f'context_{int(size)}'] = tensor.cpu()
+        save_file(state_dict, path)
+        # mark as cached
+        self.is_control_context_cached = True
+        return path
+
+    def load_control_contexts(self: 'FileItemDTO'):
+        path = self.get_control_context_path(recalculate=False)
+        if not os.path.exists(path):
+            return None
+        state_dict = load_file(path, device='cpu')
+        contexts = {}
+        for key, val in state_dict.items():
+            if key.startswith('context_'):
+                try:
+                    size = int(key.split('_', 1)[1])
+                except Exception:
+                    continue
+                contexts[size] = val
+        if len(contexts) == 0:
+            return None
+        self.is_control_context_cached = True
+        return contexts
+
+
 class TextEmbeddingFileItemDTOMixin:
     def __init__(self, *args, **kwargs):
         # if we have super, call it
         if hasattr(super(), '__init__'):
             super().__init__(*args, **kwargs)
         self.prompt_embeds: Union[PromptEmbeds, None] = None
+        self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
         self._text_embedding_path: Union[str, None] = None
+        self._dop_text_embedding_path: Union[str, None] = None
         self.is_text_embedding_cached = False
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_space_version = 'sd1'
         self.text_embedding_version = 1
 
-    def get_text_embedding_info_dict(self: 'FileItemDTO'):
+    def get_text_embedding_info_dict(self: 'FileItemDTO', dop_class: str = None):
         # make sure the caption is loaded here
-        # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
         if self.caption is None:
             self.load_caption()
+        # Build a deterministic dict describing the text embedding input.
+        # If dop_class is provided, include it so dop variants have separate cache entries.
         item = OrderedDict([
             ("caption", self.caption),
             ("text_embedding_space_version", self.text_embedding_space_version),
@@ -2155,29 +2230,43 @@ class TextEmbeddingFileItemDTOMixin:
         # if we have a control image, cache the path
         if self.encode_control_in_text_embeddings and self.control_path is not None:
             item["control_path"] = self.control_path
+        if dop_class is not None:
+            item["dop_class"] = dop_class
         return item
 
-    def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        if self._text_embedding_path is not None and not recalculate:
-            return self._text_embedding_path
+    def get_text_embedding_path(self: 'FileItemDTO', recalculate=False, dop_class: str = None):
+        # choose cached path for normal or dop variant
+        if dop_class is None:
+            if self._text_embedding_path is not None and not recalculate:
+                return self._text_embedding_path
         else:
-            # we store text embeddings in a folder in same path as image called _text_embedding_cache
-            img_dir = os.path.dirname(self.path)
-            te_dir = os.path.join(img_dir, '_t_e_cache')
-            hash_dict = self.get_text_embedding_info_dict()
-            filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
-            # get base64 hash of md5 checksum of hash_dict
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            self._text_embedding_path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+            if self._dop_text_embedding_path is not None and not recalculate:
+                return self._dop_text_embedding_path
 
-        return self._text_embedding_path
+        # we store text embeddings in a folder in same path as image called _text_embedding_cache
+        img_dir = os.path.dirname(self.path)
+        te_dir = os.path.join(img_dir, '_t_e_cache')
+        hash_dict = self.get_text_embedding_info_dict(dop_class=dop_class)
+        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+        # get base64 hash of md5 checksum of hash_dict
+        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+        hash_str = hash_str.replace('=', '')
+        path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+        if dop_class is None:
+            self._text_embedding_path = path
+        else:
+            self._dop_text_embedding_path = path
+
+        return path
 
     def cleanup_text_embedding(self):
         if self.prompt_embeds is not None:
             # we are caching on disk, don't save in memory
             self.prompt_embeds = None
+        if self.dop_prompt_embeds is not None:
+            # clear any cached dop embedding in memory as well
+            self.dop_prompt_embeds = None
 
     def load_prompt_embedding(self, device=None):
         if not self.is_text_embedding_cached:
@@ -2185,6 +2274,21 @@ class TextEmbeddingFileItemDTOMixin:
         if self.prompt_embeds is None:
             # load it from disk
             self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+
+    def load_dop_prompt_embedding(self, dop_class: str, device=None):
+        """Load a precomputed DOP variant prompt embedding (if present on disk).
+
+        DOP prompt embeddings are persisted under the `_t_e_cache` directory.
+        """
+        if not self.is_text_embedding_cached:
+            return
+        if self.dop_prompt_embeds is None:
+            dop_path = self.get_text_embedding_path(recalculate=False, dop_class=dop_class)
+            if os.path.exists(dop_path):
+                self.dop_prompt_embeds = PromptEmbeds.load(dop_path)
+            else:
+                # missing dop embedding on disk; leave as None
+                return
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):

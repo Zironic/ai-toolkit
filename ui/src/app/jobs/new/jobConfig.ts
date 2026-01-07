@@ -92,6 +92,9 @@ export const defaultJobConfig: JobConfig = {
           diff_output_preservation: false,
           diff_output_preservation_multiplier: 1.0,
           diff_output_preservation_class: 'person',
+          diff_output_preservation_every: 1,
+          diff_output_preservation_resolution: null,
+          blank_prompt_preservation_resolution: null,
           switch_boundary_every: 1,
           loss_type: 'mse',
           // Masked reconstruction defaults (enabled by default)

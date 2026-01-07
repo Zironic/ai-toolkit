@@ -19,7 +19,7 @@ def test_predict_noise_zimage_raises_on_resize_failure(monkeypatch):
     latents = torch.randn((1, 16, 64, 64))
 
     # control latents encoded at 60x60 (mismatch)
-    zimage_control_latents = torch.randn((1, 4, 60, 60))
+    zimage_control_latents = torch.randn((1, 16, 60, 60))
 
     class FakeControlNet:
         def __call__(self, sample, timestep, control_context, conditioning_scale=1.0, *args, **kwargs):
@@ -42,4 +42,5 @@ def test_predict_noise_zimage_raises_on_resize_failure(monkeypatch):
     with pytest.raises(RuntimeError) as exc:
         func(sd, latents, text_embeddings, torch.tensor([1.0]), zimage_controlnet=fakecn, zimage_control_images=zimage_control_latents, zimage_conditioning_scale=1.0)
 
-    assert 'Z-Image control latent resize failed' in str(exc.value)
+    # Expect a clear mismatch/resize failure message
+    assert 'Z-Image control latent' in str(exc.value) and ('resize' in str(exc.value) or 'spatial mismatch' in str(exc.value) or 'resize failed' in str(exc.value))

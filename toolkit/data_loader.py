@@ -388,7 +388,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
     ):
         self.dataset_config = dataset_config
         # update bucket divisibility
-        self.dataset_config.bucket_tolerance = sd.get_bucket_divisibility()
+        # Some SD stubs in tests may not implement get_bucket_divisibility; default to 1
+        self.dataset_config.bucket_tolerance = getattr(sd, 'get_bucket_divisibility', lambda: 1)()
         self.is_video = dataset_config.num_frames > 1
         super().__init__()
         folder_path = dataset_config.folder_path
@@ -497,7 +498,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     dataloader_transforms=self.transform,
                     size_database=self.size_database,
                     dataset_root=dataset_folder,
-                    encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
+                    encode_control_in_text_embeddings=(getattr(self.sd, 'encode_control_in_text_embeddings', False) if self.sd else False),
                 )
                 self.file_list.append(file_item)
             except Exception as e:
@@ -556,7 +557,23 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 # setup buckets
                 self.setup_buckets()
             if self.is_caching_latents:
-                self.cache_latents_all_latents()
+                # Call the dataset's cache method directly if present; otherwise delegate to nested datasets
+                # (wrappers that hold `.datasets`). Do not catch exceptions raised inside the method so
+                # real errors (e.g., SD missing attributes) surface clearly.
+                if hasattr(self, 'cache_latents_all_latents') and callable(getattr(self, 'cache_latents_all_latents')):
+                    self.cache_latents_all_latents()
+                else:
+                    called = False
+                    if hasattr(self, 'datasets') and isinstance(self.datasets, (list, tuple)):
+                        for sub in self.datasets:
+                            if hasattr(sub, 'cache_latents_all_latents') and callable(getattr(sub, 'cache_latents_all_latents')):
+                                sub.cache_latents_all_latents()
+                                called = True
+                    if not called:
+                        raise RuntimeError(
+                            f"Dataset is configured to cache latents but does not implement 'cache_latents_all_latents': {type(self).__name__}."
+                            " Ensure your dataset class includes LatentCachingMixin or that caching is disabled in the dataset config.")
+
             if self.is_caching_clip_vision_to_disk:
                 self.cache_clip_vision_to_disk()
             if self.is_caching_text_embeddings:

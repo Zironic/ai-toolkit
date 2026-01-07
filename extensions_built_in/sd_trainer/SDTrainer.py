@@ -199,6 +199,8 @@ class SDTrainer(BaseSDTrainProcess):
         self._control_batch_count = 0
         self._total_batch_count = 0
         self._last_batch_has_control = False
+        # Counter for how many times diff_output_preservation actually executed
+        self._diff_output_preservation_exec_count = 0
 
     @staticmethod
     def compute_adapter_multiplier(is_t2i_adapter: bool, match_adapter_assist: bool, device, dtype) -> float:
@@ -239,6 +241,24 @@ class SDTrainer(BaseSDTrainProcess):
         Expected shapes: [B, C, H, W] or [C, H, W] or a list of such tensors. Raise RuntimeError with a descriptive
         message when the shape is invalid to support fail-fast behavior.
         """
+
+    def _is_dop_scheduled(self, for_encoding: bool = False) -> bool:
+        """Return True if a diff_output_preservation step is scheduled.
+
+        - for_encoding=True uses (total_batch_count + 1) to decide, which is useful when preparing
+          embeddings *before* the batch counter is incremented.
+        - for_encoding=False uses the current total batch counter (the usual sense during loss
+          calculation where the counter has been incremented).
+        """
+        if not getattr(self.train_config, 'diff_output_preservation', False):
+            return False
+        every = int(getattr(self.train_config, 'diff_output_preservation_every', 1))
+        if every < 1:
+            return False
+        total = int(getattr(self, '_total_batch_count', 0))
+        if for_encoding:
+            return ((total + 1) % every) == 0
+        return (total % every) == 0
         if adapter_images is None:
             raise RuntimeError("ControlNet invocation error: adapter images are None")
         if isinstance(adapter_images, torch.Tensor):
@@ -439,7 +459,29 @@ class SDTrainer(BaseSDTrainProcess):
                     print_acc(f"[SplitPrompt] Loaded split prompt embedding for dataset {key}")
 
     def hook_before_train_loop(self):
+        # If differential output preservation is requested while caching text embeddings,
+        # ensure we have dataset objects or a dataloader available so DOP prompts can be
+        # precomputed and cached. If a dataloader hasn't been created yet but
+        # dataset configurations exist, try to build the dataloader now. Otherwise fail
+        # fast with a descriptive error so users know what to provide.
+        if getattr(self.train_config, 'diff_output_preservation', False) and self.is_caching_text_embeddings:
+            if self.data_loader is None and (self.datasets is None or len(self.datasets) == 0):
+                # try to build a dataloader from dataset_configs if available
+                try:
+                    if getattr(self, 'dataset_configs', None) and len(self.dataset_configs) > 0:
+                        from toolkit.data_loader import get_dataloader_from_datasets
+                        self.data_loader = get_dataloader_from_datasets(self.dataset_configs, self.train_config.batch_size, self.sd)
+                except Exception as e:
+                    try:
+                        print_acc(f"[DOP Cache] Failed to construct dataloader from dataset_configs: {e}")
+                    except Exception:
+                        pass
+
+            if self.data_loader is None and (self.datasets is None or len(self.datasets) == 0):
+                raise RuntimeError("Differential Output Preservation with cached text embeddings requires dataset(s) or a dataloader to be configured so DOP prompts can be precomputed. No datasets, dataset_configs, or dataloader found.")
+
         super().hook_before_train_loop()
+
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -542,8 +584,9 @@ class SDTrainer(BaseSDTrainProcess):
             with torch.no_grad():
                 if self.train_config.train_text_encoder:
                     raise ValueError("Cannot unload text encoder if training text encoder")
-                # cache embeddings
-                self.sd.text_encoder_to(self.device_torch)
+                # cache embeddings - move text encoder to device if helper exists
+                if hasattr(self.sd, 'text_encoder_to') and callable(getattr(self.sd, 'text_encoder_to')):
+                    self.sd.text_encoder_to(self.device_torch)
                 encode_kwargs = {}
                 if self.sd.encode_control_in_text_embeddings:
                     # just do a blank image for unconditionals
@@ -556,7 +599,101 @@ class SDTrainer(BaseSDTrainProcess):
                     self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
                 if self.train_config.diff_output_preservation:
                     self.diff_output_preservation_embeds = self.sd.encode_prompt(self.train_config.diff_output_preservation_class)
-                
+
+                    # If we're caching text embeddings to disk, pre-generate per-file DOP prompt embeddings so
+                    # the text encoder doesn't need to run each training timestep.
+                    # DOP prompt embeddings are saved under `_t_e_cache`. (No relation to control context cache.)
+                    if self.is_caching_text_embeddings:
+                        dop_class = self.train_config.diff_output_preservation_class
+                        print_acc(f"[DOP Cache] Precomputing DOP prompts for dop_class='{dop_class}'")
+                        # iterate dataset objects (if a dataloader exists) and their file items, create dop embedding files where missing
+                        datasets_for_caching = []
+                        if getattr(self, 'data_loader', None) is not None:
+                            try:
+                                from toolkit.data_loader import get_dataloader_datasets
+                                datasets_for_caching = get_dataloader_datasets(self.data_loader)
+                            except Exception:
+                                datasets_for_caching = []
+
+                        # gather statistics about precompute
+                        total_files = 0
+                        created = 0
+                        existing = 0
+                        failed = 0
+                        failed_files = []
+
+                        for ds in datasets_for_caching:
+                            # skip if this dataset does not expose file_list
+                            file_list = getattr(ds, 'file_list', None)
+                            if file_list is None:
+                                continue
+                            for fi in file_list:
+                                total_files += 1
+                                try:
+                                    # create the intended dop path; recalculate to avoid stale cached path
+                                    dop_path = fi.get_text_embedding_path(recalculate=True, dop_class=dop_class)
+                                    if os.path.exists(dop_path):
+                                        existing += 1
+                                        continue
+                                    # build encode kwargs (control images) if required
+                                    encode_kwargs_local = {}
+                                    if fi.encode_control_in_text_embeddings:
+                                        if fi.control_path is None:
+                                            raise Exception(f"Could not find a control image for {fi.path} which is needed for this model")
+                                        ctrl_img_list = []
+                                        control_path_list = fi.control_path
+                                        if not isinstance(control_path_list, list):
+                                            control_path_list = [control_path_list]
+                                        for cp in control_path_list:
+                                            img = Image.open(cp).convert("RGB")
+                                            img = exif_transpose(img)
+                                            img = (
+                                                TF.to_tensor(img)
+                                                .unsqueeze(0)
+                                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                                            )
+                                            ctrl_img_list.append(img)
+                                        if len(ctrl_img_list) == 0:
+                                            ctrl_img = None
+                                        elif not self.sd.has_multiple_control_images:
+                                            ctrl_img = ctrl_img_list[0]
+                                        else:
+                                            ctrl_img = ctrl_img_list
+                                        encode_kwargs_local['control_images'] = ctrl_img
+
+                                    # replace trigger word with dop_class similar to runtime
+                                    dop_caption = fi.caption
+                                    if self.trigger_word is not None:
+                                        dop_caption = dop_caption.replace(self.trigger_word, dop_class)
+
+                                    dop_emb = self.sd.encode_prompt(dop_caption, **encode_kwargs_local)
+                                    dop_emb.save(dop_path)
+                                    created += 1
+                                except Exception as e:
+                                    failed += 1
+                                    failed_files.append(getattr(fi, 'path', 'unknown'))
+                                    try:
+                                        print_acc(f"[DOP Cache] Failed to cache DOP prompt for {getattr(fi,'path','unknown')}: {e}")
+                                    except Exception:
+                                        pass
+
+                        # record stats for diagnostics and tooling
+                        self.dop_cache_stats = {
+                            'dop_class': dop_class,
+                            'total_files': total_files,
+                            'existing': existing,
+                            'created': created,
+                            'failed': failed,
+                            'failed_files': failed_files,
+                        }
+
+                        try:
+                            print_acc(f"[DOP Cache] Summary for class='{dop_class}': total={total_files} existing={existing} created={created} failed={failed}")
+                            if failed > 0:
+                                print_acc(f"[DOP Cache] Failed files: {failed_files}")
+                        except Exception:
+                            pass
+
                 # Per-dataset SplitPrompt caching: encode the optional per-dataset SplitPrompt once and cache it
                 self.dataset_split_prompt_embeds = {}
                 if getattr(self, 'datasets', None) is not None:
@@ -1649,6 +1786,21 @@ class SDTrainer(BaseSDTrainProcess):
         # Evaluate each file's cached contexts and collect diagnostics when issues are found
         for fi in batch.file_items:
             contexts = getattr(fi, '_preencoded_zimage_control_contexts', None)
+            # If contexts missing, try in-process registry (previous precompute run may have stored it there)
+            if contexts is None:
+                try:
+                    from toolkit.precompute_cache import get_preencoded_control_contexts
+                    cached = get_preencoded_control_contexts(fi.path)
+                    if cached is not None:
+                        fi._preencoded_zimage_control_contexts = cached
+                        contexts = fi._preencoded_zimage_control_contexts
+                        try:
+                            from toolkit.print import print_acc
+                            print_acc(f"[PRECOMPUTE] Loaded precomputed contexts from registry for {fi.path}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             if contexts is None:
                 diagnostics.append(f"{fi.path}: missing _preencoded_zimage_control_contexts")
                 continue
@@ -1749,7 +1901,13 @@ class SDTrainer(BaseSDTrainProcess):
             cfg = getattr(ds, 'dataset_config', None)
             if cfg is None:
                 continue
-            do_precompute = getattr(cfg, 'control_precompute_control', False) or getattr(cfg, 'cache_control_latents', False)
+            do_precompute = (
+                getattr(cfg, 'control_precompute_control', False)
+                or getattr(cfg, 'cache_control_contexts', False)
+                or getattr(cfg, 'cache_control_contexts_to_disk', False)
+                or getattr(cfg, 'cache_latents', False)
+                or getattr(cfg, 'cache_latents_to_disk', False)
+            )
             if not do_precompute:
                 continue
             try:
@@ -2021,6 +2179,23 @@ class SDTrainer(BaseSDTrainProcess):
                             print_acc(f"[PRECOMPUTE] Cached precomputed sizes for {fi.path}: {keys}")
                         except Exception:
                             print(f"[PRECOMPUTE] Cached precomputed sizes for {fi.path}: {keys}")
+                        # Publish into in-process registry so later lookups can find it even if FileItem instances are recreated.
+                        try:
+                            from toolkit.precompute_cache import set_preencoded_control_contexts
+                            set_preencoded_control_contexts(fi.path, fi._preencoded_zimage_control_contexts)
+                            # Optionally persist control_contexts to disk for cross-process discovery
+                            try:
+                                if getattr(fi.dataset_config, 'cache_control_contexts_to_disk', False) and hasattr(fi, 'save_control_contexts') and callable(getattr(fi, 'save_control_contexts')):
+                                    fi.save_control_contexts(fi._preencoded_zimage_control_contexts)
+                            except Exception as e:
+                                # non-fatal; report for diagnostics
+                                try:
+                                    from toolkit.print import print_acc
+                                    print_acc(f"Warning: failed to persist control_contexts for {fi.path}: {e}")
+                                except Exception:
+                                    print(f"Warning: failed to persist control_contexts for {fi.path}: {e}")
+                        except Exception:
+                            pass
                     else:
                         try:
                             from toolkit.print import print_acc
@@ -2733,17 +2908,56 @@ class SDTrainer(BaseSDTrainProcess):
                                     self.adapter.is_unconditional_run = False
                             
                             if self.train_config.diff_output_preservation:
-                                dop_prompts = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in conditioned_prompts]
-                                dop_prompts_2 = None
-                                if prompt_2 is not None:
-                                    dop_prompts_2 = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in prompt_2]
-                                self.diff_output_preservation_embeds = self.sd.encode_prompt(
-                                    dop_prompts, dop_prompts_2,
-                                    dropout_prob=self.train_config.prompt_dropout_prob,
-                                    long_prompts=self.do_long_prompts,
-                                    **prompt_kwargs
-                                )
-                                self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
+                                # Determine whether to perform DOP for this batch when preparing embeddings.
+                                is_dop_scheduled_for_encode = self._is_dop_scheduled(for_encoding=True)
+                                if not is_dop_scheduled_for_encode:
+                                    # Skip preparing DOP embeddings for this batch to save compute
+                                    self.diff_output_preservation_embeds = None
+                                    print_acc(f"[DOP] Skipping diff_output_preservation embedding prep this batch (every={getattr(self.train_config, 'diff_output_preservation_every', 1)})")
+                                else:
+                                    # If text embeddings are cached to disk, prefer loading per-file DOP embeds to avoid
+                                    # re-encoding each training timestep. Otherwise fall back to encoding the DOP prompts.
+                                    if self.is_caching_text_embeddings and getattr(batch, 'file_items', None) is not None:
+                                        dop_class = self.train_config.diff_output_preservation_class
+                                        dop_embeds_list = []
+                                        ok = True
+                                        for fi in batch.file_items:
+                                            try:
+                                                fi.load_dop_prompt_embedding(dop_class)
+                                            except Exception:
+                                                pass
+                                            if fi.dop_prompt_embeds is None:
+                                                ok = False
+                                                break
+                                            dop_embeds_list.append(fi.dop_prompt_embeds)
+                                        if ok:
+                                            self.diff_output_preservation_embeds = concat_prompt_embeds(dop_embeds_list)
+                                            self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
+                                        else:
+                                            # fallback to encoding
+                                            dop_prompts = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in conditioned_prompts]
+                                            dop_prompts_2 = None
+                                            if prompt_2 is not None:
+                                                dop_prompts_2 = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in prompt_2]
+                                            self.diff_output_preservation_embeds = self.sd.encode_prompt(
+                                                dop_prompts, dop_prompts_2,
+                                                dropout_prob=self.train_config.prompt_dropout_prob,
+                                                long_prompts=self.do_long_prompts,
+                                                **prompt_kwargs
+                                            )
+                                            self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
+                                    else:
+                                        dop_prompts = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in conditioned_prompts]
+                                        dop_prompts_2 = None
+                                        if prompt_2 is not None:
+                                            dop_prompts_2 = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in prompt_2]
+                                        self.diff_output_preservation_embeds = self.sd.encode_prompt(
+                                            dop_prompts, dop_prompts_2,
+                                            dropout_prob=self.train_config.prompt_dropout_prob,
+                                            long_prompts=self.do_long_prompts,
+                                            **prompt_kwargs
+                                        )
+                                        self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
                         # detach the embeddings safely
                         conditional_embeds = self._maybe_detach_embeds(conditional_embeds)
                         if self.train_config.do_cfg:
@@ -3829,9 +4043,10 @@ class SDTrainer(BaseSDTrainProcess):
                         with self.timer('calculate_loss'):
                             noise = noise.to(self.device_torch, dtype=dtype).detach()
                             prior_to_calculate_loss = prior_pred
-                            # if we are doing diff_output_preservation and not noing inverted masked prior
-                            # then we need to send none here so it will not target the prior
-                            doing_preservation = self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation
+                            # Determine whether preservation will run for this batch. For diff_output_preservation
+                            # this is gated by `diff_output_preservation_every` and uses the current batch counter.
+                            do_dop_this_step = self._is_dop_scheduled(for_encoding=False)
+                            doing_preservation = do_dop_this_step or self.train_config.blank_prompt_preservation
                             if doing_preservation and not do_inverted_masked_prior:
                                 prior_to_calculate_loss = None
                             
@@ -3870,10 +4085,21 @@ class SDTrainer(BaseSDTrainProcess):
                         # send the loss backwards otherwise checkpointing will fail
                         self.accelerator.backward(loss)
                         normal_loss = loss.detach() # dont send backward again
-                        
+                        try:
+                            self._last_normal_loss = float(normal_loss.detach())
+                        except Exception:
+                            self._last_normal_loss = None
                         with torch.no_grad():
-                            if self.train_config.diff_output_preservation:
+                            # Only compute diff output preservation if it's scheduled for this batch
+                            if 'do_dop_this_step' in locals() and do_dop_this_step:
+                                if self.diff_output_preservation_embeds is None:
+                                    raise RuntimeError("Scheduled diff_output_preservation step but embeds are not prepared. Ensure 'diff_output_preservation_every' and precompute settings are correct.")
                                 preservation_embeds = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
+                                # record execution count for diagnostics
+                                try:
+                                    self._diff_output_preservation_exec_count += 1
+                                except Exception:
+                                    pass
                             elif self.train_config.blank_prompt_preservation:
                                 blank_embeds = self.cached_blank_embeds.clone().detach().to(
                                     self.device_torch, dtype=dtype
@@ -3881,22 +4107,58 @@ class SDTrainer(BaseSDTrainProcess):
                                 preservation_embeds = concat_prompt_embeds(
                                     [blank_embeds] * noisy_latents.shape[0]
                                 )
-                        preservation_pred = self.predict_noise(
-                            noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
-                            timesteps=timesteps,
-                            conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
-                            unconditional_embeds=unconditional_embeds,
-                            batch=batch,
-                            **pred_kwargs
-                        )
-                        multiplier = self.train_config.diff_output_preservation_multiplier if self.train_config.diff_output_preservation else self.train_config.blank_prompt_preservation_multiplier
-                        preservation_loss = torch.nn.functional.mse_loss(preservation_pred, prior_pred) * multiplier
-                        self.accelerator.backward(preservation_loss)
+                            else:
+                                # preservation not scheduled this step; skip entirely
+                                preservation_embeds = None
+                        # reset per-step diagnostics
+                        self._last_preservation_loss = None
+                        self._last_normal_loss = None
+                        # Compute preservation prediction and loss via helper (adds DOP timers)
+                        preservation_pred = None
+                        if preservation_embeds is not None:
+                            # Determine if we should run preservation at a reduced resolution
+                            preservation_resolution = None
+                            if 'do_dop_this_step' in locals() and do_dop_this_step:
+                                preservation_resolution = getattr(self.train_config, 'diff_output_preservation_resolution', None)
+                            elif self.train_config.blank_prompt_preservation:
+                                preservation_resolution = getattr(self.train_config, 'blank_prompt_preservation_resolution', None)
 
-                        loss = normal_loss + preservation_loss
-                        loss = loss.clone().detach()
-                        # require grad again so the backward wont fail
-                        loss.requires_grad_(True)
+                            # indicate whether this is a DOP or blank prompt preservation step
+                            preservation_kind = 'dop' if ('do_dop_this_step' in locals() and do_dop_this_step) else ('blank' if self.train_config.blank_prompt_preservation else None)
+
+                            preservation_pred_res = self._run_preservation_forward(
+                                noisy_latents=noisy_latents,
+                                timesteps=timesteps,
+                                preservation_embeds=preservation_embeds,
+                                unconditional_embeds=unconditional_embeds,
+                                batch=batch,
+                                pred_kwargs=pred_kwargs,
+                                dtype=dtype,
+                                prior_pred=prior_pred,
+                                preservation_resolution=preservation_resolution,
+                                preservation_kind=preservation_kind,
+                            )
+
+                            # Support returned (preservation_pred, prior_pred_for_loss) when downsampling occurred
+                            if isinstance(preservation_pred_res, tuple):
+                                preservation_pred, prior_pred_for_loss = preservation_pred_res
+                            else:
+                                preservation_pred = preservation_pred_res
+                                prior_pred_for_loss = prior_pred
+
+                        if preservation_pred is not None:
+                            multiplier = self.train_config.diff_output_preservation_multiplier if self.train_config.diff_output_preservation else self.train_config.blank_prompt_preservation_multiplier
+                            # Use possibly-downsampled prior_pred_for_loss if provided by _run_preservation_forward
+                            preservation_loss = self._compute_and_apply_preservation_loss(preservation_pred, prior_pred_for_loss if 'prior_pred_for_loss' in locals() else prior_pred, multiplier)
+
+                            loss = normal_loss + preservation_loss
+                            loss = loss.clone().detach()
+                            # require grad again so the backward wont fail
+                            loss.requires_grad_(True)
+                        else:
+                            # No preservation this step; use the normal loss only
+                            loss = normal_loss.clone().detach()
+                            loss.requires_grad_(True)
                         
                 # apply masked reconstruction if configured (best-effort, post-loss computation)
 
@@ -3925,6 +4187,116 @@ class SDTrainer(BaseSDTrainProcess):
 
         return loss.detach()
         # flush()
+
+    def _run_preservation_forward(self, noisy_latents, timesteps, preservation_embeds, unconditional_embeds, batch, pred_kwargs, dtype, prior_pred, preservation_resolution=None, preservation_kind: 'Optional[str]'=None):
+        """Run preservation forward pass for DOP/blank prompt preservation and record timings.
+
+        If `preservation_resolution` (pixels, long-side) is specified, the forward pass will be
+        executed at that reduced spatial resolution and the returned preservation prediction and
+        prior prediction (both downsampled) will be suitable for loss computation.
+
+        `preservation_kind` may be 'dop' or 'blank' to help label timers appropriately.
+
+        Returns preservation_pred (or (preservation_pred, prior_pred_down) when downsampling used) or None.
+        """
+        # Determine timer base name based on preservation kind
+        timer_base = 'blank_predict' if preservation_kind == 'blank' else 'dop_predict'
+
+        # preservation_embeds may be prompt embeds or similar. Move them and latents to device inside the timer
+        # If no resolution requested, do the normal full-res predict
+        if preservation_resolution is None:
+            with self.timer(timer_base):
+                preservation_pred = self.predict_noise(
+                    noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                    timesteps=timesteps,
+                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeds=unconditional_embeds,
+                    batch=batch,
+                    **pred_kwargs
+                )
+            return preservation_pred
+
+        # Otherwise, compute a reduced latent size and run predict at that size
+        try:
+            # compute vae scale factor (pixels -> latent). Try config first, fallback to heuristic 8
+            vae = getattr(self.sd, 'vae', None)
+            if vae is not None and hasattr(vae, 'config') and 'block_out_channels' in vae.config:
+                vae_scale = 2 ** (len(vae.config['block_out_channels']) - 1)
+            else:
+                vae_scale = getattr(self.sd, 'vae_scale_factor', 8)
+        except Exception:
+            vae_scale = 8
+
+        # Current latent spatial dims
+        _, C, H, W = noisy_latents.shape
+        # Target latent long side
+        target_long = max(1, int(round(preservation_resolution / vae_scale)))
+        # Keep aspect ratio
+        if H >= W:
+            target_h = target_long
+            target_w = max(1, int(round(W * (target_h / H))))
+        else:
+            target_w = target_long
+            target_h = max(1, int(round(H * (target_w / W))))
+
+        # If target is same or larger than current, just run full-res
+        if target_h >= H and target_w >= W:
+            with self.timer(timer_base):
+                preservation_pred = self.predict_noise(
+                    noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                    timesteps=timesteps,
+                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeds=unconditional_embeds,
+                    batch=batch,
+                    **pred_kwargs
+                )
+            return preservation_pred
+
+        # Downsample noisy_latents and prior_pred, run predict on smaller tensor
+        with self.timer(f"{timer_base}_downsampled"):
+            torch_dtype = get_torch_dtype(dtype)
+            noisy_small = torch.nn.functional.interpolate(
+                noisy_latents, size=(target_h, target_w), mode='bilinear', align_corners=False
+            ).to(self.device_torch, dtype=torch_dtype)
+            prior_small = None
+            if prior_pred is not None:
+                prior_small = torch.nn.functional.interpolate(
+                    prior_pred, size=(target_h, target_w), mode='bilinear', align_corners=False
+                ).to(self.device_torch, dtype=torch_dtype)
+
+            preservation_pred_small = self.predict_noise(
+                noisy_latents=noisy_small,
+                timesteps=timesteps,
+                conditional_embeds=preservation_embeds.to(self.device_torch, dtype=torch_dtype),
+                unconditional_embeds=unconditional_embeds,
+                batch=batch,
+                **pred_kwargs
+            )
+        # Return both small preds so loss can be computed at this resolution
+        return (preservation_pred_small, prior_small)
+
+    def _compute_and_apply_preservation_loss(self, preservation_pred, prior_pred, multiplier: float):
+        """Compute preservation loss, record diagnostics, and apply backward.
+
+        Returns the preservation_loss tensor.
+        """
+        try:
+            preservation_loss = torch.nn.functional.mse_loss(preservation_pred, prior_pred) * multiplier
+            # record a diagnostic scalar for the UI
+            try:
+                self._last_preservation_loss = float(preservation_loss.detach())
+            except Exception:
+                self._last_preservation_loss = None
+            # apply backward for preservation loss
+            self.accelerator.backward(preservation_loss)
+            return preservation_loss
+        except Exception as e:
+            try:
+                print_acc(f"[DOP] preservation loss computation failed: {e}")
+            except Exception:
+                pass
+            self._last_preservation_loss = None
+            return None
 
     def _compute_and_apply_masked_recon_loss(self, current_loss, noisy_latents, imgs, batch, dtype):
         """Thin wrapper: delegate masked reconstruction to `toolkit.masked_recon.apply_masked_recon_loss`.
@@ -4122,6 +4494,13 @@ class SDTrainer(BaseSDTrainProcess):
             except Exception:
                 pass
         loss_dict = OrderedDict({'loss': loss_val})
+
+        # If a preservation loss was recorded this step, expose it separately so graphs stay readable
+        if hasattr(self, '_last_preservation_loss') and self._last_preservation_loss is not None:
+            loss_dict['preservation'] = float(self._last_preservation_loss)
+        # Also expose the normal (non-preservation) loss if available
+        if hasattr(self, '_last_normal_loss') and self._last_normal_loss is not None:
+            loss_dict['normal'] = float(self._last_normal_loss)
 
         # Control-related metrics (diagnostics & monitoring)
         try:

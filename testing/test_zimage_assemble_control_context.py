@@ -85,8 +85,8 @@ def test_assemble_detect_mask_from_white_background():
     assert torch.allclose(mask_ch[0, :, 3:5, 3:5], torch.ones((1, 1, 2, 2)))
 
 
-def test_assemble_rejects_4_channel_base():
-    B, C, H, W = 1, 4, 8, 8
+def test_assemble_rejects_3_channel_raw_image():
+    B, C, H, W = 1, 3, 8, 8
     control_latents = torch.full((B, C, H, W), 2.0)
     in_h, in_w = 4, 4
     inpaint_latent = torch.full((B, C, in_h, in_w), 5.0)
@@ -96,7 +96,7 @@ def test_assemble_rejects_4_channel_base():
     with pytest.raises(RuntimeError) as exc:
         assemble_zimage_control_context(control_latents, inpaint_latent=inpaint_latent, mask_condition=mask_condition, control_in_dim=33)
     msg = str(exc.value)
-    assert 'Unsupported control_latents channels' in msg or 'Cannot assemble control_in_dim=33' in msg
+    assert 'Unsupported control_latents channels' in msg or 'raw' in msg
 
 
 def test_pass_through_preassembled_33():

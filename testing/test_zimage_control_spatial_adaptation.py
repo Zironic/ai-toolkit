@@ -79,7 +79,7 @@ def test_predict_noise_zimage_resizes_control_latents_to_latents():
     latents = torch.randn((1, 16, 64, 64))
 
     # control latents encoded at 60x60 (mismatch) - simulating VAE encoding/reassembly
-    zimage_control_latents = torch.randn((1, 4, 60, 60))
+    zimage_control_latents = torch.randn((1, 16, 60, 60))
 
     class FakeControlNet:
         def __call__(self, sample, timestep, control_context, conditioning_scale=1.0, *args, **kwargs):

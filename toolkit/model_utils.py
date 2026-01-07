@@ -30,6 +30,25 @@ ALLOWED_MODEL_CONFIG_KEYS = {
 } 
 
 
+def infer_arch_from_name(name_or_path: str) -> Optional[str]:
+    """Infer a conservative model arch hint from a model name or path.
+
+    This mirrors the lightweight heuristics used elsewhere in the repo UI
+    (e.g., mapping 'Tongyi-MAI/Z-Image-Turbo' to the 'zimage' arch). Keep the
+    rules small and conservative to avoid accidentally changing behavior for
+    unrelated models.
+    """
+    if not name_or_path:
+        return None
+    s = str(name_or_path).lower()
+    # Known patterns for Z-Image variants
+    if 'tongyi-mai/z-image-turbo' in s or 'z-image-turbo' in s or 'zimage' in s or 'z-image' in s:
+        return 'zimage'
+    # Add more heuristics here as needed in the future
+    return None
+
+
+
 def resolve_local_model_path(name_or_path: str) -> Optional[str]:
     """Return a local path if the model appears to be downloaded locally.
 
@@ -78,10 +97,15 @@ def sanitize_model_config(cfg: Dict[str, Any], apply_lora: bool = False) -> Dict
     if not cfg:
         return {}
     allowed = set(ALLOWED_MODEL_CONFIG_KEYS)
+    # Allow passing explicit component paths and extras for inference fallbacks
+    allowed = allowed.union({
+        'extras_name_or_path', 'unet_path', 'te_name_or_path', 'controlnet_file',
+        # Common component keys which some pipelines expect
+        'feature_extractor', 'feature_extractor_path', 'image_encoder', 'image_encoder_path', 'safety_checker', 'safety_checker_path'
+    })
     if apply_lora:
         allowed = allowed.union({'lora_path', 'assistant_lora_path', 'inference_lora_path'})
     return {k: v for k, v in cfg.items() if k in allowed}
-
 
 def load_model_for_inference(model_or_name: Any, device: str = 'cpu', dtype: str = 'bf16', apply_lora: bool = False) -> StableDiffusion:
     """Load a StableDiffusion instance suitable for inference/evaluation.
@@ -102,11 +126,21 @@ def load_model_for_inference(model_or_name: Any, device: str = 'cpu', dtype: str
         # ensure required field present
         if 'name_or_path' not in safe_cfg:
             raise ValueError('model_config must include "name_or_path"')
+        # If arch was not supplied, attempt a lightweight name-based inference
+        if 'arch' not in safe_cfg or not safe_cfg.get('arch'):
+            inferred = infer_arch_from_name(safe_cfg.get('name_or_path'))
+            if inferred:
+                safe_cfg['arch'] = inferred
         mc = ModelConfig(**safe_cfg)
     else:
         # string -> try to resolve local path first
         resolved = resolve_local_model_path(str(model_or_name))
-        mc = ModelConfig(name_or_path=resolved or str(model_or_name))
+        name_for_infer = resolved or str(model_or_name)
+        inferred = infer_arch_from_name(name_for_infer)
+        if inferred:
+            mc = ModelConfig(name_or_path=resolved or str(model_or_name), arch=inferred)
+        else:
+            mc = ModelConfig(name_or_path=resolved or str(model_or_name))
 
     # If the caller provided an explicit dtype for inference and the ModelConfig
     # does not already specify VAE/TE dtypes, set them to the requested dtype.

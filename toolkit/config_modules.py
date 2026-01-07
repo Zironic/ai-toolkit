@@ -398,6 +398,11 @@ class TrainConfig:
         self.start_step = kwargs.get('start_step', None)
         self.free_u = kwargs.get('free_u', False)
         self.adapter_assist_name_or_path: Optional[str] = kwargs.get('adapter_assist_name_or_path', None)
+
+        # Differential Output Preservation / Blank Prompt Preservation: optional lower-resolution target
+        # Accept pixel resolution (long-side) or None to use full resolution. Defaults to None (no change).
+        self.diff_output_preservation_resolution: Union[int, None] = kwargs.get('diff_output_preservation_resolution', None)
+        self.blank_prompt_preservation_resolution: Union[int, None] = kwargs.get('blank_prompt_preservation_resolution', None)
         self.adapter_assist_type: Optional[str] = kwargs.get('adapter_assist_type', 't2i')  # t2i, control_net
 
         # SplitFlux / RCA (Rank-Constrained Adaptation) options
@@ -524,6 +529,10 @@ class TrainConfig:
         self.diff_output_preservation_multiplier = kwargs.get('diff_output_preservation_multiplier', 1.0)
         # If the trigger word is in the prompt, we will use this class name to replace it eg. "sks woman" -> "woman"
         self.diff_output_preservation_class = kwargs.get('diff_output_preservation_class', '')
+        # Run differential output preservation only every N steps. Set to 1 to run every step.
+        self.diff_output_preservation_every = int(kwargs.get('diff_output_preservation_every', 1))
+        if self.diff_output_preservation_every < 1:
+            raise ValueError('diff_output_preservation_every must be >= 1')
         
         # blank prompt preservation will preserve the model's knowledge of a blank prompt
         self.blank_prompt_preservation = kwargs.get('blank_prompt_preservation', False)
@@ -1022,6 +1031,26 @@ class DatasetConfig:
         self.cache_latents_to_disk: bool = kwargs.get('cache_latents_to_disk', False)
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
+        # Control context caching: persist assembled control contexts per-file.
+        # Defaults derive from latent caching settings unless explicitly set.
+        self.cache_control_contexts: bool = kwargs.get('cache_control_contexts', self.cache_latents)
+        self.cache_control_contexts_to_disk: bool = kwargs.get('cache_control_contexts_to_disk', self.cache_latents_to_disk)
+
+        # If user enabled disk persistence for latents, make other related cache defaults ON
+        # unless they were explicitly passed in kwargs.
+        if self.cache_latents_to_disk:
+            # enable in-memory latent caching unless explicitly disabled
+            if 'cache_latents' not in kwargs:
+                self.cache_latents = True
+            # enable control context caching (in-memory) unless explicitly set
+            if 'cache_control_contexts' not in kwargs:
+                self.cache_control_contexts = True
+            # enable control context persistence unless explicitly set
+            if 'cache_control_contexts_to_disk' not in kwargs:
+                self.cache_control_contexts_to_disk = True
+            # enable text embedding caching unless explicitly set
+            if 'cache_text_embeddings' not in kwargs:
+                self.cache_text_embeddings = True
 
         self.standardize_images: bool = kwargs.get('standardize_images', False)
 
@@ -1450,11 +1479,6 @@ def validate_configs(
     # see if any datasets are caching text embeddings
     is_caching_text_embeddings = any(dataset.cache_text_embeddings for dataset in dataset_configs)
     if is_caching_text_embeddings:
-        
-        # check if they are doing differential output preservation
-        if train_config.diff_output_preservation:
-            raise ValueError("Cannot use differential output preservation with caching text embeddings. Please set diff_output_preservation to False.")
-    
         # make sure they are all cached
         for dataset in dataset_configs:
             if not dataset.cache_text_embeddings:

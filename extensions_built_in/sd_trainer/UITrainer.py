@@ -77,7 +77,12 @@ class UITrainer(SDTrainer):
                 time.sleep(interval_sec)
 
     def _run_async_operation(self, coro):
-        """Helper method to run an async coroutine and track the task."""
+        """Helper method to run an async coroutine and track the task.
+
+        Optional debug instrumentation is enabled when env var `AITK_DEBUG_ASYNC_DB` is set.
+        It logs whether the coroutine was scheduled asynchronously or executed synchronously and the elapsed time.
+        """
+        debug = os.environ.get('AITK_DEBUG_ASYNC_DB', '0') == '1'
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -87,17 +92,63 @@ class UITrainer(SDTrainer):
 
         # Create a task and track it
         if loop.is_running():
+            # schedule it thread-safe
+            if debug:
+                start = time.time()
             task = asyncio.run_coroutine_threadsafe(coro, loop)
             self._async_tasks.append(asyncio.wrap_future(task))
+            if debug:
+                # record that this was scheduled asynchronously
+                duration = time.time() - start
+                try:
+                    with open('aitk_async_db_debug.log', 'a') as f:
+                        f.write(f'async-scheduled {coro.__class__.__name__} {duration:.6f}\n')
+                except Exception:
+                    pass
         else:
-            task = loop.create_task(coro)
-            self._async_tasks.append(task)
-            loop.run_until_complete(task)
+            # No running loop: schedule the coroutine to run in the DB thread pool via asyncio.run
+            # so we don't block the main training thread. This makes DB updates fire-and-forget.
+            if debug:
+                start = time.time()
+            future = self.thread_pool.submit(lambda: asyncio.run(coro))
+            # Store the concurrent Future so callers can inspect/wait if needed, but do not block here
+            try:
+                wrapped = asyncio.wrap_future(future)
+                self._async_tasks.append(wrapped)
+            except Exception:
+                # If wrapping fails (no running loop), just store the concurrent Future
+                self._async_tasks.append(future)
+            if debug:
+                duration = time.time() - start
+                try:
+                    with open('aitk_async_db_debug.log', 'a') as f:
+                        f.write(f'threadpool-submitted {coro.__class__.__name__} {duration:.6f}\n')
+                except Exception:
+                    pass
 
     async def _execute_db_operation(self, operation_func):
-        """Execute a database operation in a separate thread to avoid blocking."""
+        """Execute a database operation in a separate thread to avoid blocking.
+
+        If `AITK_DEBUG_ASYNC_DB=1` is set, we log the duration of the database operation to
+        `aitk_async_db_debug.log` so we can detect long-running DB calls.
+        """
+        debug = os.environ.get('AITK_DEBUG_ASYNC_DB', '0') == '1'
+        def wrapped_op():
+            if not debug:
+                return operation_func()
+            start = time.time()
+            try:
+                return operation_func()
+            finally:
+                dur = time.time() - start
+                try:
+                    with open('aitk_async_db_debug.log', 'a') as f:
+                        f.write(f'db-op {operation_func.__name__} {dur:.6f}\n')
+                except Exception:
+                    pass
+
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.thread_pool, operation_func)
+        return await loop.run_in_executor(self.thread_pool, wrapped_op)
 
     def _db_connect(self):
         """Create a new connection for each operation to avoid locking."""

@@ -17,7 +17,7 @@ def test_adapter_identity_required_for_deterministic_routing():
     wrapper = VideoXControlnetWrapper(inner)
 
     lat = torch.zeros((1, 16, 64, 64))
-    # packed latents that would normally trigger assembly
+    # VAE-encoded/multi-frame latents that would normally trigger assembly (e.g., C==16)
     ctrl = torch.zeros((1, 16, 8, 8))
 
     with pytest.raises(RuntimeError) as exc:

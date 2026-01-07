@@ -24,6 +24,12 @@ import torch
 from .control_util import infer_expected_in_ch
 from .print import print_acc
 
+# Channel constants (explicit and authoritative)
+# RAW_IMAGE_CHANNELS: non-encoded RGB images (C==3)
+# ENCODED_LATENT_CHANNELS: VAE-encoded control latents as produced by our encoder (C==16)
+RAW_IMAGE_CHANNELS = 3
+ENCODED_LATENT_CHANNELS = 16
+
 # Runtime sentinel to help verify training jobs pick up this code branch.
 # This message is intentionally short and unique so you can grep logs for it:
 # "CONTROL_CHANNELS:ASSEMBLE_V1_LOADED"
@@ -213,7 +219,7 @@ def adapt_control_images(control_images: Any, adapter: Any, expected_override: O
         if adapter_has_explicit:
             # Detect pixel-like inputs: common raw images shapes
             try:
-                is_pixel = isinstance(control_images, torch.Tensor) and getattr(control_images, 'ndim', 0) == 4 and control_images.shape[1] in (1, 3, 4)
+                is_pixel = isinstance(control_images, torch.Tensor) and getattr(control_images, 'ndim', 0) == 4 and control_images.shape[1] in (1, 3)
             except Exception:
                 is_pixel = False
             if is_pixel and getattr(adapter, 'name_or_path', None) is None:
@@ -267,7 +273,7 @@ def adapt_control_images(control_images: Any, adapter: Any, expected_override: O
             adapter_cfg_dim = getattr(adapter, 'control_in_dim', None)
             origin = _format_origin(t) if isinstance(t, torch.Tensor) else 'unknown-origin'
             # Heuristic classification for helpful hints
-            looks_like = 'pixel-image' if isinstance(t, torch.Tensor) and t.ndim == 4 and t.shape[1] in (1, 3, 4) and max(t.shape[-2:]) >= 16 else 'latents/unknown'
+            looks_like = 'pixel-image' if isinstance(t, torch.Tensor) and t.ndim == 4 and t.shape[1] in (1, 3) and max(t.shape[-2:]) >= 16 else 'latents/unknown'
             hint = ''
             if adapter_cfg_dim == 33 or expected == 33:
                 hint = 'Note: VideoX/Z-Image expects a 33-channel control_context (VAE-encoded latents + mask/inpaint). Make sure you encode images via the VAE and call assemble_zimage_control_context.'
@@ -358,7 +364,14 @@ def assemble_zimage_control_context(
 
     # Scenario 1: packed/predictable base channels (e.g., 16) -> assemble
     if C == expected_base:
-        tgt_h, tgt_w = (int(inpaint_latent.shape[-2]), int(inpaint_latent.shape[-1])) if (inpaint_latent is not None and isinstance(inpaint_latent, torch.Tensor) and inpaint_latent.ndim == 4) else (int(control_latents.shape[-2]), int(control_latents.shape[-1]))
+        # Prefer the spatial size from an explicit inpaint_latent when it is provided
+        if inpaint_latent is not None:
+            if not isinstance(inpaint_latent, torch.Tensor) or inpaint_latent.ndim != 4:
+                # Validate early and provide a clear message rather than relying on later checks
+                raise RuntimeError("inpaint_latent must be a 4D torch.Tensor when provided")
+            tgt_h, tgt_w = int(inpaint_latent.shape[-2]), int(inpaint_latent.shape[-1])
+        else:
+            tgt_h, tgt_w = int(control_latents.shape[-2]), int(control_latents.shape[-1])
     else:
         # Scenario 3: invalid channel count
         raise RuntimeError(

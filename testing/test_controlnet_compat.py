@@ -13,9 +13,8 @@ def test_videox_wrapper_no_retry_on_conv_message():
     inner = DummyInnerAccepts3()
     wrapper = VideoXControlnetWrapper(inner)
     lat = torch.randn(1, 16, 32, 32)
-    ctrl4 = torch.randn(1, 4, 64, 64)
-    # With the new fail-fast policy we do not parse inner error messages to drive
-    # dynamic adaptation; instead the error should propagate from the inner.
+    ctrl_bad = torch.randn(1, 5, 64, 64)
+    # With strict policy we fail fast on unsupported channel counts (not rely on inner error messages)
     import pytest
     with pytest.raises(Exception):
-        _ = wrapper(lat, 0, ctrl4, conditioning_scale=1.0)
+        _ = wrapper(lat, 0, ctrl_bad, conditioning_scale=1.0)

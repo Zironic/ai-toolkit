@@ -41,9 +41,52 @@ class BaseProcess(object):
         ]
         control_total = sum([timing_dict.get(k, 0.0) for k in control_keys])
         model_total = sum([timing_dict.get(k, 0.0) for k in model_keys])
-        other_total = max(0.0, sum(timing_dict.values()) - control_total - model_total)
-        # print a single-line concise summary
-        print_acc(f"PERF SUMMARY: ControlNet: {control_total:.4f}s avg | Model: {model_total:.4f}s avg | Other: {other_total:.4f}s avg")
+
+        # Exclude aggregator timers (like the overall 'train_loop') so they don't dominate 'Other'
+        aggregator_keys = ['train_loop', 'train_epoch', 'train_step']
+        aggregator_total = sum([timing_dict.get(k, 0.0) for k in aggregator_keys])
+
+        # Other is everything except control/model/aggregators
+        other_total = max(0.0, sum(timing_dict.values()) - control_total - model_total - aggregator_total)
+
+        # Determine top-5 timers contributing to "Other" and include them in the summary
+        excluded_keys = set(control_keys + model_keys + aggregator_keys)
+        other_timers = [(k, v) for k, v in timing_dict.items() if k not in excluded_keys]
+        other_timers = sorted(other_timers, key=lambda x: x[1], reverse=True)
+        top_others = other_timers[:5]
+        if top_others:
+            top_others_str = ', '.join([f"{name}:{val:.4f}s" for name, val in top_others])
+            other_extra = f" (top: {top_others_str})"
+        else:
+            other_extra = ''
+
+        # Also show the overall train_loop time (if measured) and how much of it is unaccounted for
+        train_loop_total = timing_dict.get('train_loop', None)
+        unaccounted = None
+        if train_loop_total is not None:
+            # measured_sum is the sum of all non-aggregator timers (i.e., explicit measured parts)
+            measured_sum = sum([v for k, v in timing_dict.items() if k not in aggregator_keys])
+            # how much of the train loop time is not accounted for by measured timers
+            unaccounted = max(0.0, train_loop_total - measured_sum)
+
+        # Build the parts list dynamically so we don't print ControlNet for non-ControlNet jobs
+        parts = []
+        if train_loop_total is not None:
+            parts.append(f"total/train_loop: {train_loop_total:.4f}s avg")
+
+        if any(k in timing_dict for k in control_keys):
+            parts.append(f"ControlNet: {control_total:.4f}s avg")
+
+        if any(k in timing_dict for k in model_keys):
+            parts.append(f"Model: {model_total:.4f}s avg")
+
+        parts.append(f"Other: {other_total:.4f}s avg{other_extra}")
+
+        if train_loop_total is not None:
+            parts.append(f"Unaccounted: {unaccounted:.4f}s avg")
+
+        summary = ' | '.join(parts)
+        print_acc(f"PERF SUMMARY: {summary}")
 
         
     def on_error(self, e: Exception):

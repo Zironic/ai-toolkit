@@ -18,7 +18,7 @@ def test_assembly_failure_bubbles_up(monkeypatch):
     wrapper = VideoXControlnetWrapper(inner)
 
     lat = torch.zeros((1, 16, 64, 64))
-    # Packed latents shape that will go into assembly branch (C multiple of base)
+    # VAE-encoded/multi-frame latents shape that will go into assembly branch (C multiple of base)
     ctrl = torch.zeros((1, 8, 8, 8))  # 8 % 4 == 0 so we will try to reshape/collapse then assemble
 
     # Monkeypatch assemble_zimage_control_context to raise

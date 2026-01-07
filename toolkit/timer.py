@@ -12,8 +12,33 @@ class Timer:
         self.max_buffer = max_buffer
         self.timers = OrderedDict()
         self.active_timers = {}
-        self.current_timer = None  # Used for the context manager functionality
         self._after_print_hooks = []
+
+        # Pre-create a reusable context class (avoid recreating a class per __call__ invocation)
+        class _TimerContext:
+            def __init__(self, timer, name):
+                self._timer = timer
+                self._name = name
+                self._started = False
+
+            def __enter__(self):
+                self._timer.start(self._name)
+                self._started = True
+                return self
+
+            def __exit__(self, exc_type, exc_value, tb):
+                # Only stop if the timer was started and is still active
+                if not self._started:
+                    return
+                if self._name in self._timer.active_timers:
+                    # Normal exit: stop the named timer
+                    self._timer.stop(self._name)
+                else:
+                    # If an exception occurred or timer was canceled elsewhere, ensure it's removed
+                    self._timer.cancel(self._name)
+
+        # Store the context class so that __call__ can reuse it without recreating
+        self._TimerContext = _TimerContext
 
     def start(self, timer_name):
         if timer_name not in self.timers:
@@ -26,8 +51,9 @@ class Timer:
             del self.active_timers[timer_name]
 
     def stop(self, timer_name):
+        # If the timer was not started, silently ignore (avoid raising in hot path)
         if timer_name not in self.active_timers:
-            raise ValueError(f"Timer '{timer_name}' was not started!")
+            return
 
         elapsed_time = time.time() - self.active_timers[timer_name]
         self.timers[timer_name].append(elapsed_time)
@@ -35,47 +61,49 @@ class Timer:
         # Clean up active timers
         del self.active_timers[timer_name]
 
-        # Check if this timer's buffer exceeds max_buffer and remove the oldest if it does
-        if len(self.timers[timer_name]) > self.max_buffer:
-            self.timers[timer_name].popleft()
-
     def add_after_print_hook(self, hook):
         self._after_print_hooks.append(hook)
 
     def print(self):
-        if not is_ui:
-            print(f"\nTimer '{self.name}':")
+        # Consolidate printing to a single call to avoid heavy I/O cost when called frequently.
         timing_dict = {}
         # sort by longest at top
+        lines = []
+        lines.append(f"Timer '{self.name}':")
         for timer_name, timings in sorted(self.timers.items(), key=lambda x: sum(x[1]), reverse=True):
             avg_time = sum(timings) / len(timings)
-            
-            if not is_ui:
-                print(f" - {avg_time:.4f}s avg - {timer_name}, num = {len(timings)}")
+            lines.append(f" - {avg_time:.4f}s avg - {timer_name}, num = {len(timings)}")
             timing_dict[timer_name] = avg_time
 
+        # Call hooks with the timing dict before printing the consolidated block so hooks can append or use it
         for hook in self._after_print_hooks:
-            hook(timing_dict)
+            try:
+                hook(timing_dict)
+            except Exception:
+                # best effort; don't crash printing on hook failures
+                pass
+
+        # Print the entire block in a single atomic call to reduce flush overhead
         if not is_ui:
-            print('')
+            try:
+                # Import locally to avoid cyclical import issues at module import time
+                from toolkit.print import print_acc
+                print_acc('\n' + '\n'.join(lines) + '\n')
+            except Exception:
+                # fallback to plain print if import fails
+                print('\n' + '\n'.join(lines) + '\n')
 
     def reset(self):
         self.timers.clear()
         self.active_timers.clear()
 
     def __call__(self, timer_name):
-        """Enable the use of the Timer class as a context manager."""
-        self.current_timer = timer_name
-        self.start(timer_name)
-        return self
+        """Return a context manager instance for the named timer (re-uses the context class)."""
+        return self._TimerContext(self, timer_name)
 
+    # Backwards-compatible no-op enter/exit removed (we use the context object above)
     def __enter__(self):
         pass
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if exc_type is None:
-            # No exceptions, stop the timer normally
-            self.stop(self.current_timer)
-        else:
-            # There was an exception, cancel the timer
-            self.cancel(self.current_timer)
+        pass

@@ -303,18 +303,23 @@ class VideoXControlnetWrapper(torch.nn.Module):
                             print(f"[CONTROLNET] tagging assembled control_context failed: {e}")
                     return t
 
-                # 4-channel base latents are not acceptable here. Under strict VideoX
-                # semantics we require either packed latents (C % 4 == 0 and >4), or
-                # a pre-assembled 33-channel control_context. Treat 4-channel inputs as
-                # a misrouted or upstream error and fail fast with an actionable message.
-                if C == 4:
+                # 3-channel raw images are not acceptable here. Under strict VideoX
+                # semantics we require either VAE-encoded latents (C==16) or
+                # a pre-assembled 33-channel control_context. Treat raw images (C==3)
+                # as a misrouted or upstream error and fail fast with an actionable message.
+                try:
+                    from toolkit.control_channels import RAW_IMAGE_CHANNELS, ENCODED_LATENT_CHANNELS
+                except Exception:
+                    RAW_IMAGE_CHANNELS, ENCODED_LATENT_CHANNELS = 3, 16
+
+                if C == RAW_IMAGE_CHANNELS:
                     raise RuntimeError(
-                        "Received 4-channel base latents in VideoX wrapper: upstream should provide packed latents (e.g., 16) or a 33-channel assembled control_context; do not pass raw base latents to the wrapper"
+                        "Received raw 3-channel image controls in VideoX wrapper: upstream should provide VAE-encoded latents (C==16) or a 33-channel assembled control_context; do not pass raw images to the wrapper"
                     )
 
-                # Packed latents (C > 4 and divisible by base)
-                base = 4
-                if C > base and C % base == 0:
+                # VAE-encoded or multi-frame latents (C >= base and divisible by base)
+                base = ENCODED_LATENT_CHANNELS
+                if C >= base and C % base == 0:
                     # If the packed channels directly map to assembled channels (e.g., C=16 -> 2*C+1=33),
                     # assemble directly from the packed channels to avoid collapsing to base first.
                     if expected_in == 33 and (2 * C + 1) == expected_in:
@@ -341,9 +346,9 @@ class VideoXControlnetWrapper(torch.nn.Module):
                     except Exception as e:
                         try:
                             from toolkit.print import print_acc
-                            print_acc(f"[CONTROLNET] Failed to reshape packed latents for assembly: shape={tuple(t.shape)} error={e}")
+                            print_acc(f"[CONTROLNET] Failed to reshape encoded/multi-frame latents for assembly: shape={tuple(t.shape)} error={e}")
                         except Exception:
-                            print(f"[CONTROLNET] Failed to reshape packed latents for assembly: shape={tuple(t.shape)} error={e}")
+                            print(f"[CONTROLNET] Failed to reshape encoded/multi-frame latents for assembly: shape={tuple(t.shape)} error={e}")
                         raise RuntimeError(f"Failed to reshape packed latents for assembly: shape={tuple(t.shape)}") from e
                     try:
                         from toolkit.control_channels import assemble_zimage_control_context, tag_tensor
