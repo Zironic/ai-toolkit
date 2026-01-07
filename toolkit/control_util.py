@@ -94,45 +94,9 @@ def infer_expected_in_ch(adapter):
     except Exception:
         pass
 
-    # Heuristic inspection: look for conv layers and infer common in_channels.
-    try:
-        conv_candidates = []
-        a = _maybe_unwrap(adapter)
-        if a is None:
-            return None
-        # attribute named conv_in (common pattern)
-        try:
-            conv_in = getattr(a, 'conv_in', None)
-            if conv_in is not None and hasattr(conv_in, 'weight'):
-                conv_candidates.append(int(conv_in.weight.shape[1]))
-        except Exception:
-            pass
-        # named_modules search
-        try:
-            named = getattr(a, 'named_modules', None)
-            if callable(named):
-                for n, m in named():
-                    try:
-                        w = getattr(m, 'weight', None)
-                        if w is not None and hasattr(w, 'shape') and len(w.shape) >= 2:
-                            conv_candidates.append(int(w.shape[1]))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        if not conv_candidates:
-            return None
-        # prefer 4 when present (VideoX/Z-Image preference), then 3, then most common
-        if 4 in conv_candidates:
-            return 4
-        if 3 in conv_candidates:
-            return 3
-        from collections import Counter
-        c = Counter(conv_candidates)
-        return c.most_common(1)[0][0]
-    except Exception:
-        return None
+    # Heuristic inspection removed: do not infer expected channels from the
+    # adapter's internals. Only honor an explicit `control_in_dim` attribute.
+    return None
 
 
 def ensure_control_in_dim(adapter, strict: bool = False, fallback: Optional[int] = None) -> bool:

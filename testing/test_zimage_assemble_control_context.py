@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import pytest
 from toolkit.control_channels import assemble_zimage_control_context
 
 
@@ -82,3 +83,32 @@ def test_assemble_detect_mask_from_white_background():
     assert torch.allclose(mask_ch[0, :, 0:2, 0:2], torch.zeros((1, 1, 2, 2)))
     # center region (foreground) should be 1
     assert torch.allclose(mask_ch[0, :, 3:5, 3:5], torch.ones((1, 1, 2, 2)))
+
+
+def test_assemble_rejects_4_channel_base():
+    B, C, H, W = 1, 4, 8, 8
+    control_latents = torch.full((B, C, H, W), 2.0)
+    in_h, in_w = 4, 4
+    inpaint_latent = torch.full((B, C, in_h, in_w), 5.0)
+    # mask zeros -> mask_single = 1 - 0 = 1
+    mask_condition = torch.zeros((B, 3, H, W))
+
+    with pytest.raises(RuntimeError) as exc:
+        assemble_zimage_control_context(control_latents, inpaint_latent=inpaint_latent, mask_condition=mask_condition, control_in_dim=33)
+    msg = str(exc.value)
+    assert 'Unsupported control_latents channels' in msg or 'Cannot assemble control_in_dim=33' in msg
+
+
+def test_pass_through_preassembled_33():
+    B, C, H, W = 1, 33, 8, 8
+    x = torch.randn((B, C, H, W))
+    out = assemble_zimage_control_context(x, control_in_dim=33)
+    assert out is x
+
+
+def test_rejects_other_channel_counts():
+    B, C, H, W = 1, 8, 8, 8
+    x = torch.randn((B, C, H, W))
+    with pytest.raises(RuntimeError) as exc:
+        assemble_zimage_control_context(x, control_in_dim=33)
+    assert 'Unsupported control_latents channels' in str(exc.value)

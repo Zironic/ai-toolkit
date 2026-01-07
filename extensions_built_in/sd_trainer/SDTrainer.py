@@ -1607,8 +1607,12 @@ class SDTrainer(BaseSDTrainProcess):
     def _collect_preencoded_zimage_context_for_batch(self, batch: 'DataLoaderBatchDTO'):
         """If all files in `batch` have precomputed zimage control contexts, collect and return
         a stacked tensor shaped [B, C, F, H, W]. Returns None if not all samples available.
+
+        This helper now emits detailed diagnostics when precomputed contexts are not usable
+        so training can report why it fell back to on-the-fly encoding.
         """
         vals = []
+        diagnostics = []
         # Determine target spatial size from batch if possible
         target_h = None
         target_w = None
@@ -1618,7 +1622,13 @@ class SDTrainer(BaseSDTrainProcess):
                 if bt is not None and hasattr(bt, 'ndim') and bt.ndim >= 3:
                     target_h = int(bt.shape[-2])
                     target_w = int(bt.shape[-1])
-        except Exception:
+        except Exception as e:
+            try:
+                from toolkit.print import print_acc
+                import traceback
+                print_acc(f"[PRECOMPUTE] Warning: failed to determine batch target size: {e}\n{traceback.format_exc()}")
+            except Exception:
+                print(f"[PRECOMPUTE] Warning: failed to determine batch target size: {e}")
             target_h = None
             target_w = None
 
@@ -1628,13 +1638,24 @@ class SDTrainer(BaseSDTrainProcess):
                 cfg = getattr(batch.file_items[0], 'dataset_config', None)
                 if cfg is not None and getattr(cfg, 'control_size', None) is not None:
                     target_h = target_w = int(cfg.control_size)
-            except Exception:
-                pass
+            except Exception as e:
+                try:
+                    from toolkit.print import print_acc
+                    import traceback
+                    print_acc(f"[PRECOMPUTE] Warning: failed to inspect dataset control_size: {e}\n{traceback.format_exc()}")
+                except Exception:
+                    print(f"[PRECOMPUTE] Warning: failed to inspect dataset control_size: {e}")
 
+        # Evaluate each file's cached contexts and collect diagnostics when issues are found
         for fi in batch.file_items:
             contexts = getattr(fi, '_preencoded_zimage_control_contexts', None)
             if contexts is None:
-                return None
+                diagnostics.append(f"{fi.path}: missing _preencoded_zimage_control_contexts")
+                continue
+            if not isinstance(contexts, dict) or len(contexts) == 0:
+                diagnostics.append(f"{fi.path}: _preencoded_zimage_control_contexts empty or invalid: {type(contexts).__name__}")
+                continue
+
             # pick best fit: prefer exact size, else nearest
             chosen = None
             if target_h is not None and target_w is not None:
@@ -1645,16 +1666,20 @@ class SDTrainer(BaseSDTrainProcess):
                     # pick nearest size
                     sizes = sorted(contexts.keys())
                     if len(sizes) == 0:
-                        return None
+                        diagnostics.append(f"{fi.path}: contexts dict has no sizes")
+                        continue
                     # find closest by abs diff
                     closest = min(sizes, key=lambda s: abs(s - desired))
                     chosen = contexts[closest]
+                    diagnostics.append(f"{fi.path}: desired={desired}, using nearest precomputed size={closest}")
             else:
                 # no target preferred; pick smallest size by default
                 sizes = sorted(contexts.keys())
                 if len(sizes) == 0:
-                    return None
+                    diagnostics.append(f"{fi.path}: contexts dict has no sizes")
+                    continue
                 chosen = contexts[sizes[0]]
+                diagnostics.append(f"{fi.path}: no target; using smallest precomputed size={sizes[0]}")
 
             ctx = chosen
             # normalize to 5D [1, C, F, H, W]
@@ -1668,12 +1693,33 @@ class SDTrainer(BaseSDTrainProcess):
                 elif ctx.ndim == 5:
                     vals.append(ctx)
                 else:
-                    return None
+                    diagnostics.append(f"{fi.path}: precomputed tensor has unsupported ndim={ctx.ndim}")
+                    continue
             else:
-                return None
+                diagnostics.append(f"{fi.path}: precomputed entry is not a torch.Tensor (type={type(ctx).__name__})")
+                continue
+
+        if len(vals) != len(batch.file_items):
+            # Emit diagnostics for why precompute was not acceptable for the full batch
+            try:
+                from toolkit.print import print_acc
+                print_acc(f"[PRECOMPUTE] precompute not usable for batch: {len(vals)}/{len(batch.file_items)} files usable; details:")
+                for d in diagnostics:
+                    print_acc(f"[PRECOMPUTE]   {d}")
+            except Exception:
+                print(f"[PRECOMPUTE] precompute not usable for batch: {len(vals)}/{len(batch.file_items)} files usable; details:")
+                for d in diagnostics:
+                    print(f"  {d}")
+            return None
         try:
             return torch.cat(vals, dim=0)
-        except Exception:
+        except Exception as e:
+            try:
+                from toolkit.print import print_acc
+                import traceback
+                print_acc(f"[PRECOMPUTE] Failed to concat precomputed contexts: {e}\n{traceback.format_exc()}")
+            except Exception:
+                print(f"[PRECOMPUTE] Failed to concat precomputed contexts: {e}")
             return None
 
     def _precompute_zimage_control_contexts(self):
@@ -1687,8 +1733,12 @@ class SDTrainer(BaseSDTrainProcess):
         datasets = None
         try:
             datasets = get_dataloader_datasets(self.data_loader)
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                from toolkit.print import print_acc
+                print_acc(f"[PRECOMPUTE] Failed to list dataloader datasets: {e}")
+            except Exception:
+                print(f"[PRECOMPUTE] Failed to list dataloader datasets: {e}")
         if not datasets:
             return
         try:
@@ -1709,21 +1759,56 @@ class SDTrainer(BaseSDTrainProcess):
             # Ensure VAE is on compute device and ready
             try:
                 self.sd.set_device_state_preset('cache_latents')
-            except Exception:
-                pass
+            except Exception as e:
+                try:
+                    from toolkit.print import print_acc
+                    print_acc(f"[PRECOMPUTE] Warning: set_device_state_preset failed: {e}")
+                except Exception:
+                    print(f"[PRECOMPUTE] Warning: set_device_state_preset failed: {e}")
             for fi in ds.file_list:
                 # Only handle items that actually have control images or already have a control tensor
                 if not getattr(fi, 'has_control_image', False) and getattr(fi, 'control_tensor', None) is None:
                     continue
-                if getattr(fi, '_preencoded_zimage_control_context', None) is not None:
-                    continue
+                # If contexts dict exists and already contains sizes, skip re-compute for this file.
+                try:
+                    existing = getattr(fi, '_preencoded_zimage_control_contexts', None)
+                    if existing is not None and isinstance(existing, dict) and len(existing) > 0:
+                        try:
+                            from toolkit.print import print_acc
+                            print_acc(f"[PRECOMPUTE] Skipping precompute for {fi.path}: already cached sizes={sorted(existing.keys())}")
+                        except Exception:
+                            print(f"[PRECOMPUTE] Skipping precompute for {fi.path}: already cached sizes={sorted(existing.keys())}")
+                        continue
+                except Exception:
+                    # best-effort: if inspection fails, proceed to try precompute
+                    pass
                 # Ensure control image is loaded
                 try:
                     if getattr(fi, 'control_tensor', None) is None:
-                        fi.load_control_image()
-                        if getattr(fi, 'control_tensor', None) is None:
+                        try:
+                            fi.load_control_image()
+                        except Exception as e:
+                            try:
+                                from toolkit.print import print_acc
+                                import traceback
+                                print_acc(f"[PRECOMPUTE] Exception loading control image for {fi.path}: {e}\n{traceback.format_exc()}")
+                            except Exception:
+                                print(f"[PRECOMPUTE] Exception loading control image for {fi.path}: {e}")
                             continue
-                except Exception:
+                        if getattr(fi, 'control_tensor', None) is None:
+                            try:
+                                from toolkit.print import print_acc
+                                print_acc(f"[PRECOMPUTE] No control_tensor after load for {fi.path}")
+                            except Exception:
+                                print(f"[PRECOMPUTE] No control_tensor after load for {fi.path}")
+                            continue
+                except Exception as e:
+                    try:
+                        from toolkit.print import print_acc
+                        import traceback
+                        print_acc(f"[PRECOMPUTE] Exception inspecting control image for {fi.path}: {e}\n{traceback.format_exc()}")
+                    except Exception:
+                        print(f"[PRECOMPUTE] Exception inspecting control image for {fi.path}: {e}")
                     continue
                 try:
                     imgs = fi.control_tensor
@@ -1805,7 +1890,13 @@ class SDTrainer(BaseSDTrainProcess):
                                     print_acc(f"[PRECOMPUTE] calling encode for {fi.path} size={size} orig={orig[1]}x{orig[0]} resized={resized[1]}x{resized[0]} target={target[1]}x{target[0]}")
                                 except Exception:
                                     pass
-                            except Exception:
+                            except Exception as e:
+                                try:
+                                    from toolkit.print import print_acc
+                                    import traceback
+                                    print_acc(f"[PRECOMPUTE] Warning: resize failed for {fi.path} size={size}: {e}\n{traceback.format_exc()}")
+                                except Exception:
+                                    print(f"[PRECOMPUTE] Warning: resize failed for {fi.path} size={size}: {e}")
                                 batch_resized = batch_imgs.to(torch.float32)
                                 used_dataset_control = False
                         except Exception:
@@ -1858,6 +1949,11 @@ class SDTrainer(BaseSDTrainProcess):
                         # store per-size raw latents (4D: [B, C, H, W]) — runtime-only, in-memory only (no disk persistence)
                         if not hasattr(fi, '_preencoded_zimage_control_contexts') or fi._preencoded_zimage_control_contexts is None:
                             fi._preencoded_zimage_control_contexts = {}
+                            try:
+                                from toolkit.print import print_acc
+                                print_acc(f"[PRECOMPUTE] Initializing precompute dict for {fi.path}")
+                            except Exception:
+                                print(f"[PRECOMPUTE] Initializing precompute dict for {fi.path}")
                         # squeeze batch dim and move to CPU for sharing
                         stored = control_latents.squeeze(0).to('cpu')
                         # Tag the tensor with a precompute origin so consumers can deterministically
@@ -1877,30 +1973,63 @@ class SDTrainer(BaseSDTrainProcess):
                                 if locals().get('used_dataset_control', False):
                                     try:
                                         tag_tensor(stored, 'precompute:used_dataset_image')
-                                    except Exception:
-                                        pass
-                            except Exception:
+                                    except Exception as e:
+                                        try:
+                                            from toolkit.print import print_acc
+                                            print_acc(f"[PRECOMPUTE] Warning: tag_tensor for used_dataset_image failed: {e}")
+                                        except Exception:
+                                            print(f"[PRECOMPUTE] Warning: tag_tensor for used_dataset_image failed: {e}")
+                            except Exception as e:
                                 try:
                                     tag_tensor(stored, f'precompute:control_latents:size={int(size)}')
+                                except Exception as e2:
+                                    try:
+                                        from toolkit.print import print_acc
+                                        print_acc(f"[PRECOMPUTE] Warning: tagging stored precompute tensor failed: {e2}")
+                                    except Exception:
+                                        print(f"[PRECOMPUTE] Warning: tagging stored precompute tensor failed: {e2}")
+
+                            # Store the precomputed tensor in the file's contexts dict
+                            try:
+                                fi._preencoded_zimage_control_contexts[int(size)] = stored
+                            except Exception as e:
+                                try:
+                                    from toolkit.print import print_acc
+                                    print_acc(f"[PRECOMPUTE] Warning: failed to store precomputed tensor for {fi.path} size={size}: {e}")
                                 except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        fi._preencoded_zimage_control_contexts[int(size)] = stored
+                                    print(f"[PRECOMPUTE] Warning: failed to store precomputed tensor for {fi.path} size={size}: {e}")
 
-                    fi.is_control_context_cached = True
+                        except Exception as e:
+                            try:
+                                from toolkit.print import print_acc
+                                print_acc(f"[PRECOMPUTE] Warning: failed to tag precomputed tensor for {fi.path} size={size}: {e}")
+                            except Exception:
+                                print(f"[PRECOMPUTE] Warning: failed to tag precomputed tensor for {fi.path} size={size}: {e}")
                 except Exception as e:
-                    print_acc(f"[PRECOMPUTE] Warning: failed to precompute control for {fi.path}: {e}")
+                    try:
+                        from toolkit.print import print_acc
+                        print_acc(f"[PRECOMPUTE] Warning: failed to precompute control for {fi.path}: {e}")
+                    except Exception:
+                        print(f"[PRECOMPUTE] Warning: failed to precompute control for {fi.path}: {e}")
 
-            # restore device state after a dataset
+                # Per-file summary: report how many sizes were cached for this file (helps diagnose empty dicts)
+                try:
+                    keys = sorted(list(fi._preencoded_zimage_control_contexts.keys())) if getattr(fi, '_preencoded_zimage_control_contexts', None) is not None else []
+                    if keys:
+                        try:
+                            from toolkit.print import print_acc
+                            print_acc(f"[PRECOMPUTE] Cached precomputed sizes for {fi.path}: {keys}")
+                        except Exception:
+                            print(f"[PRECOMPUTE] Cached precomputed sizes for {fi.path}: {keys}")
+                    else:
+                        try:
+                            from toolkit.print import print_acc
+                            print_acc(f"[PRECOMPUTE] No precomputed sizes cached for {fi.path} (empty dict)")
+                        except Exception:
+                            print(f"[PRECOMPUTE] No precomputed sizes cached for {fi.path} (empty dict)")
+                except Exception:
+                    pass
 
-            try:
-                self.sd.restore_device_state()
-            except Exception:
-                # best-effort; don't let a missing helper or other error abort precompute
-                pass
-
-            # Defensive restore: ensure global grad mode is enabled after precompute.
             # Some third-party encoders or buggy implementations may have called
             # torch.set_grad_enabled(False) without restoring; be defensive.
 

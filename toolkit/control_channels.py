@@ -196,29 +196,12 @@ def adapt_control_images(control_images: Any, adapter: Any, expected_override: O
     except Exception as e:
         raise RuntimeError(f"Failed to infer expected control in-channels from adapter: {e}") from e
 
-    # Fallback heuristics for common adapter shapes used in tests and real adapters.
-    # Prefer explicit signals from adapter (control_in_dim), but fall back to conv_in
-    # when present, or to Z-Image default of 4 channels for known Z-Image adapters.
-    if expected is None:
-        try:
-            conv_in = getattr(adapter, 'conv_in', None)
-            if conv_in is not None and hasattr(conv_in, 'weight'):
-                expected = int(conv_in.weight.shape[1])
-                print_acc(f"[CONTROL_CHANNELS] adapt_control_images: inferred expected_in from adapter.conv_in -> {expected}")
-        except Exception:
-            pass
-    if expected is None:
-        try:
-            name = getattr(adapter, 'name_or_path', None) if adapter is not None else None
-            name_str = str(name).lower() if name is not None else ''
-            for pat in ('zimage', 'z_image', 'z-image', 'videox', 'video_x'):
-                if pat in name_str:
-                    # Z-Image Turbo canonical default for raw images is 4 channels
-                    expected = 4
-                    print_acc(f"[CONTROL_CHANNELS] adapt_control_images: detected Z-Image adapter name; defaulting expected_in=4")
-                    break
-        except Exception:
-            pass
+    # Do NOT apply heuristics here. Use explicit signals from the adapter
+    # (via `control_in_dim`) or `expected_override`. If `expected` is None we
+    # will not attempt to guess or coerce pixel/conv shapes; instead we return
+    # the tensor unchanged and `expected` remains None. This preserves strict,
+    # deterministic behavior and avoids masking upstream misconfigurations.
+    # (Any adapter-level enforcement should be done via `ensure_control_in_dim`.)
 
     # If the adapter provides an explicit control_in_dim but lacks a name, this
     # is a suspicious minimal object (tests often create such cases). To avoid
@@ -268,27 +251,7 @@ def adapt_control_images(control_images: Any, adapter: Any, expected_override: O
             print_acc(f"[CONTROL_CHANNELS] adapt_control_images: no expected_in provided; returning shape={tuple(t.shape)} (from {t_in_shape})")
             return t
 
-        # Heuristic: if tensor looks like a pixel image (1/3/4 channels, reasonable spatial size)
-        # we allow friendly adaptations such as dropping or adding alpha channels to match
-        # the adapter expectation (e.g., 4 -> 3 drop alpha, 3 -> 4 pad alpha)
-        looks_like_pixel = isinstance(t, torch.Tensor) and t.ndim == 4 and t.shape[1] in (1, 3, 4) and max(t.shape[-2:]) >= 16
         try:
-            if looks_like_pixel:
-                C = int(t.shape[1])
-                if C == 4 and expected == 3:
-                    out = t[:, :3, ...]
-                    print_acc(f"[CONTROL_CHANNELS] adapt_control_images: trimmed alpha channel 4->3 shape={tuple(out.shape)}")
-                    print_acc(f"[CONTROL_CHANNELS] adapt_control_images: adapted channels from {tuple(t_in_shape)} -> {tuple(out.shape)} expected={expected}")
-                    tag_tensor(out, 'adapt_control_images:pixel_trim_alpha')
-                    return out
-                if C == 3 and expected == 4:
-                    pad = torch.zeros((t.shape[0], 1, t.shape[2], t.shape[3]), dtype=t.dtype, device=t.device)
-                    out = torch.cat([t, pad], dim=1)
-                    print_acc(f"[CONTROL_CHANNELS] adapt_control_images: padded alpha channel 3->4 shape={tuple(out.shape)}")
-                    print_acc(f"[CONTROL_CHANNELS] adapt_control_images: adapted channels from {tuple(t_in_shape)} -> {tuple(out.shape)} expected={expected}")
-                    tag_tensor(out, 'adapt_control_images:pixel_pad_alpha')
-                    return out
-                # falls through to strict enforcement for other mismatches
             out = _trim_or_pad_tensor(t, expected)
         except RuntimeError as e:
             # Provide richer diagnostics: include adapter identity, configured control_in_dim,
@@ -372,11 +335,41 @@ def assemble_zimage_control_context(
 
     import torch.nn.functional as F
 
-    # Determine target spatial size: prefer inpaint_latent if present
-    if inpaint_latent is not None and isinstance(inpaint_latent, torch.Tensor) and inpaint_latent.ndim == 4:
-        tgt_h, tgt_w = int(inpaint_latent.shape[-2]), int(inpaint_latent.shape[-1])
+    # Implement strict handling based on three scenarios:
+    # Scenario 1: C == expected_base (e.g., 16) -> assemble to form control_in_dim
+    # Scenario 2: C == control_in_dim (e.g., 33) -> pass-through (pre-assembled)
+    # Scenario 3: Any other C -> error
+
+    if control_in_dim is None:
+        # No requested assembled size; caller will accept base latents as-is
+        print_acc(f"[CONTROL_CHANNELS] assemble_zimage_control_context: no control_in_dim requested, passing through C={C}")
+        return control_latents
+
+    # Validate that control_in_dim represents an assembled form: 2*base + 1
+    if control_in_dim < 3 or ((control_in_dim - 1) % 2) != 0:
+        raise RuntimeError(f"control_in_dim={control_in_dim} is not an assembled form (expected 2*base+1)")
+
+    expected_base = (control_in_dim - 1) // 2
+
+    # Scenario 2: already assembled (precomputed control_context)
+    if C == control_in_dim:
+        print_acc(f"[CONTROL_CHANNELS] assemble_zimage_control_context: received pre-assembled control_context with C={C}; passing through")
+        return control_latents
+
+    # Scenario 1: packed/predictable base channels (e.g., 16) -> assemble
+    if C == expected_base:
+        tgt_h, tgt_w = (int(inpaint_latent.shape[-2]), int(inpaint_latent.shape[-1])) if (inpaint_latent is not None and isinstance(inpaint_latent, torch.Tensor) and inpaint_latent.ndim == 4) else (int(control_latents.shape[-2]), int(control_latents.shape[-1]))
     else:
-        tgt_h, tgt_w = int(control_latents.shape[-2]), int(control_latents.shape[-1])
+        # Scenario 3: invalid channel count
+        raise RuntimeError(
+            f"Unsupported control_latents channels ({C}) for assembled control_in_dim={control_in_dim}; "
+            f"expected packed base channels={expected_base} (e.g., 16) or pre-assembled channels={control_in_dim}. "
+            "Do not pass raw/incorrectly-encoded latents."
+        )
+
+    # Determine target spatial size already set in tgt_h, tgt_w above if C == expected_base
+    # (fall back behavior handled by previous branch)
+
 
     # Prepare inpaint latent
     if inpaint_latent is None:

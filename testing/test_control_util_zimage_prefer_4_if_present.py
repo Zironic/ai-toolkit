@@ -3,8 +3,8 @@ from types import SimpleNamespace
 from toolkit.control_util import infer_expected_in_ch
 
 
-def test_zimage_prefer_4_when_both_3_and_4_present():
-    # adapter exposes conv_in with in_channels==3 and also has another module with in_channels==4
+def test_zimage_prefer_explicit_control_in_dim_only():
+    # With strict policy we only honor an explicit `control_in_dim` attribute.
     adapter = SimpleNamespace()
     adapter.name_or_path = 'alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps'
     # conv_in field indicates 3
@@ -18,5 +18,11 @@ def test_zimage_prefer_4_when_both_3_and_4_present():
 
     adapter._fake = FakeModule()
 
+    # Without explicit control_in_dim we return None
     expected = infer_expected_in_ch(adapter)
-    assert expected == 4, f"Expected prefer 4 when both 3 and 4 present, got {expected}"
+    assert expected is None, f"Expected None when no explicit control_in_dim provided, got {expected}"
+
+    # When explicit attribute is set, it should be returned
+    adapter.control_in_dim = 4
+    expected2 = infer_expected_in_ch(adapter)
+    assert expected2 == 4, f"Expected explicit control_in_dim to be returned, got {expected2}"

@@ -481,6 +481,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         except Exception as e:
                             raise RuntimeError(f"Failed to print unconditional wrapper step info: {e}") from e
                         if not isinstance(getattr(self, 'adapter', None), VideoXControlnetWrapper):
+                            # Ensure adapter is present: do not attempt to wrap a missing/None adapter.
+                            if getattr(self, 'adapter', None) is None:
+                                raise RuntimeError("ControlNet adapter is missing (None). Cannot apply VideoX wrapper — ensure the model provided a ControlNet or assign `self.adapter` before zimage routing.")
                             try:
                                 print_acc("[CONTROLNET] Attempting unconditional VideoXControlnetWrapper application")
                             except Exception as e:
@@ -492,36 +495,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 except Exception as e:
                                     raise RuntimeError(f"Failed to print VideoX wrapper success message: {e}") from e
                             except Exception as e:
-                                # If the wrapper failed due to a missing `control_context` parameter
-                                # try applying a small legacy-to-videox shim which maps common
-                                # legacy kw names (e.g., `controlnet_cond`) to the required
-                                # `control_context` kw before re-wrapping. This keeps fail-fast
-                                # behavior for truly incompatible adapters but allows common
-                                # legacy ControlNetModel instances to be used without requiring
-                                # source changes upstream.
-                                msg = str(e)
-                                if "missing required parameter 'control_context'" in msg or 'missing required parameter "control_context"' in msg or 'missing required parameter' in msg:
-                                    try:
-                                        from toolkit.controlnet_compat import ControlNetLegacyAdapter
-                                        try:
-                                            print_acc('[CONTROLNET] VideoX wrapper failed due to missing `control_context`; attempting legacy shim')
-                                        except Exception:
-                                            pass
-                                        old_adapter = getattr(self, 'adapter')
-                                        self.adapter = ControlNetLegacyAdapter(old_adapter)
-                                        # Attempt to wrap again
-                                        try:
-                                            self.adapter = VideoXControlnetWrapper(self.adapter)
-                                            try:
-                                                print_acc('[CONTROLNET] Applied legacy shim and successfully wrapped adapter.')
-                                            except Exception:
-                                                pass
-                                        except Exception as se:
-                                            raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping failed after applying legacy shim: {se}") from se
-                                    except Exception as se:
-                                        raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping+shim failed: {se}") from se
-                                else:
-                                    raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping failed: {e}") from e
+                                # Do not attempt legacy shims or fallbacks; fail fast and surface
+                                # the original wrapping error so callers can correct their adapter.
+                                raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping failed: {e}") from e
                         else:
                             try:
                                 print_acc('[CONTROLNET] Adapter already wrapped with VideoXControlnetWrapper; skipping')

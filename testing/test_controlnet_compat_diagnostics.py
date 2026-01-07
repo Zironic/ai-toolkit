@@ -48,6 +48,6 @@ def test_wrapper_reports_offending_tensor_and_origin():
         _ = wrapper(latents, torch.tensor(10.0), control_context, conditioning_scale=1.0)
 
     msg = str(exc.value)
-    # our fake inner error text should be included
-    assert 'Given groups=1' in msg
-    # The wrapper should not add a best-effort offending=... payload; inner error is authoritative
+    # The wrapper should fail fast on raw pixel inputs and instruct the caller to provide
+    # pre-encoded control latents rather than attempting to call the inner adapter.
+    assert 'VideoXControlnetWrapper received raw pixel images' in msg or 'provide pre-encoded control latents' in msg
