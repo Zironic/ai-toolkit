@@ -32,6 +32,7 @@ import albumentations as A
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
 from toolkit.prompt_utils import PromptEmbeds
+from pathlib import Path
 from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
@@ -2002,10 +2003,11 @@ class LatentCachingFileItemDTOMixin:
             hash_dict = self.get_latent_info_dict()
             filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
             # get base64 hash of md5 checksum of hash_dict
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            self._latent_path = os.path.join(latent_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+            # compute deterministic param digest and content digest for robust invalidation
+            from toolkit.cache_utils import compute_param_digest, compute_file_sha256
+            param_digest = compute_param_digest(hash_dict)
+            content_digest = compute_file_sha256(Path(self.path))
+            self._latent_path = os.path.join(latent_dir, f"{filename_no_ext}_{param_digest}_{content_digest}.safetensors")
 
         return self._latent_path
 
@@ -2077,12 +2079,13 @@ class LatentCachingMixin:
                 file_item.is_caching_to_memory = to_memory
                 file_item.latent_load_device = self.sd.device
 
-                latent_path = file_item.get_latent_path(recalculate=True)
-                # check if it is saved to disk already
-                if os.path.exists(latent_path):
+                latent_path = Path(file_item.get_latent_path(recalculate=True))
+                from toolkit.cache_utils import find_cached_file, atomic_write
+                # check if a cached file exists (hashed or legacy fallback)
+                cached = find_cached_file(latent_path)
+                if cached:
                     if to_memory:
-                        # load it into memory
-                        state_dict = load_file(latent_path, device='cpu')
+                        state_dict = load_file(str(cached), device='cpu')
                         file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
                 else:
                     # not saved to disk, calculate
@@ -2105,8 +2108,17 @@ class LatentCachingMixin:
                         ])
                         # metadata
                         meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
-                        os.makedirs(os.path.dirname(latent_path), exist_ok=True)
-                        save_file(state_dict, latent_path, metadata=meta)
+                        os.makedirs(latent_path.parent, exist_ok=True)
+                        # race re-check
+                        cached = find_cached_file(latent_path)
+                        if cached:
+                            if to_memory:
+                                state_dict = load_file(str(cached), device='cpu')
+                                file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
+                        else:
+                            def _writer(p: Path):
+                                save_file(state_dict, str(p), metadata=meta)
+                            atomic_write(latent_path, _writer)
 
                     if to_memory:
                         # keep it in memory
@@ -2161,24 +2173,49 @@ class ControlContextFileItemDTOMixin:
         ctx_dir = os.path.join(img_dir, '_context_cache')
         hash_dict = self.get_control_context_info_dict()
         filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
-        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-        hash_str = hash_str.replace('=', '')
-        path = os.path.join(ctx_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+        # compute stable param digest and combined content digest for control context
+        from toolkit.cache_utils import compute_param_digest, compute_combined_hash
+        param_digest = compute_param_digest(hash_dict)
+        # combined hash of image + control (if present)
+        content_hash = None
+        img_path = Path(self.path)
+        if hasattr(self, 'control_path') and self.control_path is not None:
+            ctrl = self.control_path
+            if isinstance(ctrl, list):
+                ctrl_paths = [Path(p) for p in ctrl]
+            else:
+                ctrl_paths = [Path(ctrl)]
+            content_hash = compute_combined_hash([img_path] + ctrl_paths)
+        else:
+            content_hash = compute_file_sha256(img_path)
+        path = os.path.join(ctx_dir, f'{filename_no_ext}_{param_digest}_{content_hash}.safetensors')
         self._control_contexts_path = path
         return path
 
     def save_control_contexts(self: 'FileItemDTO', contexts: dict):
         # contexts: dict size->tensor
-        path = self.get_control_context_path(recalculate=True)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        path = Path(self.get_control_context_path(recalculate=True))
+        from toolkit.cache_utils import find_cached_file, atomic_write
+        os.makedirs(path.parent, exist_ok=True)
+        # check for existing cache (hashed or legacy)
+        cached = find_cached_file(path)
+        if cached:
+            self.is_control_context_cached = True
+            return str(cached)
         state_dict = {}
         for size, tensor in contexts.items():
             state_dict[f'context_{int(size)}'] = tensor.cpu()
-        save_file(state_dict, path)
+        # race re-check and atomic write
+        cached = find_cached_file(path)
+        if cached:
+            self.is_control_context_cached = True
+            return str(cached)
+        def _writer(p: Path):
+            save_file(state_dict, str(p))
+        atomic_write(path, _writer)
         # mark as cached
         self.is_control_context_cached = True
-        return path
+        return str(path)
 
     def load_control_contexts(self: 'FileItemDTO'):
         path = self.get_control_context_path(recalculate=False)
@@ -2213,7 +2250,7 @@ class TextEmbeddingFileItemDTOMixin:
         self.text_embedding_space_version = 'sd1'
         self.text_embedding_version = 1
 
-    def get_text_embedding_info_dict(self: 'FileItemDTO', dop_class: str = None):
+    def get_text_embedding_info_dict(self: 'FileItemDTO', dop_class: str = None, trigger_word: str = None, dop_replacements_digest: str = None):
         # make sure the caption is loaded here
         if self.caption is None:
             self.load_caption()
@@ -2227,11 +2264,17 @@ class TextEmbeddingFileItemDTOMixin:
         # if we have a control image, cache the path
         if self.encode_control_in_text_embeddings and self.control_path is not None:
             item["control_path"] = self.control_path
+        # include DOP-specific items when provided; only add if explicitly passed to avoid
+        # changing existing cache keys for callers that don't pass these.
         if dop_class is not None:
             item["dop_class"] = dop_class
+        if trigger_word is not None:
+            item["trigger_word"] = trigger_word
+        if dop_replacements_digest is not None:
+            item["dop_replacements_digest"] = dop_replacements_digest
         return item
 
-    def get_text_embedding_path(self: 'FileItemDTO', recalculate=False, dop_class: str = None):
+    def get_text_embedding_path(self: 'FileItemDTO', recalculate=False, dop_class: str = None, trigger_word: str = None, dop_replacements_digest: str = None):
         # choose cached path for normal or dop variant
         if dop_class is None:
             if self._text_embedding_path is not None and not recalculate:
@@ -2246,10 +2289,19 @@ class TextEmbeddingFileItemDTOMixin:
         hash_dict = self.get_text_embedding_info_dict(dop_class=dop_class)
         filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
         # get base64 hash of md5 checksum of hash_dict
-        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-        hash_str = hash_str.replace('=', '')
-        path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+        # compute param digest (stable) and content digest (caption file or caption text)
+        from toolkit.cache_utils import compute_param_digest, compute_file_sha256
+        param_digest = compute_param_digest(hash_dict)
+        # prefer hashing the on-disk caption file if present
+        file_path_no_ext = os.path.splitext(self.path)[0]
+        caption_file = file_path_no_ext + '.' + getattr(self.dataset_config, 'caption_ext', 'txt')
+        caption_path = Path(caption_file)
+        if caption_path.exists():
+            content_digest = compute_file_sha256(caption_path)
+        else:
+            # fallback to hashing the in-memory caption text
+            content_digest = hashlib.sha256(self.caption.encode('utf-8')).hexdigest()
+        path = os.path.join(te_dir, f'{filename_no_ext}_{param_digest}_{content_digest}.safetensors')
         if dop_class is None:
             self._text_embedding_path = path
         else:
@@ -2337,9 +2389,11 @@ class TextEmbeddingCachingMixin:
                 file_item.text_embedding_space_version = self.sd.model_config.arch
                 file_item.latent_load_device = self.sd.device
 
-                text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
-                # only process if not saved to disk
-                if not os.path.exists(text_embedding_path):
+                from toolkit.cache_utils import find_cached_file
+                text_embedding_path = Path(file_item.get_text_embedding_path(recalculate=True))
+                # check for hashed or legacy cache
+                cached = find_cached_file(text_embedding_path)
+                if not cached:
                     # load if not loaded
                     if not did_move:
                         self.sd.set_device_state_preset('cache_text_encoder')
@@ -2376,8 +2430,10 @@ class TextEmbeddingCachingMixin:
                         prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
                     else:
                         prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
-                    # save it
-                    prompt_embeds.save(text_embedding_path)
+                    # race re-check
+                    cached = find_cached_file(text_embedding_path)
+                    if not cached:
+                        prompt_embeds.save(str(text_embedding_path))
                     del prompt_embeds
                 file_item.is_text_embedding_cached = True
                 i += 1

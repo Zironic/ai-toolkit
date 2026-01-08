@@ -1,5 +1,7 @@
 import os
 from typing import Optional, TYPE_CHECKING, List, Union, Tuple
+import re
+from pathlib import Path
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -135,8 +137,13 @@ class PromptEmbeds:
                     state_dict[f"attention_mask_{i}"] = attn.cpu()
             else:
                 state_dict["attention_mask"] = pe.attention_mask.cpu()
+        from toolkit.cache_utils import atomic_write
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        save_file(state_dict, path)
+        # write via atomic_write to avoid partial/corrupt files
+        def _writer(p):
+            # save_file expects a path-like or str
+            save_file(state_dict, str(p))
+        atomic_write(Path(path), _writer)
         # record source path for diagnostics
         try:
             self._source_path = path
@@ -618,6 +625,40 @@ def get_permutations(s, max_permutations=8):
 
     # Convert the tuples back to comma separated strings
     return [', '.join(permutation) for permutation in permutations]
+
+
+def parse_csv_list(value: Optional[str]) -> List[str]:
+    """Parse a comma-separated string into a list preserving explicit empty entries.
+
+    Examples:
+        "a, b, c" -> ["a", "b", "c"]
+        "a, , c" -> ["a", "", "c"]
+        "" -> []
+        None -> []
+    """
+    if value is None:
+        return []
+    # split on comma, preserve empty strings if present
+    parts = [p.strip() for p in value.split(',')]
+    # If the input is empty string, return [] (consistent with previous behavior)
+    if len(parts) == 1 and parts[0] == "":
+        return []
+    return parts
+
+
+def normalize_caption_separators(text: str) -> str:
+    """Normalize separators and spacing in caption text.
+
+    Ensures there is a single space after commas and collapses repeated whitespace.
+    This helps avoid tokenizer merging of adjacent tokens in many cases.
+    """
+    if text is None:
+        return ""
+    # Ensure space after commas
+    text = re.sub(r",\s*", ", ", text)
+    # Collapse multiple spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def get_slider_target_permutations(target: 'SliderTargetConfig', max_permutations=8) -> List['SliderTargetConfig']:

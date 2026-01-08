@@ -52,6 +52,7 @@ def test_dop_cache_path_and_load():
                 self._dop_text_embedding_path = None
                 self.is_text_embedding_cached = True
                 self.dop_prompt_embeds = None
+                self.dataset_config = SimpleNamespace(caption_ext='txt')
 
         fi = DummyFile(img_path, "a photo of [trigger] in the wild")
 
@@ -71,3 +72,43 @@ def test_dop_cache_path_and_load():
         fi.load_dop_prompt_embedding('DOP_CLASS')
         assert fi.dop_prompt_embeds is not None
         assert os.path.exists(dop_path)
+
+
+def test_dop_cache_key_changes_on_trigger_and_class():
+    # reuse the DummyFile from above by constructing a new instance
+    from toolkit.dataloader_mixins import TextEmbeddingFileItemDTOMixin
+    class DummyFile(TextEmbeddingFileItemDTOMixin):
+        def __init__(self, path, caption):
+            self.path = path
+            self.caption = caption
+            self.encode_control_in_text_embeddings = False
+            self.text_embedding_space_version = 'sd1'
+            self.text_embedding_version = 1
+            self._text_embedding_path = None
+            self._dop_text_embedding_path = None
+            self.dataset_config = SimpleNamespace(caption_ext='txt')
+
+    tmp_dir = tempfile.TemporaryDirectory()
+    img_path = os.path.join(tmp_dir.name, 'img2.png')
+    Image.new('RGB', (8, 8), (255, 255, 255)).save(img_path)
+    fi = DummyFile(img_path, 'original caption')
+
+    p0 = fi.get_text_embedding_path(recalculate=True, dop_class='classA')
+    from toolkit.cache_utils import compute_param_digest
+    dop_repl_digest = compute_param_digest({'trigger_word': 't1', 'replacements': []})
+    p1 = fi.get_text_embedding_path(recalculate=True, dop_class='classA', trigger_word='t1', dop_replacements_digest=dop_repl_digest)
+    assert p0 != p1
+
+    p2 = fi.get_text_embedding_path(recalculate=True, dop_class='classB', trigger_word='t1', dop_replacements_digest=dop_repl_digest)
+    assert p1 != p2
+
+    # change caption
+    fi.caption = 'changed caption'
+    p3 = fi.get_text_embedding_path(recalculate=True, dop_class='classB', trigger_word='t1', dop_replacements_digest=dop_repl_digest)
+    assert p2 != p3
+
+    # empty trigger and dop class handling
+    p4 = fi.get_text_embedding_path(recalculate=True, dop_class='', trigger_word='', dop_replacements_digest=compute_param_digest({'trigger_word': '', 'replacements': []}))
+    p5 = fi.get_text_embedding_path(recalculate=True, dop_class=None, trigger_word=None, dop_replacements_digest=None)
+    assert p4 != p5
+    tmp_dir.cleanup()

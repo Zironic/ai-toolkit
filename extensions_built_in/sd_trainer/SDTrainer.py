@@ -665,7 +665,12 @@ class SDTrainer(BaseSDTrainProcess):
                                 total_files += 1
                                 try:
                                     # create the intended dop path; recalculate to avoid stale cached path
-                                    dop_path = fi.get_text_embedding_path(recalculate=True, dop_class=dop_class)
+                                    from toolkit.cache_utils import compute_param_digest
+                                    dop_repl_digest = compute_param_digest({
+                                        'trigger_word': self.trigger_word or '',
+                                        'replacements': self._dop_replacements or []
+                                    })
+                                    dop_path = fi.get_text_embedding_path(recalculate=True, dop_class=dop_class, trigger_word=self.trigger_word, dop_replacements_digest=dop_repl_digest)
                                     if os.path.exists(dop_path):
                                         existing += 1
                                         continue
@@ -4265,6 +4270,8 @@ class SDTrainer(BaseSDTrainProcess):
                                 prior_pred=prior_pred,
                                 preservation_resolution=preservation_resolution,
                                 preservation_kind=preservation_kind,
+                                match_adapter_assist=match_adapter_assist,
+                                network_weight_list=network_weight_list,
                             )
 
                             # Support returned (preservation_pred, prior_pred_for_loss) when downsampling occurred
@@ -4326,7 +4333,7 @@ class SDTrainer(BaseSDTrainProcess):
         return loss.detach()
         # flush()
 
-    def _run_preservation_forward(self, noisy_latents, timesteps, preservation_embeds, unconditional_embeds, batch, pred_kwargs, dtype, prior_pred, preservation_resolution=None, preservation_kind: 'Optional[str]'=None):
+    def _run_preservation_forward(self, noisy_latents, timesteps, preservation_embeds, unconditional_embeds, batch, pred_kwargs, dtype, prior_pred, preservation_resolution=None, preservation_kind: 'Optional[str]'=None, match_adapter_assist: bool = False, network_weight_list: list = None):
         """Run preservation forward pass for DOP/blank prompt preservation and record timings.
 
         If `preservation_resolution` (pixels, long-side) is specified, the forward pass will be
@@ -4420,6 +4427,23 @@ class SDTrainer(BaseSDTrainProcess):
                 prior_small = torch.nn.functional.interpolate(
                     prior_pred, size=(target_h, target_w), mode='bilinear', align_corners=False
                 ).to(self.device_torch, dtype=torch_dtype)
+            else:
+                # No full-res prior available (we skipped it); compute a reduced prior prediction
+                # at the smaller latent size so preservation loss can be evaluated.
+                try:
+                    prior_small = self.get_prior_prediction(
+                        noisy_latents=noisy_small,
+                        conditional_embeds=preservation_embeds.to(self.device_torch, dtype=torch_dtype),
+                        match_adapter_assist=match_adapter_assist,
+                        network_weight_list=network_weight_list if network_weight_list is not None else [],
+                        timesteps=timesteps,
+                        pred_kwargs=pred_kwargs,
+                        batch=batch,
+                        noise=None,
+                        unconditional_embeds=unconditional_embeds,
+                    )
+                except Exception:
+                    prior_small = None
 
             preservation_pred_small = self.predict_noise(
                 noisy_latents=noisy_small,

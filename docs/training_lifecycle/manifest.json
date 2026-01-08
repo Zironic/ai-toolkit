@@ -1,0 +1,48 @@
+{
+  "generated": [
+    "01-ui-job-creation.md",
+    "02-prisma-and-db.md",
+    "03-worker-scheduling.md",
+    "04-run-py-and-job-loader.md",
+    "05-pipeline-and-jobs.md",
+    "06-pretraining-setup.md",
+    "07-training-loop.md",
+    "08-checkpoints.md",
+    "09-repro-troubleshoot.md",
+    "Training_Job_Lifecycle.md"
+  ],
+  "files_read": [
+    {"path": "ui/src/app/jobs/new/*", "notes": "Job form components and wiring (component files, data bindings)."},
+    {"path": "ui/src/app/api/jobs/route.ts", "lines": "1-220", "notes": "POST /api/jobs and start handlers; Prisma calls and P2002 handling"},
+    {"path": "ui/src/server/cron.ts", "lines": "1-400", "notes": "Cron loop, job selection, spawnJobProcess calls"},
+    {"path": "ui/src/cron/actions/processQueue.ts", "lines": "1-400", "notes": "Queue processing and spawn helper usage"},
+    {"path": "ui/prisma/schema.prisma", "lines": "1-400", "notes": "Datasource and models: Job, EvalJob, Settings"},
+    {"path": "ui/src/lib/prismaClient.ts", "lines": "1-240", "notes": "Singleton Prisma client export used by server and routes"},
+    {"path": "run.py", "lines": "1-200", "notes": "Python entrypoint, config parsing, job run loop"},
+    {"path": "toolkit/job.py", "lines": "1-120", "notes": "Config->Job mapping and job loader"},
+    {"path": "toolkit/config.py", "lines": "1-240", "notes": "Config file parsing, env substitution and [name] replacements"},
+    {"path": "jobs/BaseJob.py", "lines": "1-140", "notes": "Base job lifecycle and process loader"},
+    {"path": "jobs/TrainJob.py", "lines": "1-220", "notes": "Train job-specific process mapping"},
+    {"path": "toolkit/dataloader_mixins.py", "lines": "1-400", "notes": "Image transforms, bucketing, caption handling, augmentations"},
+    {"path": "toolkit/config_modules.py", "lines": "1-420", "notes": "TrainConfig, DatasetConfig, SaveConfig defaults"},
+    {"path": "toolkit/data_loader.py", "lines": "340-760", "notes": "AiToolkitDataset creation, caching and setup_epoch logic"},
+    {"path": "extensions_built_in/sd_trainer/SDTrainer.py", "lines": "1-500", "notes": "Core training steps, timers, forward/backward, hooks"},
+    {"path": "extensions_built_in/sd_trainer/UITrainer.py", "lines": "1-380", "notes": "DB update helpers, async DB threadpool, stop/save hooks"},
+    {"path": "extensions_built_in/sd_trainer/DiffusionTrainer.py", "lines": "1-380", "notes": "UI-specific trainer hooks and timing handlers"},
+    {"path": "jobs/process/BaseSDTrainProcess.py", "lines": "860-1040, 2760-3240", "notes": "Save logic, retention, push-to-hub and main train loop orchestration"},
+    {"path": "toolkit/saving.py", "lines": "1-400", "notes": "safetensors save/load helpers and conversion utilities"},
+    {"path": "toolkit/metadata.py", "lines": "1-200", "notes": "Prepare metadata for safetensors and add precomputed model hashes"},
+    {"path": "toolkit/accelerator.py", "lines": "1-100", "notes": "Accelerate wrapper used across training code"},
+    {"path": "toolkit/timer.py", "lines": "1-200", "notes": "Performance timer and hooks used for prints and DB updates"},
+    {"path": "toolkit/ema.py", "lines": "1-200", "notes": "EMA helper used for averaged checkpoints"},
+    {"path": "toolkit/model_utils.py", "lines": "1-300", "notes": "Model & LoRA helpers"},
+    {"path": "toolkit/stable_diffusion_model.py", "lines": "1-400", "notes": "Pipeline loading and model wrappers"},
+    {"path": "jobs/process/*", "notes": "Process implementations (TrainVAEProcess, TrainESRGANProcess, etc.)"}
+  ],
+  "uncertainties": [
+    "Concurrent start requests may produce identical queue_position values; recommend DB-side atomic allocation.",
+    "Race window between DB set to 'running' and PID file write can leave orphaned 'running' jobs if spawn fails (add rollback or atomic write).",
+    "Some UI job creation/import flows produce slightly different job_config shapes; confirm canonical creation path for automation.",
+    "Multi-cron worker deployments have potential for double-claiming queued jobs — current code assumes a single cron worker; consider DB conditional update/transaction to claim jobs atomically."
+  ]
+}

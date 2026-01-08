@@ -5,6 +5,7 @@ import torch
 from typing import Literal
 from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
+from pathlib import Path
 from tqdm import tqdm
 
 from torchvision import transforms
@@ -44,6 +45,20 @@ class ControlGenerator:
             return self._generate_control(img_path, control_type)
         coltrols_folder = os.path.join(os.path.dirname(img_path), '_controls')
         file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
+        # compute hashed expected path (content-aware)
+        try:
+            from toolkit.cache_utils import compute_param_digest, compute_file_sha256, find_cached_file
+            param_digest = compute_param_digest({"control_type": control_type})
+            content_digest = compute_file_sha256(Path(img_path))
+            expected = os.path.join(coltrols_folder, f"{file_name_no_ext}.{control_type}_{content_digest}.jpg")
+            cached = find_cached_file(Path(expected))
+            if cached:
+                return str(cached)
+        except Exception:
+            # best-effort: if hashing fails, fall back to legacy name checks
+            pass
+
+        # legacy lookup (file_name.control_type.ext)
         file_name_no_ext_control = f"{file_name_no_ext}.{control_type}"
         for ext in img_ext_list:
             possible_path = os.path.join(
@@ -86,8 +101,15 @@ class ControlGenerator:
                 h = int(h * scale)
                 image = image.resize((w, h), Image.BICUBIC)
 
-        save_path = os.path.join(
-            coltrols_folder, f"{file_name_no_ext}.{control_type}.jpg")
+        # compute hashed save path (content digest + param digest)
+        try:
+            from toolkit.cache_utils import compute_param_digest, compute_file_sha256, atomic_write
+            param_digest = compute_param_digest({"control_type": control_type})
+            content_digest = compute_file_sha256(Path(img_path))
+            save_path = os.path.join(coltrols_folder, f"{file_name_no_ext}.{control_type}_{content_digest}.jpg")
+        except Exception:
+            # fallback to legacy name if hashing fails
+            save_path = os.path.join(coltrols_folder, f"{file_name_no_ext}.{control_type}.jpg")
         os.makedirs(coltrols_folder, exist_ok=True)
         if control_type == 'depth':
             self.debug_print("Generating depth control")
@@ -107,7 +129,10 @@ class ControlGenerator:
             out_tensor = out_tensor.squeeze(0).cpu().numpy()
             img = Image.fromarray(out_tensor.astype('uint8'))
             img = img.resize(in_size, Image.LANCZOS)
-            img.save(save_path)
+            # atomic save
+            def _write(p: Path):
+                img.save(str(p))
+            atomic_write(Path(save_path), _write)
             return save_path
         elif control_type == 'pose':
             self.debug_print("Generating pose control")
@@ -131,7 +156,10 @@ class ControlGenerator:
             img = self.control_pose_model(
                 img, output_type="pil", include_hands=True, include_face=True, detect_resolution=detect_res)
             img = img.convert('RGB')
-            img.save(save_path)
+            # atomic save
+            def _write(p: Path):
+                img.save(str(p))
+            atomic_write(Path(save_path), _write)
             return save_path
 
         elif control_type == 'line':
@@ -146,7 +174,10 @@ class ControlGenerator:
             # img = img.filter(ImageFilter.GaussianBlur(radius=1))
             img = img.point(lambda p: p > 128 and 255)
             img = img.convert('RGB')
-            img.save(save_path)
+            # atomic save
+            def _write(p: Path):
+                img.save(str(p))
+            atomic_write(Path(save_path), _write)
             return save_path
         elif control_type == 'inpaint' or control_type == 'mask':
             self.debug_print("Generating inpaint/mask control")
@@ -186,7 +217,10 @@ class ControlGenerator:
             else:
                 img = mask
                 img = img.convert('RGB')
-            img.save(save_path)
+            # atomic save
+            def _write(p: Path):
+                img.save(str(p))
+            atomic_write(Path(save_path), _write)
             return save_path
         else:
             raise Exception(f"Error: unknown control type {control_type}")
