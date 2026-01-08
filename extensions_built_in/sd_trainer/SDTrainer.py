@@ -22,7 +22,8 @@ from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.print import print_acc
 from toolkit.control_util import adapter_uses_zimage, infer_expected_in_ch
-from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
+from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds, parse_csv_list, normalize_caption_separators
+import re
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
@@ -166,6 +167,19 @@ class SDTrainer(BaseSDTrainProcess):
                 raise ValueError("diff_output_preservation requires a network to be set")
             if self.train_config.train_text_encoder:
                 raise ValueError("diff_output_preservation is not supported with train_text_encoder")
+            # Parse CSV lists for triggers and classes and build ordered replacement pairs
+            triggers = parse_csv_list(self.trigger_word) if self.trigger_word is not None else []
+            classes = parse_csv_list(self.train_config.diff_output_preservation_class)
+            # pairs: (trigger, class) - missing class -> empty string
+            pairs = [(t, classes[i] if i < len(classes) else '') for i, t in enumerate(triggers)]
+            # sort by trigger length desc to avoid substring collisions
+            pairs.sort(key=lambda x: len(x[0]) if x[0] else 0, reverse=True)
+            self._dop_replacements = pairs
+            if len(triggers) != len(classes):
+                try:
+                    print_acc(f"[DOP] Warning: trigger list length ({len(triggers)}) != class list length ({len(classes)}). Missing classes will be replaced by empty string.")
+                except Exception:
+                    pass
         
         if self.train_config.blank_prompt_preservation:
             if self.network_config is None:
@@ -299,7 +313,26 @@ class SDTrainer(BaseSDTrainProcess):
         if hasattr(embeds, 'pooled_embeds') and isinstance(embeds.pooled_embeds, torch.Tensor):
             embeds.pooled_embeds = embeds.pooled_embeds.detach()
         return embeds
-    
+
+    def _map_triggers_to_classes_in_text(self, text: str) -> str:
+        """Apply CSV trigger->class mapping to `text` and normalize separators.
+
+        Replacements use word-boundary-aware regex first, falling back to simple string replace.
+        """
+        if text is None:
+            return ""
+        out = normalize_caption_separators(text)
+        if not hasattr(self, '_dop_replacements') or not self._dop_replacements:
+            return out
+        for tr, cls in self._dop_replacements:
+            if not tr:
+                continue
+            pattern = rf"(?<!\S){re.escape(tr)}(?!\S)"
+            out, n = re.subn(pattern, cls, out)
+            if n == 0:
+                out = out.replace(tr, cls)
+        return out
+
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
             return
@@ -587,7 +620,19 @@ class SDTrainer(BaseSDTrainProcess):
                 if self.trigger_word is not None:
                     self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
                 if self.train_config.diff_output_preservation:
-                    self.diff_output_preservation_embeds = self.sd.encode_prompt(self.train_config.diff_output_preservation_class)
+                    # If both trigger and class lists are single items, keep legacy behavior and pre-encode the single DOP class
+                    triggers = parse_csv_list(self.trigger_word) if self.trigger_word is not None else []
+                    classes = parse_csv_list(self.train_config.diff_output_preservation_class)
+                    if len(triggers) == 1 and len(classes) >= 1:
+                        self.diff_output_preservation_embeds = self.sd.encode_prompt(classes[0], **encode_kwargs)
+                    else:
+                        # Multi-trigger or no trigger defined: defer to per-file or per-batch generation
+                        self.diff_output_preservation_embeds = None
+                        try:
+                            if len(triggers) > 1:
+                                print_acc(f"[DOP] Multiple triggers/classes detected; per-file DOP prompts will be generated and cached where possible.")
+                        except Exception:
+                            pass
 
                     # If we're caching text embeddings to disk, pre-generate per-file DOP prompt embeddings so
                     # the text encoder doesn't need to run each training timestep.
@@ -650,12 +695,21 @@ class SDTrainer(BaseSDTrainProcess):
                                             ctrl_img = ctrl_img_list
                                         encode_kwargs_local['control_images'] = ctrl_img
 
-                                    # replace trigger word with dop_class similar to runtime
-                                    dop_caption = fi.caption
-                                    if self.trigger_word is not None:
-                                        dop_caption = dop_caption.replace(self.trigger_word, dop_class)
+                                    # build dop_caption by applying CSV mapping replacements
+                                    dop_caption = fi.caption or ""
+                                    if hasattr(self, '_dop_replacements') and self._dop_replacements:
+                                        dop_caption = normalize_caption_separators(dop_caption)
+                                        for tr, cls in self._dop_replacements:
+                                            if tr == '':
+                                                continue
+                                            pattern = rf"(?<!\S){re.escape(tr)}(?!\S)"
+                                            dop_caption, n = re.subn(pattern, cls, dop_caption)
+                                            if n == 0:
+                                                dop_caption = dop_caption.replace(tr, cls)
 
                                     dop_emb = self.sd.encode_prompt(dop_caption, **encode_kwargs_local)
+                                    # use the final dop_caption as the dop_class argument so per-caption caches are unique
+                                    dop_path = fi.get_text_embedding_path(recalculate=True, dop_class=dop_caption)
                                     dop_emb.save(dop_path)
                                     created += 1
                                 except Exception as e:
@@ -2870,12 +2924,22 @@ class SDTrainer(BaseSDTrainProcess):
                                     # If text embeddings are cached to disk, prefer loading per-file DOP embeds to avoid
                                     # re-encoding each training timestep. Otherwise fall back to encoding the DOP prompts.
                                     if self.is_caching_text_embeddings and getattr(batch, 'file_items', None) is not None:
-                                        dop_class = self.train_config.diff_output_preservation_class
                                         dop_embeds_list = []
                                         ok = True
                                         for fi in batch.file_items:
+                                            # compute per-file dop caption key
+                                            dop_caption = fi.caption or ""
+                                            if hasattr(self, '_dop_replacements') and self._dop_replacements:
+                                                dop_caption = normalize_caption_separators(dop_caption)
+                                                for tr, cls in self._dop_replacements:
+                                                    if tr == '':
+                                                        continue
+                                                    pattern = rf"(?<!\S){re.escape(tr)}(?!\S)"
+                                                    dop_caption, n = re.subn(pattern, cls, dop_caption)
+                                                    if n == 0:
+                                                        dop_caption = dop_caption.replace(tr, cls)
                                             try:
-                                                fi.load_dop_prompt_embedding(dop_class)
+                                                fi.load_dop_prompt_embedding(dop_caption)
                                             except Exception:
                                                 pass
                                             if fi.dop_prompt_embeds is None:
@@ -2886,11 +2950,11 @@ class SDTrainer(BaseSDTrainProcess):
                                             self.diff_output_preservation_embeds = concat_prompt_embeds(dop_embeds_list)
                                             self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
                                         else:
-                                            # fallback to encoding
-                                            dop_prompts = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in conditioned_prompts]
+                                            # fallback to encoding using CSV mapping
+                                            dop_prompts = [normalize_caption_separators(self._map_triggers_to_classes_in_text(p)) for p in conditioned_prompts]
                                             dop_prompts_2 = None
                                             if prompt_2 is not None:
-                                                dop_prompts_2 = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in prompt_2]
+                                                dop_prompts_2 = [normalize_caption_separators(self._map_triggers_to_classes_in_text(p)) for p in prompt_2]
                                             self.diff_output_preservation_embeds = self.sd.encode_prompt(
                                                 dop_prompts, dop_prompts_2,
                                                 dropout_prob=self.train_config.prompt_dropout_prob,
@@ -3126,6 +3190,50 @@ class SDTrainer(BaseSDTrainProcess):
                         prior_embeds_to_use = conditional_embeds
                         # use diff_output_preservation embeds if doing dfe
                         if self.train_config.diff_output_preservation:
+                            # ensure we have DOP embeddings available; if not, try to load per-file cached embeddings
+                            if self.diff_output_preservation_embeds is None:
+                                dop_embeds_list = []
+                                ok = True
+                                if getattr(batch, 'file_items', None) is not None and self.is_caching_text_embeddings:
+                                    for fi in batch.file_items:
+                                        dop_caption = fi.caption or ""
+                                        if hasattr(self, '_dop_replacements') and self._dop_replacements:
+                                            dop_caption = normalize_caption_separators(dop_caption)
+                                            for tr, cls in self._dop_replacements:
+                                                if tr == '':
+                                                    continue
+                                                pattern = rf"(?<!\S){re.escape(tr)}(?!\S)"
+                                                dop_caption, n = re.subn(pattern, cls, dop_caption)
+                                                if n == 0:
+                                                    dop_caption = dop_caption.replace(tr, cls)
+                                        try:
+                                            fi.load_dop_prompt_embedding(dop_caption)
+                                        except Exception:
+                                            pass
+                                        if fi.dop_prompt_embeds is None:
+                                            ok = False
+                                            break
+                                        dop_embeds_list.append(fi.dop_prompt_embeds)
+                                else:
+                                    ok = False
+
+                                if ok:
+                                    self.diff_output_preservation_embeds = concat_prompt_embeds(dop_embeds_list)
+                                    self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
+                                else:
+                                    # Fallback: encode DOP prompts on-the-fly using CSV mapping
+                                    dop_prompts = [normalize_caption_separators(self._map_triggers_to_classes_in_text(p)) for p in conditioned_prompts]
+                                    dop_prompts_2 = None
+                                    if prompt_2 is not None:
+                                        dop_prompts_2 = [normalize_caption_separators(self._map_triggers_to_classes_in_text(p)) for p in prompt_2]
+                                    self.diff_output_preservation_embeds = self.sd.encode_prompt(
+                                        dop_prompts, dop_prompts_2,
+                                        dropout_prob=self.train_config.prompt_dropout_prob,
+                                        long_prompts=self.do_long_prompts,
+                                        **pred_kwargs
+                                    )
+                                    self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
+
                             prior_embeds_to_use = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
                         
                         if self.train_config.blank_prompt_preservation:
@@ -3136,18 +3244,83 @@ class SDTrainer(BaseSDTrainProcess):
                                 [blank_embeds] * noisy_latents.shape[0]
                             )
                         
-                        prior_pred = self.get_prior_prediction(
-                            noisy_latents=noisy_latents,
-                            conditional_embeds=prior_embeds_to_use,
-                            match_adapter_assist=match_adapter_assist,
-                            network_weight_list=network_weight_list,
-                            timesteps=timesteps,
-                            pred_kwargs=pred_kwargs,
-                            noise=noise,
-                            batch=batch,
-                            unconditional_embeds=unconditional_embeds,
-                            conditioned_prompts=conditioned_prompts
-                        )
+                        # Decide whether we can skip an expensive full-resolution prior prediction.
+                        # If preservation is scheduled (DOP or blank prompt preservation) and a reduced
+                        # preservation resolution is configured which would downsample the latents, and
+                        # if no other features require a full-res prior (e.g., prior divergence, inverted_mask_prior,
+                        # correct_pred_norm, or reg-prior), then skip the full-res prior and let
+                        # `_run_preservation_forward` compute the smaller prediction instead.
+                        preservation_resolution = None
+                        preservation_kind = None
+                        if self.train_config.diff_output_preservation and getattr(self, 'diff_output_preservation_embeds', None) is not None:
+                            preservation_resolution = getattr(self.train_config, 'diff_output_preservation_resolution', None)
+                            preservation_kind = 'dop'
+                        if preservation_resolution is None and self.train_config.blank_prompt_preservation:
+                            preservation_resolution = getattr(self.train_config, 'blank_prompt_preservation_resolution', None)
+                            preservation_kind = 'blank'
+
+                        def _would_downsample(resolution, noisy_latents):
+                            if resolution is None:
+                                return False
+                            try:
+                                vae = getattr(self.sd, 'vae', None)
+                                if vae is not None and hasattr(vae, 'config') and 'block_out_channels' in vae.config:
+                                    vae_scale = 2 ** (len(vae.config['block_out_channels']) - 1)
+                                else:
+                                    vae_scale = getattr(self.sd, 'vae_scale_factor', 8)
+                            except Exception:
+                                vae_scale = 8
+                            _, C, H, W = noisy_latents.shape
+                            target_long = max(1, int(round(resolution / vae_scale)))
+                            if H >= W:
+                                target_h = target_long
+                                target_w = max(1, int(round(W * (target_h / H))))
+                            else:
+                                target_w = target_long
+                                target_h = max(1, int(round(H * (target_w / W))))
+                            # transformer patch rounding
+                            try:
+                                tr = getattr(self.sd, 'transformer', None)
+                                if tr is not None:
+                                    all_patch = getattr(tr, 'all_patch_size', None)
+                                    if all_patch:
+                                        patch_min = int(min(all_patch))
+                                    else:
+                                        patch_min = 1
+                                else:
+                                    patch_min = 1
+                            except Exception:
+                                patch_min = 1
+                            if patch_min > 1:
+                                target_h = max(patch_min, int(round(target_h / patch_min)) * patch_min)
+                                target_w = max(patch_min, int(round(target_w / patch_min)) * patch_min)
+                            return (target_h < H) or (target_w < W)
+
+                        skip_full_prior = False
+                        if preservation_resolution is not None and _would_downsample(preservation_resolution, noisy_latents):
+                            # ensure no other features require full-resolution prior
+                            if not getattr(self.train_config, 'do_prior_divergence', False) and not getattr(self.train_config, 'inverted_mask_prior', False) and not getattr(self.train_config, 'correct_pred_norm', False) and not do_reg_prior:
+                                skip_full_prior = True
+
+                        if skip_full_prior:
+                            try:
+                                print_acc(f"[DOP] Skipping full-res prior for {preservation_kind} preservation; will run reduced prediction at {preservation_resolution}px long side")
+                            except Exception:
+                                pass
+                            prior_pred = None
+                        else:
+                            prior_pred = self.get_prior_prediction(
+                                noisy_latents=noisy_latents,
+                                conditional_embeds=prior_embeds_to_use,
+                                match_adapter_assist=match_adapter_assist,
+                                network_weight_list=network_weight_list,
+                                timesteps=timesteps,
+                                pred_kwargs=pred_kwargs,
+                                noise=noise,
+                                batch=batch,
+                                unconditional_embeds=unconditional_embeds,
+                                conditioned_prompts=conditioned_prompts
+                            )
                         if prior_pred is not None:
                             prior_pred = prior_pred.detach()
 
@@ -4264,6 +4437,65 @@ class SDTrainer(BaseSDTrainProcess):
 
         Returns the preservation_loss tensor.
         """
+
+    def _should_skip_full_prior(self, noisy_latents, preservation_resolution, do_reg_prior: bool = False) -> bool:
+        """Return True if the full-resolution prior prediction can be skipped in favor of running
+        the preservation prediction at a (smaller) reduced resolution.
+
+        Conditions to skip:
+        - `preservation_resolution` is set and would downsample the `noisy_latents` spatial dims
+          when converted to latent space, AND
+        - none of the following features are active: `do_prior_divergence`, `inverted_mask_prior`,
+          `correct_pred_norm`, and there is no reg prior for this batch (`do_reg_prior`).
+        """
+        if preservation_resolution is None:
+            return False
+        try:
+            vae = getattr(self.sd, 'vae', None)
+            if vae is not None and hasattr(vae, 'config') and 'block_out_channels' in vae.config:
+                vae_scale = 2 ** (len(vae.config['block_out_channels']) - 1)
+            else:
+                vae_scale = getattr(self.sd, 'vae_scale_factor', 8)
+        except Exception:
+            vae_scale = 8
+        _, C, H, W = noisy_latents.shape
+        target_long = max(1, int(round(preservation_resolution / vae_scale)))
+        if H >= W:
+            target_h = target_long
+            target_w = max(1, int(round(W * (target_h / H))))
+        else:
+            target_w = target_long
+            target_h = max(1, int(round(H * (target_w / W))))
+        try:
+            tr = getattr(self.sd, 'transformer', None)
+            if tr is not None:
+                all_patch = getattr(tr, 'all_patch_size', None)
+                if all_patch:
+                    patch_min = int(min(all_patch))
+                else:
+                    patch_min = 1
+            else:
+                patch_min = 1
+        except Exception:
+            patch_min = 1
+        if patch_min > 1:
+            target_h = max(patch_min, int(round(target_h / patch_min)) * patch_min)
+            target_w = max(patch_min, int(round(target_w / patch_min)) * patch_min)
+
+        # will downsample if either target dimension strictly less than current
+        will_downsample = (target_h < H) or (target_w < W)
+        if not will_downsample:
+            return False
+        # check feature flags that require full-res prior
+        if getattr(self.train_config, 'do_prior_divergence', False):
+            return False
+        if getattr(self.train_config, 'inverted_mask_prior', False):
+            return False
+        if getattr(self.train_config, 'correct_pred_norm', False):
+            return False
+        if do_reg_prior:
+            return False
+        return True
         try:
             # Ensure both tensors are on the same device and dtype to avoid dtype/device mismatch errors
             if prior_pred is not None:
