@@ -34,10 +34,10 @@ class BaseProcess(object):
         """
 
         control_keys = [
-            'get_adapter_images', 'encode_adapter', 'encode_adapter_embeds', 'use_precomputed_control_residuals', 'get_mask_multiplier'
+            'get_adapter_images', 'encode_adapter', 'encode_adapter_embeds', 'use_precomputed_control_residuals', 'get_mask_multiplier', 'controlnet_forward'
         ]
         model_keys = [
-            'predict_unet', 'calculate_loss', 'backward', 'optimizer_step', 'ema_update'
+            'predict_unet', 'encode_images', 'to_device', 'cpu_transfer', 'calculate_loss', 'backward', 'optimizer_step', 'ema_update'
         ]
         control_total = sum([timing_dict.get(k, 0.0) for k in control_keys])
         model_total = sum([timing_dict.get(k, 0.0) for k in model_keys])

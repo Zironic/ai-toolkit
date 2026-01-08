@@ -5,7 +5,7 @@ from toolkit.config_modules import TrainConfig
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 
 
-def test_train_single_accumulation_uses_precomputed_residuals(monkeypatch, tmp_path):
+def test_train_single_accumulation_ignores_precomputed_and_uses_adapter(monkeypatch, tmp_path):
     # Create a simple image file and residuals
     img = tmp_path / 'img.jpg'
     from PIL import Image
@@ -29,23 +29,22 @@ def test_train_single_accumulation_uses_precomputed_residuals(monkeypatch, tmp_p
     batch.control_tensor = torch.zeros(1, 3, 64, 64)
 
     # instantiate trainer (lightweight) and monkeypatch heavy methods
-    # pass a minimal job object required by BaseProcess
-    # Create a trainer *without* calling __init__ (avoid heavy setup)
     trainer = SDTrainer.__new__(SDTrainer)
-    # use a real TrainConfig to ensure defaults like dtype are present
     trainer.train_config = TrainConfig()
     trainer.train_config.controlnet_reroute = 'precompute'
     trainer.batch = None
     trainer.device_torch = torch.device('cpu')
 
-    # Monkeypatch a dummy adapter class type check - replace T2IAdapter in module with a dummy type
+    # Monkeypatch T2IAdapter check and use a stub adapter that returns residuals
     import extensions_built_in.sd_trainer.SDTrainer as sdmod
 
-    class DummyAdapter:
-        pass
+    class StubAdapter:
+        def __call__(self, x):
+            # simulate per-scale residuals
+            return [torch.zeros(1, 3, 8, 8), torch.zeros(1, 6, 4, 4)]
 
-    sdmod.T2IAdapter = DummyAdapter
-    trainer.adapter = DummyAdapter()
+    sdmod.T2IAdapter = StubAdapter
+    trainer.adapter = StubAdapter()
     trainer.assistant_adapter = None
 
     # Patch process_general_training_batch to return small tensors
@@ -56,7 +55,6 @@ def test_train_single_accumulation_uses_precomputed_residuals(monkeypatch, tmp_p
     imgs = None
 
     trainer.process_general_training_batch = lambda b: (noisy_latents, noise, timesteps, conditioned_prompts, imgs)
-    trainer.batch = None
 
     # Capture kwargs passed to predict_noise
     captured = {}
@@ -67,7 +65,7 @@ def test_train_single_accumulation_uses_precomputed_residuals(monkeypatch, tmp_p
 
     trainer.predict_noise = fake_predict_noise
 
-    # Also provide minimal methods/attributes used in train_single_accumulation
+    # Minimal attributes used in train_single_accumulation
     trainer.sd = SimpleNamespace(vae=SimpleNamespace(dtype='fp32'), vae_torch_dtype='fp32', is_xl=False, text_encoder=SimpleNamespace(dtype='fp32'))
     trainer.sd.te_torch_dtype = 'fp32'
     trainer.adapter_config = None
@@ -89,22 +87,21 @@ def test_train_single_accumulation_uses_precomputed_residuals(monkeypatch, tmp_p
     trainer.timer = DummyTimer()
 
     # Replace the heavy trainer method with a minimal version that exercises
-    # the precompute branch and calls predict_noise (avoids needing a full trainer setup)
-    from extensions_built_in.sd_trainer.SDTrainer import use_precomputed_control_residuals
+    # on-the-fly adapter residual computation and calls predict_noise
     def mini_train(b):
         noisy_latents, noise, timesteps, conditioned_prompts, imgs = trainer.process_general_training_batch(b)
-        pre = use_precomputed_control_residuals(trainer, dtype=torch.float32)
+        # Simulate on-the-fly residual computation and insertion into kwargs
         pred_kwargs = {}
-        if pre is not None:
-            pred_kwargs['down_intrablock_additional_residuals'] = pre
+        down = trainer.adapter(batch.control_tensor)
+        pred_kwargs['down_intrablock_additional_residuals'] = down
         trainer.predict_noise(noisy_latents, timesteps=timesteps, batch=b, **pred_kwargs)
 
     trainer.train_single_accumulation = mini_train
 
-    # attach batch to trainer so use_precomputed_control_residuals can access it
+    # attach batch to trainer
     trainer.batch = batch
 
-    # Run the minimal training step - it should set pred_kwargs using precomputed residuals and call predict_noise
+    # Run the minimal training step - it should set pred_kwargs using adapter residuals and call predict_noise
     trainer.train_single_accumulation(batch)
 
     assert 'down_intrablock_additional_residuals' in captured['kwargs']

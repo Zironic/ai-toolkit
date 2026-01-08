@@ -119,7 +119,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                         return p.device
             except Exception as e:
                 try:
-                    from toolkit.print import print_acc
                     print_acc(f"[CONTROLNET] _inner_device parameters probe failed: {e}")
                 except Exception:
                     print(f"[CONTROLNET] _inner_device parameters probe failed: {e}")
@@ -130,7 +129,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                         return b.device
             except Exception as e:
                 try:
-                    from toolkit.print import print_acc
                     print_acc(f"[CONTROLNET] _inner_device buffers probe failed: {e}")
                 except Exception:
                     print(f"[CONTROLNET] _inner_device buffers probe failed: {e}")
@@ -177,7 +175,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                 return out
             except Exception as e:
                 try:
-                    from toolkit.print import print_acc
                     print_acc(f"[CONTROLNET] _maybe_restore_output failed: {e}")
                 except Exception:
                     print(f"[CONTROLNET] _maybe_restore_output failed: {e}")
@@ -202,7 +199,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                         tag_tensor(c, f'input:control_context[{i}]')
         except Exception as e:
             try:
-                from toolkit.print import print_acc
                 print_acc(f"[CONTROLNET] tagging inputs failed: {e}")
             except Exception:
                 print(f"[CONTROLNET] tagging inputs failed: {e}")
@@ -297,7 +293,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                         tag_tensor(t, 'precomputed:assembled_control_context')
                     except Exception as e:
                         try:
-                            from toolkit.print import print_acc
                             print_acc(f"[CONTROLNET] tagging assembled control_context failed: {e}")
                         except Exception:
                             print(f"[CONTROLNET] tagging assembled control_context failed: {e}")
@@ -330,7 +325,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                                 tag_tensor(assembled, 'precomputed:assembled_control_context')
                             except Exception as e:
                                 try:
-                                    from toolkit.print import print_acc
                                     print_acc(f"[CONTROLNET] tagging assembled control_context failed: {e}")
                                 except Exception:
                                     print(f"[CONTROLNET] tagging assembled control_context failed: {e}")
@@ -345,7 +339,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                         t3 = t.reshape(B, base, F, H, W).mean(dim=2)
                     except Exception as e:
                         try:
-                            from toolkit.print import print_acc
                             print_acc(f"[CONTROLNET] Failed to reshape encoded/multi-frame latents for assembly: shape={tuple(t.shape)} error={e}")
                         except Exception:
                             print(f"[CONTROLNET] Failed to reshape encoded/multi-frame latents for assembly: shape={tuple(t.shape)} error={e}")
@@ -357,7 +350,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                             tag_tensor(assembled, 'precomputed:assembled_control_context')
                         except Exception as e:
                             try:
-                                from toolkit.print import print_acc
                                 print_acc(f"[CONTROLNET] tagging assembled control_context failed: {e}")
                             except Exception:
                                 print(f"[CONTROLNET] tagging assembled control_context failed: {e}")
@@ -391,7 +383,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                     tag_tensor(adapted_control_context, 'precomputed:control_context_passthrough')
             except Exception as e:
                 try:
-                    from toolkit.print import print_acc
                     print_acc(f"[CONTROLNET] tagging precomputed control_context failed: {e}")
                 except Exception:
                     print(f"[CONTROLNET] tagging precomputed control_context failed: {e}")
@@ -440,7 +431,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
             print_acc(f"[CONTROLNET-REROUTE] pre-call shapes latents={lat_shape} control_context={ctrl_shape} expected_in={expected_in}")
         except Exception as e:
             try:
-                from toolkit.print import print_acc
                 print_acc(f"[CONTROLNET] pre-call shapes logging failed: {e}")
             except Exception:
                 print(f"[CONTROLNET] pre-call shapes logging failed: {e}")
@@ -474,7 +464,6 @@ class VideoXControlnetWrapper(torch.nn.Module):
                 latents = latents.to(inner_dtype)
         except Exception as e:
             try:
-                from toolkit.print import print_acc
                 print_acc(f"[CONTROLNET] casting latents to inner dtype failed: {e}")
             except Exception:
                 print(f"[CONTROLNET] casting latents to inner dtype failed: {e}")

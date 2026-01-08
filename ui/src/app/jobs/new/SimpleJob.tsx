@@ -833,7 +833,7 @@ export default function SimpleJob({
                         />
                         {jobConfig.config.process[0].train.diff_output_preservation_resolution === 128 && (
                           <div className="text-xs text-yellow-300 pt-1">128 px is very coarse — preserves generalization but loses fine detail.</div>
-                        )
+                        )}
                       </>
                     )}
                   </>
@@ -888,7 +888,7 @@ export default function SimpleJob({
                         />
                         {jobConfig.config.process[0].train.blank_prompt_preservation_resolution === 128 && (
                           <div className="text-xs text-yellow-300 pt-1">128 px is very coarse — preserves generalization but loses fine detail.</div>
-                        )
+                        )}
                       </>
                     )}
                   </>

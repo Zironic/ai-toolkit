@@ -4,7 +4,7 @@ import inspect
 import json
 import random
 import shutil
-from collections import OrderedDict
+from collections import OrderedDict, deque, deque
 import os
 import re
 import traceback
@@ -932,6 +932,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     os.remove(yaml_file)
             if combined_items:
                 latest_item = combined_items[-1]
+        self.timer.stop('checkpoint_save')
         return latest_item
 
     def post_save_hook(self, save_path):
@@ -944,10 +945,49 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def end_step_hook(self):
         pass
 
+    def end_of_training_loop(self):
+        """Hook called at the end of assembling per-step loss_dict; subclasses may override."""
+        # default no-op
+        return
+
+    def _append_python_gap(self):
+        """Compute per-step python gap (step_total_python - sum(last measured timers)) and append to timer 'python_gap'.
+        This is best-effort diagnostic and will not raise on failure.
+        """
+        try:
+            total = None
+            if 'step_total_python' in self.timer.timers and len(self.timer.timers['step_total_python']) > 0:
+                total = self.timer.timers['step_total_python'][-1]
+            elif 'train_loop' in self.timer.timers and len(self.timer.timers['train_loop']) > 0:
+                total = self.timer.timers['train_loop'][-1]
+            else:
+                return
+
+            # Exclude aggregators and the gap timer itself
+            aggregator_keys = set(['train_loop', 'train_epoch', 'train_step'])
+            exclude = set(['python_gap', 'step_total_python']) | aggregator_keys
+
+            measured_last = 0.0
+            for k, dq in self.timer.timers.items():
+                if k in exclude:
+                    continue
+                if len(dq) == 0:
+                    continue
+                measured_last += dq[-1]
+
+            gap = max(0.0, total - measured_last)
+            if 'python_gap' not in self.timer.timers:
+                self.timer.timers['python_gap'] = deque(maxlen=self.timer.max_buffer)
+            self.timer.timers['python_gap'].append(gap)
+        except Exception:
+            # Best effort: don't crash training on diagnostic failure
+            pass
+
     def save(self, step=None):
         if not self.accelerator.is_main_process:
             return
         flush()
+        self.timer.start('checkpoint_save')
         if self.ema is not None:
             # always save params as ema
             self.ema.eval()
@@ -1542,9 +1582,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return noise
 
     def process_general_training_batch(self, batch: 'DataLoaderBatchDTO'):
-        with torch.no_grad():
-            with self.timer('prepare_prompt'):
-                prompts = batch.get_caption_list()
+        with self.timer('process_general_training_batch'):
+            with torch.no_grad():
+                with self.timer('prepare_prompt'):
+                    prompts = batch.get_caption_list()
                 is_reg_list = batch.get_is_reg_list()
 
                 is_any_reg = any([is_reg for is_reg in is_reg_list])
@@ -2400,7 +2441,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         from toolkit.splitflux import freeze_unet_blocks, build_rca_combined_block_dims
                         frozen = freeze_unet_blocks(self.sd.get_model_to_train(), list(range(1, 20)))
                         try:
-                            from toolkit.print import print_acc
                             print_acc(f"[RCA] Enabled: frozen early blocks 1-19; frozen params: {len(frozen)}")
                         except Exception:
                             pass
@@ -3018,24 +3058,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         
                         if self.accelerator.is_main_process:
                             # log to logger
-                            self.logger.log({
-                                'learning_rate': learning_rate,
-                            })
-                            if loss_dict is not None:
+                            with self.timer('logger_log'):
+                                self.logger.log({
+                                    'learning_rate': learning_rate,
+                                })
+                                if loss_dict is not None:
+                                    for key, value in loss_dict.items():
+                                        self.logger.log({
+                                            f'loss/{key}': value,
+                                        })
+                    elif self.logging_config.log_every is None:
+                        if self.accelerator.is_main_process:
+                            # log every step
+                            with self.timer('logger_log'):
+                                self.logger.log({
+                                    'learning_rate': learning_rate,
+                                })
                                 for key, value in loss_dict.items():
                                     self.logger.log({
                                         f'loss/{key}': value,
                                     })
-                    elif self.logging_config.log_every is None:
-                        if self.accelerator.is_main_process:
-                            # log every step
-                            self.logger.log({
-                                'learning_rate': learning_rate,
-                            })
-                            for key, value in loss_dict.items():
-                                self.logger.log({
-                                    f'loss/{key}': value,
-                                })
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
@@ -3061,24 +3103,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             elif getattr(self.logging_config, 'log_every', 0) and self.step_num % self.logging_config.log_every != 0:
                                 should_write_tb = True
                             if should_write_tb and loss_dict is not None:
-                                # total loss scalar
-                                if 'loss' in loss_dict:
-                                    try:
-                                        self.writer.add_scalar('loss/loss', float(loss_dict.get('loss', 0.0)), self.step_num)
-                                    except Exception:
-                                        pass
-                                # preservation loss scalar (if present)
-                                if 'preservation' in loss_dict:
-                                    try:
-                                        self.writer.add_scalar('loss/preservation', float(loss_dict.get('preservation', 0.0)), self.step_num)
-                                    except Exception:
-                                        pass
-                                # train/loss_over_noise scalar
-                                if 'train/loss_over_noise' in loss_dict:
-                                    try:
-                                        self.writer.add_scalar('loss/train/loss_over_noise', float(loss_dict.get('train/loss_over_noise')), self.step_num)
-                                    except Exception:
-                                        pass
+                                with self.timer('tensorboard_write'):
+                                    # total loss scalar
+                                    if 'loss' in loss_dict:
+                                        try:
+                                            self.writer.add_scalar('loss/loss', float(loss_dict.get('loss', 0.0)), self.step_num)
+                                        except Exception:
+                                            pass
+                                    # preservation loss scalar (if present)
+                                    if 'preservation' in loss_dict:
+                                        try:
+                                            self.writer.add_scalar('loss/preservation', float(loss_dict.get('preservation', 0.0)), self.step_num)
+                                        except Exception:
+                                            pass
+                                    # train/loss_over_noise scalar
+                                    if 'train/loss_over_noise' in loss_dict:
+                                        try:
+                                            self.writer.add_scalar('loss/train/loss_over_noise', float(loss_dict.get('train/loss_over_noise')), self.step_num)
+                                        except Exception:
+                                            pass
                     except Exception:
                         # non-fatal: don't let logging issues halt training
                         pass

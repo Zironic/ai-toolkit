@@ -5,7 +5,7 @@ from PIL import Image
 import torch
 from toolkit.config_modules import DatasetConfig
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
-from extensions_built_in.sd_trainer.SDTrainer import use_precomputed_control_residuals
+import extensions_built_in.sd_trainer.SDTrainer as sdmod
 
 
 def make_image(path, size=(32, 32), color=(128, 128, 128)):
@@ -49,7 +49,7 @@ def test_precomputed_residuals_are_loaded_and_used(tmp_path):
     trainer.batch = batch
     trainer.device_torch = torch.device('cpu')
 
-    pre = use_precomputed_control_residuals(trainer, dtype=torch.float32)
-    assert pre is not None
-    assert len(pre) == 2
-    assert pre[0].shape == (1, 3, 8, 8)
+    # Legacy helper removed — the batch still contains `control_residuals` loaded from disk
+    assert getattr(batch, 'control_residuals', None) is not None
+    assert sdmod is not None
+    assert not hasattr(sdmod, 'use_precomputed_control_residuals')

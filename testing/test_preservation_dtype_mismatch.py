@@ -22,39 +22,37 @@ class DummyEmbeds:
     def __init__(self, tensor):
         self.tensor = tensor
     def expand_to_batch(self, bsize):
-        # return an object that has .to and acts like a tensor
         t = self.tensor.repeat(bsize, 1)
         return t
     def to(self, device, dtype=None):
+        # return as tensor with given dtype if dtype provided
+        if dtype is not None and isinstance(dtype, torch.dtype):
+            return self.tensor.to(dtype=dtype)
         return self.tensor
 
 
-def test_dop_timer_recorded(monkeypatch):
+def test_preservation_loss_with_dtype_mismatch(monkeypatch):
     job, cfg = make_job_and_cfg()
     trainer = SDTrainer(0, job, cfg)
 
-    # enable DOP and prepare embeddings
     trainer.train_config.diff_output_preservation = True
     trainer.train_config.diff_output_preservation_every = 1
-
-    # set a small dummy prior_pred and noisy_latents
-    prior_pred = torch.zeros((1, 4))
-    noisy_latents = torch.zeros((1, 4))
-    timesteps = torch.tensor([0])
-    unconditional_embeds = None
-    batch = None
 
     # set prepared preservation embeds
     trainer.diff_output_preservation_embeds = DummyEmbeds(torch.zeros((1,4)))
 
-    # monkeypatch predict_noise to return a tensor
+    # create preservation_pred float32 and prior_pred bfloat16 to simulate mismatch
+    preservation_pred = torch.ones((1,4), dtype=torch.float32)
+    prior_pred = torch.zeros((1,4), dtype=torch.bfloat16)
+
+    # monkeypatch predict_noise to return preservation_pred
     def fake_predict_noise(**kwargs):
-        return torch.zeros_like(prior_pred)
+        return preservation_pred
     monkeypatch.setattr(trainer, 'predict_noise', fake_predict_noise)
 
-    # call the helper
-    pred = trainer._run_preservation_forward(noisy_latents, timesteps, trainer.diff_output_preservation_embeds, unconditional_embeds, batch, {}, torch.float32, prior_pred)
+    # run helper and compute loss
+    pl = trainer._compute_and_apply_preservation_loss(preservation_pred, prior_pred, multiplier=1.0)
 
-    # timer should have recorded 'dop_predict'
-    assert 'dop_predict' in trainer.timer.timers
-    assert pred is not None
+    assert pl is not None
+    assert hasattr(trainer, '_last_preservation_loss')
+    assert trainer._last_preservation_loss is not None

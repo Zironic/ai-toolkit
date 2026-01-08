@@ -2423,7 +2423,6 @@ class StableDiffusion:
 
         # Debug: log control_context presence and shapes (helps diagnose FLUX/Transformer-style adapters)
         try:
-            from toolkit.print import print_acc
             try:
                 ctx_shapes = [tuple(img.shape) for img in control_context]
             except Exception:
@@ -2497,7 +2496,6 @@ class StableDiffusion:
         try:
             # Move/cast latents, timestep and control_context to adapter dtype/device when adapter hints available
             if adapter_dev is not None:
-                from toolkit.print import print_acc
                 # Log any casting
                 try:
                     if isinstance(latents, torch.Tensor) and adapter_dtype is not None and latents.dtype != adapter_dtype:
@@ -2776,7 +2774,6 @@ class StableDiffusion:
                                 a = assemble_zimage_control_context(item, control_in_dim=ctl_dim)
                                 assembled.append(a)
                                 try:
-                                    from toolkit.print import print_acc
                                     print_acc(f"[VIDEOX] ASSEMBLE_DONE element control_context_ndim={getattr(a,'ndim',None)} control_in_dim={ctl_dim} shape={tuple(a.shape)}")
                                 except Exception:
                                     print(f"[VIDEOX] ASSEMBLE_DONE element control_context_ndim={getattr(a,'ndim',None)} control_in_dim={ctl_dim}")
@@ -2908,7 +2905,6 @@ class StableDiffusion:
 
         # Debug: print control_hints info so we know what the adapter returned
         try:
-            from toolkit.print import print_acc
             try:
                 if control_hints is None:
                     print_acc("[ZIMAGE] control_hints returned None")
