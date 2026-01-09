@@ -2358,17 +2358,28 @@ class TextEmbeddingFileItemDTOMixin:
                     pass
                 return
 
-    def load_dop_prompt_embedding(self, dop_class: str, device=None):
+    def load_dop_prompt_embedding(self, dop_class: str, device=None, trigger_word: str = None, dop_replacements_digest: str = None):
         """Load a precomputed DOP variant prompt embedding (if present on disk).
 
         DOP prompt embeddings are persisted under the `_t_e_cache` directory.
+        
+        Args:
+            dop_class: The DOP caption (with trigger replaced by class)
+            device: Optional device to load to
+            trigger_word: The trigger word used during precompute (for cache key consistency)
+            dop_replacements_digest: The digest of trigger/class replacements (for cache key consistency)
         """
         if not self.is_text_embedding_cached:
             return
         if self.dop_prompt_embeds is None:
             from toolkit.cache_utils import find_cached_file, wait_for_cached_file
+            # Use stored params from precompute if available and not explicitly passed
+            if trigger_word is None:
+                trigger_word = getattr(self, '_dop_trigger_word', None)
+            if dop_replacements_digest is None:
+                dop_replacements_digest = getattr(self, '_dop_replacements_digest', None)
             try:
-                dop_path = Path(self.get_text_embedding_path(recalculate=False, dop_class=dop_class))
+                dop_path = Path(self.get_text_embedding_path(recalculate=False, dop_class=dop_class, trigger_word=trigger_word, dop_replacements_digest=dop_replacements_digest))
             except Exception:
                 return
             cached = wait_for_cached_file(dop_path, timeout=float(os.getenv('CACHE_WAIT_TIMEOUT', 5.0)))

@@ -721,27 +721,35 @@ class SDTrainer(BaseSDTrainProcess):
                                 total_files += 1
                                 try:
                                     # create the intended dop path; recalculate to avoid stale cached path
-                                    from toolkit.cache_utils import compute_param_digest
+                                    from toolkit.cache_utils import compute_param_digest, find_cached_file, atomic_write
                                     dop_repl_digest = compute_param_digest({
                                         'trigger_word': self.trigger_word or '',
                                         'replacements': self._dop_replacements or []
                                     })
+                                    # Store dop_repl_digest on FileItemDTO so load can use the same params
+                                    fi._dop_trigger_word = self.trigger_word
+                                    fi._dop_replacements_digest = dop_repl_digest
                                     # build dop_caption by applying CSV mapping replacements
                                     dop_caption = self._map_triggers_to_classes_in_text(fi.caption or "")
                                     # Check per-file DOP cache (exact-match only)
                                     dop_path = fi.get_text_embedding_path(recalculate=True, dop_class=dop_caption, trigger_word=self.trigger_word, dop_replacements_digest=dop_repl_digest)
-                                    try:
-                                        print_acc(f"[DOP Cache DEBUG] checking file {getattr(fi,'path','unknown')} -> dop_path={dop_path}")
-                                    except Exception:
-                                        pass
-                                    # Always generate per-file DOP prompt embeddings (do not rely on legacy fallback heuristics)
+                                    
+                                    # Check if DOP cache already exists
+                                    cached = find_cached_file(Path(dop_path))
+                                    if cached:
+                                        existing += 1
+                                        try:
+                                            print_acc(f"[DOP Cache DEBUG] existing cache found at {cached}")
+                                        except Exception:
+                                            pass
+                                        continue  # Skip - already cached
+
                                     try:
                                         print_acc(f"[DOP Cache DEBUG] will encode dop for {getattr(fi,'path','unknown')} -> {dop_path}")
                                     except Exception:
                                         pass
 
                                     # build encode kwargs (control images) if required
-                                    encode_kwargs_local = {}
                                     encode_kwargs_local = {}
                                     if fi.encode_control_in_text_embeddings:
                                         if fi.control_path is None:
@@ -774,19 +782,19 @@ class SDTrainer(BaseSDTrainProcess):
                                         except Exception:
                                             pass
 
+                                    # Actually encode and save the DOP prompt embedding
+                                    dop_prompt_embeds = self.sd.encode_prompt(dop_caption, **encode_kwargs_local)
+                                    # Ensure cache directory exists
+                                    os.makedirs(os.path.dirname(dop_path), exist_ok=True)
+                                    # Atomic write to avoid partial files
+                                    atomic_write(Path(dop_path), lambda p: dop_prompt_embeds.save(str(p)))
+                                    del dop_prompt_embeds
+                                    
                                     try:
-                                        # record successful write
-                                        try:
-                                            print_acc(f"[DOP Cache DEBUG] wrote dop cache to {dop_path}")
-                                        except Exception:
-                                            pass
-                                        created += 1
-                                    except Exception as e:
-                                        try:
-                                            print_acc(f"[DOP Cache DEBUG] failed to write dop cache to {dop_path}: {e}")
-                                        except Exception:
-                                            pass
-                                        raise
+                                        print_acc(f"[DOP Cache DEBUG] wrote dop cache to {dop_path}")
+                                    except Exception:
+                                        pass
+                                    created += 1
                                 except Exception as e:
                                     failed += 1
                                     failed_files.append(getattr(fi, 'path', 'unknown'))
@@ -2955,23 +2963,57 @@ class SDTrainer(BaseSDTrainProcess):
 
                 if has_adapter_img:
                     # Z-Image adapter handling: if adapter is explicitly a Z-Image controlnet, run it and collect residuals
+                    # We don't train controlnets, so always run with gradients disabled
                     if is_zimage_adapter(self.adapter, self.adapter_config) or is_zimage_adapter(self.assistant_adapter, self.adapter_config):
                         adapter = self.adapter if is_zimage_adapter(self.adapter, self.adapter_config) else self.assistant_adapter
+                        # Get adapter path for meta tensor materialization fallback
+                        adapter_path = (
+                            getattr(adapter, 'name_or_path', None) or
+                            getattr(adapter, '_name_or_path', None) or
+                            (getattr(self.adapter_config, 'name_or_path', None) if self.adapter_config else None) or
+                            getattr(self.train_config, 'adapter_assist_name_or_path', None)
+                        )
                         if self.train_config.do_cfg:
                             raise ValueError("Z-Image ControlNet is not supported with CFG")
-                        with torch.set_grad_enabled(self.adapter is not None and self.adapter_config.train):
-                            adapter_images_dev = adapter_images.to(self.device_torch, dtype=dtype)
+                        
+                        # Try to use precomputed control_context (avoids VAE encoding every timestep)
+                        precomputed_context = self._collect_preencoded_zimage_context_for_batch(batch)
+                        
+                        with torch.no_grad():
                             from extensions_built_in.diffusion_models.z_image.z_image import compute_zimage_adapter_residuals
-                            down, mid, control_context, _raw = compute_zimage_adapter_residuals(
-                                self.sd,
-                                noisy_latents,
-                                timesteps,
-                                zimage_controlnet=adapter,
-                                zimage_control_images=adapter_images_dev,
-                                zimage_conditioning_scale=getattr(self.sd, 'controlnet_guidance_scale', 1.0),
-                                train_dtype=dtype,
-                                batch=batch
-                            )
+                            
+                            if precomputed_context is not None:
+                                # Use precomputed context - skip VAE encoding
+                                down, mid, control_context, _raw = compute_zimage_adapter_residuals(
+                                    self.sd,
+                                    noisy_latents,
+                                    timesteps,
+                                    zimage_controlnet=adapter,
+                                    zimage_control_context=precomputed_context.to(self.device_torch, dtype=dtype),
+                                    zimage_conditioning_scale=getattr(self.sd, 'controlnet_guidance_scale', 1.0),
+                                    train_dtype=dtype,
+                                    batch=batch,
+                                    adapter_path=adapter_path,
+                                )
+                            else:
+                                # No precomputed context - encode images (slower)
+                                adapter_images_dev = adapter_images.to(self.device_torch, dtype=dtype)
+                                down, mid, control_context, _raw = compute_zimage_adapter_residuals(
+                                    self.sd,
+                                    noisy_latents,
+                                    timesteps,
+                                    zimage_controlnet=adapter,
+                                    zimage_control_images=adapter_images_dev,
+                                    zimage_conditioning_scale=getattr(self.sd, 'controlnet_guidance_scale', 1.0),
+                                    train_dtype=dtype,
+                                    batch=batch,
+                                    adapter_path=adapter_path,
+                                )
+                            # Z-Image uses control_context passed to transformer, not down/mid block residuals
+                            if control_context is not None:
+                                pred_kwargs['control_context'] = control_context
+                                pred_kwargs['control_context_scale'] = getattr(self.sd, 'controlnet_guidance_scale', 1.0)
+                            # Also pass down/mid if they were returned (for compatibility)
                             if down is not None:
                                 pred_kwargs['down_block_additional_residuals'] = down
                             if mid is not None:

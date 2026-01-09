@@ -433,30 +433,93 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         except Exception as e:
                             raise RuntimeError(f"Failed to print VideoX wrapper assignment attempt: {e}") from e
 
-                        # If the model-provided controlnet appears to be a legacy Flux1-style
-                        # ControlNet (e.g., forward requires `encoder_hidden_states` or lacks
-                        # `control_context`) attempt to replace it with a proper VideoX loader
-                        # backed adapter from `extensions_built_in.diffusion_models.z_image_adapter`.
-                        try:
-                            import inspect
-                            target_fn = getattr(self.sd.controlnet, 'forward', self.sd.controlnet if callable(self.sd.controlnet) else None)
-                            params = inspect.signature(target_fn).parameters if target_fn is not None else {}
+                        # Skip if already wrapped - no need to reload
+                        if isinstance(self.sd.controlnet, VideoXControlnetWrapper):
+                            print_acc("[CONTROLNET] Already wrapped in VideoXControlnetWrapper, skipping replacement")
                             needs_replacement = False
-                            if 'control_context' not in params:
-                                needs_replacement = True
-                            elif 'encoder_hidden_states' in params:
-                                p = params['encoder_hidden_states']
-                                if p.default is inspect._empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                        else:
+                            # If the model-provided controlnet appears to be a legacy Flux1-style
+                            # ControlNet (e.g., forward requires `encoder_hidden_states` or lacks
+                            # `control_context`) attempt to replace it with a proper VideoX loader
+                            # backed adapter from `extensions_built_in.diffusion_models.z_image_adapter`.
+                            try:
+                                import inspect
+                                target_fn = getattr(self.sd.controlnet, 'forward', self.sd.controlnet if callable(self.sd.controlnet) else None)
+                                params = inspect.signature(target_fn).parameters if target_fn is not None else {}
+                                needs_replacement = False
+                                if 'control_context' not in params:
                                     needs_replacement = True
-                        except Exception:
-                            # If we cannot inspect the signature reliably, attempt replacement
-                            needs_replacement = True
+                                elif 'encoder_hidden_states' in params:
+                                    p = params['encoder_hidden_states']
+                                    if p.default is inspect._empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                                        needs_replacement = True
+                            except Exception:
+                                # If we cannot inspect the signature reliably, attempt replacement
+                                needs_replacement = True
 
                         if needs_replacement:
                             try:
                                 from extensions_built_in.diffusion_models.z_image_adapter import load_videox_control_adapter
+                                import gc
+                                import os
                                 name_or_path = getattr(self.sd.controlnet, 'name_or_path', None) or getattr(self, 'adapter_config', None) and getattr(self.adapter_config, 'name_or_path', None)
-                                new_adapter = load_videox_control_adapter(name_or_path=name_or_path, device=self.device_torch, torch_dtype=get_torch_dtype(self.train_config.dtype))
+                                # Pass quantization settings from model config to match main transformer
+                                quantize_controlnet = getattr(self.model_config, 'quantize', None)
+                                
+                                # Get base transformer path from model config for control-only checkpoints
+                                # Control-only checkpoints (<8GB) need base weights loaded first
+                                base_transformer_path = None
+                                if hasattr(self.model_config, 'name_or_path') and self.model_config.name_or_path:
+                                    candidate = os.path.join(self.model_config.name_or_path, 'transformer')
+                                    if os.path.isdir(candidate):
+                                        base_transformer_path = candidate
+                                
+                                # If quantizing, we need to temporarily offload the main transformer to free GPU memory
+                                transformer_was_on_gpu = False
+                                if quantize_controlnet and hasattr(self.sd, 'transformer') and self.sd.transformer is not None:
+                                    try:
+                                        first_param = next(self.sd.transformer.parameters())
+                                        if first_param.device.type == 'cuda':
+                                            transformer_was_on_gpu = True
+                                            print_acc("[CONTROLNET] Temporarily moving transformer to CPU for controlnet quantization...")
+                                            self.sd.transformer.to('cpu')
+                                            gc.collect()
+                                            torch.cuda.empty_cache()
+                                    except StopIteration:
+                                        pass
+                                
+                                # Load controlnet - if quantizing, load directly to GPU since we freed space
+                                if quantize_controlnet:
+                                    new_adapter = load_videox_control_adapter(
+                                        name_or_path=name_or_path, 
+                                        device=None,  # materialize_device will handle this
+                                        torch_dtype=get_torch_dtype(self.train_config.dtype),
+                                        quantize=quantize_controlnet,
+                                        quantize_device=self.device_torch,  # Load and quantize on GPU
+                                        base_transformer_path=base_transformer_path,  # For control-only checkpoints
+                                    )
+                                else:
+                                    # No quantization - load to CPU then move to GPU
+                                    new_adapter = load_videox_control_adapter(
+                                        name_or_path=name_or_path, 
+                                        device='cpu',
+                                        torch_dtype=get_torch_dtype(self.train_config.dtype),
+                                        quantize=None,
+                                        base_transformer_path=base_transformer_path,  # For control-only checkpoints
+                                    )
+                                    # Move to GPU
+                                    if hasattr(new_adapter, 'inner') and new_adapter.inner is not None:
+                                        new_adapter.inner = new_adapter.inner.to(self.device_torch)
+                                    else:
+                                        new_adapter = new_adapter.to(self.device_torch)
+                                
+                                # Move transformer back to GPU if we offloaded it
+                                if transformer_was_on_gpu:
+                                    print_acc("[CONTROLNET] Moving transformer back to GPU...")
+                                    self.sd.transformer.to(self.device_torch)
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
+                                
                                 try:
                                     from toolkit.control_util import set_adapter_name_if_missing
                                     set_adapter_name_if_missing(new_adapter, name_or_path or '<unknown>')

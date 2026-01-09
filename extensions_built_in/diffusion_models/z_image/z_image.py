@@ -399,6 +399,15 @@ class ZImageModel(BaseModel):
                         # If anything else goes wrong, re-raise to make failures visible during load
                         raise
 
+                    # Wrap in VideoXControlnetWrapper for consistent interface
+                    try:
+                        from toolkit.controlnet_compat import VideoXControlnetWrapper
+                        if not isinstance(self.controlnet, VideoXControlnetWrapper):
+                            self.controlnet = VideoXControlnetWrapper(self.controlnet)
+                            self.print_and_status_update("Wrapped ControlNet in VideoXControlnetWrapper")
+                    except Exception as e:
+                        self.print_and_status_update(f"Warning: Could not wrap ControlNet in VideoXControlnetWrapper: {e}")
+
                     self.is_controlnet_enabled = True
                     self.print_and_status_update(f"[CONTROLNET] Loaded ControlNet adapter from '{cpath}' (frozen). To finetune, set model_config.controlnet_train = True or adapter.train = True in your config.")
                     # Validate that the loaded adapter is well-formed; fail fast if not.
@@ -906,9 +915,36 @@ class ZImageModel(BaseModel):
                 except Exception as e2:
                     raise RuntimeError(f"No config.json found in controlnet repo and failed to load base transformer config: {e}; fallback generator failed: {e2}")
 
-        # Instantiate control transformer
+        # Instantiate control transformer - use meta tensors to avoid memory allocation
         control_cls = globals().get('ZImageControlTransformer2DModel', None) or ZImageTransformer2DModel
-        self.controlnet = control_cls(**config)
+        
+        # Check safetensors file size to determine if it's a full model or just control weights
+        file_size_gb = os.path.getsize(safetensors_path) / (1024**3)
+        self.print_and_status_update(f"ControlNet file size: {file_size_gb:.2f} GB")
+        
+        # If file is small (<8GB), it likely only contains control-specific weights
+        # and we need to copy base transformer weights first
+        # If file is large (>=8GB), it's a full model and we can load directly
+        is_full_model = file_size_gb >= 8.0
+        
+        if is_full_model:
+            # Full model - use accelerate to load with minimal memory
+            self.print_and_status_update(f"ControlNet appears to be full model, loading directly...")
+            try:
+                from diffusers.utils import is_accelerate_available
+                if is_accelerate_available():
+                    import accelerate
+                    with accelerate.init_empty_weights():
+                        self.controlnet = control_cls(**config)
+                else:
+                    self.controlnet = control_cls(**config)
+            except Exception:
+                self.controlnet = control_cls(**config)
+        else:
+            # Small file - need to instantiate and copy base weights first
+            self.print_and_status_update(f"ControlNet appears to be control-only weights, will copy base first...")
+            self.controlnet = control_cls(**config)
+        
         # Propagate config control_in_dim (if present) to the instantiated object
         try:
             from toolkit.control_util import ensure_control_in_dim, set_adapter_name_if_missing
@@ -925,89 +961,147 @@ class ZImageModel(BaseModel):
         except Exception:
             # Re-raise to make failures visible during model load
             raise
-        try:
-            base = ZImageTransformer2DModel.from_pretrained(self.model_config.name_or_path, subfolder='transformer', torch_dtype=self.torch_dtype)
-            base_state = base.state_dict()
-            m, u = self.controlnet.load_state_dict(base_state, strict=False)
-            self.print_and_status_update(f"Base→Control copy: {len(m)} missing, {len(u)} unexpected")
-            del base, base_state
-            torch.cuda.empty_cache()
-        except Exception as e:
-            # Non-fatal; continue but warn
-            self.print_and_status_update(f"Warning: Base->Control copy skipped: {e}")
+        
+        # Only copy base transformer weights if the controlnet file is small (control-only weights)
+        if not is_full_model:
+            try:
+                base = ZImageTransformer2DModel.from_pretrained(self.model_config.name_or_path, subfolder='transformer', torch_dtype=self.torch_dtype)
+                base_state = base.state_dict()
+                m, u = self.controlnet.load_state_dict(base_state, strict=False)
+                self.print_and_status_update(f"Base→Control copy: {len(m)} missing, {len(u)} unexpected")
+                del base, base_state
+                torch.cuda.empty_cache()
+            except Exception as e:
+                # Non-fatal; continue but warn
+                self.print_and_status_update(f"Warning: Base->Control copy skipped: {e}")
+        else:
+            self.print_and_status_update("Skipping base transformer copy (full model controlnet)")
 
         # Load control weights (streaming if requested)
+        # Check if model has meta tensors (from init_empty_weights)
+        has_meta = any(p.device.type == 'meta' for p in self.controlnet.parameters())
+        
         if self.model_config.controlnet_streaming:
             # Streaming mode: first inspect keys to ensure compatibility
             with safe_open(safetensors_path, framework='pt', device='cpu') as f:
                 keys = list(f.keys())
-                model_keys = set(self.controlnet.state_dict().keys())
-                unexpected = [k for k in keys if k not in model_keys]
-                if unexpected:
+                model_keys = set(self.controlnet.state_dict().keys()) if not has_meta else set()
+                unexpected = [k for k in keys if k not in model_keys] if model_keys else []
+                if unexpected and model_keys:
                     sample = unexpected[:5]
                     raise RuntimeError(f"ControlNet checkpoint has unexpected keys (incompatible): sample {sample}")
-                # Assign tensors one by one
-                for k in keys:
-                    t = f.get_tensor(k)
-                    self.set_nested_parameter(self.controlnet, k, t)
-                    del t
-        else:
-            # Attempt a full-file load (fast) but be robust: if the safetensors file
-            # is large relative to available RAM or if load_file raises MemoryError,
-            # fall back to streaming assignment to avoid OOM on low-RAM hosts.
-            use_streaming_fallback = False
-            try:
-                # Heuristic: prefer streaming if file > 60% of available RAM
-                file_bytes = os.path.getsize(safetensors_path)
-                try:
-                    import psutil
-
-                    avail = psutil.virtual_memory().available
-                    if avail is not None and file_bytes > (avail * 0.6):
-                        self.print_and_status_update("ControlNet checkpoint is large relative to available host RAM; using streaming assignment to avoid OOM.")
-                        use_streaming_fallback = True
-                except Exception:
-                    # psutil missing or failed; continue and rely on catching MemoryError below
-                    pass
-
-                if not use_streaming_fallback:
+                
+                if has_meta:
+                    # Use accelerate to materialize meta tensors
                     try:
-                        state_dict = load_file(safetensors_path)
-                    except MemoryError:
-                        # MemoryError during load: fall back to streaming assignment
-                        self.print_and_status_update("ControlNet load via load_file failed due to MemoryError; falling back to streaming assignment.")
-                        use_streaming_fallback = True
-
-                if use_streaming_fallback:
-                    with safe_open(safetensors_path, framework='pt', device='cpu') as f:
-                        keys = list(f.keys())
-                        model_keys = set(self.controlnet.state_dict().keys())
-                        unexpected = [k for k in keys if k not in model_keys]
-                        if unexpected:
-                            sample = unexpected[:5]
-                            raise RuntimeError(f"ControlNet checkpoint has unexpected keys (incompatible): sample {sample})")
+                        from accelerate.utils import set_module_tensor_to_device
                         for k in keys:
                             t = f.get_tensor(k)
-                            self.set_nested_parameter(self.controlnet, k, t)
+                            set_module_tensor_to_device(self.controlnet, k, 'cpu', value=t)
                             del t
+                        self.print_and_status_update(f"Materialized {len(keys)} keys from meta tensors (streaming)")
+                    except ImportError:
+                        raise RuntimeError("Accelerate required for meta tensor loading but not available")
                 else:
-                    # Quick unexpected check
-                    model_keys = set(self.controlnet.state_dict().keys())
-                    unexpected = [k for k in state_dict.keys() if k not in model_keys]
-                    if unexpected:
-                        sample = unexpected[:5]
+                    # Assign tensors one by one
+                    for k in keys:
+                        t = f.get_tensor(k)
+                        self.set_nested_parameter(self.controlnet, k, t)
+                        del t
+        else:
+            # Non-streaming load path
+            if has_meta:
+                # For meta tensors, use streaming with accelerate (most memory efficient)
+                self.print_and_status_update("Using streaming load for meta tensor model...")
+                with safe_open(safetensors_path, framework='pt', device='cpu') as f:
+                    keys = list(f.keys())
+                    try:
+                        from accelerate.utils import set_module_tensor_to_device
+                        for k in keys:
+                            t = f.get_tensor(k)
+                            # Load in target dtype if specified
+                            if self.torch_dtype is not None and t.dtype != self.torch_dtype:
+                                t = t.to(dtype=self.torch_dtype)
+                            set_module_tensor_to_device(self.controlnet, k, 'cpu', value=t)
+                            del t
+                        self.print_and_status_update(f"Materialized {len(keys)} keys from meta tensors to CPU")
+                    except ImportError:
+                        raise RuntimeError("Accelerate required for meta tensor loading but not available")
+            else:
+                # Standard load path for non-meta models
+                # Attempt a full-file load (fast) but be robust: if the safetensors file
+                # is large relative to available RAM or if load_file raises MemoryError,
+                # fall back to streaming assignment to avoid OOM on low-RAM hosts.
+                use_streaming_fallback = False
+                try:
+                    # Heuristic: prefer streaming if file > 60% of available RAM
+                    file_bytes = os.path.getsize(safetensors_path)
+                    try:
+                        import psutil
+
+                        avail = psutil.virtual_memory().available
+                        if avail is not None and file_bytes > (avail * 0.6):
+                            self.print_and_status_update("ControlNet checkpoint is large relative to available host RAM; using streaming assignment to avoid OOM.")
+                            use_streaming_fallback = True
+                    except Exception:
+                        # psutil missing or failed; continue and rely on catching MemoryError below
+                        pass
+
+                    if not use_streaming_fallback:
+                        try:
+                            state_dict = load_file(safetensors_path)
+                        except MemoryError:
+                            # MemoryError during load: fall back to streaming assignment
+                            self.print_and_status_update("ControlNet load via load_file failed due to MemoryError; falling back to streaming assignment.")
+                            use_streaming_fallback = True
+
+                    if use_streaming_fallback:
+                        with safe_open(safetensors_path, framework='pt', device='cpu') as f:
+                            keys = list(f.keys())
+                            model_keys = set(self.controlnet.state_dict().keys())
+                            unexpected = [k for k in keys if k not in model_keys]
+                            if unexpected:
+                                sample = unexpected[:5]
+                                raise RuntimeError(f"ControlNet checkpoint has unexpected keys (incompatible): sample {sample})")
+                            for k in keys:
+                                t = f.get_tensor(k)
+                                self.set_nested_parameter(self.controlnet, k, t)
+                                del t
+                    else:
+                        # Quick unexpected check
                         model_keys = set(self.controlnet.state_dict().keys())
-                        # If control transformer has no keys (very minimal DummyControl used in tests)
-                        # don't fail; warn and continue so we still write out a config.json when available.
-                        if len(model_keys) == 0:
-                            self.print_and_status_update(f"Warning: ControlNet checkpoint has unexpected keys but control transformer has no reference keys; continuing: sample {sample}")
-                        else:
-                            # Non-streaming loads should fail fast on unexpected keys to avoid silent mismatch
-                            raise RuntimeError(f"ControlNet checkpoint has unexpected keys (incompatible): sample {sample}")
-                    self.controlnet.load_state_dict(state_dict, strict=False)
-            except Exception as e:
-                # If anything unexpected occurs during the fallback attempt, raise a clear error
-                raise RuntimeError(f"ControlNet load failed (tried full-load then streaming fallback): {e}")
+                        unexpected = [k for k in state_dict.keys() if k not in model_keys]
+                        if unexpected:
+                            sample = unexpected[:5]
+                            model_keys = set(self.controlnet.state_dict().keys())
+                            # If control transformer has no keys (very minimal DummyControl used in tests)
+                            # don't fail; warn and continue so we still write out a config.json when available.
+                            if len(model_keys) == 0:
+                                self.print_and_status_update(f"Warning: ControlNet checkpoint has unexpected keys but control transformer has no reference keys; continuing: sample {sample}")
+                            else:
+                                # Non-streaming loads should fail fast on unexpected keys to avoid silent mismatch
+                                raise RuntimeError(f"ControlNet checkpoint has unexpected keys (incompatible): sample {sample}")
+                        self.controlnet.load_state_dict(state_dict, strict=False)
+                        # Clean up state_dict to free memory before moving to device
+                        del state_dict
+                except Exception as e:
+                    # If anything unexpected occurs during the fallback attempt, raise a clear error
+                    raise RuntimeError(f"ControlNet load failed (tried full-load then streaming fallback): {e}")
+
+        # CRITICAL: Allow memory to shrink before moving to device
+        # Previous versions worked because there was time for GC to clean up intermediate tensors
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.print_and_status_update("ControlNet loaded, memory cleaned up before device transfer")
+
+        # Wrap in VideoXControlnetWrapper for consistent interface
+        try:
+            from toolkit.controlnet_compat import VideoXControlnetWrapper
+            self.controlnet = VideoXControlnetWrapper(self.controlnet)
+            self.print_and_status_update("Wrapped ControlNet in VideoXControlnetWrapper")
+        except Exception as e:
+            self.print_and_status_update(f"Warning: Could not wrap ControlNet in VideoXControlnetWrapper: {e}")
 
         # Move to device/offload according to offload_strategy
         try:
@@ -2175,9 +2269,11 @@ def encode_and_assemble_zimage_controls(sd, control_context):
     return assemble_zimage_control_context(control_latents, control_in_dim=ctl_dim)
 
 
-def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps: torch.Tensor, zimage_controlnet=None, zimage_control_images=None, zimage_control_context=None, zimage_conditioning_scale: float = 1.0, train_dtype=None, dataset_controlnet_debug: bool = False, batch=None):
+def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps: torch.Tensor, zimage_controlnet=None, zimage_control_images=None, zimage_control_context=None, zimage_conditioning_scale: float = 1.0, train_dtype=None, dataset_controlnet_debug: bool = False, batch=None, adapter_path: str = None):
     """Compute adapter residuals for Z-Image (VideoX) adapters and return
     (down_block_additional_residuals, mid_block_additional_residual, control_context, raw_out).
+
+    adapter_path: Optional path to adapter weights for meta tensor materialization.
 
     This extracts the adapter invocation and normalization logic from
     `predict_noise_zimage` into a focused helper that the trainer and wrapper can
@@ -2186,6 +2282,8 @@ def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps:
     Behavior mirrors `predict_noise_zimage` for dtype/device normalization,
     timing, diagnostics, and error handling.
     """
+    from toolkit.controlnet_offload import bring_adapter, offload_adapter
+    
     # Prepare diagnostics/timers
     try:
         sd._last_zimage_adapter_called = False
@@ -2193,10 +2291,148 @@ def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps:
     except Exception:
         pass
 
-    # Determine job dtype
+    # Determine target device and dtype
+    target_device = noisy_latents.device
     job_torch_dtype = get_torch_dtype(train_dtype) or getattr(sd, 'torch_dtype', None)
-    if job_torch_dtype == torch.bfloat16 and noisy_latents.device.type == 'cpu':
+    if job_torch_dtype == torch.bfloat16 and target_device.type == 'cpu':
         job_torch_dtype = torch.float32
+
+    # Get offload strategy from train_config if available
+    offload_strategy = 'none'
+    try:
+        train_config = getattr(sd, 'train_config', None)
+        if train_config is not None:
+            offload_strategy = getattr(train_config, 'controlnet_offload_strategy', 'none') or 'none'
+    except Exception:
+        pass
+
+    # Helper to check if module has meta tensors
+    def _has_meta_tensors(module):
+        try:
+            for p in module.parameters():
+                if p.device.type == 'meta':
+                    return True
+            for b in module.buffers():
+                if b.device.type == 'meta':
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # Helper to materialize meta tensors in-place using accelerate's efficient method
+    def _materialize_meta_tensors_inplace(module, device, dtype, fallback_path=None):
+        """Materialize meta tensors in-place using accelerate.set_module_tensor_to_device.
+        
+        This is memory efficient - it loads weights directly into the correct device
+        without creating intermediate copies.
+        """
+        # Find the weights path - try module attrs first, then fallback
+        weights_path = (
+            fallback_path or
+            getattr(module, 'name_or_path', None) or 
+            getattr(module, '_name_or_path', None)
+        )
+        if weights_path is None:
+            config = getattr(module, 'config', None)
+            if config is not None:
+                weights_path = getattr(config, '_name_or_path', None)
+        
+        if weights_path is None:
+            return False
+            
+        import os
+        
+        # Find the actual weights file
+        weights_file = None
+        if os.path.isdir(weights_path):
+            for fname in ['diffusion_pytorch_model.safetensors', 'pytorch_model.safetensors', 
+                          'model.safetensors', 'diffusion_pytorch_model.bin', 'pytorch_model.bin']:
+                fpath = os.path.join(weights_path, fname)
+                if os.path.exists(fpath):
+                    weights_file = fpath
+                    break
+        elif os.path.isfile(weights_path):
+            weights_file = weights_path
+        
+        if weights_file is None:
+            return False
+        
+        try:
+            from toolkit.print import print_acc
+            print_acc(f"[ZIMAGE] Materializing meta tensors from {weights_file}")
+            
+            # Load weights
+            if weights_file.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                state_dict = load_file(weights_file, device='cpu')
+            else:
+                state_dict = torch.load(weights_file, map_location='cpu')
+            
+            # Use accelerate's efficient set_module_tensor_to_device
+            # IMPORTANT: Load to CPU first to avoid CUDA OOM, then move to target device
+            try:
+                from accelerate.utils import set_module_tensor_to_device
+                # First materialize to CPU
+                for name, param in state_dict.items():
+                    try:
+                        set_module_tensor_to_device(module, name, 'cpu', value=param)
+                    except Exception:
+                        pass  # Skip keys that don't exist in model
+                print_acc(f"[ZIMAGE] Materialized {len(state_dict)} keys to CPU using accelerate")
+                # Now move to target device and dtype
+                target_dev = device if device is not None else 'cpu'
+                if target_dev != 'cpu' or dtype is not None:
+                    module.to(device=target_dev, dtype=dtype)
+                return True
+            except ImportError:
+                # Fallback to to_empty + load_state_dict
+                print_acc("[ZIMAGE] accelerate.set_module_tensor_to_device not available, using fallback")
+                module.to_empty(device='cpu')
+                module.load_state_dict(state_dict, strict=False)
+                # Move to target device/dtype
+                target_dev = device if device is not None else 'cpu'
+                module.to(device=target_dev, dtype=dtype)
+                return True
+            
+        except Exception as e:
+            from toolkit.print import print_acc
+            print_acc(f"[ZIMAGE] Failed to materialize meta tensors: {e}")
+            return False
+
+    # Bring adapter to compute device (handle meta tensors if present)
+    # If offload_strategy is 'none', skip explicit moves - let Windows shared GPU memory handle it
+    if offload_strategy in ('none', None, ''):
+        # Only materialize meta tensors if present; otherwise leave adapter where it is
+        if _has_meta_tensors(zimage_controlnet):
+            if not _materialize_meta_tensors_inplace(zimage_controlnet, target_device, job_torch_dtype, fallback_path=adapter_path):
+                raise RuntimeError(
+                    f"Z-Image controlnet has meta tensors but could not be materialized. "
+                    f"Adapter name_or_path: {getattr(zimage_controlnet, 'name_or_path', 'unknown')}. "
+                    f"Fallback path: {adapter_path or 'None'}. "
+                    f"Ensure the adapter checkpoint is accessible."
+                )
+        # else: adapter is already on some device - let shared memory handle transfers implicitly
+    else:
+        # Non-none strategy: explicit device management
+        if _has_meta_tensors(zimage_controlnet):
+            # Try to materialize in-place (this is how accelerate's lazy loading works)
+            if not _materialize_meta_tensors_inplace(zimage_controlnet, target_device, job_torch_dtype, fallback_path=adapter_path):
+                raise RuntimeError(
+                    f"Z-Image controlnet has meta tensors but could not be materialized. "
+                    f"Adapter name_or_path: {getattr(zimage_controlnet, 'name_or_path', 'unknown')}. "
+                    f"Fallback path: {adapter_path or 'None'}. "
+                    f"Ensure the adapter checkpoint is accessible."
+                )
+        else:
+            # Normal case - just move to device
+            try:
+                bring_adapter(zimage_controlnet, device=target_device, strategy=offload_strategy)
+            except Exception as e:
+                # Fallback: try direct .to() if bring_adapter fails
+                try:
+                    zimage_controlnet.to(target_device, dtype=job_torch_dtype)
+                except Exception:
+                    raise RuntimeError(f"Failed to move Z-Image controlnet to {target_device}: {e}") from e
 
     # Assemble or normalize control_context
     control_context = None
@@ -2211,14 +2447,18 @@ def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps:
     else:
         raise RuntimeError('Z-Image adapter residual helper requires `zimage_control_images` or a preassembled `zimage_control_context`.')
 
-    # Ensure on correct device/dtype
+    # Ensure control_context on correct device/dtype
     try:
-        control_context = control_context.to(dtype=job_torch_dtype, device=noisy_latents.device)
+        control_context = control_context.to(dtype=job_torch_dtype, device=target_device)
     except Exception:
         try:
-            control_context = control_context.to(device=noisy_latents.device)
+            control_context = control_context.to(device=target_device)
         except Exception:
             pass
+
+    # Ensure noisy_latents and timesteps are on target device with correct dtype
+    noisy_latents = noisy_latents.to(dtype=job_torch_dtype, device=target_device)
+    timesteps = timesteps.to(device=target_device)
 
     # Optional per-call debug notice
     if dataset_controlnet_debug:
@@ -2230,25 +2470,34 @@ def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps:
 
     # Time the adapter invocation
     timer_ctx = (sd.timer('controlnet_zimage_forward') if hasattr(sd, 'timer') else nullcontext())
-    with timer_ctx:
-        acc = getattr(sd, 'accelerator', None)
-        autocast_ctx = (acc.autocast() if (acc is not None and hasattr(acc, 'autocast')) else nullcontext())
-        with autocast_ctx:
+    raw_out = None
+    try:
+        with timer_ctx:
+            acc = getattr(sd, 'accelerator', None)
+            autocast_ctx = (acc.autocast() if (acc is not None and hasattr(acc, 'autocast')) else nullcontext())
+            with autocast_ctx:
+                try:
+                    sd._last_zimage_adapter_call_ts = time.time()
+                except Exception:
+                    pass
+                # Enforce conditioning_scale kwarg signature
+                try:
+                    raw_out = zimage_controlnet(noisy_latents, timesteps, control_context, conditioning_scale=zimage_conditioning_scale)
+                except TypeError as e:
+                    raise RuntimeError("Z-Image: ControlNet adapter must accept `conditioning_scale` kwarg; update adapter signature to `forward(latents, timestep, control_context, conditioning_scale=...)`") from e
+                except Exception as e:
+                    raise RuntimeError(f"Z-Image adapter call failed: {e}") from e
+                try:
+                    sd._last_zimage_adapter_called = True
+                    sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0) + 1
+                    sd._last_zimage_adapter_last_return_ts = time.time()
+                except Exception:
+                    pass
+    finally:
+        # Offload adapter back if using an offload strategy
+        if offload_strategy not in ('none', None, ''):
             try:
-                sd._last_zimage_adapter_call_ts = time.time()
-            except Exception:
-                pass
-            # Enforce conditioning_scale kwarg signature
-            try:
-                raw_out = zimage_controlnet(noisy_latents, timesteps, control_context, conditioning_scale=zimage_conditioning_scale)
-            except TypeError as e:
-                raise RuntimeError("Z-Image: ControlNet adapter must accept `conditioning_scale` kwarg; update adapter signature to `forward(latents, timestep, control_context, conditioning_scale=...)`") from e
-            except Exception as e:
-                raise RuntimeError(f"Z-Image adapter call failed: {e}") from e
-            try:
-                sd._last_zimage_adapter_called = True
-                sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0) + 1
-                sd._last_zimage_adapter_last_return_ts = time.time()
+                offload_adapter(zimage_controlnet, strategy=offload_strategy)
             except Exception:
                 pass
 
@@ -2268,14 +2517,17 @@ def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps:
         except Exception:
             raise RuntimeError('Z-Image adapter returned an unsupported type; expected (down_residuals, mid_residual) tuple, a list of tensors, or a single tensor')
 
-    # Validate and move down residuals
+    # Validate and move down residuals to target device
     down_validated = None
     if down is not None:
         down_validated = []
         for d in (down if isinstance(down, (list, tuple)) else [down]):
             if not torch.is_tensor(d):
                 raise RuntimeError('Z-Image adapter down residuals must be torch.Tensors')
-            d = d.to(dtype=job_torch_dtype, device=noisy_latents.device)
+            # Detach and clone to avoid meta tensor issues, then move to target
+            if d.device.type == 'meta':
+                raise RuntimeError('Z-Image adapter returned meta tensors; ensure adapter is properly materialized on compute device')
+            d = d.detach().to(dtype=job_torch_dtype, device=target_device)
             down_validated.append(d)
         try:
             sd._last_zimage_control_hints_shapes = [tuple(d.shape) for d in down_validated]
@@ -2286,7 +2538,9 @@ def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps:
     if mid is not None:
         if not torch.is_tensor(mid):
             raise RuntimeError('Z-Image adapter mid residual must be a torch.Tensor or None')
-        mid = mid.to(dtype=job_torch_dtype, device=noisy_latents.device)
+        if mid.device.type == 'meta':
+            raise RuntimeError('Z-Image adapter returned meta tensor for mid residual; ensure adapter is properly materialized')
+        mid = mid.detach().to(dtype=job_torch_dtype, device=target_device)
 
     # Bookkeeping
     try:

@@ -906,6 +906,8 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         torch_dtype: Optional[torch.dtype] = None,
         low_cpu_mem_usage: bool = True,
         load_control_only: bool = False,
+        materialize_device: str = 'cpu',
+        base_transformer_path: Optional[str] = None,
     ):
         """Workspace-friendly `from_pretrained` for the shim.
 
@@ -916,6 +918,15 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         - Keep implementation small and deterministic (no external HF downloads,
           no accelerate/flash-attn assumptions).
         - Provide clear, actionable errors when paths are missing or invalid.
+        
+        Args:
+            base_transformer_path: Path to base transformer weights. Required for 
+                control-only checkpoints (<8GB) which only contain delta weights.
+                The base weights are loaded first, then control weights override them.
+        
+        Args:
+            materialize_device: Device to load weights onto (default 'cpu'). 
+                               Set to 'cuda' to load directly to GPU (avoids CPU->GPU copy).
         """
         transformer_additional_kwargs = transformer_additional_kwargs or {}
 
@@ -946,6 +957,45 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             else:
                 print(f"Warning: no config.json in {model_dir}; instantiating with defaults")
 
+        # Find weight files first
+        weight_files = []
+        for ext in ("*.safetensors", "pytorch_model.bin", "*.bin"):
+            found = glob.glob(os.path.join(model_dir, ext))
+            if found:
+                weight_files.extend(found)
+        
+        # Detect control_in_dim from checkpoint if not already set
+        # Z-Image standard: control_tensor(16) + mask(1) + latent_tensor(16) = 33
+        # Z-Image Union: 4 control types * 33 = 132
+        safetensors = [p for p in weight_files if p.endswith(".safetensors")]
+        detected_control_in_dim = None
+        if safetensors:
+            try:
+                from safetensors import safe_open
+                for sf_path in safetensors:
+                    with safe_open(sf_path, framework='pt', device='cpu') as f:
+                        for k in f.keys():
+                            # Look for control embedder weight to detect control_in_dim
+                            if 'control' in k and 'embedder' in k and 'weight' in k:
+                                shape = f.get_slice(k).get_shape()
+                                if len(shape) == 2:
+                                    detected_control_in_dim = shape[1]
+                                    print(f"from_pretrained: detected control_in_dim={detected_control_in_dim} from {k}")
+                                    break
+                    if detected_control_in_dim:
+                        break
+            except Exception as e:
+                print(f"from_pretrained: failed to detect control_in_dim: {e}")
+        
+        # Set control_in_dim - prefer detected, then config, then default 33
+        final_control_in_dim = detected_control_in_dim or config.get('control_in_dim') or (transformer_additional_kwargs or {}).get('control_in_dim') or 33
+        if config.get('control_in_dim') != final_control_in_dim:
+            print(f"from_pretrained: setting control_in_dim={final_control_in_dim}")
+            config['control_in_dim'] = final_control_in_dim
+        if transformer_additional_kwargs is None:
+            transformer_additional_kwargs = {}
+        transformer_additional_kwargs['control_in_dim'] = final_control_in_dim
+
         # Optionally construct model with accelerate.init_empty_weights to avoid allocating
         # full parameter tensors. Do this *before* any normal instantiation when
         # `low_cpu_mem_usage=True` so we don't allocate large tensors inadvertently.
@@ -955,15 +1005,20 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 from diffusers.utils import is_accelerate_available
                 if is_accelerate_available():
                     import accelerate
-                    print(f"from_pretrained: using accelerate.init_empty_weights to construct {cls.__name__} with minimal memory")
+                    print(f"from_pretrained: [1/4] using accelerate.init_empty_weights to construct {cls.__name__} (no memory allocation)")
+                    print(f"from_pretrained: config control_in_dim={config.get('control_in_dim')}")
                     with accelerate.init_empty_weights():
                         model = cls.from_config(config, **(transformer_additional_kwargs or {}))
-            except Exception:
+                    print(f"from_pretrained: [1/4] meta model created successfully")
+                else:
+                    print("from_pretrained: accelerate available but is_accelerate_available() returned False")
+            except Exception as e:
                 # accelerate not available or failed; fall back to normal instantiation
-                print("from_pretrained: accelerate.init_empty_weights not available or failed; falling back to normal constructor")
+                print(f"from_pretrained: accelerate.init_empty_weights failed: {e}; falling back to normal constructor")
 
         # Instantiate model normally (if empty-weight construction didn't succeed)
         if model is None:
+            print(f"from_pretrained: [1/4] WARNING - using normal constructor (will allocate ~20GB)")
             if hasattr(cls, "from_config") and callable(getattr(cls, "from_config")):
                 try:
                     model = cls.from_config(config, **(transformer_additional_kwargs or {}))
@@ -982,13 +1037,6 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 except Exception as e:
                     raise RuntimeError(f"Failed to construct model {cls.__name__}: {e}") from e
 
-        # Find weight files (prefer safetensors)
-        weight_files = []
-        for ext in ("*.safetensors", "pytorch_model.bin", "*.bin"):
-            found = glob.glob(os.path.join(model_dir, ext))
-            if found:
-                weight_files.extend(found)
-
         if not weight_files:
             # No loadable weights found; return the instantiated model
             print(f"No weights found in {model_dir}; returning model instantiated from config")
@@ -996,8 +1044,139 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 model = model.to(torch_dtype)
             return model
 
-        # Low-memory path: optionally load only control-related keys and use
-        # accelerate.init_empty_weights when available to limit peak RAM.
+        # Check if model has meta tensors (from init_empty_weights)
+        has_meta = any(p.device.type == 'meta' for p in model.parameters())
+        
+        # Count checkpoint keys to determine if this is a complete control model or a delta
+        # A complete Z-Image control transformer has ~295 control-specific keys
+        # A delta checkpoint would have fewer keys and need base weights
+        total_file_size = sum(os.path.getsize(f) for f in weight_files)
+        checkpoint_key_count = 0
+        safetensors_files = [p for p in weight_files if p.endswith(".safetensors")]
+        if safetensors_files:
+            try:
+                from safetensors import safe_open
+                for sf in safetensors_files:
+                    with safe_open(sf, framework='pt', device='cpu') as f:
+                        checkpoint_key_count += len(f.keys())
+            except:
+                pass
+        
+        # A complete control transformer has 250+ keys - doesn't need base weights
+        # A delta checkpoint would have <200 keys and need base weights
+        is_complete_control_model = checkpoint_key_count >= 250
+        needs_base_weights = not is_complete_control_model and total_file_size < 15 * 1024**3
+        
+        print(f"from_pretrained: checkpoint has {checkpoint_key_count} keys, size={total_file_size/(1024**3):.2f}GB")
+        print(f"from_pretrained: is_complete_control_model={is_complete_control_model}, needs_base_weights={needs_base_weights}")
+        
+        # For meta tensor models loading to GPU, use streaming to avoid loading entire file to RAM
+        if has_meta and materialize_device != 'cpu':
+            print(f"from_pretrained: [2/4] streaming weights directly to {materialize_device}...")
+            safetensors = safetensors_files
+            if safetensors:
+                try:
+                    from safetensors import safe_open
+                    from accelerate.utils import set_module_tensor_to_device
+                    import gc
+                    
+                    model_state = model.state_dict()
+                    loaded_keys = set()
+                    
+                    # Only load base weights if this is a delta checkpoint
+                    if needs_base_weights:
+                        print(f"from_pretrained: [2.5/4] delta checkpoint detected, loading base weights first...")
+                        # Use explicitly provided base_transformer_path if available
+                        base_path = None
+                        if base_transformer_path:
+                            if os.path.isdir(base_transformer_path):
+                                base_sfs = glob.glob(os.path.join(base_transformer_path, "*.safetensors"))
+                                if base_sfs:
+                                    base_path = base_transformer_path
+                                    print(f"from_pretrained: using provided base_transformer_path: {base_path}")
+                            elif os.path.isfile(base_transformer_path):
+                                # Single file provided
+                                base_path = os.path.dirname(base_transformer_path)
+                                print(f"from_pretrained: using provided base_transformer_path dir: {base_path}")
+                        
+                        # Fallback: try to find base transformer in parent directory
+                        if not base_path:
+                            parent_dir = os.path.dirname(model_dir.rstrip('/\\'))
+                            transformer_dir = os.path.join(parent_dir, 'transformer')
+                            if os.path.isdir(transformer_dir):
+                                base_sfs = glob.glob(os.path.join(transformer_dir, "*.safetensors"))
+                                if base_sfs:
+                                    base_path = transformer_dir
+                                    print(f"from_pretrained: found base transformer at {base_path}")
+                        
+                        if base_path:
+                            # Stream base weights to device first
+                            base_sfs = glob.glob(os.path.join(base_path, "*.safetensors"))
+                            for p in base_sfs:
+                                with safe_open(p, framework='pt', device='cpu') as f:
+                                    for k in f.keys():
+                                        if k in model_state and model_state[k].size() == f.get_slice(k).get_shape():
+                                            t = f.get_tensor(k)
+                                            if torch_dtype is not None and t.dtype != torch_dtype:
+                                                t = t.to(dtype=torch_dtype)
+                                            set_module_tensor_to_device(model, k, materialize_device, value=t)
+                                            loaded_keys.add(k)
+                                            del t
+                            print(f"from_pretrained: [2.5/4] loaded {len(loaded_keys)} base keys to {materialize_device}")
+                        else:
+                            print(f"from_pretrained: WARNING - delta checkpoint but no base transformer found!")
+                            print(f"from_pretrained: Provide base_transformer_path arg or place transformer/ dir next to controlnet")
+                    
+                    # Now load checkpoint weights directly
+                    # For complete control models, these are all the weights needed
+                    # For delta checkpoints, these overwrite base weights for control-specific params
+                    for p in safetensors:
+                        with safe_open(p, framework='pt', device='cpu') as f:
+                            for k in f.keys():
+                                # Skip non-control keys if load_control_only
+                                if load_control_only and "control" not in k:
+                                    continue
+                                
+                                # Check if key matches model directly
+                                if k in model_state and model_state[k].size() == f.get_slice(k).get_shape():
+                                    # Load tensor, convert dtype if needed, send directly to device
+                                    t = f.get_tensor(k)
+                                    if torch_dtype is not None and t.dtype != torch_dtype:
+                                        t = t.to(dtype=torch_dtype)
+                                    set_module_tensor_to_device(model, k, materialize_device, value=t)
+                                    loaded_keys.add(k)
+                                    del t
+                    
+                    # GC to free any intermediate memory
+                    gc.collect()
+                    
+                    print(f"from_pretrained: [4/4] loaded total {len(loaded_keys)} keys to {materialize_device}")
+                    
+                    # For remaining meta tensors, materialize to CPU with zeros (NOT GPU)
+                    # This keeps GPU memory minimal - only actual weights go to GPU
+                    remaining_meta = [n for n, p in model.named_parameters() if p.device.type == 'meta']
+                    if remaining_meta:
+                        if needs_base_weights and len(remaining_meta) > 50:
+                            # Something is wrong - delta checkpoint should have loaded base weights
+                            print(f"from_pretrained: WARNING - {len(remaining_meta)} params still meta after delta load!")
+                            print(f"from_pretrained: This suggests base transformer weights were not found.")
+                            print(f"from_pretrained: Model may not function correctly without base weights.")
+                        print(f"from_pretrained: {len(remaining_meta)} params not in checkpoint, initializing to CPU (not GPU)")
+                        for name in remaining_meta:
+                            param = model_state[name]
+                            # Initialize on CPU to save GPU memory - these are unused anyway
+                            zeros = torch.zeros(param.shape, dtype=torch_dtype or torch.float32, device='cpu')
+                            set_module_tensor_to_device(model, name, 'cpu', value=zeros)
+                    
+                    return model
+                except Exception as e:
+                    import traceback
+                    print(f"from_pretrained: streaming load failed: {e}")
+                    traceback.print_exc()
+                    print("from_pretrained: falling back to standard load")
+        
+        # Standard path: load state_dict then transfer
+        print(f"from_pretrained: [2/4] loading weights from disk...")
         state_dict = None
         try:
             safetensors = [p for p in weight_files if p.endswith(".safetensors")]
@@ -1007,23 +1186,33 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             # Prefer safetensors; they allow incremental loading and are generally
             # faster for selective key extraction.
             if safetensors:
+                print(f"from_pretrained: [2/4] loading from safetensors: {safetensors}")
                 try:
                     from safetensors.torch import load_file
 
                     if load_control_only:
-                        # Load and filter on the fly
+                        # Load and filter on the fly, convert to target dtype only if needed
                         state_dict = {}
                         for p in safetensors:
                             sd = load_file(p)
                             for k, v in sd.items():
                                 if ("control" in k) or (not load_control_only):
-                                    state_dict[k] = v
+                                    # Only convert if dtype doesn't match (avoid unnecessary copy)
+                                    if torch_dtype is not None and v.dtype != torch_dtype:
+                                        state_dict[k] = v.to(dtype=torch_dtype)
+                                    else:
+                                        state_dict[k] = v
                     else:
                         state_dict = {}
                         for p in safetensors:
                             sd = load_file(p)
                             for k, v in sd.items():
-                                state_dict[k] = v
+                                # Only convert if dtype doesn't match (avoid unnecessary copy)
+                                if torch_dtype is not None and v.dtype != torch_dtype:
+                                    state_dict[k] = v.to(dtype=torch_dtype)
+                                else:
+                                    state_dict[k] = v
+                    print(f"from_pretrained: [2/4] loaded {len(state_dict)} keys from safetensors")
                 except Exception as e:
                     print(f"Failed to read safetensors from {model_dir}: {e}")
                     state_dict = None
@@ -1035,11 +1224,23 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                         state_dict = {}
                         for k, v in raw.items():
                             if ("control" in k) or (not load_control_only):
-                                state_dict[k] = v
+                                # Only convert if dtype doesn't match
+                                if torch_dtype is not None and hasattr(v, 'dtype') and v.dtype != torch_dtype:
+                                    state_dict[k] = v.to(dtype=torch_dtype)
+                                else:
+                                    state_dict[k] = v
                         # free raw if possible
                         del raw
                     else:
-                        state_dict = torch.load(bin_files[0], map_location="cpu")
+                        raw = torch.load(bin_files[0], map_location="cpu")
+                        state_dict = {}
+                        for k, v in raw.items():
+                            # Only convert if dtype doesn't match
+                            if torch_dtype is not None and hasattr(v, 'dtype') and v.dtype != torch_dtype:
+                                state_dict[k] = v.to(dtype=torch_dtype)
+                            else:
+                                state_dict[k] = v
+                        del raw
                 except Exception as e:
                     print(f"Failed to load bin weights from {model_dir}: {e}")
                     state_dict = None
@@ -1054,6 +1255,8 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             return model
 
         # Filter and load matching keys only (and try to map control_ keys)
+        # NOTE: We avoid creating copies - just reference same tensors from state_dict
+        print(f"from_pretrained: [3/4] filtering keys to match model...")
         model_state = model.state_dict()
         filtered = {}
         for k, v in state_dict.items():
@@ -1061,11 +1264,12 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 filtered[k] = v
 
         # Try control->non-control key mapping e.g., control.weight <- weight
+        # NOTE: No .clone() - just reference the same tensor
         for k in list(model_state.keys()):
             if k not in filtered and k.startswith("control_"):
                 alt = k.replace("control_", "")
                 if alt in state_dict and model_state[k].size() == state_dict[alt].size():
-                    filtered[k] = state_dict[alt].clone()
+                    filtered[k] = state_dict[alt]  # No clone - same tensor
 
         # Initialize missing parameters to sensible defaults to support partial loads
         missing_keys = [k for k in model_state.keys() if k not in filtered]
@@ -1076,9 +1280,49 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 if k not in filtered:
                     filtered[k] = v
 
-        missing, unexpected = model.load_state_dict(filtered, strict=False)
-        print(f"from_pretrained: loaded {len(filtered)} keys; missing: {len(missing)}; unexpected: {len(unexpected)}")
+        print(f"from_pretrained: [3/4] filtered to {len(filtered)} keys, freeing unused...")
+        # Free state_dict keys we won't use to reduce peak memory
+        keys_to_keep = set(filtered.keys())
+        for k in list(state_dict.keys()):
+            if k not in keys_to_keep:
+                del state_dict[k]
+        
+        # GC before GPU transfer to free any intermediate allocations
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        if torch_dtype is not None:
-            model = model.to(torch_dtype)
+        # Check if model has meta tensors (from init_empty_weights)
+        has_meta = any(p.device.type == 'meta' for p in model.parameters())
+        print(f"from_pretrained: [4/4] loading into model (has_meta={has_meta}, target_device={materialize_device})...")
+        
+        if has_meta:
+            # Use accelerate's set_module_tensor_to_device for proper meta tensor handling
+            try:
+                from accelerate.utils import set_module_tensor_to_device
+                for name, param in filtered.items():
+                    set_module_tensor_to_device(model, name, materialize_device, value=param)
+                    del param  # Free the tensor after it's assigned
+                # Clear filtered dict and GC
+                filtered.clear()
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"from_pretrained: [4/4] materialized keys from meta tensors to {materialize_device} using accelerate")
+            except ImportError:
+                # Fallback: use to_empty + load_state_dict
+                print("from_pretrained: accelerate.set_module_tensor_to_device not available, using to_empty fallback")
+                model.to_empty(device=materialize_device)
+                model.load_state_dict(filtered, strict=False)
+        else:
+            missing, unexpected = model.load_state_dict(filtered, strict=False)
+            print(f"from_pretrained: loaded {len(filtered)} keys; missing: {len(missing)}; unexpected: {len(unexpected)}")
+            # Free filtered before device transfer
+            filtered.clear()
+            gc.collect()
+            # Move to target device if not already there
+            if materialize_device != 'cpu':
+                model = model.to(materialize_device)
+
+        # Don't call model.to(dtype) - tensors are already the right dtype from loading
+        # Calling .to() would create a full copy of the model, doubling memory
         return model
