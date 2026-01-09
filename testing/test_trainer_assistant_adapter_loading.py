@@ -54,8 +54,8 @@ def test_assistant_controlnet_is_loaded_and_set(monkeypatch):
             self.last_requires_grad = val
             return self
 
-    # monkeypatch loading to return DummyAdapter
-    monkeypatch.setattr('extensions_built_in.sd_trainer.SDTrainer.ControlNetModel.from_pretrained', lambda *args, **kwargs: DummyAdapter())
+    # monkeypatch deterministic loader to return DummyAdapter
+    monkeypatch.setattr('toolkit.control_util._load_adapter_from_spec', lambda *args, **kwargs: DummyAdapter())
 
     trainer.before_dataset_load()
 

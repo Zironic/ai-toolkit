@@ -3,6 +3,8 @@ import json
 from collections import OrderedDict
 from toolkit.print import print_acc
 from toolkit.timer import Timer
+# Optional VRAM diagnostic utility (opt-in, disabled by default)
+from toolkit.gpu_diagnostics import dump_vram_map
 
 
 class BaseProcess(object):
@@ -21,9 +23,15 @@ class BaseProcess(object):
         self.name = self.get_conf('name', self.job.name)
         self.meta = copy.deepcopy(self.job.meta)
         self.timer: Timer = Timer(f'{self.name} Timer')
+        # Allow opt-in GPU timing for diagnostics (disabled by default).
+        self.timer.gpu_timing_enabled = self.get_conf('performance.precise_gpu_timing', False)
         # Add a composite hook that prints aggregated ControlNet vs Model timings
         # so users can quickly see how heavy ControlNet work is relative to model work.
         self.timer.add_after_print_hook(self._print_timer_composites)
+        # Add an optional VRAM diagnostic hook to print a lightweight VRAM map
+        # alongside the PERF SUMMARY. Controlled by `performance.vram_diagnostics` config.
+        self._vram_diag_printed = False
+        self.timer.add_after_print_hook(self._print_vram_diagnostics)
         self.performance_log_every = self.get_conf('performance_log_every', 0)
 
         print(json.dumps(self.config, indent=4))
@@ -34,7 +42,7 @@ class BaseProcess(object):
         """
 
         control_keys = [
-            'get_adapter_images', 'encode_adapter', 'encode_adapter_embeds', 'use_precomputed_control_residuals', 'get_mask_multiplier', 'controlnet_forward'
+            'get_adapter_images', 'encode_adapter', 'encode_adapter_embeds', 'use_precomputed_control_residuals', 'get_mask_multiplier', 'controlnet_forward', 'controlnet_forward_io', 'controlnet_zimage_forward'
         ]
         model_keys = [
             'predict_unet', 'encode_images', 'to_device', 'cpu_transfer', 'calculate_loss', 'backward', 'optimizer_step', 'ema_update'
@@ -87,6 +95,68 @@ class BaseProcess(object):
 
         summary = ' | '.join(parts)
         print_acc(f"PERF SUMMARY: {summary}")
+
+    def _print_vram_diagnostics(self, timing_dict):
+        """Optional hook to print a lightweight VRAM diagnostic at the same time as PERF SUMMARY.
+        Controlled by these config keys (all optional):
+          - performance.vram_diagnostics.enabled (bool, default False)
+          - performance.vram_diagnostics.once_per_run (bool, default True)
+          - performance.vram_diagnostics.deep_scan (bool, default False)
+          - performance.vram_diagnostics.include_nvidia_smi (bool, default False)
+        """
+        try:
+            enabled = self.get_conf('performance.vram_diagnostics.enabled', False)
+            if not enabled:
+                return
+
+            # Print at most once per run by default to avoid heavy output
+            once_per_run = self.get_conf('performance.vram_diagnostics.once_per_run', True)
+            if once_per_run and getattr(self, '_vram_diag_printed', False):
+                return
+
+            deep_scan = self.get_conf('performance.vram_diagnostics.deep_scan', False)
+            include_nvidia_smi = self.get_conf('performance.vram_diagnostics.include_nvidia_smi', False)
+
+            # Build a minimal root_modules map if present (best-effort, non-fatal)
+            root_modules = {}
+            try:
+                # `self` is often a process subclass with attributes like `sd`, `adapter`
+                sd = getattr(self, 'sd', None)
+                if sd is not None:
+                    if hasattr(sd, 'unet'):
+                        root_modules['sd.unet'] = sd.unet
+                    if hasattr(sd, 'vae'):
+                        root_modules['sd.vae'] = sd.vae
+                    # text_encoder can be a list or single module
+                    te = getattr(sd, 'text_encoder', None)
+                    if te is not None:
+                        if isinstance(te, (list, tuple)):
+                            for i, t in enumerate(te):
+                                root_modules[f'sd.text_encoder[{i}]'] = t
+                        else:
+                            root_modules['sd.text_encoder'] = te
+            except Exception:
+                # best effort; do not fail the perf printing if introspection fails
+                pass
+
+            # Include adapter (if present) for adapter-heavy jobs
+            try:
+                adapter = getattr(self, 'adapter', None)
+                if adapter is not None:
+                    root_modules['adapter'] = adapter
+            except Exception:
+                pass
+
+            # Run the diagnostic (best-effort; it returns a string)
+            try:
+                diag = dump_vram_map(root_modules, deep_scan=deep_scan, include_nvidia_smi=include_nvidia_smi)
+                print_acc(diag)
+                self._vram_diag_printed = True
+            except Exception as e:
+                print_acc(f"[VRAM-DIAG] Failed to compute VRAM diagnostic: {e}")
+        except Exception:
+            # Never let diagnostic fail the timer print
+            pass
 
         
     def on_error(self, e: Exception):

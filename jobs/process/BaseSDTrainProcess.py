@@ -326,37 +326,55 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     # Try to load by identifier using diffusers' ControlNetModel.from_pretrained
                     try:
-                        from diffusers import ControlNetModel
-                        self.print_and_status_update(f"Attempting to lazily load ControlNet from identifier: {cpath}")
-                        self.sd.controlnet = ControlNetModel.from_pretrained(cpath, torch_dtype=getattr(self.sd, 'torch_dtype', None))
+                        # Synthesize an adapter_config from the identifier so the loader
+                        # can make deterministic decisions (e.g., zimage detection).
+                        from types import SimpleNamespace
+                        tmp_adapter_cfg = SimpleNamespace()
+                        tmp_adapter_cfg.name_or_path = cpath
+                        tmp_adapter_cfg.type = 'control_net'
+                        tmp_adapter_cfg.train = False
+                        nlow = str(cpath).lower() if cpath is not None else ''
+                        if any(pat in nlow for pat in ('zimage', 'z_image', 'z-image', 'videox', 'video_x', 'pipeline_z_image', 'zimage_control')):
+                            tmp_adapter_cfg.controlnet_mode = 'zimage'
+                            try:
+                                self.print_and_status_update("[CONTROLNET] Auto-detected adapter_config.controlnet_mode='zimage' based on controlnet identifier.")
+                            except Exception:
+                                pass
+                        else:
+                            tmp_adapter_cfg.controlnet_mode = None
+
+                        # Prefer deterministic loader helper when available
+                        try:
+                            from toolkit.control_util import prepare_controlnet_adapter
+                        except Exception:
+                            prepare_controlnet_adapter = None
+
+                        if prepare_controlnet_adapter is None:
+                            from diffusers import ControlNetModel
+                            self.print_and_status_update(f"Attempting to lazily load ControlNet from identifier: {cpath}")
+                            self.sd.controlnet = ControlNetModel.from_pretrained(cpath, torch_dtype=getattr(self.sd, 'torch_dtype', None))
+                        else:
+                            self.print_and_status_update(f"Attempting to lazily load ControlNet from identifier: {cpath} (deterministic loader)")
+                            self.sd.controlnet = prepare_controlnet_adapter(
+                                sd=self.sd,
+                                adapter_spec_or_obj=cpath,
+                                adapter_config=tmp_adapter_cfg,
+                                train_config=self.train_config,
+                                strict=True,
+                                require_zimage_model=True if tmp_adapter_cfg.controlnet_mode == 'zimage' else False,
+                            )
+
                         # Default: keep frozen unless explicitly requested elsewhere
                         for p in self.sd.controlnet.parameters():
                             p.requires_grad = False
                         self.sd.is_controlnet_enabled = True
                         self.print_and_status_update(f"[CONTROLNET] Lazily loaded ControlNet adapter from '{cpath}' (frozen).")
 
-                        # If the process-level adapter_config is missing, synthesize one from the
-                        # ControlNet identifier so downstream routing heuristics (zimage detection)
-                        # and trainer logic have the expected config available.
+                        # If the process-level adapter_config is missing, copy our synthesized one
                         try:
-                            from types import SimpleNamespace
                             if getattr(self, 'adapter_config', None) is None:
-                                self.adapter_config = SimpleNamespace()
-                                self.adapter_config.name_or_path = cpath
-                                self.adapter_config.type = 'control_net'
-                                self.adapter_config.train = False
-                                # Auto-detect zimage/video_x hints in the controlnet name
-                                nlow = str(cpath).lower() if cpath is not None else ''
-                                if any(pat in nlow for pat in ('zimage', 'z_image', 'z-image', 'videox', 'video_x', 'pipeline_z_image', 'zimage_control')):
-                                    self.adapter_config.controlnet_mode = 'zimage'
-                                    try:
-                                        self.print_and_status_update("[CONTROLNET] Auto-set adapter_config.controlnet_mode='zimage' based on controlnet identifier.")
-                                    except Exception as e:
-                                        raise RuntimeError(f"Failed to log adapter_config controlnet_mode detection: {e}") from e
-                                else:
-                                    self.adapter_config.controlnet_mode = None
+                                self.adapter_config = tmp_adapter_cfg
                         except Exception:
-                            # Do not let config synth failure to block training; best-effort only
                             pass
                     except Exception as e:
                         raise RuntimeError(f"Failed to lazily load ControlNet from '{cpath}': {e}")
@@ -390,10 +408,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # If this adapter looks like a VideoX/zimage-style adapter, wrap it with a compatibility shim.
             # Detection: use adapter_uses_zimage helper plus dataset-level hints so wrapping is applied reliably.
             try:
-                from toolkit.control_util import adapter_uses_zimage
+                from toolkit.controlnet_utils import is_zimage_adapter, ensure_zimage_mode
                 # Prefer checking the model-provided controlnet and a cfg source (adapter_config or model_config)
                 cfg_src = getattr(self, 'adapter_config', None) or getattr(self, 'model_config', None)
-                is_zimage = adapter_uses_zimage(getattr(self.sd, 'controlnet', None), cfg_src)
+                # Ensure explicit config if permissive detection finds a zimage hint
+                try:
+                    ensure_zimage_mode(getattr(self.sd, 'controlnet', None), cfg_src)
+                except Exception:
+                    pass
+                # Evaluate zimage after ensuring explicit config
+                is_zimage = is_zimage_adapter(getattr(self.sd, 'controlnet', None), cfg_src)
                 # Also honor dataset-level controlnet_mode flags (some configs specify zimage per-dataset)
                 if not is_zimage:
                     for ds in getattr(self, 'dataset_configs', []):
@@ -463,9 +487,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # Ensure the VideoX wrapper is applied even when `self.adapter` was already assigned earlier
             # (some model-loading code paths pre-assign adapters before we reach the assignment branch above).
             try:
-                from toolkit.control_util import adapter_uses_zimage
+                from toolkit.controlnet_utils import is_zimage_adapter, ensure_zimage_mode
                 cfg_src = getattr(self, 'adapter_config', None) or getattr(self, 'model_config', None)
-                is_zimage = adapter_uses_zimage(getattr(self.sd, 'controlnet', None), cfg_src)
+                try:
+                    ensure_zimage_mode(getattr(self, 'adapter', None) or getattr(self.sd, 'controlnet', None), cfg_src)
+                except Exception:
+                    pass
+                is_zimage = is_zimage_adapter(getattr(self.sd, 'controlnet', None), cfg_src)
                 if not is_zimage:
                     for ds in getattr(self, 'dataset_configs', []):
                         if getattr(ds, 'controlnet_mode', None) and str(ds.controlnet_mode).lower() in ('zimage', 'video_x'):
@@ -505,6 +533,69 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 raise RuntimeError(f"Failed to print adapter already wrapped message: {e}") from e
                     except Exception as e:
                         raise RuntimeError(f"ControlNet zimage detection failed during unconditional wrapper step: {e}") from e
+
+                    # Enforce control_in_dim==33 for Z-Image adapters; set it or fail fast
+                    try:
+                        from toolkit.control_util import ensure_control_in_dim, enforce_zimage_control_in_dim
+                        final_adapter = getattr(self, 'adapter', None) or getattr(self.sd, 'controlnet', None)
+                        set_ok = False
+                        # Try to detect and honor an explicit value when present
+                        try:
+                            set_ok = ensure_control_in_dim(final_adapter, strict=False, fallback=None)
+                        except Exception:
+                            set_ok = False
+                        # Force 33 on adapter when nothing was discoverable
+                        if not set_ok:
+                            try:
+                                set_ok = enforce_zimage_control_in_dim(final_adapter, expected=33, force=True)
+                            except Exception:
+                                set_ok = False
+                        # If adapter cannot be set, attempt to set on adapter_config
+                        if not set_ok and getattr(self, 'adapter_config', None) is not None:
+                            try:
+                                self.adapter_config.control_in_dim = 33
+                                set_ok = True
+                            except Exception:
+                                set_ok = False
+                        if not set_ok:
+                            raise RuntimeError("Z-Image adapter detected but unable to set 'control_in_dim=33' on adapter or adapter_config. Aborting.")
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to enforce control_in_dim for Z-Image adapter: {e}") from e
+
+                    # Enforce presence of model-side Z-Image hook or fail early (configurable)
+                    try:
+                        require_hook = getattr(self.train_config, 'require_zimage_model', True)
+                        if require_hook:
+                            if not hasattr(self.sd, '_predict_noise_zimage'):
+                                # Gather diagnostics to help users understand why the model is incompatible
+                                sd_cls = type(self.sd).__name__
+                                sd_mod = type(self.sd).__module__
+                                has_predict_noise = hasattr(self.sd, 'predict_noise')
+                                has_encode_control_images = hasattr(self.sd, 'encode_control_images')
+                                has_encode_control_images_vx = hasattr(self.sd, 'encode_control_images_videox')
+                                has_unet = hasattr(self.sd, 'unet')
+                                model_name = getattr(getattr(self, 'model_config', {}), 'name_or_path', None)
+                                arch = getattr(getattr(self, 'model_config', {}), 'arch', None)
+                                diag = (
+                                    f"Model class={sd_mod}.{sd_cls} has_predict_noise={has_predict_noise} "
+                                    f"has_encode_control_images={has_encode_control_images} has_encode_control_images_videox={has_encode_control_images_vx} "
+                                    f"has_unet={has_unet} model_name={model_name} arch={arch}"
+                                )
+                                raise RuntimeError(
+                                    "Z-Image routing requires the model to implement `_predict_noise_zimage`, "
+                                    "but the current StableDiffusion instance does not provide it. "
+                                    "Aborting training to avoid non-deterministic fallback behavior. "
+                                    "If you intentionally want the trainer to compute control hints instead, "
+                                    "set `train.require_zimage_model=false` in your job config.\n" +
+                                    "Diagnostics: " + diag
+                                )
+                        else:
+                            try:
+                                print_acc("[CONTROLNET] `train.require_zimage_model` is False; trainer will use deterministic fallback when model-side hook is absent.")
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        raise RuntimeError(f"Z-Image model compatibility check failed: {e}") from e
             except Exception as e:
                 raise RuntimeError(f"ControlNet zimage detection failed: {e}")
 
@@ -521,9 +612,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zimage routing instead of attempting a model dry-run which may fail due to
         # differing control input expectations (list vs tensor, stacked frames, etc.).
         try:
-            from toolkit.control_util import adapter_uses_zimage
+            from toolkit.controlnet_utils import is_zimage_adapter
             cfg_src = getattr(self, 'adapter_config', None) or getattr(self, 'model_config', None)
-            if adapter_uses_zimage(getattr(self.sd, 'controlnet', None), cfg_src):
+            if is_zimage_adapter(getattr(self.sd, 'controlnet', None), cfg_src):
                 # Use the existing print helper if available
                 if hasattr(self, 'print_and_status_update'):
                     try:
@@ -572,9 +663,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # Adapt control and sample tensors (collapse frames, trim/pad channels)
                 # For Z-Image style adapters (VideoX), skip adapting raw pixel controls here
                 # and let the Z-Image pipeline perform deterministic encoding & assembly.
-                from toolkit.control_util import adapter_uses_zimage
+                from toolkit.controlnet_utils import is_zimage_adapter
                 cfg_src = getattr(self, 'adapter_config', None) or getattr(self, 'model_config', None)
-                is_zimage = adapter_uses_zimage(self.sd.controlnet if getattr(self, 'sd', None) is not None else None, cfg_src)
+                is_zimage = is_zimage_adapter(self.sd.controlnet if getattr(self, 'sd', None) is not None else None, cfg_src)
                 if is_zimage:
                     try:
                         print_acc("[CONTROLNET DRY-RUN] Z-Image adapter detected; skipping control_images adaptation in dry-run")
@@ -1129,6 +1220,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             dtype=get_torch_dtype(self.save_config.dtype),
                             direct_save=direct_save
                         )
+
+            # Save APPA (Appearance-Pose Adapter) state if present
+            try:
+                if getattr(self, 'appearance_pose_adapter', None) is not None:
+                    appa_name = f'{self.job.name}_appa{step_num}.safetensors'
+                    appa_path = os.path.join(self.save_root, appa_name)
+                    appa_state = self.appearance_pose_adapter.state_dict()
+                    appa_state_safe = {}
+                    for k, v in appa_state.items():
+                        if isinstance(v, torch.Tensor):
+                            appa_state_safe[k] = v.detach().to('cpu', dtype=get_torch_dtype(self.save_config.dtype))
+                    # ensure parent folder exists
+                    os.makedirs(os.path.dirname(appa_path), exist_ok=True)
+                    save_file(appa_state_safe, appa_path, metadata=save_meta)
+                    print_acc(f"Saved APPA to {appa_path}")
+            except Exception as e:
+                print_acc(f"[APPA] Failed to save APPA: {e}")
         else:
             if self.save_config.save_format == "diffusers":
                 # saving as a folder path
@@ -1439,11 +1547,73 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def load_weights(self, path):
         if self.network is not None:
             extra_weights = self.network.load_weights(path)
+            # Load APPA state if present in the same save directory
+            try:
+                self._maybe_load_appa_state(path)
+            except Exception as e:
+                print_acc(f"[APPA] Failed to load APPA state: {e}")
             self.load_training_state_from_metadata(path)
             return extra_weights
         else:
             print_acc("load_weights not implemented for non-network models")
             return None
+
+    def _maybe_load_appa_state(self, path=None):
+        """Attempt to locate and load an APPA state file for this job.
+
+        Strategy:
+          - If `path` is provided and is a file or directory, scan that directory
+            for files matching `{job.name}_appa*.safetensors` and pick the latest.
+          - Otherwise, use `get_latest_save_path(name=f'{job.name}_appa')`.
+
+        Loads state into `self.appearance_pose_adapter` via `load_state_dict(strict=False)` if found.
+        """
+        if not self.accelerator.is_main_process:
+            return
+        if getattr(self, 'appearance_pose_adapter', None) is None:
+            return
+
+        appa_path = None
+        try:
+            candidates = []
+            if path is not None:
+                # if path is a file, look in same directory
+                candidate_dir = None
+                if os.path.isdir(path):
+                    candidate_dir = path
+                elif os.path.isfile(path):
+                    candidate_dir = os.path.dirname(path)
+                else:
+                    candidate_dir = self.save_root
+
+                if candidate_dir is not None:
+                    candidates = glob.glob(os.path.join(candidate_dir, f"{self.job.name}_appa*.safetensors"))
+
+            if not candidates:
+                # fallback to save_root
+                candidates = glob.glob(os.path.join(self.save_root, f"{self.job.name}_appa*.safetensors"))
+
+            if candidates:
+                appa_path = max(candidates, key=os.path.getctime)
+            else:
+                # last-resort: use the helper for latest path by name
+                appa_path = self.get_latest_save_path(name=f"{self.job.name}_appa")
+
+            if appa_path is None:
+                return
+
+            raw = load_file(appa_path, device='cpu')
+            # convert loaded tensors to the right dtype/device for the adapter
+            state_dict = OrderedDict()
+            for k, v in raw.items():
+                state_dict[k] = v
+            try:
+                self.appearance_pose_adapter.load_state_dict(state_dict, strict=False)
+                print_acc(f"Loaded APPA state from {appa_path}")
+            except Exception as e:
+                print_acc(f"[APPA] Failed to apply APPA state dict from {appa_path}: {e}")
+        except Exception as e:
+            print_acc(f"[APPA] Error while searching/loading APPA state: {e}")
 
     def apply_snr(self, seperated_loss, timesteps):
         if self.train_config.learnable_snr_gos:
@@ -2074,12 +2244,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # prefer the VideoX loader which instantiates a proper Flux2/Z-Image adapter
             # rather than loading a legacy `ControlNetModel` that expects `controlnet_cond`.
             try:
-                from toolkit.control_util import adapter_uses_zimage
+                from toolkit.controlnet_utils import is_zimage_adapter
             except Exception:
-                adapter_uses_zimage = lambda a, b: False
+                is_zimage_adapter = lambda a, b: False
 
             loaded_videox = False
-            if adapter_uses_zimage(None, self.adapter_config):
+            if is_zimage_adapter(None, self.adapter_config):
                 # Detection says Z-Image; we must construct a proper VideoX adapter.
                 from extensions_built_in.diffusion_models.z_image_adapter import load_videox_control_adapter
                 self.adapter = load_videox_control_adapter(name_or_path=load_from_path, device=self.device_torch, torch_dtype=get_torch_dtype(self.train_config.dtype))
@@ -2101,22 +2271,40 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 loaded_videox = True
 
             if not loaded_videox:
-                # Fallback: load standard ControlNetModel from diffusers
-                self.adapter = ControlNetModel.from_pretrained(
-                    load_from_path,
-                    torch_dtype=get_torch_dtype(self.train_config.dtype),
-                )
-                # Default behavior: ControlNet adapters are frozen by default to provide
-                # stable spatial conditioning while lightweight adapters (LoRA/LoKr) train.
-                # Log this to make the behavior explicit. If finetuning is desired, set
-                # `adapter.train = True` in the adapter config.
+                # Fallback: deterministically load and validate adapter using toolkit helper
                 try:
-                    if not getattr(getattr(self, 'adapter_config', None), 'train', False):
-                        print_acc(f"[CONTROLNET] Loaded ControlNet adapter (frozen). To finetune, set adapter.train = True in your config.")
-                    else:
-                        print_acc(f"[CONTROLNET] Loaded ControlNet adapter (finetuning enabled). Watch memory usage when training ControlNet weights.")
-                except Exception as e:
-                    raise RuntimeError(f"Failed to print ControlNet adapter load status: {e}") from e
+                    from toolkit.control_util import prepare_controlnet_adapter
+                except Exception:
+                    prepare_controlnet_adapter = None
+
+                if prepare_controlnet_adapter is None:
+                    # Fall back to best-effort direct load if helper is unavailable
+                    self.adapter = ControlNetModel.from_pretrained(
+                        load_from_path,
+                        torch_dtype=get_torch_dtype(self.train_config.dtype),
+                    )
+                    try:
+                        print_acc(f"[CONTROLNET] Loaded ControlNet adapter (legacy loader). Consider updating to deterministic loader.")
+                    except Exception:
+                        pass
+                else:
+                    # Use deterministic loader. For non-VideoX adapters we do not require
+                    # the SD instance to implement zimage hooks.
+                    try:
+                        self.adapter = prepare_controlnet_adapter(
+                            sd=self.sd,
+                            adapter_spec_or_obj=load_from_path,
+                            adapter_config=self.adapter_config,
+                            train_config=self.train_config,
+                            strict=True,
+                            require_zimage_model=False,
+                        )
+                        if not getattr(getattr(self, 'adapter_config', None), 'train', False):
+                            print_acc(f"[CONTROLNET] Loaded ControlNet adapter (frozen). To finetune, set adapter.train = True in your config.")
+                        else:
+                            print_acc(f"[CONTROLNET] Loaded ControlNet adapter (finetuning enabled). Watch memory usage when training ControlNet weights.")
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to construct/validate adapter '{load_from_path}': {e}") from e
         elif self.adapter_config.type == 'clip':
             self.adapter = ClipVisionAdapter(
                 sd=self.sd,

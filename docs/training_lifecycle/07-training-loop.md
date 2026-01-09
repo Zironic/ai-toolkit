@@ -133,6 +133,8 @@ TL;DR
 
 ## Observability & saved artifacts 🕵️‍♀️
 - Timers: `Timer` aggregates per-named-timer averages. Periodic `Timer.print()` calls (triggered every `performance_log_every` steps) produce a consolidated perf summary and feed hooks (UI DB updates).
+
+- Performance tuning: New optional config under `performance` lets you enable `precise_gpu_timing` (opt-in GPU event timers) and `vram_diagnostics` (a lightweight VRAM snapshot printed alongside PERF SUMMARY). These are off by default; enable them for short diagnostic runs only.
 - DB fields updated: `step` (via `update_step()`), `speed_string` (via `handle_timing_print_hook()`), `status` and `info` (via `update_status()`), `return_to_queue`/`stop` are polled.`logger` writes to a SQLite DB (`loss_log.db`) the per-step metrics.
 - Checkpoints: saved under `save_root` with `.safetensors` files and metadata YAML files.
 - Sample generation: periodic sampling runs at `sample_every` and is coordinated with save steps; the trainer will call `sample()` which uses `sd.sample_prompts_cache` when configured.

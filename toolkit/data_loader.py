@@ -441,8 +441,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             # repeat the list
             file_list = file_list * self.dataset_config.num_repeats
 
-        if self.dataset_config.standardize_images:
-            if self.sd.is_xl or self.sd.is_vega or self.sd.is_ssd:
+        if getattr(self.dataset_config, 'standardize_images', False):
+            if getattr(self.sd, 'is_xl', False) or getattr(self.sd, 'is_vega', False) or getattr(self.sd, 'is_ssd', False):
                 NormalizeMethod = NormalizeSDXLTransform
             else:
                 NormalizeMethod = NormalizeSD15Transform

@@ -2,6 +2,7 @@ import os
 import tempfile
 import torch
 from PIL import Image
+from types import SimpleNamespace
 
 from toolkit.config_modules import DatasetConfig
 from toolkit.data_loader import AiToolkitDataset

@@ -2249,6 +2249,8 @@ class TextEmbeddingFileItemDTOMixin:
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_space_version = 'sd1'
         self.text_embedding_version = 1
+        # honor dataset-level preference to keep text embeddings in memory
+        self.is_caching_text_embeddings_to_memory = getattr(self.dataset_config, 'cache_text_embeddings_to_memory', True)
 
     def get_text_embedding_info_dict(self: 'FileItemDTO', dop_class: str = None, trigger_word: str = None, dop_replacements_digest: str = None):
         # make sure the caption is loaded here
@@ -2286,7 +2288,7 @@ class TextEmbeddingFileItemDTOMixin:
         # we store text embeddings in a folder in same path as image called _text_embedding_cache
         img_dir = os.path.dirname(self.path)
         te_dir = os.path.join(img_dir, '_t_e_cache')
-        hash_dict = self.get_text_embedding_info_dict(dop_class=dop_class)
+        hash_dict = self.get_text_embedding_info_dict(dop_class=dop_class, trigger_word=trigger_word, dop_replacements_digest=dop_replacements_digest)
         filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
         # get base64 hash of md5 checksum of hash_dict
         # compute param digest (stable) and content digest (caption file or caption text)
@@ -2310,19 +2312,51 @@ class TextEmbeddingFileItemDTOMixin:
         return path
 
     def cleanup_text_embedding(self):
+        # Respect memory caching preference: if enabled, keep embeddings in-memory (move to CPU),
+        # otherwise clear them so subsequent batches will reload from disk when needed.
         if self.prompt_embeds is not None:
-            # we are caching on disk, don't save in memory
-            self.prompt_embeds = None
+            if not getattr(self, 'is_caching_text_embeddings_to_memory', False):
+                self.prompt_embeds = None
+            else:
+                try:
+                    self.prompt_embeds = self.prompt_embeds.to('cpu')
+                except Exception:
+                    # best-effort: do not fail cleanup
+                    pass
         if self.dop_prompt_embeds is not None:
-            # clear any cached dop embedding in memory as well
-            self.dop_prompt_embeds = None
+            if not getattr(self, 'is_caching_text_embeddings_to_memory', False):
+                self.dop_prompt_embeds = None
+            else:
+                try:
+                    self.dop_prompt_embeds = self.dop_prompt_embeds.to('cpu')
+                except Exception:
+                    pass
 
     def load_prompt_embedding(self, device=None):
         if not self.is_text_embedding_cached:
             return
         if self.prompt_embeds is None:
-            # load it from disk
-            self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+            # load it from disk using robust lookup (hashed + legacy fallback)
+            from toolkit.cache_utils import find_cached_file, wait_for_cached_file
+            try:
+                expected = Path(self.get_text_embedding_path())
+            except Exception:
+                return
+            cached = wait_for_cached_file(expected, timeout=float(os.getenv('CACHE_WAIT_TIMEOUT', 5.0)))
+            if not cached:
+                return
+            try:
+                self.prompt_embeds = PromptEmbeds.load(str(cached))
+            except FileNotFoundError:
+                # file was removed racing with load; treat as missing
+                return
+            except Exception as e:
+                # don't let a corrupted cache crash the flow; log and skip
+                try:
+                    print_acc(f"Warning: failed to load prompt embedding {cached}: {e}")
+                except Exception:
+                    pass
+                return
 
     def load_dop_prompt_embedding(self, dop_class: str, device=None):
         """Load a precomputed DOP variant prompt embedding (if present on disk).
@@ -2332,11 +2366,25 @@ class TextEmbeddingFileItemDTOMixin:
         if not self.is_text_embedding_cached:
             return
         if self.dop_prompt_embeds is None:
-            dop_path = self.get_text_embedding_path(recalculate=False, dop_class=dop_class)
-            if os.path.exists(dop_path):
-                self.dop_prompt_embeds = PromptEmbeds.load(dop_path)
-            else:
+            from toolkit.cache_utils import find_cached_file, wait_for_cached_file
+            try:
+                dop_path = Path(self.get_text_embedding_path(recalculate=False, dop_class=dop_class))
+            except Exception:
+                return
+            cached = wait_for_cached_file(dop_path, timeout=float(os.getenv('CACHE_WAIT_TIMEOUT', 5.0)))
+            if not cached:
                 # missing dop embedding on disk; leave as None
+                return
+            try:
+                self.dop_prompt_embeds = PromptEmbeds.load(str(cached))
+            except FileNotFoundError:
+                # file removed between discovery and load; treat as missing
+                return
+            except Exception as e:
+                try:
+                    print_acc(f"[DOP Cache] Failed to load DOP prompt embed {cached}: {e}")
+                except Exception:
+                    pass
                 return
 
 class TextEmbeddingCachingMixin:
@@ -2374,7 +2422,8 @@ class TextEmbeddingCachingMixin:
                 try:
                     sp_emb = sp_emb.to('cpu')
                     split_path = os.path.join(self.dataset_path, 'split_prompt.safetensors')
-                    sp_emb.save(split_path)
+                    from toolkit.cache_utils import atomic_write
+                    atomic_write(Path(split_path), lambda p: sp_emb.save(str(p)))
                     # also cache in-memory on the dataset object for immediate use
                     self.split_prompt_embeds = sp_emb
                     print_acc(f"[SplitPrompt] Saved split prompt embedding to {split_path}")
@@ -2389,7 +2438,7 @@ class TextEmbeddingCachingMixin:
                 file_item.text_embedding_space_version = self.sd.model_config.arch
                 file_item.latent_load_device = self.sd.device
 
-                from toolkit.cache_utils import find_cached_file
+                from toolkit.cache_utils import find_cached_file, wait_for_cached_file
                 text_embedding_path = Path(file_item.get_text_embedding_path(recalculate=True))
                 # check for hashed or legacy cache
                 cached = find_cached_file(text_embedding_path)
@@ -2433,7 +2482,9 @@ class TextEmbeddingCachingMixin:
                     # race re-check
                     cached = find_cached_file(text_embedding_path)
                     if not cached:
-                        prompt_embeds.save(str(text_embedding_path))
+                        # atomic write to avoid partial files
+                        from toolkit.cache_utils import atomic_write
+                        atomic_write(text_embedding_path, lambda p: prompt_embeds.save(str(p)))
                     del prompt_embeds
                 file_item.is_text_embedding_cached = True
                 i += 1

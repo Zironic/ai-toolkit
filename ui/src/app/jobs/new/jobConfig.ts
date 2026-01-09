@@ -43,6 +43,16 @@ export const defaultJobConfig: JobConfig = {
         device: 'cuda',
         trigger_word: null,
         performance_log_every: 10,
+        // performance tuning and diagnostics (opt-in)
+        performance: {
+          precise_gpu_timing: false,
+          vram_diagnostics: {
+            enabled: false,
+            once_per_run: true,
+            deep_scan: false,
+            include_nvidia_smi: false,
+          },
+        },
         network: {
           type: 'lora',
           linear: 32,
@@ -105,10 +115,9 @@ export const defaultJobConfig: JobConfig = {
           rca_enabled: false,
           // Mask preview/debug options
           mask_preview_enabled: false,
-          mask_preview_max_steps: 10,
-          mask_preview_samples_per_step: 2,
           mask_preview_save_path: 'output/{job_name}/masks',
           mask_preview_overwrite: false,
+          mask_preview_overlay: true,
           controlnet_frozen: false,
         },
         logging: {
@@ -241,6 +250,40 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
     // non-fatal
     console.warn('ControlNet migration skipped due to error', e);
   }
+
+  // Ensure performance defaults exist so UI can set them
+  try {
+    const proc = jobConfig.config.process && jobConfig.config.process[0];
+    if (proc && !('performance' in proc)) {
+      proc.performance = {
+        precise_gpu_timing: false,
+        vram_diagnostics: {
+          enabled: false,
+          once_per_run: true,
+          deep_scan: false,
+          include_nvidia_smi: false,
+        },
+      } as any;
+    }
+  } catch (e) {
+    // non-fatal
+  }
+
+  // migrate old mask preview per-step keys (removed in favor of single-run per-job previews)
+  try {
+    const train = jobConfig?.config?.process && jobConfig.config.process[0] && jobConfig.config.process[0].train;
+    if (train) {
+      if (train.mask_preview_max_steps !== undefined) {
+        delete train.mask_preview_max_steps;
+      }
+      if (train.mask_preview_samples_per_step !== undefined) {
+        delete train.mask_preview_samples_per_step;
+      }
+      if (train.mask_preview_overlay === undefined) {
+        train.mask_preview_overlay = true;
+      }
+    }
+  } catch (e) {}
 
   return jobConfig;
 };

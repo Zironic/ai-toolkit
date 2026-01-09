@@ -477,60 +477,57 @@ def apply_masked_recon_loss(current_loss, train_config, sd, noisy_latents, imgs,
     target_img = target_img.to(device_torch)
 
     pred_img = None
-    try:
-        if hasattr(sd, 'vae') and sd.vae is not None:
-            vae_device = next(sd.vae.parameters(), torch.tensor(0)).device if hasattr(sd.vae, 'parameters') else device_torch
-            decoded = sd.vae.decode(noisy_latents.to(vae_device))
-            pred_img = decoded.sample if hasattr(decoded, 'sample') else decoded
-            pred_img = pred_img.to(device_torch)
-            if pred_img.min() < 0.0:
-                pred_img = (pred_img + 1.0) / 2.0
-            try:
-                tgt_c = target_img.shape[1]
-                if pred_img.shape[1] != tgt_c:
-                    if pred_img.shape[1] > tgt_c:
-                        pred_img = pred_img[:, :tgt_c, :, :].contiguous()
-                    else:
-                        reps = (tgt_c + pred_img.shape[1] - 1) // pred_img.shape[1]
-                        pred_img = pred_img.repeat(1, reps, 1, 1)[:, :tgt_c, :, :].contiguous()
-            except Exception:
-                pass
-        else:
-            return current_loss, None
-    except Exception:
+    # Ensure we have a VAE to decode latents; raise on decode errors so callers can log and handle them.
+    if not hasattr(sd, 'vae') or sd.vae is None:
         return current_loss, None
+
+    try:
+        vae_device = next(sd.vae.parameters(), torch.tensor(0)).device if hasattr(sd.vae, 'parameters') else device_torch
+        decoded = sd.vae.decode(noisy_latents.to(vae_device))
+        pred_img = decoded.sample if hasattr(decoded, 'sample') else decoded
+        pred_img = pred_img.to(device_torch)
+        if pred_img.min() < 0.0:
+            pred_img = (pred_img + 1.0) / 2.0
+        try:
+            tgt_c = target_img.shape[1]
+            if pred_img.shape[1] != tgt_c:
+                if pred_img.shape[1] > tgt_c:
+                    pred_img = pred_img[:, :tgt_c, :, :].contiguous()
+                else:
+                    reps = (tgt_c + pred_img.shape[1] - 1) // pred_img.shape[1]
+                    pred_img = pred_img.repeat(1, reps, 1, 1)[:, :tgt_c, :, :].contiguous()
+        except Exception:
+            pass
+    except Exception as e:
+        # Propagate error so the caller (trainer) can catch and log it explicitly
+        raise RuntimeError(f"Masked recon VAE decode or processing failed: {e}") from e
 
     if target_img.min() < 0.0:
         target_img = (target_img + 1.0) / 2.0
 
     mtype = getattr(train_config, 'masked_recon_type', 'illum')
     mask = None
-    try:
-        if mtype == 'illum':
-            mask = luminance_mask_from_images(pred_img, target_img, blur_kernel=9)
-        elif mtype == 'edge':
-            lum = 0.299 * target_img[:, 0:1] + 0.587 * target_img[:, 1:2] + 0.114 * target_img[:, 2:3]
-            kx = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=lum.dtype, device=lum.device).view(1, 1, 3, 3)
-            ky = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=lum.dtype, device=lum.device).view(1, 1, 3, 3)
-            grad_x = torch.nn.functional.conv2d(lum, kx, padding=1)
-            grad_y = torch.nn.functional.conv2d(lum, ky, padding=1)
-            mag = (grad_x.abs() + grad_y.abs())
-            bmax = mag.view(mag.shape[0], -1).amax(dim=1).view(-1, 1, 1, 1)
-            mag = mag / (bmax + 1e-9)
-            mask = (1.0 - mag).clamp(0.0, 1.0)
-        elif mtype == 'control':
-            ctrl = getattr(batch, 'control_tensor', None)
-            mask = None
-            if ctrl is not None:
-                try:
-                    # Use the shared helper to build a control-derived mask at the prediction image size
-                    Ht = pred_img.shape[2]
-                    Wt = pred_img.shape[3]
-                    mask = build_control_mask(ctrl, train_config, target_size=(Ht, Wt), device_torch=device_torch)
-                except Exception:
-                    mask = None
-    except Exception:
+    # Generate mask according to selected mode. Let internal errors propagate so callers can log them.
+    if mtype == 'illum':
+        mask = luminance_mask_from_images(pred_img, target_img, blur_kernel=9)
+    elif mtype == 'edge':
+        lum = 0.299 * target_img[:, 0:1] + 0.587 * target_img[:, 1:2] + 0.114 * target_img[:, 2:3]
+        kx = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=lum.dtype, device=lum.device).view(1, 1, 3, 3)
+        ky = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=lum.dtype, device=lum.device).view(1, 1, 3, 3)
+        grad_x = torch.nn.functional.conv2d(lum, kx, padding=1)
+        grad_y = torch.nn.functional.conv2d(lum, ky, padding=1)
+        mag = (grad_x.abs() + grad_y.abs())
+        bmax = mag.view(mag.shape[0], -1).amax(dim=1).view(-1, 1, 1, 1)
+        mag = mag / (bmax + 1e-9)
+        mask = (1.0 - mag).clamp(0.0, 1.0)
+    elif mtype == 'control':
+        ctrl = getattr(batch, 'control_tensor', None)
         mask = None
+        if ctrl is not None:
+            # Use the shared helper to build a control-derived mask at the prediction image size
+            Ht = pred_img.shape[2]
+            Wt = pred_img.shape[3]
+            mask = build_control_mask(ctrl, train_config, target_size=(Ht, Wt), device_torch=device_torch)
 
     if mask is None:
         return current_loss, None
@@ -542,35 +539,152 @@ def apply_masked_recon_loss(current_loss, train_config, sd, noisy_latents, imgs,
     except Exception:
         mloss = None
 
-    # optionally save mask preview images for debugging
-    try:
-        if getattr(train_config, 'mask_preview_enabled', False):
-            max_steps = int(getattr(train_config, 'mask_preview_max_steps', 10))
-            samples_per_step = int(getattr(train_config, 'mask_preview_samples_per_step', 2))
-            save_path_tpl = getattr(train_config, 'mask_preview_save_path', 'output/{job_name}/masks')
-            overwrite = bool(getattr(train_config, 'mask_preview_overwrite', False))
-            step = int(getattr(getattr(sd, 'trainer', None), '_total_batch_count', 0)) if getattr(getattr(sd, 'trainer', None), '_total_batch_count', None) is not None else 0
-            if step <= max_steps:
-                job_name = getattr(getattr(sd, 'trainer', None), 'job', None)
-                job_name = getattr(job_name, 'name', 'job') if job_name is not None else 'job'
-                save_dir = save_path_tpl.format(job_name=job_name)
-                b = mask.shape[0]
-                n_save = min(b, samples_per_step)
-                from toolkit.visualization import save_mask_preview
-                for i in range(n_save):
-                    suffix = f"step_{step:06d}_{i}.png"
-                    full_path = os.path.join(save_dir, suffix)
-                    if (os.path.exists(full_path) and not overwrite):
-                        continue
-                    try:
-                        save_mask_preview(mask[i, 0], full_path)
-                    except Exception as e:
-                        print(f"[MASK_PREVIEW] failed to save preview: {e}")
-    except Exception:
-        pass
+    # NOTE: per-step mask preview saving was removed in favor of a single per-job preview run.
+    # The new approach generates one mask + overlay per dataset item once at job start (see `save_mask_previews`).
+    pass
 
     weight = float(getattr(train_config, 'masked_recon_weight', 0.0))
     if weight != 0.0 and mloss is not None:
         current_loss = current_loss + (weight * mloss)
         return current_loss, mloss.detach()
     return current_loss, None
+
+
+def save_mask_previews(datasets, train_config, sd, save_path_tpl: str, overwrite: bool = False, overlay: bool = True):
+    """Generate one mask + optional overlay per dataset item and save to disk.
+
+    Args:
+        datasets: iterable of dataset objects exposing `file_list` (list of FileItemDTO-like objects).
+        train_config: training config (used for mask generation params).
+        sd: StableDiffusion instance (used only for job name lookup if needed).
+        save_path_tpl: directory path template already formatted with job_name (e.g., 'output/myjob/masks').
+        overwrite: whether to overwrite existing files.
+        overlay: whether to create overlay PNGs (default True).
+
+    Returns:
+        index: list of records {'src': original_path, 'mask': mask_path, 'overlay': overlay_path}
+    """
+    import json
+
+    try:
+        from PIL import Image as PILImage
+        from PIL import ImageOps
+        from PIL.ImageOps import exif_transpose as _exif_transpose
+        import numpy as _np
+        from toolkit.visualization import save_mask_preview
+    except Exception:
+        PILImage = None
+
+    out_dir = save_path_tpl
+    os.makedirs(out_dir, exist_ok=True)
+
+    index = []
+    for ds in datasets:
+        file_list = getattr(ds, 'file_list', None)
+        if file_list is None:
+            continue
+        for fi in file_list:
+            try:
+                # determine target size
+                Ht = int(getattr(fi, 'crop_height', getattr(fi, 'scale_to_height', 256)))
+                Wt = int(getattr(fi, 'crop_width', getattr(fi, 'scale_to_width', 256)))
+
+                # find control source
+                ctrl = None
+                if getattr(fi, 'control_path', None) is not None:
+                    cp = fi.control_path
+                    if isinstance(cp, list):
+                        tensors = []
+                        for p in cp:
+                            try:
+                                img = PILImage.open(p).convert('RGB')
+                                t = TF.to_tensor(img)
+                                tensors.append(t)
+                            except Exception:
+                                continue
+                        if len(tensors) == 0:
+                            continue
+                        ctrl = tensors
+                    else:
+                        # single path
+                        ctrl = cp
+                elif getattr(fi, 'control_tensor', None) is not None:
+                    ctrl = fi.control_tensor
+                elif getattr(fi, 'control_tensor_list', None) is not None:
+                    ctrl = fi.control_tensor_list
+                else:
+                    # nothing to build a mask from
+                    continue
+
+                # build mask
+                mask = None
+                try:
+                    mask = build_control_mask(ctrl, train_config, target_size=(Ht, Wt), device_torch='cpu')
+                except Exception:
+                    mask = None
+                if mask is None:
+                    continue
+                if mask.dim() == 3:
+                    mask = mask.unsqueeze(1)
+
+                # single-file only (expect batch dim = 1)
+                if mask.shape[0] > 1:
+                    use_mask = mask[0, 0]
+                else:
+                    use_mask = mask[0, 0]
+
+                # file paths
+                basename = os.path.splitext(os.path.basename(getattr(fi, 'path', 'unknown')))[0]
+                mask_path = os.path.join(out_dir, f"{basename}_mask.png")
+                overlay_path = os.path.join(out_dir, f"{basename}_overlay.png") if overlay else None
+
+                if (not overwrite) and os.path.exists(mask_path):
+                    # skip write but still add to index
+                    index.append({'src': getattr(fi, 'path', None), 'mask': mask_path, 'overlay': overlay_path})
+                    continue
+
+                try:
+                    save_mask_preview(use_mask, mask_path)
+                except Exception:
+                    # best-effort; skip failures
+                    continue
+
+                if overlay and PILImage is not None:
+                    try:
+                        base_img_path = getattr(fi, 'path', None)
+                        if base_img_path is not None and os.path.exists(base_img_path):
+                            base_img = PILImage.open(base_img_path)
+                            base_img = _exif_transpose(base_img).convert('RGBA')
+                            base_img = base_img.resize((Wt, Ht), PILImage.BICUBIC)
+                            # mask array
+                            m = (use_mask.detach().cpu().numpy() * 255.0).astype(_np.uint8)
+                            alpha = PILImage.fromarray(m).convert('L')
+                            red = PILImage.new('RGBA', base_img.size, (255, 0, 0, 0))
+                            # build overlay by tinting red where mask > 0
+                            # create colored overlay with alpha proportional to mask
+                            alpha_rgba = alpha.point(lambda x: int(x))
+                            colored = PILImage.new('RGBA', base_img.size, (255, 0, 0, 0))
+                            colored.putalpha(alpha_rgba)
+                            composed = PILImage.alpha_composite(base_img, colored)
+                            composed.save(overlay_path)
+                        else:
+                            # cannot form overlay without base image; create an empty placeholder
+                            pass
+                    except Exception:
+                        pass
+
+                index.append({'src': getattr(fi, 'path', None), 'mask': mask_path, 'overlay': overlay_path})
+
+            except Exception:
+                # ignore per-file failures
+                continue
+
+    # write index
+    try:
+        idx_path = os.path.join(out_dir, 'index.json')
+        with open(idx_path, 'w') as f:
+            json.dump(index, f, indent=2)
+    except Exception:
+        pass
+
+    return index

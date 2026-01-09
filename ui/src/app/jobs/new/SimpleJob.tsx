@@ -723,21 +723,12 @@ export default function SimpleJob({
                       checked={jobConfig.config.process[0].train.mask_preview_enabled || false}
                       onChange={value => setJobConfig(value, 'config.process[0].train.mask_preview_enabled')}
                     />
-                    <NumberInput
-                      label="Max Steps to Save"
+                    {/* Per-step mask preview controls removed — previews now run once per job */}
+                    <Checkbox
+                      label="Overlay Mask on Source Image"
                       className="pt-2"
-                      value={jobConfig.config.process[0].train.mask_preview_max_steps || 10}
-                      onChange={value => setJobConfig(value, 'config.process[0].train.mask_preview_max_steps')}
-                      min={1}
-                      step={1}
-                    />
-                    <NumberInput
-                      label="Samples per Step"
-                      className="pt-2"
-                      value={jobConfig.config.process[0].train.mask_preview_samples_per_step || 2}
-                      onChange={value => setJobConfig(value, 'config.process[0].train.mask_preview_samples_per_step')}
-                      min={1}
-                      step={1}
+                      checked={jobConfig.config.process[0].train.mask_preview_overlay || true}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.mask_preview_overlay')}
                     />
                     <TextInput
                       label="Save Path Template"

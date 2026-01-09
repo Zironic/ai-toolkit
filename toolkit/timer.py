@@ -13,6 +13,10 @@ class Timer:
         self.timers = OrderedDict()
         self.active_timers = {}
         self._after_print_hooks = []
+        # GPU timing is disabled by default to avoid extra overhead. Toggle at runtime with
+        # `timer.gpu_timing_enabled = True` when running short diagnostics.
+        self.gpu_timing_enabled = False
+        self._active_cuda_events = {}
 
         # Pre-create a reusable context class (avoid recreating a class per __call__ invocation)
         class _TimerContext:
@@ -44,6 +48,20 @@ class Timer:
         if timer_name not in self.timers:
             self.timers[timer_name] = deque(maxlen=self.max_buffer)
         self.active_timers[timer_name] = time.time()
+        # Optionally record a GPU start event for more accurate GPU kernel timing.
+        # Disabled by default to avoid overhead; enable with `timer.gpu_timing_enabled = True`.
+        if getattr(self, 'gpu_timing_enabled', False):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    ev = torch.cuda.Event(enable_timing=True)
+                    ev.record()
+                    if not hasattr(self, '_active_cuda_events'):
+                        self._active_cuda_events = {}
+                    self._active_cuda_events[timer_name] = ev
+            except Exception:
+                # best-effort; do not crash timing on import/availability issues
+                pass
 
     def cancel(self, timer_name):
         """Cancel an active timer."""
@@ -53,10 +71,36 @@ class Timer:
     def stop(self, timer_name):
         # If the timer was not started, silently ignore (avoid raising in hot path)
         if timer_name not in self.active_timers:
+            # also cleanup any cuda event if present
+            if hasattr(self, '_active_cuda_events') and timer_name in self._active_cuda_events:
+                del self._active_cuda_events[timer_name]
             return
 
         elapsed_time = time.time() - self.active_timers[timer_name]
         self.timers[timer_name].append(elapsed_time)
+
+        # If GPU events were recorded for this timer, attempt to capture GPU elapsed time without global sync.
+        if getattr(self, 'gpu_timing_enabled', False) and hasattr(self, '_active_cuda_events') and timer_name in self._active_cuda_events:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    stop_ev = torch.cuda.Event(enable_timing=True)
+                    stop_ev.record()
+                    start_ev = self._active_cuda_events.pop(timer_name, None)
+                    if start_ev is not None:
+                        gpu_ms = stop_ev.elapsed_time(start_ev)
+                        gpu_secs = gpu_ms / 1000.0
+                        gpu_timer_name = f"{timer_name}_gpu"
+                        if gpu_timer_name not in self.timers:
+                            self.timers[gpu_timer_name] = deque(maxlen=self.max_buffer)
+                        self.timers[gpu_timer_name].append(gpu_secs)
+            except Exception:
+                # best-effort; ignore GPU timing failures and ensure cleanup
+                try:
+                    if timer_name in self._active_cuda_events:
+                        del self._active_cuda_events[timer_name]
+                except Exception:
+                    pass
 
         # Clean up active timers
         del self.active_timers[timer_name]

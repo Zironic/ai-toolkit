@@ -4,7 +4,7 @@ import pytest
 from toolkit.stable_diffusion_model import StableDiffusion
 
 
-def test_predict_noise_zimage_raises_on_resize_failure(monkeypatch):
+def test_predict_noise_zimage_raises_on_bad_control_latents_in_strict_mode(monkeypatch):
     sd = SimpleNamespace()
 
     class FakeUnet:
@@ -18,29 +18,12 @@ def test_predict_noise_zimage_raises_on_resize_failure(monkeypatch):
     # latents (noisy) have 64x64 spatial dims
     latents = torch.randn((1, 16, 64, 64))
 
-    # control latents encoded at 60x60 (mismatch)
+    # control latents encoded at 60x60 with wrong channel count (16) should be rejected
     zimage_control_latents = torch.randn((1, 16, 60, 60))
 
-    class FakeControlNet:
-        def __call__(self, sample, timestep, control_context, conditioning_scale=1.0, *args, **kwargs):
-            return torch.zeros((1, 4, sample.shape[2], sample.shape[3]))
-
-    fakecn = FakeControlNet()
-
-    text_embeddings = torch.zeros((1, 1, 16))
-
-    # Monkeypatch interpolate to raise an error to simulate a failure scenario
-    import torch.nn.functional as F
-
-    def bad_interpolate(*args, **kwargs):
-        raise ValueError("interpolate failure simulated")
-
-    monkeypatch.setattr('torch.nn.functional.interpolate', bad_interpolate)
+    fakecn = lambda *a, **k: torch.zeros((1, 4, a[0].shape[2], a[0].shape[3]))
 
     func = StableDiffusion._predict_noise_zimage
 
-    with pytest.raises(RuntimeError) as exc:
-        func(sd, latents, text_embeddings, torch.tensor([1.0]), zimage_controlnet=fakecn, zimage_control_images=zimage_control_latents, zimage_conditioning_scale=1.0)
-
-    # Expect a clear mismatch/resize failure message
-    assert 'Z-Image control latent' in str(exc.value) and ('resize' in str(exc.value) or 'spatial mismatch' in str(exc.value) or 'resize failed' in str(exc.value))
+    with pytest.raises(RuntimeError, match="Illegal `control_context` channel count"):
+        func(sd, latents, torch.zeros((1,1,16)), torch.tensor([1.0]), zimage_controlnet=fakecn, zimage_control_images=zimage_control_latents, zimage_conditioning_scale=1.0)

@@ -7,6 +7,7 @@ and normalizes return values for robustness in mixed environments.
 """
 import torch
 from typing import Any
+from types import SimpleNamespace
 
 
 class ControlNetLegacyAdapter(torch.nn.Module):
@@ -568,12 +569,23 @@ class VideoXControlnetWrapper(torch.nn.Module):
             except Exception:
                 print(f"[CONTROLNET] signature inspection failed: {e}")
 
-        # Perform the single, strict call using VideoX list-of-samples parity (latent list form)
+        # Perform the single, strict call using the centralized adapter helper so
+        # the adapter invocation, autocast, timers, and normalization are canonical.
         try:
-            raw_out = callable_inner(*pos_args_list, *args, **call_kwargs, **kwargs)
+            # The helper lives in the Z-Image extension module and accepts a preassembled control_context
+            from extensions_built_in.diffusion_models.z_image.z_image import compute_zimage_adapter_residuals as _compute
+            sd_for_helper = getattr(self, '_owner_sd', None)
+            down, mid, control_context, raw_out = _compute(sd_for_helper or SimpleNamespace(),
+                                                           latents if isinstance(latents, torch.Tensor) else torch.stack(latents, dim=0),
+                                                           timestep,
+                                                           zimage_controlnet=callable_inner,
+                                                           zimage_control_context=adapted_control_context,
+                                                           zimage_conditioning_scale=conditioning_scale,
+                                                           train_dtype=getattr(self, 'torch_dtype', None),
+                                                           dataset_controlnet_debug=False,
+                                                           batch=None)
         except Exception as e:
-            # Let errors bubble up; include some context
-            raise RuntimeError(f"VideoXControlnetWrapper: calling inner adapter failed: {e}") from e
+            raise RuntimeError(f"VideoXControlnetWrapper: calling inner adapter via centralized helper failed: {e}") from e
 
         # Restore output channels to the original latents channel count when possible
         try:

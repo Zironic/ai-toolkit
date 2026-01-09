@@ -4,6 +4,8 @@ from typing import List, Optional
 import huggingface_hub
 import torch
 import yaml
+import time
+from contextlib import nullcontext
 from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.models.base_model import BaseModel
@@ -41,6 +43,39 @@ scheduler_config = {
     "use_dynamic_shifting": False,
     "shift": 3.0,
 }
+
+
+def _effective_num_train_timesteps(sd_or_scheduler):
+    """Return an integer number of train timesteps from a scheduler or SD instance.
+
+    Preference order:
+    - If given a scheduler-like object, check `.config.num_train_timesteps` (dict or namespace)
+    - Else check `.num_train_timesteps` attribute
+    - Else fall back to `len(scheduler.timesteps)` if available
+    - Otherwise return 1000 as a conservative default
+    """
+    try:
+        # allow passing either the sd instance or a scheduler-like object
+        sched = getattr(sd_or_scheduler, 'noise_scheduler', None) or getattr(sd_or_scheduler, 'scheduler', None) or sd_or_scheduler
+        if sched is None:
+            return 1000
+        cfg = getattr(sched, 'config', None)
+        if isinstance(cfg, dict):
+            n = cfg.get('num_train_timesteps', None)
+        else:
+            n = getattr(cfg, 'num_train_timesteps', None) if cfg is not None else None
+        if n is None:
+            n = getattr(sched, 'num_train_timesteps', None)
+        if n is None:
+            try:
+                n = len(getattr(sched, 'timesteps', []))
+            except Exception:
+                n = None
+        if n is None:
+            return 1000
+        return int(n)
+    except Exception:
+        return 1000
 
 
 class ZImageModel(BaseModel):
@@ -308,6 +343,31 @@ class ZImageModel(BaseModel):
                     from diffusers import ControlNetModel
                     # Use model's configured torch dtype (avoid referencing external TrainConfig on the model)
                     self.controlnet = ControlNetModel.from_pretrained(cpath, torch_dtype=self.torch_dtype)
+
+                    # If Accelerate is available, infer an auto device map for this ControlNet and
+                    # attach it to the instance for later dispatch/inspection. This is a non-fatal
+                    # best-effort configuration step: failures are logged but do not abort model load.
+                    try:
+                        import accelerate
+                        try:
+                            device_map = accelerate.infer_auto_device_map(self.controlnet, dtype=self.torch_dtype)
+                            # attach for diagnostics and potential later dispatch
+                            self._controlnet_auto_device_map = device_map
+                            try:
+                                from toolkit.print import print_acc
+                                print_acc(f"[CONTROLNET-LOAD] infer_auto_device_map produced {len(device_map)} entries for '{cpath}'")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            try:
+                                from toolkit.print import print_acc
+                                print_acc(f"[CONTROLNET-LOAD] infer_auto_device_map failed: {e}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        # Accelerate not available or import failed; silently continue (no heuristics)
+                        self._controlnet_auto_device_map = None
+
                     # Default behavior: keep it frozen unless explicitly configured otherwise elsewhere
                     for p in self.controlnet.parameters():
                         p.requires_grad = False
@@ -1160,7 +1220,8 @@ class ZImageModel(BaseModel):
         latent_model_input = latent_model_input.unsqueeze(2)
         latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
-        timestep_model_input = (1000 - timestep) / 1000
+        num_train_timesteps = _effective_num_train_timesteps(self)
+        timestep_model_input = (num_train_timesteps - timestep) / float(num_train_timesteps)
 
         model_out_list = self.transformer(
             latent_model_input_list,
@@ -1174,6 +1235,33 @@ class ZImageModel(BaseModel):
         noise_pred = -noise_pred
 
         return noise_pred
+
+    def _predict_noise_zimage(self, latents: torch.Tensor, text_embeddings, timestep: torch.Tensor, zimage_controlnet=None, zimage_control_images=None, zimage_conditioning_scale: float = 1.0, **kwargs):
+        """Model-side compatibility helper so ZImageModel instances provide the expected
+        `_predict_noise_zimage` method used by the trainer's detection logic. Delegates to
+        the module-level `predict_noise_zimage` implementation.
+        """
+        # Emit a concise model-level diagnostic about the adapter and inputs.
+        try:
+            from toolkit.print import print_acc
+            ad_name = getattr(zimage_controlnet, 'name_or_path', None) or getattr(zimage_controlnet, 'name', None) or str(type(zimage_controlnet))
+            ci_shape = None
+            try:
+                if zimage_control_images is not None and hasattr(zimage_control_images, 'shape'):
+                    ci_shape = tuple(zimage_control_images.shape)
+            except Exception:
+                ci_shape = None
+            print_acc(f"[ZIMAGE] _predict_noise_zimage delegating: adapter={ad_name!r} control_images_shape={ci_shape}")
+        except Exception:
+            pass
+
+        # Import and call the canonical implementation from the extension module.
+        try:
+            return predict_noise_zimage(self, latents, text_embeddings, timestep, zimage_controlnet=zimage_controlnet, zimage_control_images=zimage_control_images, zimage_conditioning_scale=zimage_conditioning_scale, **kwargs)
+        except Exception as e:
+            # Surface a clear runtime error to match trainer expectations
+            raise RuntimeError(f"Z-Image _predict_noise_zimage failed: {e}") from e
+
 
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
         if self.pipeline.text_encoder.device != self.device_torch:
@@ -1228,3 +1316,984 @@ class ZImageModel(BaseModel):
             new_key = key.replace("diffusion_model.", "transformer.")
             new_sd[new_key] = value
         return new_sd
+
+
+def predict_noise_zimage(sd, latents: torch.Tensor, text_embeddings, timestep: torch.Tensor, zimage_controlnet=None, zimage_control_images=None, zimage_conditioning_scale: float = 1.0, zimage_control_context=None, **kwargs):
+    """Module-level implementation of Z-Image routing used by `StableDiffusion._predict_noise_zimage`.
+
+    Strict behavior enforced:
+    - No silent fallbacks for adapter signature (adapter MUST accept `conditioning_scale` kwarg).
+    - Text embeddings are validated and the raw tensor (`.text_embeds`) is passed to the transformer.
+    - Adapter and transformer calls run under the accelerator's autocast when available.
+    - Adapter outputs are strictly validated and moved to the job/device dtype (e.g., `train.dtype`) to respect job precision.
+
+    Note: This function is intended **only** for ControlNet (model-side) routing in Z-Image training. Calling it
+    without control information (both `zimage_control_context` and `zimage_control_images` are None) will raise
+    a RuntimeError; use the model's standard noise prediction function for non-control inference.
+    """
+    from contextlib import nullcontext
+
+    # Initialize diagnostics and always record an entry timestamp/counter so callers
+    # can determine whether the function ran even when debug prints are disabled.
+    try:
+        sd._last_zimage_called = True
+        sd._last_zimage_entry_ts = time.time()
+        sd._last_zimage_adapter_called = False
+        sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0)
+        sd._last_zimage_control_hints_present = False
+        sd._last_zimage_control_hints_shapes = None
+        sd._last_zimage_fellback_to_down_blocks = False
+        sd._last_zimage_text_embed_shape = None
+        sd._last_zimage_conditioning_scale = float(zimage_conditioning_scale)
+    except Exception:
+        pass
+
+    # Start a timer to capture I/O and preprocessing leading up to the adapter call.
+    _io_timer_started = False
+    if hasattr(sd, 'timer'):
+        try:
+            sd.timer.start('controlnet_forward_io')
+            _io_timer_started = True
+        except Exception:
+            _io_timer_started = False
+
+    # Dataset-level debug opt-in: prefer explicit kwarg passed by trainer (see SDTrainer),
+    # fall back to dataset_config.debug if available on the current batch/file item.
+    dataset_controlnet_debug = False
+    try:
+        # allow trainer to pass a boolean marker
+        dataset_controlnet_debug = bool(kwargs.pop('dataset_controlnet_debug', False))
+    except Exception:
+        dataset_controlnet_debug = False
+    try:
+        # If not explicitly passed, try to infer from batch.file_items[0].dataset_config.debug/controlnet_debug
+        if not dataset_controlnet_debug:
+            batch = kwargs.get('batch', None)
+            if batch is not None and getattr(batch, 'file_items', None):
+                ds_cfg = getattr(batch.file_items[0], 'dataset_config', None)
+                if ds_cfg is not None:
+                    dataset_controlnet_debug = bool(getattr(ds_cfg, 'controlnet_debug', getattr(ds_cfg, 'debug', False)))
+    except Exception:
+        dataset_controlnet_debug = dataset_controlnet_debug
+
+    # Emit an entry-level debug notice when enabled so logs show whether the function ran
+    if dataset_controlnet_debug:
+        try:
+            from toolkit.print import print_acc
+            print_acc(f"[CONTROLNET-DEBUG] predict_noise_zimage entry: adapter_provided={zimage_controlnet is not None} control_context_provided={zimage_control_context is not None} control_images_provided={zimage_control_images is not None} conditioning_scale={zimage_conditioning_scale}")
+        except Exception:
+            pass
+
+    try:
+        # Lazy-load or resolve the provided controlnet adapter when necessary.
+        # Behavior: prefer an explicitly supplied `zimage_controlnet` argument; else use
+        # `sd.controlnet` if present; else attempt to load from `sd.model_config.controlnet_name_or_path`.
+        # Fail-fast on load errors to keep behavior deterministic.
+        if zimage_controlnet is None:
+            zimage_controlnet = getattr(sd, 'controlnet', None)
+            if zimage_controlnet is None:
+                try:
+                    model_cfg = getattr(sd, 'model_config', None)
+                    cpath = getattr(model_cfg, 'controlnet_name_or_path', None) if model_cfg is not None else None
+                    if cpath:
+                        from types import SimpleNamespace
+                        from toolkit.control_util import prepare_controlnet_adapter
+
+                        # Load adapter strictly; require Z-Image compatibility
+                        zimage_controlnet = prepare_controlnet_adapter(
+                            sd, cpath, adapter_config=SimpleNamespace(controlnet_mode='zimage'), train_config=getattr(sd, 'train_config', None), strict=True, require_zimage_model=True
+                        )
+                        # Attach to sd for reuse
+                        try:
+                            sd.controlnet = zimage_controlnet
+                        except Exception:
+                            pass
+
+                        # Try to infer an auto device map for accelerate-based dispatch (best-effort)
+                        try:
+                            import accelerate
+                            try:
+                                device_map = accelerate.infer_auto_device_map(zimage_controlnet, dtype=getattr(sd, 'torch_dtype', None))
+                                sd._controlnet_auto_device_map = device_map
+                                try:
+                                    from toolkit.print import print_acc
+                                    print_acc(f"[CONTROLNET-LAZY-LOAD] infer_auto_device_map produced {len(device_map)} entries for '{cpath}'")
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                try:
+                                    from toolkit.print import print_acc
+                                    print_acc(f"[CONTROLNET-LAZY-LOAD] infer_auto_device_map failed: {e}")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            # Accelerate not present; leave map as-is
+                            sd._controlnet_auto_device_map = getattr(sd, '_controlnet_auto_device_map', None)
+                except Exception as e:
+                    # Keep behavior deterministic: fail fast when lazy-loading fails
+                    raise RuntimeError(f"Z-Image: failed to load controlnet adapter lazily: {e}") from e
+    finally:
+        # Ensure the I/O timer is stopped before the adapter forward begins (or on early return/exception)
+        if _io_timer_started:
+            try:
+                sd.timer.stop('controlnet_forward_io')
+            except Exception:
+                pass
+            _io_timer_started = False
+
+    # Normalize text embeddings to raw tensor and validate (no silent casts)
+    te = getattr(text_embeddings, 'text_embeds', text_embeddings)
+    if not torch.is_tensor(te):
+        raise RuntimeError("Z-Image: `text_embeddings` must be a PromptEmbeds or a torch.Tensor")
+    if not torch.is_floating_point(te):
+        raise RuntimeError("Z-Image: `text_embeddings` must be a floating point tensor")
+    B = latents.shape[0]
+    if te.shape[0] not in (B, 2 * B):
+        raise RuntimeError(f"Z-Image: unexpected batch size for text_embeddings: expected {B} or {2*B}, got {te.shape[0]}")
+
+    # Determine job dtype preference (canonical): override via kwargs -> sd.torch_dtype -> te.dtype
+    job_dtype_arg = kwargs.get('train_dtype', None)
+    # normalize possible override (str or torch.dtype) to torch.dtype or None
+    job_torch_dtype = get_torch_dtype(job_dtype_arg)
+    job_torch_dtype = job_torch_dtype or getattr(sd, 'torch_dtype', None) or te.dtype
+
+    # Avoid converting to CPU bfloat16 (unsupported/suspect on CPU)
+    if job_torch_dtype == torch.bfloat16 and latents.device.type == 'cpu':
+        job_torch_dtype = torch.float32
+
+    if te.device != latents.device:
+        raise RuntimeError(f"Z-Image: text embeddings device {te.device} does not match latents device {latents.device}")
+    sd._last_zimage_text_embed_shape = (tuple(te.shape), str(te.device), str(te.dtype), str(job_torch_dtype))
+
+    # Cast embeddings to job dtype (respecting CPU bfloat16 safety)
+    try:
+        te = te.to(dtype=job_torch_dtype, device=latents.device)
+    except Exception:
+        try:
+            te = te.to(device=latents.device)
+        except Exception:
+            pass
+
+    # Validate conditioning scale
+    try:
+        zimage_conditioning_scale = float(zimage_conditioning_scale)
+        if not (zimage_conditioning_scale == zimage_conditioning_scale):  # check NaN
+            raise ValueError
+    except Exception:
+        raise RuntimeError("Z-Image: invalid `zimage_conditioning_scale`; expected finite numeric value (e.g., 1.0)")
+
+    # Prepare common transformer inputs (Z-Image expects per-sample list of latents with a frame dim)
+    latent_model_input = latents.unsqueeze(2)  # [B, C, 1, H, W]
+    latent_model_input_list = list(latent_model_input.unbind(dim=0))
+
+    num_train_timesteps = _effective_num_train_timesteps(sd)
+    timestep_model_input = (num_train_timesteps - timestep) / float(num_train_timesteps)
+    # normalize timestep to device/dtype for transformer
+    try:
+        timestep_model_input = timestep_model_input.to(dtype=torch.float32, device=latents.device)
+    except Exception:
+        try:
+            timestep_model_input = timestep_model_input.to(device=latents.device)
+        except Exception:
+            pass
+
+    # Prepare a safe autocast context using accelerator when available
+    acc = getattr(sd, 'accelerator', None)
+    autocast_ctx = (acc.autocast() if (acc is not None and hasattr(acc, 'autocast')) else nullcontext())
+
+
+    # Local debug helper: record presence/shape info about control residuals into sd
+    def _emit_local_control_debug(sd, down_residuals, mid_residual):
+        try:
+            info = {}
+            # down_residuals may be list/tuple or tensor
+            if down_residuals is None:
+                info['has_down'] = False
+                info['num_down'] = 0
+                info['down_shapes'] = None
+            else:
+                if isinstance(down_residuals, (list, tuple)):
+                    info['has_down'] = len(down_residuals) > 0
+                    info['num_down'] = len(down_residuals)
+                    info['down_shapes'] = [tuple(d.shape) for d in down_residuals if torch.is_tensor(d)]
+                elif torch.is_tensor(down_residuals):
+                    info['has_down'] = True
+                    info['num_down'] = 1
+                    info['down_shapes'] = [tuple(down_residuals.shape)]
+                else:
+                    info['has_down'] = False
+                    info['num_down'] = 0
+                    info['down_shapes'] = None
+
+            if mid_residual is None:
+                info['has_mid'] = False
+                info['mid_shape'] = None
+            elif torch.is_tensor(mid_residual):
+                info['has_mid'] = True
+                info['mid_shape'] = tuple(mid_residual.shape)
+            else:
+                info['has_mid'] = False
+                info['mid_shape'] = None
+
+            # attach to sd for easy introspection; do not print by default
+            sd._last_zimage_local_debug = info
+        except Exception:
+            # never fail the main flow for debug bookkeeping
+            pass
+
+    # Quick path: no control info -> direct transformer call (under autocast)
+    # NOTE: This function is strictly for ControlNet model-side routing. Calling it without
+    # control information is a misuse; fail fast so callers don't accidentally rely on a
+    # non-control quick path.
+    if zimage_control_context is None and zimage_control_images is None:
+        # Emit a minimal local debug record showing absence of residuals.
+        _emit_local_control_debug(sd, None, None)
+        # Fail-fast: model-side routing requires control signals (control images or control context).
+        raise RuntimeError(
+            "Z-Image: model-side routing requires `zimage_control_context` or `zimage_control_images`. "
+            "For non-control noise prediction use the model's standard noise prediction routine."
+        )
+
+    # Build control_context
+    control_context = None
+    if zimage_control_context is not None:
+        control_context = zimage_control_context
+    else:
+        # Convert provided control images into a per-sample list
+        if isinstance(zimage_control_images, torch.Tensor):
+            if zimage_control_images.ndim == 5:
+                Bc, C, F, H, W = zimage_control_images.shape
+                if F != 1:
+                    raise RuntimeError('Multi-frame Z-Image controls not supported by model-side routing')
+                imgs = [zimage_control_images[i, :, 0, :, :] for i in range(Bc)]
+            elif zimage_control_images.ndim == 4:
+                imgs = [zimage_control_images[i] for i in range(zimage_control_images.shape[0])]
+            else:
+                raise RuntimeError('Unsupported zimage_control_images tensor shape for model-side routing')
+        elif isinstance(zimage_control_images, (list, tuple)):
+            imgs = list(zimage_control_images)
+        else:
+            raise RuntimeError('Unsupported zimage_control_images type for model-side routing')
+
+        control_latents = sd.encode_control_images(imgs, tile=getattr(sd.model_config, 'control_use_tiling', False))
+
+        # Normalize to tensor [B, C, H, W]
+        if isinstance(control_latents, torch.Tensor):
+            ctl = control_latents
+        else:
+            ctl = torch.stack([x if x.ndim == 3 else x.squeeze(0) for x in control_latents], dim=0)
+
+        if ctl.ndim == 4:
+            ctl = ctl.unsqueeze(2)  # -> [B, C, 1, H, W]
+
+        B_ctl = ctl.shape[0]
+        H_lat = ctl.shape[-2]
+        W_lat = ctl.shape[-1]
+
+        latent_ch = getattr(sd.transformer, 'in_channels', None) or 4
+        try:
+            inpaint_latent = torch.zeros((B_ctl, latent_ch, H_lat, W_lat), device=ctl.device, dtype=ctl.dtype)
+        except Exception:
+            inpaint_latent = torch.zeros((B_ctl, latent_ch, H_lat, W_lat), device=latents.device, dtype=latents.dtype)
+
+        mask_condition = torch.zeros((B_ctl, 1, H_lat, W_lat), device=ctl.device, dtype=ctl.dtype)
+        mask_condition = mask_condition.unsqueeze(2)
+        inpaint_latent = inpaint_latent.unsqueeze(2)
+
+        if ctl.ndim == 5:
+            ctl = ctl
+        else:
+            ctl = ctl.unsqueeze(2)
+
+        control_context = torch.concat([ctl, mask_condition, inpaint_latent], dim=1)
+
+    # Ensure control_context is on the same device/dtype as latents
+    try:
+        control_context = control_context.to(dtype=job_torch_dtype, device=latents.device)
+    except Exception:
+        try:
+            control_context = control_context.to(device=latents.device)
+        except Exception:
+            pass
+
+    # Call adapter (if provided) to compute residuals (run under autocast)
+    down_block_additional_residuals = None
+    mid_block_additional_residual = None
+    if zimage_controlnet is not None:
+        sample_for_adapter = latents
+        expected_in_ch = getattr(zimage_controlnet, 'control_in_dim', None)
+        if expected_in_ch is not None and isinstance(sample_for_adapter, torch.Tensor) and sample_for_adapter.ndim == 4 and sample_for_adapter.shape[1] != expected_in_ch:
+            # Do not silently fallback; require proper adapter or pre-adapted input
+            raise RuntimeError(f"Z-Image: adapter expects control_in_dim={expected_in_ch} but latents have {sample_for_adapter.shape[1]} channels; pre-adapt latents before calling model-side routing")
+
+        # Emit per-call debug (dataset opt-in) so callers can see whether adapter call will happen
+        if dataset_controlnet_debug:
+            try:
+                from toolkit.print import print_acc
+                print_acc(f"[CONTROLNET-DEBUG] adapter_call preparing: adapter={getattr(zimage_controlnet,'name_or_path',None) or getattr(zimage_controlnet,'name',None)} sample_shape={getattr(sample_for_adapter,'shape',None)} control_context_shape={getattr(control_context,'shape',None)} timestep_shape={getattr(timestep_model_input,'shape',None)} conditioning_scale={zimage_conditioning_scale}")
+            except Exception:
+                pass
+
+        # Time the adapter invocation for accurate ControlNet accounting
+        timer_ctx = (sd.timer('controlnet_zimage_forward') if hasattr(sd, 'timer') else nullcontext())
+        with timer_ctx:
+            with autocast_ctx:
+                # Mark that an adapter call is about to occur (for observability)
+                try:
+                    sd._last_zimage_adapter_call_ts = time.time()
+                    sd._last_zimage_adapter_called = False
+                except Exception:
+                    pass
+                # Require adapter to accept `conditioning_scale` kwarg (no heuristics)
+                try:
+                    adapter_out = zimage_controlnet(sample_for_adapter, timestep_model_input, control_context, conditioning_scale=zimage_conditioning_scale)
+                except TypeError as e:
+                    raise RuntimeError("Z-Image: ControlNet adapter must accept `conditioning_scale` kwarg; update adapter signature to `forward(latents, timestep, control_context, conditioning_scale=...)`") from e
+                except Exception as e:
+                    raise RuntimeError(f"Z-Image adapter call failed: {e}") from e
+                # Record adapter execution
+                try:
+                    sd._last_zimage_adapter_called = True
+                    sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0) + 1
+                    sd._last_zimage_adapter_last_return_ts = time.time()
+                except Exception:
+                    pass
+
+        if adapter_out is None:
+            sd._last_zimage_control_hints_present = False
+            sd._last_zimage_control_hints_shapes = None
+            raise RuntimeError("Z-Image adapter returned None (no control hints); an adapter that returns control hints is required for model-side Z-Image routing")
+
+        sd._last_zimage_control_hints_present = True
+
+        # Record detailed debug shapes and optionally print them when dataset_controlnet_debug is enabled.
+        try:
+            down_shapes = None
+            mid_shape = None
+            if isinstance(adapter_out, tuple) and len(adapter_out) == 2:
+                if isinstance(adapter_out[0], (list, tuple)):
+                    down_shapes = [tuple(getattr(d, 'shape', None)) for d in adapter_out[0] if torch.is_tensor(d)]
+                elif torch.is_tensor(adapter_out[0]):
+                    down_shapes = [tuple(adapter_out[0].shape)]
+                if torch.is_tensor(adapter_out[1]):
+                    mid_shape = tuple(adapter_out[1].shape)
+            elif torch.is_tensor(adapter_out):
+                down_shapes = [tuple(adapter_out.shape)]
+            else:
+                try:
+                    l = list(adapter_out)
+                    down_shapes = [tuple(getattr(d, 'shape', None)) for d in l if torch.is_tensor(d)]
+                except Exception:
+                    down_shapes = None
+            sd._last_zimage_control_debug_detail = {
+                'adapter_name': getattr(zimage_controlnet,'name_or_path',None) or getattr(zimage_controlnet,'name',None) or str(type(zimage_controlnet)),
+                'down_shapes': down_shapes,
+                'mid_shape': mid_shape,
+                'conditioning_scale': float(zimage_conditioning_scale),
+            }
+            if dataset_controlnet_debug:
+                try:
+                    from toolkit.print import print_acc
+                    print_acc(f"[CONTROLNET-DEBUG] adapter_return: adapter={sd._last_zimage_control_debug_detail['adapter_name']} down_shapes={down_shapes} mid_shape={mid_shape} conditioning_scale={sd._last_zimage_control_debug_detail['conditioning_scale']}")
+                except Exception:
+                    pass
+        except Exception:
+            # never fail the main flow for bookkeeping
+            pass
+
+        # Normalize adapter outputs: require list-of-tensors or (down, mid) tuple
+        down = None
+        mid = None
+        if isinstance(adapter_out, tuple) and len(adapter_out) == 2:
+            down, mid = adapter_out
+        elif torch.is_tensor(adapter_out):
+            down = [adapter_out]
+        else:
+            try:
+                down = list(adapter_out)
+            except Exception:
+                raise RuntimeError("Z-Image adapter returned an unsupported type; expected (down_residuals, mid_residual) tuple, a list of tensors, or a single tensor")
+
+        # Validate and move down residuals
+        if down is not None:
+            validated_down = []
+            for d in (down if isinstance(down, (list, tuple)) else [down]):
+                if not torch.is_tensor(d):
+                    raise RuntimeError("Z-Image adapter down residuals must be torch.Tensors")
+                # Ensure correct device/dtype (use job dtype)
+                d = d.to(dtype=job_torch_dtype, device=latents.device)
+                validated_down.append(d)
+            down_block_additional_residuals = validated_down
+            sd._last_zimage_control_hints_shapes = [tuple(d.shape) for d in down_block_additional_residuals]
+            sd._last_zimage_fellback_to_down_blocks = True
+
+        if mid is not None:
+            if not torch.is_tensor(mid):
+                raise RuntimeError("Z-Image adapter mid residual must be a torch.Tensor or None")
+            mid_block_additional_residual = mid.to(dtype=job_torch_dtype, device=latents.device)
+
+    # Prepare transformer kwargs
+    transformer_kwargs = {}
+    if down_block_additional_residuals is not None:
+        transformer_kwargs['down_block_additional_residuals'] = down_block_additional_residuals
+        if mid_block_additional_residual is not None:
+            transformer_kwargs['mid_block_additional_residual'] = mid_block_additional_residual
+    else:
+        transformer_kwargs['control_context'] = control_context
+        transformer_kwargs['control_context_scale'] = float(zimage_conditioning_scale)
+
+    # Emit local debug info (records presence/shape of residuals) before main transformer call
+    _emit_local_control_debug(sd, down_block_additional_residuals, mid_block_additional_residual)
+
+    # Before calling transformer, mark adapter allowed for offload when present (used by offload manager)
+    if zimage_controlnet is not None:
+        try:
+            zimage_controlnet._allow_offload = True
+            sd._controlnet_allowed_offload = True
+            try:
+                from toolkit.print import print_acc
+                print_acc("[CONTROLNET] marked adapter allowed for offload (main path)")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # Time the transformer/model invocation so it contributes to 'Model' in PERF SUMMARY
+    model_timer = (sd.timer('predict_unet') if hasattr(sd, 'timer') else nullcontext())
+    with model_timer:
+        # Call transformer under autocast and normalize output
+        with autocast_ctx:
+            t_out = sd.transformer(latent_model_input_list, timestep_model_input, te, return_dict=False, **transformer_kwargs)
+
+    # Normalize transformer output
+    model_out_list = None
+    if torch.is_tensor(t_out):
+        # tensor outputs may be [B, C, 1, H, W] or [B, C, H, W]
+        if t_out.ndim == 5:
+            model_out_list = list(t_out.unbind(dim=0))
+        elif t_out.ndim == 4:
+            noise_pred = t_out.to(dtype=torch.float32, device=latents.device)
+            return -noise_pred
+        else:
+            raise RuntimeError(f"Unexpected transformer tensor output shape: {t_out.shape}")
+    elif isinstance(t_out, (tuple, list)) and len(t_out) > 0 and isinstance(t_out[0], (list, tuple)):
+        model_out_list = t_out[0]
+    elif isinstance(t_out, (tuple, list)) and len(t_out) > 0 and torch.is_tensor(t_out[0]):
+        first = t_out[0]
+        if first.ndim == 5:
+            model_out_list = list(first.unbind(dim=0))
+        else:
+            try:
+                model_out_list = list(first)
+            except Exception:
+                model_out_list = [first]
+    else:
+        try:
+            model_out_list = list(t_out)
+        except Exception:
+            raise RuntimeError(f"Unexpected transformer output type from Z-Image transformer: {type(t_out)}")
+
+    # Stack per-sample outputs into a tensor [B, C, 1, H, W] -> reduce to [B, C, H, W]
+    try:
+        noise_pred = torch.stack([t.to(dtype=job_torch_dtype, device=latents.device) for t in model_out_list], dim=0)
+        noise_pred = noise_pred.squeeze(2)
+        noise_pred = -noise_pred
+    except Exception as e:
+        raise RuntimeError(f"Failed to assemble noise prediction from transformer output: {e}") from e
+
+    return noise_pred
+
+
+# Backwards-compatible alternate name (internal API)
+_predict_noise_zimage = predict_noise_zimage
+
+
+# Helper: collect pre-encoded Z-Image control contexts for a training batch
+def collect_preencoded_zimage_context_for_batch(batch: 'DataLoaderBatchDTO') -> Optional[torch.Tensor]:
+    """If all files in `batch` have precomputed zimage control contexts, collect and return
+    a stacked tensor shaped [B, C, F, H, W]. Returns None if not all samples available.
+    """
+    vals = []
+    diagnostics = []
+    # Determine target spatial size from batch if possible
+    target_h = None
+    target_w = None
+    try:
+        if getattr(batch, 'tensor', None) is not None:
+            bt = batch.tensor
+            if bt is not None and hasattr(bt, 'ndim') and bt.ndim >= 3:
+                target_h = int(bt.shape[-2])
+                target_w = int(bt.shape[-1])
+    except Exception:
+        target_h = None
+        target_w = None
+
+    # If no batch tensor, try to use dataset control_size
+    if target_h is None or target_w is None:
+        try:
+            cfg = getattr(batch.file_items[0], 'dataset_config', None)
+            if cfg is not None and getattr(cfg, 'control_size', None) is not None:
+                target_h = target_w = int(cfg.control_size)
+        except Exception:
+            target_h = None
+            target_w = None
+
+    for fi in batch.file_items:
+        contexts = getattr(fi, '_preencoded_zimage_control_contexts', None)
+        if contexts is None:
+            try:
+                from toolkit.precompute_cache import get_preencoded_control_contexts
+                cached = get_preencoded_control_contexts(fi.path)
+                if cached is not None:
+                    fi._preencoded_zimage_control_contexts = cached
+                    contexts = fi._preencoded_zimage_control_contexts
+            except Exception:
+                pass
+        if contexts is None:
+            diagnostics.append(f"{fi.path}: missing _preencoded_zimage_control_contexts")
+            continue
+        if not isinstance(contexts, dict) or len(contexts) == 0:
+            diagnostics.append(f"{fi.path}: _preencoded_zimage_control_contexts empty or invalid: {type(contexts).__name__}")
+            continue
+
+        # pick best fit: prefer exact size, else nearest
+        chosen = None
+        if target_h is not None and target_w is not None:
+            desired = int(target_h)
+            if desired in contexts:
+                chosen = contexts[desired]
+            else:
+                sizes = sorted(contexts.keys())
+                if len(sizes) == 0:
+                    diagnostics.append(f"{fi.path}: contexts dict has no sizes")
+                    continue
+                closest = min(sizes, key=lambda s: abs(s - desired))
+                chosen = contexts[closest]
+                diagnostics.append(f"{fi.path}: desired={desired}, using nearest precomputed size={closest}")
+        else:
+            sizes = sorted(contexts.keys())
+            if len(sizes) == 0:
+                diagnostics.append(f"{fi.path}: contexts dict has no sizes")
+                continue
+            chosen = contexts[sizes[0]]
+            diagnostics.append(f"{fi.path}: no target; using smallest precomputed size={sizes[0]}")
+
+        ctx = chosen
+        if isinstance(ctx, torch.Tensor):
+            if ctx.ndim == 4:
+                vals.append(ctx.unsqueeze(0))
+            elif ctx.ndim == 3:
+                vals.append(ctx.unsqueeze(0).unsqueeze(2))
+            elif ctx.ndim == 5:
+                vals.append(ctx)
+            else:
+                diagnostics.append(f"{fi.path}: precomputed tensor has unsupported ndim={ctx.ndim}")
+                continue
+        else:
+            diagnostics.append(f"{fi.path}: precomputed entry is not a torch.Tensor (type={type(ctx).__name__})")
+            continue
+
+    if len(vals) != len(batch.file_items):
+        try:
+            from toolkit.print import print_acc
+            print_acc(f"[PRECOMPUTE] precompute not usable for batch: {len(vals)}/{len(batch.file_items)} files usable; details:")
+            for d in diagnostics:
+                print_acc(f"[PRECOMPUTE]   {d}")
+        except Exception:
+            for d in diagnostics:
+                pass
+        return None
+    try:
+        return torch.cat(vals, dim=0)
+    except Exception:
+        return None
+
+
+# Helper: precompute zimage control contexts across datasets (attach cached dict to FileItemDTO._preencoded_zimage_control_contexts)
+def precompute_zimage_control_contexts(sd, data_loader):
+    """Precompute assembled VideoX (Z-Image) control contexts for datasets that requested precompute.
+    This is a direct migration of trainer precompute logic intended to be invoked from trainer when needed.
+    """
+    if getattr(sd, '_precomputed_zimage_controls_done', False):
+        return
+    datasets = None
+    try:
+        from toolkit.data_loader import get_dataloader_datasets
+        datasets = get_dataloader_datasets(data_loader)
+    except Exception:
+        datasets = None
+    if not datasets:
+        return
+
+    try:
+        from toolkit.print import print_acc
+        print_acc("[PRECOMPUTE] Starting precompute_zimage_control_contexts")
+    except Exception:
+        pass
+
+    for ds in datasets:
+        cfg = getattr(ds, 'dataset_config', None)
+        if cfg is None:
+            continue
+        do_precompute = (
+            getattr(cfg, 'control_precompute_control', False)
+            or getattr(cfg, 'cache_control_contexts', False)
+            or getattr(cfg, 'cache_control_contexts_to_disk', False)
+            or getattr(cfg, 'cache_latents', False)
+            or getattr(cfg, 'cache_latents_to_disk', False)
+        )
+        if not do_precompute:
+            continue
+        try:
+            print_acc(f"[PRECOMPUTE] Precomputing Z-Image control contexts for dataset: {getattr(cfg,'name', ds.dataset_path)}")
+        except Exception:
+            pass
+
+        try:
+            sd.set_device_state_preset('cache_latents')
+        except Exception:
+            pass
+
+        for fi in ds.file_list:
+            if not getattr(fi, 'has_control_image', False) and getattr(fi, 'control_tensor', None) is None:
+                continue
+            try:
+                existing = getattr(fi, '_preencoded_zimage_control_contexts', None)
+                if existing is not None and isinstance(existing, dict) and len(existing) > 0:
+                    try:
+                        print_acc(f"[PRECOMPUTE] Skipping precompute for {fi.path}: already cached sizes={sorted(existing.keys())}")
+                    except Exception:
+                        pass
+                    continue
+            except Exception:
+                pass
+
+            try:
+                if getattr(fi, 'control_tensor', None) is None:
+                    try:
+                        fi.load_control_image()
+                    except Exception:
+                        continue
+                    if getattr(fi, 'control_tensor', None) is None:
+                        continue
+            except Exception:
+                continue
+
+            try:
+                imgs = fi.control_tensor
+                sizes = None
+                try:
+                    cfg = getattr(fi, 'dataset_config', None)
+                    if cfg is not None:
+                        if getattr(cfg, 'control_sizes', None) is not None:
+                            sizes = list(cfg.control_sizes)
+                        elif getattr(cfg, 'control_size', None) is not None:
+                            sizes = [int(cfg.control_size)]
+                except Exception:
+                    sizes = None
+                if sizes is None or len(sizes) == 0:
+                    derived_size = None
+                    try:
+                        if getattr(fi, 'full_size_control_images', False):
+                            c_w = getattr(fi, 'crop_width', None)
+                            c_h = getattr(fi, 'crop_height', None)
+                            s_w = getattr(fi, 'scale_to_width', None)
+                            s_h = getattr(fi, 'scale_to_height', None)
+                            if c_w and c_h:
+                                derived_size = max(int(c_w), int(c_h))
+                            elif s_w and s_h:
+                                derived_size = max(int(s_w), int(s_h))
+                            else:
+                                derived_size = max(int(getattr(fi, 'width', 0)), int(getattr(fi, 'height', 0)))
+                    except Exception:
+                        derived_size = None
+                    if derived_size is not None and int(derived_size) > 0:
+                        sizes = [int(derived_size)]
+                    else:
+                        sizes = [512]
+
+                for size in sizes:
+                    try:
+                        if imgs.ndim == 3:
+                            batch_imgs = imgs.unsqueeze(0)
+                        else:
+                            batch_imgs = imgs
+
+                        try:
+                            batch_resized, used_dataset_control, _meta = _resize_batch_to_bucket(batch_imgs, size, getattr(fi, 'full_size_control_images', False))
+                        except Exception:
+                            batch_resized = batch_imgs.to(torch.float32)
+                            used_dataset_control = False
+
+                        try:
+                            if hasattr(sd, 'encode_control_images_videox'):
+                                enc_out = sd.encode_control_images_videox(list(batch_resized))
+                            else:
+                                enc_out = sd.encode_control_images(list(batch_resized))
+                        except Exception:
+                            # Fallback to local helper
+                            enc_out = encode_and_assemble_zimage_controls(sd, batch_resized)
+
+                        # Extract latents robustly
+                        control_latents = None
+                        if isinstance(enc_out, torch.Tensor):
+                            control_latents = enc_out
+                        elif hasattr(enc_out, 'latents'):
+                            control_latents = enc_out.latents
+                        elif hasattr(enc_out, 'latent_dist'):
+                            dist = enc_out.latent_dist
+                            if hasattr(dist, 'mode') and callable(dist.mode):
+                                control_latents = dist.mode()
+                            else:
+                                control_latents = dist.mean
+                        elif isinstance(enc_out, (list, tuple)):
+                            control_latents = enc_out[0]
+                        else:
+                            control_latents = enc_out
+
+                        if control_latents is None:
+                            continue
+
+                        if not hasattr(fi, '_preencoded_zimage_control_contexts') or fi._preencoded_zimage_control_contexts is None:
+                            fi._preencoded_zimage_control_contexts = {}
+                        stored = control_latents.squeeze(0).to('cpu')
+                        try:
+                            from toolkit.control_channels import tag_tensor
+                            if 'batch_resized' in locals() and isinstance(batch_resized, torch.Tensor):
+                                B2, C2, H2, W2 = batch_resized.shape
+                                tag_tensor(stored, f'precompute:control_latents:size={int(size)}:orig={H}x{W}:padded={H2}x{W2}')
+                            else:
+                                tag_tensor(stored, f'precompute:control_latents:size={int(size)}:orig={H}x{W}')
+                            if locals().get('used_dataset_control', False):
+                                tag_tensor(stored, 'precompute:used_dataset_image')
+                        except Exception:
+                            pass
+
+                        try:
+                            fi._preencoded_zimage_control_contexts[int(size)] = stored
+                        except Exception:
+                            pass
+
+                    except Exception:
+                        pass
+
+                try:
+                    keys = sorted(list(fi._preencoded_zimage_control_contexts.keys())) if getattr(fi, '_preencoded_zimage_control_contexts', None) is not None else []
+                    if keys:
+                        try:
+                            from toolkit.precompute_cache import set_preencoded_control_contexts
+                            set_preencoded_control_contexts(fi.path, fi._preencoded_zimage_control_contexts)
+                            if getattr(fi.dataset_config, 'cache_control_contexts_to_disk', False) and hasattr(fi, 'save_control_contexts') and callable(getattr(fi, 'save_control_contexts')):
+                                fi.save_control_contexts(fi._preencoded_zimage_control_contexts)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+    sd._precomputed_zimage_controls_done = True
+
+
+# Helper: encode raw pixel controls and assemble into zimage control context
+def encode_and_assemble_zimage_controls(sd, control_context):
+    """Encode raw pixel `control_context` into latents and assemble a VideoX-style
+    `control_context` tensor with control_in_dim matching the transformer's expectation.
+    Returns a 5D tensor [B, control_in_dim, 1, H, W]."""
+    if not (hasattr(sd, 'encode_control_images') or hasattr(sd, 'encode_control_images_videox')):
+        raise RuntimeError("Z-Image control images provided but model lacks `encode_control_images` (or `encode_control_images_videox`); provide pre-encoded control latents or add VAE encoder support.")
+
+    imgs = []
+    imgs_sizes = []
+    if isinstance(control_context, (list, tuple)):
+        for img in control_context:
+            imgs.append(img)
+            imgs_sizes.append((int(img.shape[-1]), int(img.shape[-2])))
+    elif control_context.ndim == 5:
+        Bz, Cz, Fz, Hz, Wz = control_context.shape
+        if Fz != 1:
+            raise RuntimeError("Multi-frame Z-Image control images are not supported for auto-encoding; pass pre-encoded control latents instead.")
+        for i in range(Bz):
+            img = control_context[i, :, 0, :, :]
+            imgs.append(img)
+            imgs_sizes.append((int(img.shape[-1]), int(img.shape[-2])))
+    else:
+        Bz, Cz, Hz, Wz = control_context.shape
+        for i in range(Bz):
+            img = control_context[i]
+            imgs.append(img)
+            imgs_sizes.append((int(img.shape[-1]), int(img.shape[-2])))
+
+    use_tiling = getattr(sd.model_config, 'control_use_tiling', False)
+    try:
+        if hasattr(sd, 'encode_control_images_videox'):
+            encoded = sd.encode_control_images_videox(imgs, height=None, width=None, tile=use_tiling)
+        else:
+            encoded = sd.encode_control_images(imgs, tile=use_tiling)
+    except Exception as e:
+        raise RuntimeError(f"Failed while encoding Z-Image control images: {e}") from e
+
+    # Reassemble encoded output into per-image latents
+    control_latents = None
+    if isinstance(encoded, torch.Tensor):
+        control_latents = encoded
+    elif isinstance(encoded, (list, tuple)):
+        reassembled = []
+        for idx, per_image_tiles in enumerate(encoded):
+            if not per_image_tiles:
+                raise RuntimeError('encode_control_images returned empty tiles for an image')
+            first_lat, _, tile_px = per_image_tiles[0]
+            try:
+                tile_px_w, tile_px_h = int(tile_px[0]), int(tile_px[1])
+            except Exception:
+                tile_px_h, tile_px_w = int(tile_px[0]), int(tile_px[1])
+            lat_h = int(first_lat.shape[-2])
+            latent_downsample = 1
+            try:
+                if tile_px_h is not None and lat_h > 0:
+                    latent_downsample = max(1, round(tile_px_h / lat_h))
+            except Exception:
+                latent_downsample = 1
+            try:
+                full_w, full_h = imgs_sizes[idx]
+            except Exception:
+                full_w, full_h = (tile_px_w, tile_px_h)
+            lat = first_lat
+            if latent_downsample > 1:
+                lat = torch.nn.functional.interpolate(lat, size=(max(1, full_h // latent_downsample), max(1, full_w // latent_downsample)), mode='bilinear', align_corners=False)
+            if lat.ndim == 3:
+                reassembled.append(lat)
+            else:
+                reassembled.append(lat.squeeze(0))
+        control_latents = torch.stack(reassembled, dim=0)
+    else:
+        raise RuntimeError('Unsupported return type from encode_control_images')
+
+    from toolkit.control_channels import assemble_zimage_control_context
+    ctl_dim = getattr(getattr(sd, 'transformer', None), 'control_in_dim', 33)
+    return assemble_zimage_control_context(control_latents, control_in_dim=ctl_dim)
+
+
+def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps: torch.Tensor, zimage_controlnet=None, zimage_control_images=None, zimage_control_context=None, zimage_conditioning_scale: float = 1.0, train_dtype=None, dataset_controlnet_debug: bool = False, batch=None):
+    """Compute adapter residuals for Z-Image (VideoX) adapters and return
+    (down_block_additional_residuals, mid_block_additional_residual, control_context, raw_out).
+
+    This extracts the adapter invocation and normalization logic from
+    `predict_noise_zimage` into a focused helper that the trainer and wrapper can
+    call to compute residuals or delegate the adapter invocation.
+
+    Behavior mirrors `predict_noise_zimage` for dtype/device normalization,
+    timing, diagnostics, and error handling.
+    """
+    # Prepare diagnostics/timers
+    try:
+        sd._last_zimage_adapter_called = False
+        sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0)
+    except Exception:
+        pass
+
+    # Determine job dtype
+    job_torch_dtype = get_torch_dtype(train_dtype) or getattr(sd, 'torch_dtype', None)
+    if job_torch_dtype == torch.bfloat16 and noisy_latents.device.type == 'cpu':
+        job_torch_dtype = torch.float32
+
+    # Assemble or normalize control_context
+    control_context = None
+    if zimage_control_context is not None:
+        control_context = zimage_control_context
+    elif zimage_control_images is not None:
+        try:
+            # Reuse the central encoding/assembly helper. It accepts lists or 4/5D tensors.
+            control_context = encode_and_assemble_zimage_controls(sd, zimage_control_images)
+        except Exception as e:
+            raise RuntimeError(f"Failed to encode/assemble zimage control images: {e}") from e
+    else:
+        raise RuntimeError('Z-Image adapter residual helper requires `zimage_control_images` or a preassembled `zimage_control_context`.')
+
+    # Ensure on correct device/dtype
+    try:
+        control_context = control_context.to(dtype=job_torch_dtype, device=noisy_latents.device)
+    except Exception:
+        try:
+            control_context = control_context.to(device=noisy_latents.device)
+        except Exception:
+            pass
+
+    # Optional per-call debug notice
+    if dataset_controlnet_debug:
+        try:
+            from toolkit.print import print_acc
+            print_acc(f"[CONTROLNET-DEBUG] compute_zimage_adapter_residuals: adapter={getattr(zimage_controlnet,'name_or_path',None) or getattr(zimage_controlnet,'name',None)} sample_shape={getattr(noisy_latents,'shape',None)} control_context_shape={getattr(control_context,'shape',None)} conditioning_scale={zimage_conditioning_scale}")
+        except Exception:
+            pass
+
+    # Time the adapter invocation
+    timer_ctx = (sd.timer('controlnet_zimage_forward') if hasattr(sd, 'timer') else nullcontext())
+    with timer_ctx:
+        acc = getattr(sd, 'accelerator', None)
+        autocast_ctx = (acc.autocast() if (acc is not None and hasattr(acc, 'autocast')) else nullcontext())
+        with autocast_ctx:
+            try:
+                sd._last_zimage_adapter_call_ts = time.time()
+            except Exception:
+                pass
+            # Enforce conditioning_scale kwarg signature
+            try:
+                raw_out = zimage_controlnet(noisy_latents, timesteps, control_context, conditioning_scale=zimage_conditioning_scale)
+            except TypeError as e:
+                raise RuntimeError("Z-Image: ControlNet adapter must accept `conditioning_scale` kwarg; update adapter signature to `forward(latents, timestep, control_context, conditioning_scale=...)`") from e
+            except Exception as e:
+                raise RuntimeError(f"Z-Image adapter call failed: {e}") from e
+            try:
+                sd._last_zimage_adapter_called = True
+                sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0) + 1
+                sd._last_zimage_adapter_last_return_ts = time.time()
+            except Exception:
+                pass
+
+    if raw_out is None:
+        raise RuntimeError("Z-Image adapter returned None (no control hints); an adapter that returns control hints is required for model-side routing")
+
+    # Normalize outputs into (down list, mid tensor)
+    down = None
+    mid = None
+    if isinstance(raw_out, tuple) and len(raw_out) == 2:
+        down, mid = raw_out
+    elif torch.is_tensor(raw_out):
+        down = [raw_out]
+    else:
+        try:
+            down = list(raw_out)
+        except Exception:
+            raise RuntimeError('Z-Image adapter returned an unsupported type; expected (down_residuals, mid_residual) tuple, a list of tensors, or a single tensor')
+
+    # Validate and move down residuals
+    down_validated = None
+    if down is not None:
+        down_validated = []
+        for d in (down if isinstance(down, (list, tuple)) else [down]):
+            if not torch.is_tensor(d):
+                raise RuntimeError('Z-Image adapter down residuals must be torch.Tensors')
+            d = d.to(dtype=job_torch_dtype, device=noisy_latents.device)
+            down_validated.append(d)
+        try:
+            sd._last_zimage_control_hints_shapes = [tuple(d.shape) for d in down_validated]
+            sd._last_zimage_fellback_to_down_blocks = True
+        except Exception:
+            pass
+
+    if mid is not None:
+        if not torch.is_tensor(mid):
+            raise RuntimeError('Z-Image adapter mid residual must be a torch.Tensor or None')
+        mid = mid.to(dtype=job_torch_dtype, device=noisy_latents.device)
+
+    # Bookkeeping
+    try:
+        sd._last_zimage_control_hints_present = True
+        sd._last_zimage_control_context_passed = True
+        sd._last_zimage_control_context_shape = tuple(control_context.shape)
+    except Exception:
+        pass
+
+    return down_validated, mid, control_context, raw_out

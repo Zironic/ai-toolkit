@@ -257,3 +257,155 @@ def set_adapter_name_if_missing(adapter, name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Deterministic, load-time helper for constructing and validating adapters
+# ---------------------------------------------------------------------------
+
+def _load_adapter_from_spec(adapter_spec, adapter_config=None, train_config=None):
+    """Load an adapter object from a specification.
+
+    adapter_spec may be:
+    - an already-instantiated adapter object (returned unchanged)
+    - a string path or repo id to pass to the relevant `from_pretrained` loader
+
+    This function is intentionally defensive: it attempts to load common adapter
+    types (ControlNetModel, T2IAdapter) when available and otherwise returns
+    the original object or raises a helpful RuntimeError if loading fails.
+    """
+    # If already an object, return as-is
+    if adapter_spec is None:
+        return None
+    # already an object
+    if not isinstance(adapter_spec, (str, bytes)):
+        return adapter_spec
+
+    # adapter_spec is a path / id; attempt to load
+    # Defer heavy imports to runtime so module import is cheap when unused
+    last_err = None
+    try:
+        from diffusers import ControlNetModel
+        try:
+            return ControlNetModel.from_pretrained(adapter_spec)
+        except Exception as e:
+            last_err = e
+    except Exception as e:
+        last_err = e
+
+    try:
+        from diffusers import T2IAdapter
+        try:
+            return T2IAdapter.from_pretrained(adapter_spec)
+        except Exception as e:
+            last_err = e
+    except Exception as e:
+        last_err = e
+
+    # If we didn't find a loader, raise a clear error
+    raise RuntimeError(
+        f"Failed to load adapter from '{adapter_spec}'. Ensure the path is correct and that the required Diffusers adapter type is available. Underlying error: {last_err}"
+    )
+
+
+def prepare_controlnet_adapter(sd, adapter_spec_or_obj, adapter_config=None, train_config=None, *, strict: bool = True, require_zimage_model: bool = True):
+    """Deterministically construct and validate a ControlNet/T2I adapter for training.
+
+    Responsibilities:
+    - Load the adapter if a path is provided
+    - Set `name_or_path` if missing when a repo/path is supplied via adapter_config
+    - Enforce or set `control_in_dim` for VideoX/Z-Image adapters (33)
+    - Validate that the provided StableDiffusion `sd` instance supports required
+      model-side hooks for Z-Image routing when `require_zimage_model` is True
+
+    Returns the adapter instance on success.
+
+    Raises RuntimeError with clear remediation steps when strict and validation fails.
+    """
+    # Load adapter if needed
+    try:
+        adapter = _load_adapter_from_spec(adapter_spec_or_obj, adapter_config, train_config)
+    except Exception as e:
+        if strict:
+            raise RuntimeError(f"[CONTROLNET-LOAD] adapter load failed: {e}") from e
+        else:
+            return None
+
+    # If adapter_config supplies a name, set it when missing
+    try:
+        name = None
+        if adapter_config is not None:
+            name = getattr(adapter_config, 'name_or_path', None) or getattr(adapter_config, 'adapter_name', None)
+        # If we loaded from a string, try to attach the path as name
+        if name is None and isinstance(adapter_spec_or_obj, str):
+            name = adapter_spec_or_obj
+        if name is not None:
+            try:
+                set_adapter_name_if_missing(adapter, name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # If this looks like a Z-Image/VideoX adapter, enforce control_in_dim==33
+    try:
+        if adapter_uses_zimage(adapter, adapter_config):
+            # Enforce strictly; force will set to 33 when missing
+            ok = enforce_zimage_control_in_dim(adapter, expected=33, force=True)
+            if not ok and strict:
+                raise RuntimeError("[CONTROLNET-LOAD] Failed to enforce VideoX control_in_dim=33 on adapter; ensure adapter exposes 'control_in_dim' or use a known VideoX adapter.")
+    except Exception as e:
+        if strict:
+            raise RuntimeError(f"[CONTROLNET-LOAD] Z-Image control_in_dim enforcement failed: {e}") from e
+
+    # If strict, validate sd compatibility for Z-Image routing
+    try:
+        if adapter_uses_zimage(adapter, adapter_config) and require_zimage_model:
+            missing = []
+            if sd is None:
+                missing.append("StableDiffusion instance (sd) was not provided for validation")
+            else:
+                if not hasattr(sd, '_predict_noise_zimage') or not callable(getattr(sd, '_predict_noise_zimage')):
+                    missing.append("model-side hook `_predict_noise_zimage` is missing on the loaded SD instance")
+                if not hasattr(sd, 'encode_control_images') or not callable(getattr(sd, 'encode_control_images')):
+                    missing.append("SD instance lacks `encode_control_images` required for Z-Image routing")
+
+            if missing:
+                msg = (
+                    "Z-Image adapter requires a Z-Image aware SD model. "
+                    "The following issues were detected: " + "; ".join(missing) + ". "
+                    "Remediation: load an SD variant that supports VideoX/Z-Image routing (model transformer with control_in_dim=33 and `_predict_noise_zimage`) or set `train_config.require_zimage_model=False` to allow trainer-side fallback."
+                )
+                raise RuntimeError(f"[CONTROLNET-LOAD] {msg}")
+    except Exception as e:
+        if strict:
+            raise
+        else:
+            # Non-strict: attach a note on the adapter and continue
+            try:
+                setattr(adapter, '_controlnet_load_note', str(e))
+            except Exception:
+                pass
+
+    # Final check: ensure adapter has numeric control_in_dim set
+    try:
+        if not hasattr(adapter, 'control_in_dim') or getattr(adapter, 'control_in_dim') is None:
+            # For non-zimage adapters strict may tolerate missing value, but for zimage it should be present
+            if adapter_uses_zimage(adapter, adapter_config):
+                if strict:
+                    raise RuntimeError("[CONTROLNET-LOAD] adapter.control_in_dim is missing after enforcement. This is required for Z-Image adapters.")
+                else:
+                    # set a conservative default only if requested
+                    enforce_zimage_control_in_dim(adapter, expected=33, force=True)
+    except Exception:
+        raise
+
+    # Attach a reference to the SD instance for adapter-level diagnostics/timing when possible
+    try:
+        if sd is not None:
+            setattr(adapter, '_owner_sd', sd)
+    except Exception:
+        pass
+
+    # Return the prepared adapter
+    return adapter

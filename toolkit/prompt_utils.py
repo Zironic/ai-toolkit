@@ -900,11 +900,15 @@ def inject_trigger_into_prompt(prompt, trigger=None, to_replace_list=None, add_i
         # replace it
         output_prompt = output_prompt.replace(to_replace, replace_with)
 
-    if trigger.strip() != "":
+    # If trigger contains multiple CSV entries, do not auto-prepend it for backwards compatibility
+    parsed_triggers = parse_csv_list(trigger)
+    allow_prepend = add_if_not_present and len(parsed_triggers) == 1 and parsed_triggers[0].strip() != ''
+
+    if trigger.strip() != "" and allow_prepend:
         # see how many times replace_with is in the prompt
         num_instances = output_prompt.count(replace_with)
 
-        if num_instances == 0 and add_if_not_present:
+        if num_instances == 0:
             # add it to the beginning of the prompt
             output_prompt = replace_with + " " + output_prompt
 

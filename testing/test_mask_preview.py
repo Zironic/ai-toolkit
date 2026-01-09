@@ -30,11 +30,10 @@ class DummyTrainer(SDTrainer):
         self.train_config.masked_recon_control_blur = 3
         # mask preview defaults
         self.train_config.mask_preview_enabled = True
-        self.train_config.mask_preview_max_steps = 10
-        self.train_config.mask_preview_samples_per_step = 1
         self.tmpdir = tempfile.mkdtemp()
         self.train_config.mask_preview_save_path = os.path.join(self.tmpdir, '{job_name}', 'masks')
         self.train_config.mask_preview_overwrite = True
+        self.train_config.mask_preview_overlay = True
         self.job = types.SimpleNamespace(name='testjob')
 
     def cleanup(self):
@@ -92,6 +91,38 @@ def test_mask_preview_saves_files():
 
     files = glob.glob(outglob)
     assert len(files) >= 1
+
+
+def test_save_mask_previews_helper_creates_files():
+    # Setup a fake dataset with file_list and control images
+    tmpdir = tempfile.mkdtemp()
+    try:
+        # create simple base and control images
+        from PIL import Image
+        base_img_path = os.path.join(tmpdir, 'img1.png')
+        ctrl_img_path = os.path.join(tmpdir, 'img1_ctrl.png')
+        img = Image.new('RGB', (32, 32), color=(255, 255, 255))
+        img.save(base_img_path)
+        ctrl = Image.new('RGB', (32, 32), color=(0, 0, 0))
+        # draw a white stick
+        for y in range(4, 28):
+            for x in range(15, 17):
+                ctrl.putpixel((x, y), (255, 255, 255))
+        ctrl.save(ctrl_img_path)
+
+        dataset = types.SimpleNamespace(file_list=[types.SimpleNamespace(path=base_img_path, control_path=ctrl_img_path, crop_height=32, crop_width=32)])
+        t = DummyTrainer()
+        save_dir = os.path.join(t.tmpdir, 'testjob', 'masks')
+        os.makedirs(save_dir, exist_ok=True)
+        from toolkit.masked_recon import save_mask_previews
+        save_mask_previews([dataset], t.train_config, t.sd, save_dir, overwrite=True, overlay=True)
+
+        files = glob.glob(os.path.join(save_dir, '*.png'))
+        assert len(files) >= 1
+        idx = os.path.join(save_dir, 'index.json')
+        assert os.path.exists(idx)
+    finally:
+        shutil.rmtree(tmpdir)
 
     # cleanup
     t.cleanup()

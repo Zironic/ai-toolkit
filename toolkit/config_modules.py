@@ -435,6 +435,11 @@ class TrainConfig:
         # instead of computing adapter outputs to avoid shortcut learning.
         self.controlnet_reroute: str = kwargs.get('controlnet_reroute', 'none')
 
+        # Whether to require the model to implement the Z-Image model hook (`_predict_noise_zimage`) when
+        # Z-Image (VideoX) routing is used. Default: True (fail-fast). Set to False to allow the trainer to
+        # perform a deterministic fallback for models that do not expose the hook.
+        self.require_zimage_model: bool = kwargs.get('require_zimage_model', True)
+
         # Auxiliary controlnet loss (opt-in)
         # Options: 'none', 'edge'  (edge compares Sobel of image to control tensor)
         self.controlnet_aux_loss: str = kwargs.get('controlnet_aux_loss', 'none')
@@ -455,10 +460,11 @@ class TrainConfig:
         self.masked_recon_control_dilate_scale_factor: float = kwargs.get('masked_recon_control_dilate_scale_factor', 4.0)
         # Mask preview/debugging options
         self.mask_preview_enabled: bool = kwargs.get('mask_preview_enabled', False)
-        self.mask_preview_max_steps: int = kwargs.get('mask_preview_max_steps', 10)
-        self.mask_preview_samples_per_step: int = kwargs.get('mask_preview_samples_per_step', 2)
+        # `mask_preview_max_steps` and `mask_preview_samples_per_step` removed — preview now runs once per job
         self.mask_preview_save_path: str = kwargs.get('mask_preview_save_path', 'output/{job_name}/masks')
         self.mask_preview_overwrite: bool = kwargs.get('mask_preview_overwrite', False)
+        # whether to create an overlay image (mask blended over the source image) — default True
+        self.mask_preview_overlay: bool = kwargs.get('mask_preview_overlay', True)
         # Option to freeze ControlNet/adapter parameters during fine-tuning
         self.controlnet_frozen: bool = kwargs.get('controlnet_frozen', False)
 
@@ -533,6 +539,8 @@ class TrainConfig:
         self.diff_output_preservation_every = int(kwargs.get('diff_output_preservation_every', 1))
         if self.diff_output_preservation_every < 1:
             raise ValueError('diff_output_preservation_every must be >= 1')
+        # Debug: when true, print before/after DOP caption mappings during precompute/runtime steps
+        self.diff_output_preservation_debug = kwargs.get('diff_output_preservation_debug', False)
         
         # blank prompt preservation will preserve the model's knowledge of a blank prompt
         self.blank_prompt_preservation = kwargs.get('blank_prompt_preservation', False)
@@ -1031,6 +1039,8 @@ class DatasetConfig:
         self.cache_latents_to_disk: bool = kwargs.get('cache_latents_to_disk', False)
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
+        # keep text embeddings in-memory between batches to avoid repeated disk reads
+        self.cache_text_embeddings_to_memory: bool = kwargs.get('cache_text_embeddings_to_memory', True)
         # Control context caching: persist assembled control contexts per-file.
         # Defaults derive from latent caching settings unless explicitly set.
         self.cache_control_contexts: bool = kwargs.get('cache_control_contexts', self.cache_latents)
@@ -1051,20 +1061,9 @@ class DatasetConfig:
             # enable text embedding caching unless explicitly set
             if 'cache_text_embeddings' not in kwargs:
                 self.cache_text_embeddings = True
-
-        self.standardize_images: bool = kwargs.get('standardize_images', False)
-
-        # https://albumentations.ai/docs/api_reference/augmentations/transforms
-        # augmentations are returned as a separate image and cannot currently be cached
-        self.augmentations: List[dict] = kwargs.get('augmentations', None)
-        self.shuffle_augmentations: bool = kwargs.get('shuffle_augmentations', False)
-
-        has_augmentations = self.augmentations is not None and len(self.augmentations) > 0
-
-        if (len(self.augments) > 0 or has_augmentations) and (self.cache_latents or self.cache_latents_to_disk):
-            print(f"WARNING: Augments are not supported with caching latents. Setting cache_latents to False")
-            self.cache_latents = False
-            self.cache_latents_to_disk = False
+            # enable in-memory text embedding caching unless explicitly set
+            if 'cache_text_embeddings_to_memory' not in kwargs:
+                self.cache_text_embeddings_to_memory = True
 
         # legacy compatability
         legacy_caption_type = kwargs.get('caption_type', None)
@@ -1079,6 +1078,9 @@ class DatasetConfig:
         self.clip_image_from_same_folder: bool = kwargs.get('clip_image_from_same_folder', False)
         self.clip_image_augmentations: List[dict] = kwargs.get('clip_image_augmentations', None)
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
+        # legacy: per-dataset augmentations for images
+        self.augmentations: List[dict] = kwargs.get('augmentations', [])
+        self.shuffle_augmentations: bool = kwargs.get('shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
 

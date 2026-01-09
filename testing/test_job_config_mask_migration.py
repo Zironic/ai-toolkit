@@ -1,0 +1,1 @@
+# Migration test for UI is implemented in the UI unit tests (TypeScript). Skipping Python-driven check as the UI module is TypeScript/React.

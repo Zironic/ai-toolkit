@@ -51,6 +51,7 @@ A concise index of common helpers and where to find them. Check here first befor
 - **Run targeted tests** relevant to the area: `python -m pytest testing -q -k <test-name-substring>` and add tests for any new behavior in `testing/`.
 - **If adding CLI/UI behavior**, update API routes and worker persistence (e.g., `ui/src/app/api/eval_dataset/route.ts`, `ui/cron/actions/processEvalQueue.ts`) and add smoke checks.
 - **Document** the change in `AGENTS.md` (brief note) and `LEARNINGS.md` (why, tests, caveats).
+- **Keep the TODO list up to date (use `manage_todo_list`):** For multi-step or multi-phase tasks, use the `manage_todo_list` tool to create and maintain a concise TODO list in the issue, PR description, or `LEARNINGS.md`. Add todos before starting work, mark exactly one todo as `in-progress` before you begin, keep only one `in-progress` item at a time, mark each todo `completed` immediately after finishing, and add newly discovered follow-ups as new todos. This explicit workflow helps reviewers and future contributors follow progress and reduces confusion.
 - **Training lifecycle docs:** Read the relevant chapter(s) in `docs/training_lifecycle/` before modifying training or pipeline code and add a one-line summary of the chapter(s) to the PR description.
   - `docs/training_lifecycle/Training_Job_Lifecycle.md` — Master index and verification checklist (start here)
   - `docs/training_lifecycle/01-ui-job-creation.md` — UI job creation: form → API → DB
@@ -82,6 +83,7 @@ A concise index of common helpers and where to find them. Check here first befor
 **PR checklist (recommended):**
 - Search for existing helpers in `toolkit/` (e.g., `rg "<keyword>|def <name>|class <Name>" toolkit/ -n`) and reuse them if possible.
 - If the change requires GPU pipeline verification: include manual test steps, hardware requirements, and assign a reviewer with GPU access; mark the PR `manual-testing-required`.
+- **TODOs (use `manage_todo_list`):** Use the `manage_todo_list` tool to keep the TODO list current; ensure the work's TODO list is up-to-date in the issue/PR or `LEARNINGS.md`, resolve or explicitly document any outstanding TODOs before merging, and include the current TODO list state (completed / in-progress) in the PR description so reviewers can see remaining tasks or known limitations.
 - Confirm code fails fast and is deterministic where applicable, and add tests or documentation that demonstrate this.
 - If you used a subagent (Raptor Mini), include the subagent query and a short summary of the findings in the PR description and `LEARNINGS.md`.
 

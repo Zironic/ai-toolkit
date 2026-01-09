@@ -136,3 +136,39 @@ def find_cached_file(expected_path: Path, legacy_fallback: bool = True) -> Optio
     # pick most recently modified candidate as heuristic
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates[0]
+
+
+def wait_for_cached_file(expected_path: Path, timeout: float = 5.0, poll_interval: float = 0.1, legacy_fallback: bool = True) -> Optional[Path]:
+    """Wait up to `timeout` seconds for a cached file to appear and be stable.
+
+    Returns the Path if found and stable, otherwise None.
+    Stability heuristic: file exists and its size is unchanged across two polls.
+    """
+    import time
+
+    deadline = time.time() + float(timeout)
+    last_size = None
+    while time.time() < deadline:
+        candidate = find_cached_file(Path(expected_path), legacy_fallback=legacy_fallback)
+        if candidate is None:
+            time.sleep(poll_interval)
+            continue
+        try:
+            stat = candidate.stat()
+            size = stat.st_size
+            # If size is 0, it's still possibly being written; wait for stability
+            if last_size is None:
+                last_size = size
+                time.sleep(poll_interval)
+                continue
+            if size == last_size:
+                return candidate
+            last_size = size
+        except FileNotFoundError:
+            # race: file disappeared between discovery and stat — retry
+            time.sleep(poll_interval)
+            continue
+        except Exception:
+            time.sleep(poll_interval)
+            continue
+    return None

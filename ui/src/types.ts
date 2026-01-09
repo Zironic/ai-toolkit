@@ -211,6 +211,18 @@ export interface LoggingConfig {
   use_ui_logger: boolean;
 }
 
+export interface VRAMDiagnosticsConfig {
+  enabled?: boolean;
+  once_per_run?: boolean;
+  deep_scan?: boolean;
+  include_nvidia_smi?: boolean;
+}
+
+export interface PerformanceConfig {
+  precise_gpu_timing?: boolean;
+  vram_diagnostics?: VRAMDiagnosticsConfig;
+}
+
 export interface SliderConfig {
   guidance_strength?: number;
   anchor_strength?: number;
@@ -235,6 +247,8 @@ export interface ProcessConfig {
   logging: LoggingConfig;
   model: ModelConfig;
   sample: SampleConfig;
+  // Optional performance tuning & diagnostics
+  performance?: PerformanceConfig;
 }
 
 export interface ConfigObject {

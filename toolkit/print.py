@@ -1,10 +1,17 @@
 import sys
 import os
-from toolkit.accelerator import get_accelerator
 
 
 def print_acc(*args, **kwargs):
-    if get_accelerator().is_local_main_process:
+    """Print only on local main process; import accelerator lazily to avoid
+    heavyweight imports during test collection."""
+    try:
+        from toolkit.accelerator import get_accelerator
+        if get_accelerator().is_local_main_process:
+            print(*args, **kwargs)
+    except Exception:
+        # Fall back to printing to keep tests and diagnostics visible when
+        # accelerator is not available during unit tests.
         print(*args, **kwargs)
 
 
@@ -24,8 +31,13 @@ class Logger:
 
 
 def setup_log_to_file(filename):
-    if get_accelerator().is_local_main_process:
-        if not os.path.exists(os.path.dirname(filename)):
-            os.makedirs(os.path.dirname(filename))
+    try:
+        from toolkit.accelerator import get_accelerator
+        if get_accelerator().is_local_main_process:
+            if not os.path.exists(os.path.dirname(filename)):
+                os.makedirs(os.path.dirname(filename))
+    except Exception:
+        # If accelerator not available during tests, still allow log setup to proceed
+        pass
     sys.stdout = Logger(filename)
     sys.stderr = Logger(filename)
