@@ -2839,13 +2839,12 @@ class SDTrainer(BaseSDTrainProcess):
                             except Exception:
                                 vae_scale = 8
                             _, C, H, W = noisy_latents.shape
-                            target_long = max(1, int(round(resolution / vae_scale)))
-                            if H >= W:
-                                target_h = target_long
-                                target_w = max(1, int(round(W * (target_h / H))))
-                            else:
-                                target_w = target_long
-                                target_h = max(1, int(round(H * (target_w / W))))
+                            # Calculate target dimensions based on pixel area, not side length
+                            import math
+                            target_latent_area = (resolution / vae_scale) ** 2
+                            aspect_ratio = H / W
+                            target_h = max(1, int(round(math.sqrt(target_latent_area * aspect_ratio))))
+                            target_w = max(1, int(round(math.sqrt(target_latent_area / aspect_ratio))))
                             # transformer patch rounding
                             try:
                                 tr = getattr(self.sd, 'transformer', None)
@@ -2872,7 +2871,7 @@ class SDTrainer(BaseSDTrainProcess):
 
                         if skip_full_prior:
                             try:
-                                print_acc(f"[DOP] Skipping full-res prior for {preservation_kind} preservation; will run reduced prediction at {preservation_resolution}px long side")
+                                print_acc(f"[DOP] Skipping full-res prior for {preservation_kind} preservation; will run reduced prediction at {preservation_resolution}px area (sqrt={int(math.sqrt((preservation_resolution**2)))}px)")
                             except Exception:
                                 pass
                             prior_pred = None
@@ -3160,9 +3159,6 @@ class SDTrainer(BaseSDTrainProcess):
                             if param_requires_count == 0:
                                 raise RuntimeError("No model parameters are configured to require gradients. Did you accidentally freeze all parameters or misconfigure the optimizer? Aborting.")
 
-                            if not getattr(noisy_latents, 'requires_grad', False):
-                                raise RuntimeError("`noisy_latents` does not require gradients (it appears detached). This prevents any backward propagation. Aborting training to avoid silent progress.")
-
                             # Make batch visible to pre/post UNet hooks (for attention alignment)
                             self._last_batch_for_attn = batch
                             # proceed to forward
@@ -3233,32 +3229,53 @@ class SDTrainer(BaseSDTrainProcess):
                                 self._last_normal_loss = float(normal_loss.detach())
                         except Exception:
                             self._last_normal_loss = None
-                        with torch.no_grad():
-                            # Only compute diff output preservation if it's scheduled for this batch
-                            if 'do_dop_this_step' in locals() and do_dop_this_step:
-                                if self.diff_output_preservation_embeds is None:
-                                    raise RuntimeError("Scheduled diff_output_preservation step but embeds are not prepared. Ensure 'diff_output_preservation_every' and precompute settings are correct.")
-                                preservation_embeds = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
-                                # record execution count for diagnostics
-                                try:
-                                    self._diff_output_preservation_exec_count += 1
-                                except Exception:
-                                    pass
-                            elif self.train_config.blank_prompt_preservation:
-                                blank_embeds = self.cached_blank_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
+                        
+                        # Determine which preservation embeddings to use
+                        # Only compute diff output preservation if it's scheduled for this batch
+                        preservation_embeds = None
+                        if 'do_dop_this_step' in locals() and do_dop_this_step:
+                            if self.diff_output_preservation_embeds is None:
+                                raise RuntimeError(
+                                    "Scheduled diff_output_preservation step but embeds are not prepared. "
+                                    "Ensure 'diff_output_preservation_every' and precompute settings are correct. "
+                                    f"Current batch count: {getattr(self, '_total_batch_count', 0)}, "
+                                    f"DOP every: {getattr(self.train_config, 'diff_output_preservation_every', 1)}"
                                 )
-                                preservation_embeds = concat_prompt_embeds(
-                                    [blank_embeds] * noisy_latents.shape[0]
-                                )
-                            else:
-                                # preservation not scheduled this step; skip entirely
-                                preservation_embeds = None
+                            preservation_embeds = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
+                            # record execution count for diagnostics
+                            try:
+                                self._diff_output_preservation_exec_count += 1
+                            except Exception:
+                                pass
+                        elif self.train_config.blank_prompt_preservation:
+                            if self.cached_blank_embeds is None:
+                                raise RuntimeError("blank_prompt_preservation enabled but cached_blank_embeds is None")
+                            blank_embeds = self.cached_blank_embeds.clone().detach().to(
+                                self.device_torch, dtype=dtype
+                            )
+                            preservation_embeds = concat_prompt_embeds(
+                                [blank_embeds] * noisy_latents.shape[0]
+                            )
+                        
                         # reset per-step diagnostics
                         self._last_preservation_loss = None
-                        self._last_normal_loss = None
                         # Compute preservation prediction and loss via helper (adds DOP timers)
                         preservation_pred = None
+                        if preservation_embeds is not None:
+                            # Additional validation: ensure preservation_embeds has required attributes
+                            # This catches edge cases where embeds might be malformed
+                            try:
+                                # Verify embeds can be moved to device (has .to method or is a proper PromptEmbeds)
+                                if not (hasattr(preservation_embeds, 'to') or hasattr(preservation_embeds, 'text_embeds')):
+                                    raise RuntimeError(f"preservation_embeds is not a valid PromptEmbeds object: {type(preservation_embeds)}")
+                            except Exception as e:
+                                try:
+                                    print_acc(f"[DOP] preservation_embeds validation failed: {e}")
+                                except Exception:
+                                    pass
+                                # Skip preservation this step if embeds are invalid
+                                preservation_embeds = None
+                        
                         if preservation_embeds is not None:
                             # Determine if we should run preservation at a reduced resolution
                             preservation_resolution = None
@@ -3272,6 +3289,8 @@ class SDTrainer(BaseSDTrainProcess):
 
                             # Run preservation forward with gradients enabled so the preservation
                             # prediction participates in autograd and its loss can be backpropagated.
+                            # This handles BOTH high-resolution (no downsampling) and low-resolution
+                            # (downsampled latents + prior) cases based on preservation_resolution parameter.
                             with torch.set_grad_enabled(True):
                                 preservation_pred_res = self._run_preservation_forward(
                                     noisy_latents=noisy_latents,
@@ -3288,7 +3307,10 @@ class SDTrainer(BaseSDTrainProcess):
                                     network_weight_list=network_weight_list,
                                 )
 
-                            # Support returned (preservation_pred, prior_pred_for_loss) when downsampling occurred
+                            # Support returned (preservation_pred, prior_pred_for_loss) when downsampling occurred.
+                            # In low-res mode, _run_preservation_forward computes both preservation pred AND
+                            # a downsampled prior pred (if original prior_pred was None) so loss can be computed
+                            # at the reduced resolution.
                             if isinstance(preservation_pred_res, tuple):
                                 preservation_pred, prior_pred_for_loss = preservation_pred_res
                             else:
@@ -3309,14 +3331,23 @@ class SDTrainer(BaseSDTrainProcess):
                                 loss = normal_loss.clone().detach()
                                 loss.requires_grad_(True)
                             else:
+                                # Combined loss is for logging only - backward already called in _compute_and_apply_preservation_loss
                                 loss = normal_loss + preservation_loss
                                 loss = loss.clone().detach()
                                 # require grad again so the backward wont fail
                                 loss.requires_grad_(True)
+                                try:
+                                    print_acc(f"[DOP] Combined loss (already backwarded separately): normal={float(normal_loss):.6e}, preservation={float(preservation_loss):.6e}, total={float(loss):.6e}")
+                                except Exception:
+                                    pass
                         else:
                             # No preservation this step; use the normal loss only
                             loss = normal_loss.clone().detach()
                             loss.requires_grad_(True)
+                            try:
+                                print_acc(f"[DOP] No preservation scheduled for this step (batch {getattr(self, '_total_batch_count', 0)})")
+                            except Exception:
+                                pass
 
                 # If loss is NaN after all attempts, fail loudly and abort the run (do not fallback to a zero tensor)
                 if torch.isnan(loss):
@@ -3362,8 +3393,24 @@ class SDTrainer(BaseSDTrainProcess):
             local_pred_kwargs.pop('down_block_additional_residuals', None)
             local_pred_kwargs.pop('mid_block_additional_residual', None)
 
+        # Every 5 timesteps, if DOP resolution is < 512, boost to 512 for that step
+        # This helps maintain quality at higher resolutions while keeping most steps fast
+        effective_preservation_resolution = preservation_resolution
+        if preservation_resolution is not None and preservation_resolution < 512:
+            # Check if any timestep in the batch is divisible by 5
+            # timesteps is a tensor, check if any value % 5 == 0
+            try:
+                if torch.any((timesteps % 5) == 0):
+                    effective_preservation_resolution = 512
+                    try:
+                        print_acc(f"[DOP] Timestep divisible by 5 detected; boosting DOP resolution from {preservation_resolution} to 512")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         # If no resolution requested, do the normal full-res predict (using cleaned local kwargs)
-        if preservation_resolution is None:
+        if effective_preservation_resolution is None:
             with self.timer(timer_base):
                 preservation_pred = self.predict_noise(
                     noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
@@ -3388,15 +3435,16 @@ class SDTrainer(BaseSDTrainProcess):
 
         # Current latent spatial dims
         _, C, H, W = noisy_latents.shape
-        # Target latent long side
-        target_long = max(1, int(round(preservation_resolution / vae_scale)))
-        # Keep aspect ratio
-        if H >= W:
-            target_h = target_long
-            target_w = max(1, int(round(W * (target_h / H))))
-        else:
-            target_w = target_long
-            target_h = max(1, int(round(H * (target_w / W))))
+        # Target latent area from pixel area: effective_preservation_resolution represents sqrt of target pixel area
+        # e.g., effective_preservation_resolution=128 means 128*128=16k pixels, which is (128/vae_scale)^2 latent pixels
+        target_latent_area = (effective_preservation_resolution / vae_scale) ** 2
+        # Preserve aspect ratio: target_h / target_w = H / W
+        # Solve: target_h * target_w = target_latent_area AND target_h / target_w = H / W
+        # Therefore: target_h = sqrt(target_latent_area * H / W), target_w = sqrt(target_latent_area * W / H)
+        import math
+        aspect_ratio = H / W
+        target_h = max(1, int(round(math.sqrt(target_latent_area * aspect_ratio))))
+        target_w = max(1, int(round(math.sqrt(target_latent_area / aspect_ratio))))
 
         # Ensure target dims are compatible with transformer patch sizes (avoid invalid view shapes)
         try:
@@ -3426,24 +3474,28 @@ class SDTrainer(BaseSDTrainProcess):
                     conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
                     unconditional_embeds=unconditional_embeds,
                     batch=batch,
-                    **pred_kwargs
+                    **local_pred_kwargs
                 )
             return preservation_pred
 
         # Downsample noisy_latents and prior_pred, run predict on smaller tensor
         with self.timer(f"{timer_base}_downsampled"):
             torch_dtype = get_torch_dtype(dtype)
+            # Use area mode for downsampling latents - it's better than bilinear for preserving
+            # latent structure as it averages patches rather than interpolating, which is more
+            # appropriate for the discrete nature of latent representations
             noisy_small = torch.nn.functional.interpolate(
-                noisy_latents, size=(target_h, target_w), mode='bilinear', align_corners=False
+                noisy_latents, size=(target_h, target_w), mode='area'
             ).to(self.device_torch, dtype=torch_dtype)
             prior_small = None
             if prior_pred is not None:
                 prior_small = torch.nn.functional.interpolate(
-                    prior_pred, size=(target_h, target_w), mode='bilinear', align_corners=False
+                    prior_pred, size=(target_h, target_w), mode='area'
                 ).to(self.device_torch, dtype=torch_dtype)
             else:
                 # No full-res prior available (we skipped it); compute a reduced prior prediction
                 # at the smaller latent size so preservation loss can be evaluated.
+                # Use preservation_embeds (class-only) since prior should be base model + class
                 try:
                     prior_small = self.get_prior_prediction(
                         noisy_latents=noisy_small,

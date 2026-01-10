@@ -6,7 +6,7 @@ import fs from 'fs';
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { datasetName, imagePath, identifiers } = body;
+    const { datasetName, imagePath, identifiers, merge_texts = true } = body;
 
     if (!datasetName || !identifiers || identifiers.length === 0) {
       return NextResponse.json(
@@ -58,6 +58,11 @@ export async function POST(request: NextRequest) {
       '--model', 'sam3.pt',
       '--text', identifiers.join(',')
     ];
+
+    // If merge_texts is true, include the flag so the script will merge CSV identifiers into a single mask
+    if (merge_texts) {
+      args.push('--merge-texts');
+    }
 
     // Spawn the Python process
     const pythonProcess = spawn(pythonPath, args, {

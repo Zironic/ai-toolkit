@@ -218,36 +218,75 @@ def generate_mask_from_text(
     text: str,
     model,
     processor,
-    device: str
+    device: str,
+    merge: bool = False
 ) -> np.ndarray:
     """Generate binary mask using text prompt (SAM3 only).
-    
+
     Args:
         image_path: Path to input image
-        text: Text prompt
+        text: Text prompt (can be comma-separated values)
         model: SAM3 model wrapper
         processor: SAM3 processor
         device: Device string
-    
+        merge: If True, split `text` by commas and merge masks for each term (logical OR)
+
     Returns:
         Binary mask [H, W] with values {0, 255}
     """
     image = Image.open(image_path).convert("RGB")
-    
-    # SAM3 uses a state-based API
-    state = {}
-    state = processor.set_image(image, state)
-    state = processor.set_text_prompt(text, state)
-    
-    # Get masks from state
-    if "masks" in state and len(state["masks"]) > 0:
-        # Take the first (highest confidence) mask
-        mask = state["masks"][0, 0].cpu().numpy()  # [H, W]
-        mask_binary = (mask > 0.5).astype(np.uint8) * 255
-    else:
-        # No masks found, return empty mask
-        mask_binary = np.zeros((image.height, image.width), dtype=np.uint8)
-    
+
+    # If not merging, use simple single-text flow
+    if not merge:
+        # SAM3 uses a state-based API
+        state = {}
+        state = processor.set_image(image, state)
+        state = processor.set_text_prompt(text, state)
+
+        # Get masks from state
+        if "masks" in state and len(state["masks"]) > 0:
+            # Take the first (highest confidence) mask
+            mask = state["masks"][0, 0].cpu().numpy()  # [H, W]
+            mask_binary = (mask > 0.5).astype(np.uint8) * 255
+        else:
+            # No masks found, return empty mask
+            mask_binary = np.zeros((image.height, image.width), dtype=np.uint8)
+
+        return mask_binary
+
+    # Merge mode: split CSV and OR all masks from each text term
+    terms = [t.strip() for t in text.split(',')] if text else []
+    merged = np.zeros((image.height, image.width), dtype=bool)
+
+    for term in terms:
+        if not term:
+            continue
+        # Fresh image state for each term
+        state = {}
+        state = processor.set_image(image, state)
+        state = processor.set_text_prompt(term, state)
+        masks = state.get("masks", None)
+
+        if masks is None or len(masks) == 0:
+            continue
+
+        # Convert masks to numpy
+        if isinstance(masks, torch.Tensor):
+            masks_np = masks.cpu().numpy()
+        else:
+            masks_np = np.array(masks)
+
+        # Normalize shape: [N, H, W] or [N,1,H,W] -> squeeze
+        if masks_np.ndim == 4:
+            masks_np = masks_np.squeeze(1)
+
+        if masks_np.ndim == 2:
+            merged |= (masks_np > 0.5)
+        else:
+            # OR across all returned masks for this term
+            merged |= np.any(masks_np > 0.5, axis=0)
+
+    mask_binary = (merged.astype(np.uint8) * 255)
     return mask_binary
 
 
@@ -263,9 +302,10 @@ def process_dataset(
     text: Optional[str] = None,
     use_comfyui: bool = False,
     comfyui_loader_path: Optional[str] = None,
+    merge_texts: bool = False,
 ):
     """Process all images in dataset and generate masks.
-    
+
     Args:
         dataset_path: Path to dataset folder
         output_folder: Path to output folder for masks
@@ -278,6 +318,7 @@ def process_dataset(
         text: Text prompt for SAM3
         use_comfyui: Use ComfyUI SAM3 loader
         comfyui_loader_path: Path to ComfyUI load_model.py
+        merge_texts: If True, split `text` on commas and merge masks for each identifier into a single mask
     """
     dataset_path = Path(dataset_path)
     output_dir = Path(output_folder)
@@ -321,7 +362,7 @@ def process_dataset(
                 )
             elif text:
                 mask = generate_mask_from_text(
-                    str(img_file), text, model, processor, device
+                    str(img_file), text, model, processor, device, merge=merge_texts
                 )
             # Save mask with same name as image (as PNG)
             mask_name = img_file.stem + ".png"
@@ -383,6 +424,9 @@ Examples:
                        help="Comma-separated file extensions (default: jpg,jpeg,png,webp,bmp)")
     parser.add_argument("--text", type=str, default=None,
                        help="Text prompt for SAM3 (requires --use-comfyui)")
+    parser.add_argument("--merge-texts", action="store_true",
+                        help="If set, split --text on commas and merge masks into a single mask")
+
     args = parser.parse_args()
     
     # Parse points
@@ -438,7 +482,11 @@ Examples:
         extensions=extensions,
         use_comfyui=args.use_comfyui,
         comfyui_loader_path=args.comfyui_sam3 if args.use_comfyui else None,
+        merge_texts=args.merge_texts,
     )
+
+# Example: merge multiple text identifiers into a single mask
+# python scripts/generate_masks_sam2.py --dataset datasets/my_dataset --text "dog,cat" --merge-texts --use-comfyui --output datasets/my_dataset/masks
 
 
 

@@ -131,7 +131,7 @@ class ControlGenerator:
             img = img.resize(in_size, Image.LANCZOS)
             # atomic save
             def _write(p: Path):
-                img.save(str(p))
+                img.save(str(p), format='JPEG')
             atomic_write(Path(save_path), _write)
             return save_path
         elif control_type == 'pose':
@@ -158,7 +158,7 @@ class ControlGenerator:
             img = img.convert('RGB')
             # atomic save
             def _write(p: Path):
-                img.save(str(p))
+                img.save(str(p), format='JPEG')
             atomic_write(Path(save_path), _write)
             return save_path
 
@@ -176,7 +176,7 @@ class ControlGenerator:
             img = img.convert('RGB')
             # atomic save
             def _write(p: Path):
-                img.save(str(p))
+                img.save(str(p), format='JPEG')
             atomic_write(Path(save_path), _write)
             return save_path
         elif control_type == 'inpaint' or control_type == 'mask':
@@ -217,9 +217,10 @@ class ControlGenerator:
             else:
                 img = mask
                 img = img.convert('RGB')
-            # atomic save
+            # atomic save - determine format from save_path extension
+            save_format = 'WEBP' if save_path.endswith('.webp') else 'JPEG'
             def _write(p: Path):
-                img.save(str(p))
+                img.save(str(p), format=save_format)
             atomic_write(Path(save_path), _write)
             return save_path
         else:

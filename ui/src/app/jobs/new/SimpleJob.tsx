@@ -1071,7 +1071,36 @@ export default function SimpleJob({
                             docKey="datasets.do_i2v"
                           />
                         )}
+                        <Checkbox
+                          label="Use Masks"
+                          checked={dataset.mask_path !== null && dataset.mask_path !== undefined}
+                          onChange={value => {
+                            if (value) {
+                              // Enable masks: set mask_path to <folder_path>/masks
+                              const folderPath = dataset.folder_path || '';
+                              const maskPath = folderPath ? `${folderPath}/masks` : null;
+                              setJobConfig(maskPath, `config.process[0].datasets[${i}].mask_path`);
+                            } else {
+                              // Disable masks: set mask_path to null
+                              setJobConfig(null, `config.process[0].datasets[${i}].mask_path`);
+                            }
+                          }}
+                          docKey="datasets.mask_path"
+                        />
                       </FormGroup>
+                      {dataset.mask_path !== null && dataset.mask_path !== undefined && (
+                        <SliderInput
+                          label="Mask Strength"
+                          className="mt-2"
+                          value={dataset.mask_min_value ?? 0.1}
+                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].mask_min_value`)}
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          showValue={true}
+                          docKey="datasets.mask_min_value"
+                        />
+                      )}
                       <FormGroup label="Flipping" docKey={'datasets.flip'} className="mt-2">
                         <Checkbox
                           label={

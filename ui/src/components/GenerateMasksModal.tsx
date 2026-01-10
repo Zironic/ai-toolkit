@@ -23,6 +23,7 @@ export default function GenerateMasksModal({
   const [identifiers, setIdentifiers] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [mergeTexts, setMergeTexts] = useState(true);
 
   const handleGenerate = async () => {
     if (!identifiers.trim()) {
@@ -38,6 +39,7 @@ export default function GenerateMasksModal({
         datasetName,
         imagePath: imagePath || null,
         identifiers: identifiers.split(',').map(id => id.trim()).filter(id => id),
+        merge_texts: mergeTexts,
       });
 
       if (response.data.success) {
@@ -57,6 +59,7 @@ export default function GenerateMasksModal({
     if (!isGenerating) {
       setIdentifiers('');
       setError(null);
+      setMergeTexts(true);
       onClose();
     }
   };
@@ -101,6 +104,19 @@ export default function GenerateMasksModal({
                     disabled={isGenerating}
                     className="w-full rounded bg-gray-700 text-white p-2 border border-gray-600 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
                   />
+
+                  <div className="mt-3 flex items-center gap-2">
+                    <input
+                      id="merge_texts"
+                      type="checkbox"
+                      checked={mergeTexts}
+                      onChange={(e) => setMergeTexts(e.target.checked)}
+                      disabled={isGenerating}
+                      className="h-4 w-4 rounded bg-gray-700 border-gray-600 text-emerald-500 focus:ring-emerald-500 disabled:opacity-50"
+                    />
+                    <label htmlFor="merge_texts" className="text-sm text-gray-300">Merge identifiers into a single mask (default)</label>
+                  </div>
+
                   {error && (
                     <p className="text-sm text-red-500 mt-2">{error}</p>
                   )}
