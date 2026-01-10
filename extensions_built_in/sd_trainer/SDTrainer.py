@@ -999,35 +999,9 @@ class SDTrainer(BaseSDTrainProcess):
 
         Factored out for testability and to avoid inlining a large block inside `run()`.
         """
-        try:
-            if not getattr(self.train_config, 'mask_preview_enabled', False):
-                return
-            from toolkit.masked_recon import save_mask_previews
-            datasets_for_preview = []
-            if getattr(self, 'data_loader', None) is not None:
-                try:
-                    from toolkit.data_loader import get_dataloader_datasets
-                    datasets_for_preview = get_dataloader_datasets(self.data_loader)
-                except Exception:
-                    datasets_for_preview = []
-            # Only run if we found at least one dataset with file_list
-            if len(datasets_for_preview) == 0:
-                return
-            job_name = getattr(getattr(self, 'job', None), 'name', 'job')
-            save_path_tpl = getattr(self.train_config, 'mask_preview_save_path', 'output/{job_name}/masks')
-            save_path = save_path_tpl.format(job_name=job_name)
-            overwrite = bool(getattr(self.train_config, 'mask_preview_overwrite', False))
-            overlay = bool(getattr(self.train_config, 'mask_preview_overlay', True))
-            try:
-                save_mask_previews(datasets_for_preview, self.train_config, self.sd, save_path, overwrite=overwrite, overlay=overlay)
-            except Exception:
-                try:
-                    print_acc('[MASK_PREVIEW] failed to generate mask previews (continuing)')
-                except Exception:
-                    pass
-        except Exception:
-            # best-effort: never fail the main run
-            pass
+        # Mask preview feature removed (was part of masked_recon)
+        pass
+
     def calculate_loss(
             self,
             noise_pred: torch.Tensor,
@@ -2040,17 +2014,8 @@ class SDTrainer(BaseSDTrainProcess):
 
                 # Determine mask
                 mask = None
-                try:
-                    from toolkit.masked_recon import build_control_mask
-                    if getattr(self.train_config, 'attention_align_prefer_control_mask', True) and getattr(batch, 'control_tensor', None) is not None:
-                        try:
-                            mask = build_control_mask(batch.control_tensor, self.train_config, target_size=(H_lat, W_lat), device_torch=self.device_torch)
-                        except Exception:
-                            mask = None
-                except Exception:
-                    mask = None
-
-                if mask is None and getattr(batch, 'mask_tensor', None) is not None:
+                
+                if getattr(batch, 'mask_tensor', None) is not None:
                     try:
                         mask = batch.mask_tensor.to(self.device_torch)
                     except Exception:
@@ -2281,6 +2246,16 @@ class SDTrainer(BaseSDTrainProcess):
                     # expand to match latents
                     mask_multiplier = mask_multiplier.expand(-1, noisy_latents.shape[1], -1, -1)
                     mask_multiplier = mask_multiplier.to(self.device_torch, dtype=dtype).detach()
+                    
+                    # Apply mask_strength blending (get from first file item's dataset config)
+                    if len(batch.file_items) > 0:
+                        mask_strength = float(getattr(batch.file_items[0].dataset_config, 'mask_strength', 1.0))
+                        if 0.0 < mask_strength < 1.0:
+                            # Blend: masked regions (1.0) get full weight, non-masked (0.0) get reduced weight
+                            # Formula: final = mask * 1.0 + (1-mask) * (1-strength)
+                            #        = mask + (1-mask) * (1-strength)
+                            mask_multiplier = mask_multiplier + (1.0 - mask_multiplier) * (1.0 - mask_strength)
+                    
                     # make avg 1.0
                     mask_multiplier = mask_multiplier / mask_multiplier.mean()
 
@@ -2288,22 +2263,6 @@ class SDTrainer(BaseSDTrainProcess):
             # Delegate to class-level helper which uses torch RNG for reproducibility
             is_t2i = (self.adapter and isinstance(self.adapter, T2IAdapter))
             return SDTrainer.compute_adapter_multiplier(is_t2i, match_adapter_assist, self.device_torch, dtype)
-
-        # Helper: compute and optionally apply masked reconstruction loss
-        def _apply_masked_recon_loss_local(current_loss):
-            # Lightweight wrapper to call class method; keeps local scope simple
-            try:
-                loss_out, mloss = self._compute_and_apply_masked_recon_loss(current_loss, noisy_latents, imgs, batch, dtype)
-                return loss_out, mloss
-            except Exception as e:
-                try:
-                    print_acc(f"[MASKED_RECON] failed: {e}")
-                except Exception:
-                    print(f"[MASKED_RECON] failed: {e}")
-                return current_loss, None
-
-        # initialize masked recon logger
-        masked_recon_logged = None
 
 
 
@@ -3358,14 +3317,6 @@ class SDTrainer(BaseSDTrainProcess):
                             # No preservation this step; use the normal loss only
                             loss = normal_loss.clone().detach()
                             loss.requires_grad_(True)
-                        
-                # apply masked reconstruction if configured (best-effort, post-loss computation)
-
-                    # call helper to integrate masked recon loss into main loss
-                with self.timer('masked_recon'):
-                    loss, mloss = _apply_masked_recon_loss_local(loss)
-                if mloss is not None:
-                    masked_recon_logged = float(mloss.detach())
 
                 # If loss is NaN after all attempts, fail loudly and abort the run (do not fallback to a zero tensor)
                 if torch.isnan(loss):
@@ -3642,27 +3593,6 @@ class SDTrainer(BaseSDTrainProcess):
         if do_reg_prior:
             return False
         return True
-
-    def _compute_and_apply_masked_recon_loss(self, current_loss, noisy_latents, imgs, batch, dtype):
-        """Thin wrapper: delegate masked reconstruction to `toolkit.masked_recon.apply_masked_recon_loss`.
-        Returns (loss, mloss_tensor_or_None)
-        """
-        try:
-            from toolkit.masked_recon import apply_masked_recon_loss
-        except Exception:
-            return current_loss, None
-
-        try:
-            return apply_masked_recon_loss(current_loss, self.train_config, self.sd, noisy_latents, imgs, batch, dtype, self.device_torch)
-        except Exception as e:
-            try:
-                print_acc(f"[MASKED_RECON] helper failure: {e}")
-            except Exception:
-                print(f"[MASKED_RECON] helper failure: {e}")
-            return current_loss, None
-
-        # legacy masked-recon implementation removed; wrapper delegates to `toolkit.masked_recon`
-        return current_loss, None
 
     def _maybe_log_per_example(self, batch: 'DataLoaderBatchDTO', batch_list_len: int) -> list:
         """Return per-example entries for the given batch and update streaming aggregator.

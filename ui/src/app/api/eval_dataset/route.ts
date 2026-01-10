@@ -29,7 +29,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const datasetPath = body.dataset_path;
-    const model = body.model || 'default';
+    let model = body.model || 'default';
     const model_config = body.model_config || null;
     // Batch size is forced to 1 for per-example loss evaluation
     const batch_size = 1;

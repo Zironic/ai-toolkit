@@ -45,7 +45,7 @@ function findImagesRecursively(dir: string): string[] {
     const itemPath = path.join(dir, item);
     const stat = fs.statSync(itemPath);
 
-    if (stat.isDirectory() && item !== '_controls' && !item.startsWith('.')) {
+    if (stat.isDirectory() && item !== '_controls' && item !== 'masks' && !item.startsWith('.')) {
       // If it's a directory, recursively search it
       results = results.concat(findImagesRecursively(itemPath));
     } else {

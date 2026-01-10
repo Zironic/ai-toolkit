@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, ReactNode, KeyboardEvent } from 'react';
-import { FaTrashAlt, FaEye, FaEyeSlash } from 'react-icons/fa';
+import { FaTrash, FaEye, FaEyeSlash, FaMask, FaWandMagicSparkles } from 'react-icons/fa6';
 import { openConfirm } from './ConfirmModal';
 import classNames from 'classnames';
 import { apiClient } from '@/utils/api';
@@ -21,6 +21,11 @@ interface DatasetImageCardProps {
   loss?: number | null;
   // which metric to display: 'raw' | 'norm' | 'ablation'
   displayMetric?: 'raw' | 'norm' | 'ablation';
+  // mask overlay props
+  showMaskOverlay?: boolean;
+  onToggleMask?: () => void;
+  onGenerateMask?: () => void;
+  datasetName?: string;
 }
 
 const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
@@ -34,6 +39,10 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   ablLoss = null,
   loss = null,
   displayMetric,
+  showMaskOverlay = false,
+  onToggleMask,
+  onGenerateMask,
+  datasetName,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [isVisible, setIsVisible] = useState<boolean>(false);
@@ -43,6 +52,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [caption, setCaption] = useState<string>('');
   const [savedCaption, setSavedCaption] = useState<string>('');
   const isGettingCaption = useRef<boolean>(false);
+  const [maskPath, setMaskPath] = useState<string | null>(null);
+  const [maskLoaded, setMaskLoaded] = useState<boolean>(false);
   
   // choose primary value based on displayMetric prop
   const chosenMetric = displayMetric || 'raw';
@@ -169,6 +180,17 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
 
   const isItAVideo = isVideo(imageUrl);
 
+  // Check for mask file existence
+  useEffect(() => {
+    if (datasetName && imageUrl) {
+      const parts = String(imageUrl).split(/[\\/]/);
+      const filename = parts[parts.length - 1];
+      const nameWithoutExt = filename.replace(/\.[^.]+$/, '');
+      const potentialMaskPath = `${datasetName}/masks/${nameWithoutExt}.png`;
+      setMaskPath(potentialMaskPath);
+    }
+  }, [datasetName, imageUrl]);
+
   return (
     <div className={`flex flex-col ${className}`}>
       {/* Square image container */}
@@ -190,14 +212,51 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                   controls
                 />
               ) : (
-                <img
-                  src={`/api/img/${encodeURIComponent(String(imageUrl || ''))}`}
-                  alt={alt}
-                  onLoad={handleLoad}
-                  className={`w-full h-full object-contain transition-opacity duration-300 ${
-                    loaded ? 'opacity-100' : 'opacity-0'
-                  }`}
-                />
+                <>
+                  <img
+                    src={`/api/img/${encodeURIComponent(String(imageUrl || ''))}`}
+                    alt={alt}
+                    onLoad={handleLoad}
+                    className={`w-full h-full object-contain transition-opacity duration-300 ${
+                      loaded ? 'opacity-100' : 'opacity-0'
+                    }`}
+                  />
+                  {/* Mask overlay */}
+                  {showMaskOverlay && maskPath && maskLoaded && (
+                    <>
+                      {/* Full dark overlay to dim entire image */}
+                      <div className="absolute inset-0 w-full h-full bg-black opacity-30" />
+                      
+
+
+                      {/* Green overlay that only shows on masked areas */}
+                      <div 
+                        className="absolute inset-0 w-full h-full bg-green-400 opacity-60"
+                        style={{
+                          maskImage: `url(/api/img/${encodeURIComponent(maskPath)})`,
+                          maskSize: 'contain',
+                          maskRepeat: 'no-repeat',
+                          maskPosition: 'center',
+                          maskMode: 'luminance',
+                          WebkitMaskImage: `url(/api/img/${encodeURIComponent(maskPath)})`,
+                          WebkitMaskSize: 'contain',
+                          WebkitMaskRepeat: 'no-repeat',
+                          WebkitMaskPosition: 'center',
+                        }}
+                      />
+                    </>
+                  )}
+                  {/* Hidden image to trigger onLoad/onError */}
+                  {showMaskOverlay && maskPath && (
+                    <img
+                      src={`/api/img/${encodeURIComponent(maskPath)}`}
+                      alt="mask"
+                      onLoad={() => setMaskLoaded(true)}
+                      onError={() => setMaskLoaded(false)}
+                      className="hidden"
+                    />
+                  )}
+                </>
               )}
             </>
           )}
@@ -207,35 +266,29 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             </div>
           )}
           {children && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
-          {/* Loss overlay (top-left) - show raw prominently and normalized secondary */}
-          {
-            /* Show a single primary value (prefer raw, then loss, then normalized) and
-               render the normalized value as secondary when the primary is raw/loss */
-          }
-          <div className="absolute top-1 left-1">
-            <div className="bg-black bg-opacity-70 text-white text-xs px-2 py-1 rounded text-left">
-              <div className="font-medium leading-tight">
-                {(() => {
-                  let primary: number | null = null;
-                  if (chosenMetric === 'raw') {
-                    primary = rawLoss != null ? rawLoss : (loss != null ? loss : normLoss);
-                  } else if (chosenMetric === 'norm') {
-                    primary = normLoss != null ? normLoss : (rawLoss != null ? rawLoss : loss);
-                  } else if (chosenMetric === 'ablation') {
-                    primary = ablLoss != null ? ablLoss : (rawLoss != null ? rawLoss : normLoss);
-                  }
-                  return primary != null ? Number(primary).toFixed(3) : '—';
-                })()}
-              </div>
-              {chosenMetric !== 'norm' && normLoss != null && (
-                <div className="text-[10px] opacity-80">norm {Number(normLoss).toFixed(3)}</div>
-              )}
-              {chosenMetric === 'ablation' && ablLoss != null && (
-                <div className="text-[10px] opacity-80">abl {Number(ablLoss).toFixed(3)}</div>
-              )}
-            </div>
-          </div>
+          
+          {/* Icon buttons (top-right) */}
           <div className="absolute top-1 right-1 flex space-x-2">
+            {onGenerateMask && (
+              <button
+                className="bg-gray-800 rounded-full p-2 hover:bg-emerald-700 transition-colors"
+                onClick={onGenerateMask}
+                title="Generate mask for this image"
+              >
+                <FaWandMagicSparkles className="text-sm" />
+              </button>
+            )}
+            {onToggleMask && (
+              <button
+                className={classNames('bg-gray-800 rounded-full p-2 hover:bg-blue-700 transition-colors', {
+                  'bg-blue-600': showMaskOverlay,
+                })}
+                onClick={onToggleMask}
+                title={showMaskOverlay ? 'Hide mask overlay' : 'Show mask overlay'}
+              >
+                <FaMask className="text-sm" />
+              </button>
+            )}
             <button
               className="bg-gray-800 rounded-full p-2"
               onClick={() => {
@@ -258,7 +311,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                 });
               }}
             >
-              <FaTrashAlt />
+              <FaTrash />
             </button>
           </div>
         </div>

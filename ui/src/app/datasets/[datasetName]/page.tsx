@@ -2,12 +2,13 @@
 
 import { useEffect, useState, use, useMemo } from 'react';
 import { LuImageOff, LuLoader, LuBan } from 'react-icons/lu';
-import { FaChevronLeft } from 'react-icons/fa';
+import { FaChevronLeft, FaMask, FaWandMagicSparkles } from 'react-icons/fa6';
 import DatasetImageCard from '@/components/DatasetImageCard';
 import { Button } from '@headlessui/react';
 import AddImagesModal, { openImagesModal } from '@/components/AddImagesModal';
 import EvalDatasetModal from '@/components/EvalDatasetModal';
 import EvalJobsList from '@/components/EvalJobsList';
+import GenerateMasksModal from '@/components/GenerateMasksModal';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
 import FullscreenDropOverlay from '@/components/FullscreenDropOverlay';
@@ -18,9 +19,13 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const datasetName = usableParams.datasetName;
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [showEvalModal, setShowEvalModal] = useState(false);
+  const [showGenerateMasksModal, setShowGenerateMasksModal] = useState(false);
+  const [selectedImageForMask, setSelectedImageForMask] = useState<string | null>(null);
   const [evalRefreshKey, setEvalRefreshKey] = useState(0);
   const [evalMap, setEvalMap] = useState<Record<string, { raw?: number; norm?: number; abl?: number }>>({});
   const [displayMetric, setDisplayMetric] = useState<'raw' | 'norm' | 'ablation'>('raw');
+  const [globalMaskOverlay, setGlobalMaskOverlay] = useState(false);
+  const [perImageMaskState, setPerImageMaskState] = useState<Record<string, boolean>>({});
 
   // modelsList: array of { label, jobId }
   const [modelsList, setModelsList] = useState<Array<{ label: string; jobId: string }>>([]);
@@ -96,7 +101,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         }
         const datasetKey = Object.keys(j.datasets)[0];
         const itemStats = j.datasets[datasetKey]?.item_stats || {};
-        const map: Record<string, { raw?: number; norm?: number; abl?: number; abl?: number }> = {};
+        const map: Record<string, { raw?: number; norm?: number; abl?: number }> = {};
         for (const [pathKey, stats] of Object.entries(itemStats)) {
           const parts = String(pathKey).split(/[\\/]/);
           const b = parts[parts.length - 1];
@@ -159,6 +164,34 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       setEvalMap({});
     }
   }, [selectedEvalJobId]);
+
+  const toggleGlobalMaskOverlay = () => {
+    const newState = !globalMaskOverlay;
+    setGlobalMaskOverlay(newState);
+    // Update all individual cards to match global state
+    const newPerImageState: Record<string, boolean> = {};
+    imgList.forEach(img => {
+      newPerImageState[img.img_path] = newState;
+    });
+    setPerImageMaskState(newPerImageState);
+  };
+
+  const toggleIndividualMask = (imgPath: string) => {
+    setPerImageMaskState(prev => ({
+      ...prev,
+      [imgPath]: !prev[imgPath]
+    }));
+  };
+
+  const openMaskModalForImage = (imgPath: string) => {
+    setSelectedImageForMask(imgPath);
+    setShowGenerateMasksModal(true);
+  };
+
+  const closeMaskModal = () => {
+    setSelectedImageForMask(null);
+    setShowGenerateMasksModal(false);
+  };
 
   const refreshImageList = (dbName: string) => {
     setStatus('loading');
@@ -263,15 +296,25 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         <div className="flex-1"></div>
         <div className="flex items-center gap-2">
           <Button
-            className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
-            onClick={() => openImagesModal(datasetName, () => refreshImageList(datasetName))}
+            className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md hover:bg-slate-500 transition-colors flex items-center gap-2"
+            onClick={toggleGlobalMaskOverlay}
+            title="Toggle mask overlay for all images"
           >
-            Add Images
+            <FaMask />
+            <span>{globalMaskOverlay ? 'Hide' : 'Show'} Masks</span>
           </Button>
-          {/* Model evaluation selector */}
-          <div className="text-sm text-gray-200 bg-gray-800 rounded px-2 py-1 flex items-center gap-2">
-            <label className="mr-2 text-xs text-gray-300">Eval:</label>
-            <select
+          <Button
+            className="text-gray-200 bg-emerald-600 px-3 py-1 rounded-md hover:bg-emerald-500 transition-colors flex items-center gap-2"
+            onClick={() => {
+              setSelectedImageForMask(null);
+              setShowGenerateMasksModal(true);
+            }}
+            title="Generate masks for all images in dataset"
+          >
+            <FaWandMagicSparkles />
+            <span>Generate Masks</span>
+          </Button>
+          <select
               value={selectedEvalJobId || ''}
               onChange={e => setSelectedEvalJobId(e.target.value || null)}
               className="bg-gray-800 text-white text-sm outline-none rounded px-1 py-0.5 appearance-none"
@@ -291,7 +334,6 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
               <option value="norm">Normalized</option>
               <option value="ablation" disabled={!Object.values(evalMap).some(x => x.abl != null)}>Ablation</option>
             </select>
-          </div>
           <Button
             className="text-white bg-emerald-600 px-3 py-1 rounded-md"
             onClick={() => setShowEvalModal(true)}
@@ -310,16 +352,21 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
               const e = (evalMap as any)[bname] || {};
               const rawLoss = typeof e.raw !== 'undefined' ? e.raw : null;
               const normLoss = typeof e.norm !== 'undefined' ? e.norm : null;
+              const showMask = perImageMaskState[img.img_path] ?? false;
               return (
                 <DatasetImageCard
                   key={img.img_path || String(idx)}
                   alt="image"
                   imageUrl={String(img.img_path)}
+                  datasetName={datasetName}
                   onDelete={() => refreshImageList(String(datasetName))}
                   rawLoss={rawLoss}
                   normLoss={normLoss}
                   ablLoss={typeof e.abl !== 'undefined' ? e.abl : null}
                   displayMetric={displayMetric}
+                  showMaskOverlay={showMask}
+                  onToggleMask={() => toggleIndividualMask(img.img_path)}
+                  onGenerateMask={() => openMaskModalForImage(img.img_path)}
                 />
               );
             })}
@@ -340,13 +387,33 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         </div>
       </MainContent>
 
+      <EvalDatasetModal
+        datasetName={datasetName}
+        isOpen={showEvalModal} 
+        onClose={() => setShowEvalModal(false)} 
+        onStarted={(id) => { 
+          setShowEvalModal(false); 
+          setEvalRefreshKey(k=>k+1); 
+        }} 
+      />
+
+      <GenerateMasksModal
+        isOpen={showGenerateMasksModal}
+        onClose={closeMaskModal}
+        datasetName={datasetName}
+        imagePath={selectedImageForMask || undefined}
+        onComplete={() => {
+          closeMaskModal();
+          // Optionally refresh or show success message
+        }}
+      />
+
       <AddImagesModal />
       <FullscreenDropOverlay
         datasetName={datasetName}
         onComplete={() => refreshImageList(datasetName)}
       />
 
-      <EvalDatasetModal datasetName={datasetName} isOpen={showEvalModal} onClose={() => setShowEvalModal(false)} onStarted={(id) => { setShowEvalModal(false); setEvalRefreshKey(k=>k+1); }} />
     </>
   );
 }

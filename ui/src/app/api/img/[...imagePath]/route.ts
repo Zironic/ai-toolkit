@@ -4,16 +4,42 @@ import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder, getDataRoot } from '@/server/settings';
 
-export async function GET(request: NextRequest, { params }: { params: { imagePath: string } }) {
+export async function GET(request: NextRequest, { params }: { params: { imagePath: string[] } }) {
   const { imagePath } = await params;
   try {
-    // Decode the path
-    const filepath = decodeURIComponent(imagePath);
+    // Join array segments and decode the path
+    const decodedPath = decodeURIComponent(Array.isArray(imagePath) ? imagePath.join('/') : imagePath);
+    console.log('[API /api/img] Requested path:', decodedPath, 'Type:', Array.isArray(imagePath) ? 'array' : 'string', 'Raw:', imagePath);
 
     // Get allowed directories
     const datasetRoot = await getDatasetsRoot();
     const trainingRoot = await getTrainingFolder();
     const dataRoot = await getDataRoot();
+    console.log('[API /api/img] Allowed roots:', { datasetRoot, trainingRoot, dataRoot });
+
+    // Resolve relative paths to absolute paths
+    let filepath = decodedPath;
+    if (!path.isAbsolute(filepath)) {
+      // Try to resolve relative to known roots
+      const possiblePaths = [
+        path.resolve(datasetRoot, filepath),
+        path.resolve(trainingRoot, filepath),
+        path.resolve(dataRoot, filepath),
+      ];
+      
+      console.log('[API /api/img] Trying paths:', possiblePaths);
+      
+      // Use the first path that exists
+      const existingPath = possiblePaths.find(p => fs.existsSync(p));
+      if (existingPath) {
+        filepath = existingPath;
+        console.log('[API /api/img] Found existing file at:', filepath);
+      } else {
+        // If no path exists, use the first possibility for security check
+        filepath = possiblePaths[0];
+        console.log('[API /api/img] No file found, using first path for security check:', filepath);
+      }
+    }
 
     const allowedDirs = [datasetRoot, trainingRoot, dataRoot];
 
@@ -21,13 +47,13 @@ export async function GET(request: NextRequest, { params }: { params: { imagePat
     const isAllowed = allowedDirs.some(allowedDir => filepath.startsWith(allowedDir)) && !filepath.includes('..');
 
     if (!isAllowed) {
-      console.warn(`Access denied: ${filepath} not in ${allowedDirs.join(', ')}`);
+      console.warn(`[API /api/img] Access denied: ${filepath} not in ${allowedDirs.join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
     }
 
     // Check if file exists
     if (!fs.existsSync(filepath)) {
-      console.warn(`File not found: ${filepath}`);
+      console.warn(`[API /api/img] File not found: ${filepath}`);
       return new NextResponse('File not found', { status: 404 });
     }
 

@@ -444,25 +444,6 @@ class TrainConfig:
         # Options: 'none', 'edge'  (edge compares Sobel of image to control tensor)
         self.controlnet_aux_loss: str = kwargs.get('controlnet_aux_loss', 'none')
         self.controlnet_aux_loss_weight: float = kwargs.get('controlnet_aux_loss_weight', 1.0)
-
-        # Masked reconstruction (LumiCtrl-style) — opt-in auxiliary loss
-        self.masked_recon_weight: float = kwargs.get('masked_recon_weight', 0.5)  # default enabled; set >0 to enable masked reconstruction
-        self.masked_recon_type: str = kwargs.get('masked_recon_type', 'illum')  # 'illum'|'edge'|'custom'
-        self.masked_recon_mask_key: Optional[str] = kwargs.get('masked_recon_mask_key', None)  # dataset-provided mask attribute name
-        # Control-derived mask tuning
-        self.masked_recon_control_threshold: float = kwargs.get('masked_recon_control_threshold', 0.05)
-        self.masked_recon_control_dilate: int = kwargs.get('masked_recon_control_dilate', 7)
-        self.masked_recon_control_blur: int = kwargs.get('masked_recon_control_blur', 9)
-        # Reference resolution used to create masks (build mask at this size then downsample to target)
-        self.masked_recon_control_ref_max_size: int = kwargs.get('masked_recon_control_ref_max_size', 1024)
-        # Auto-scale dilate based on detected control bbox fraction (useful for full-image controls)
-        self.masked_recon_control_dilate_auto: bool = kwargs.get('masked_recon_control_dilate_auto', True)
-        self.masked_recon_control_dilate_scale_factor: float = kwargs.get('masked_recon_control_dilate_scale_factor', 4.0)
-        # Mask preview/debugging options
-        self.mask_preview_enabled: bool = kwargs.get('mask_preview_enabled', False)
-        # `mask_preview_max_steps` and `mask_preview_samples_per_step` removed — preview now runs once per job
-        self.mask_preview_save_path: str = kwargs.get('mask_preview_save_path', 'output/{job_name}/masks')
-        self.mask_preview_overwrite: bool = kwargs.get('mask_preview_overwrite', False)
         # whether to create an overlay image (mask blended over the source image) — default True
         self.mask_preview_overlay: bool = kwargs.get('mask_preview_overlay', True)
         # Option to freeze ControlNet/adapter parameters during fine-tuning
@@ -1029,6 +1010,7 @@ class DatasetConfig:
                                                   None)  # path where matching unconditional images are located
         self.invert_mask: bool = kwargs.get('invert_mask', False)  # invert mask
         self.mask_min_value: float = kwargs.get('mask_min_value', 0.0)  # min value for . 0 - 1
+        self.mask_strength: float = kwargs.get('mask_strength', 1.0)  # mask strength: 1.0 = fully zero non-masked, 0.0 = no masking
         self.poi: Union[str, None] = kwargs.get('poi',
                                                 None)  # if one is set and in json data, will be used as auto crop scale point of interes
         self.use_short_captions: bool = kwargs.get('use_short_captions', False)  # if true, will use 'caption_short' from json
@@ -1503,7 +1485,7 @@ def validate_configs(
     if train_config.controlnet_residual_storage not in allowed_storage:
         raise ValueError(f"Invalid controlnet_residual_storage '{train_config.controlnet_residual_storage}'. Must be one of {allowed_storage}.")
 
-    allowed_aux = {'none', 'edge', 'masked_recon'}
+    allowed_aux = {'none', 'edge'}
     if train_config.controlnet_aux_loss not in allowed_aux:
         raise ValueError(f"Invalid controlnet_aux_loss '{train_config.controlnet_aux_loss}'. Must be one of {allowed_aux}.")
 

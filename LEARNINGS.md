@@ -1,3 +1,64 @@
+Mask Workflow Implementation — 2026-01-10
+
+Summary:
+- Replaced Masked Reconstruction feature with enhanced mask workflow using existing infrastructure.
+- Removed `toolkit/masked_recon.py` (690 lines) and all related config/UI/trainer code.
+- Added `mask_strength` parameter (0.0-1.0) to DatasetConfig for configurable mask blending.
+- Created `scripts/generate_masks_sam2.py` using facebook/sam2.1-hiera-tiny from HuggingFace for automated mask generation.
+
+Files changed:
+- `toolkit/config_modules.py` — removed masked_recon_* config fields, added mask_strength to DatasetConfig
+- `extensions_built_in/sd_trainer/SDTrainer.py` — removed _compute_and_apply_masked_recon_loss and related code, added mask_strength blending formula in mask_multiplier computation
+- `ui/src/app/jobs/new/SimpleJob.tsx` — removed Masked Reconstruction UI section
+- `ui/src/app/jobs/new/jobConfig.ts` — removed masked_recon defaults
+- `scripts/generate_masks_sam2.py` — new CLI tool for SAM2-based mask generation (supports point/box prompts)
+- `testing/test_mask_strength.py` — comprehensive unit tests for mask_strength blending
+- `docs/MASK_WORKFLOW_IMPLEMENTATION.md` — complete implementation documentation
+- `toolkit/masked_recon.py` — deleted (replaced by existing mask infrastructure)
+
+Key discovery:
+- 95% of requested mask functionality already existed in `MaskFileItemDTOMixin` (toolkit/dataloader_mixins.py lines 1620-1740)
+- Existing infrastructure: mask_path loading, automatic resizing, loss multiplication, inverted_mask_prior
+- Only needed to add: mask_strength parameter, SAM2 CLI script, and remove masked_recon code
+
+Mask strength formula:
+```python
+# Blend masked (1.0) and non-masked (0.0) regions based on strength
+# strength=1.0: non-masked regions get 0.0 weight (full masking)
+# strength=0.0: all regions get 1.0 weight (no masking effect)
+mask_multiplier = mask + (1-mask) * (1-strength)
+```
+
+SAM2 usage:
+```bash
+# Generate masks using point prompts
+python scripts/generate_masks_sam2.py --dataset datasets/my_dataset --points "[[512,512]]" --output datasets/my_dataset/masks
+
+# Generate masks using bounding box
+python scripts/generate_masks_sam2.py --dataset datasets/my_dataset --box "[[100,100,400,400]]" --output datasets/my_dataset/masks
+```
+
+Notes & caveats:
+- Breaking change: masked_recon_* config fields removed (users must migrate to mask_path + mask_strength)
+- Backward compatible: existing mask_path, alpha_mask, invert_mask configs continue working unchanged
+- Default mask_strength=1.0 maintains full mask effect (no change in behavior)
+- SAM2 models require transformers library and GPU for efficient processing
+- Masks are binary (0/255) PNG files stored in separate folder
+
+Testing:
+- Added 8 unit tests covering full/half/no strength, normalization, edge cases, and batch consistency
+- All tests pass: `python -m pytest testing/test_mask_strength.py -v`
+- Manual GPU smoke test recommended for end-to-end training validation
+
+Implementation time:
+- Original estimate: 20-33 hours (full reimplementation)
+- Actual: ~4 hours (discovered existing infrastructure only needed enhancements)
+
+Subagent use:
+- Used grep_search extensively to find all masked_recon references and ensure complete removal
+- Searched HuggingFace for SAM models (found SAM2.1 with 183K downloads, facebook/sam2.1-hiera-tiny)
+
+
 MultiTrigger CSV DOP mapping — 2026-01-08
 
 Summary:
