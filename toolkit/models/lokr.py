@@ -286,18 +286,44 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
 
     def get_orig_weight(self):
         weight = self.org_module[0].weight
+        # If the weight is a quantized tensor type (optimum QTensor/QBytesTensor or
+        # other quantized implementations like torchao's AffineQuantizedTensor),
+        # prefer to dequantize it to a plain Tensor before doing arithmetic with it.
+        if hasattr(weight, 'dequantize') and callable(weight.dequantize):
+            try:
+                deq = weight.dequantize()
+                if hasattr(deq, 'data'):
+                    return deq.data.detach()
+                if isinstance(deq, torch.Tensor):
+                    return deq.detach()
+            except Exception:
+                # If dequantize fails for any reason, fall through to existing logic
+                pass
+
         if isinstance(weight, QTensor) or isinstance(weight, QBytesTensor):
             return weight.dequantize().data.detach()
         else:
             return weight.data.detach()
 
     def get_orig_bias(self):
-        if hasattr(self.org_module[0], 'bias') and self.org_module[0].bias is not None:
-            if isinstance(self.org_module[0].bias, QTensor) or isinstance(self.org_module[0].bias, QBytesTensor):
-                return self.org_module[0].bias.dequantize().data.detach()
-            else:
-                return self.org_module[0].bias.data.detach()
-        return None
+        if not (hasattr(self.org_module[0], 'bias') and self.org_module[0].bias is not None):
+            return None
+
+        bias = self.org_module[0].bias
+        if hasattr(bias, 'dequantize') and callable(bias.dequantize):
+            try:
+                deq = bias.dequantize()
+                if hasattr(deq, 'data'):
+                    return deq.data.detach()
+                if isinstance(deq, torch.Tensor):
+                    return deq.detach()
+            except Exception:
+                pass
+
+        if isinstance(bias, QTensor) or isinstance(bias, QBytesTensor):
+            return bias.dequantize().data.detach()
+        else:
+            return bias.data.detach()
 
     def _call_forward(self, x):
         if isinstance(x, QTensor) or isinstance(x, QBytesTensor):

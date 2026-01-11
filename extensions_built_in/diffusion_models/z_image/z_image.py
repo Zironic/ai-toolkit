@@ -1314,8 +1314,7 @@ class ZImageModel(BaseModel):
         latent_model_input = latent_model_input.unsqueeze(2)
         latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
-        num_train_timesteps = _effective_num_train_timesteps(self)
-        timestep_model_input = (num_train_timesteps - timestep) / float(num_train_timesteps)
+        timestep_model_input = (1000 - timestep) / 1000.0
 
         model_out_list = self.transformer(
             latent_model_input_list,
@@ -1580,8 +1579,7 @@ def predict_noise_zimage(sd, latents: torch.Tensor, text_embeddings, timestep: t
     latent_model_input = latents.unsqueeze(2)  # [B, C, 1, H, W]
     latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
-    num_train_timesteps = _effective_num_train_timesteps(sd)
-    timestep_model_input = (num_train_timesteps - timestep) / float(num_train_timesteps)
+    timestep_model_input = (1000 - timestep) / 1000.0
     # normalize timestep to device/dtype for transformer
     try:
         timestep_model_input = timestep_model_input.to(dtype=torch.float32, device=latents.device)

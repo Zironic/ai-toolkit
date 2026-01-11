@@ -3478,38 +3478,63 @@ class SDTrainer(BaseSDTrainProcess):
                 )
             return preservation_pred
 
-        # Downsample noisy_latents and prior_pred, run predict on smaller tensor
+        # CRITICAL: To downsample correctly for DOP, we must downsample the clean latents
+        # and noise separately, then re-apply the noise schedule at the small resolution.
+        # Downsampling already-noisy latents produces corrupted signals because interpolation
+        # doesn't commute with the noise addition formula: downsample(clean + noise) ≠ downsample(clean) + downsample(noise)
         with self.timer(f"{timer_base}_downsampled"):
             torch_dtype = get_torch_dtype(dtype)
-            # Use area mode for downsampling latents - it's better than bilinear for preserving
-            # latent structure as it averages patches rather than interpolating, which is more
-            # appropriate for the discrete nature of latent representations
-            noisy_small = torch.nn.functional.interpolate(
-                noisy_latents, size=(target_h, target_w), mode='area'
+            
+            # Step 1: Downsample clean latents using bicubic interpolation
+            # Bicubic preserves high-frequency information better than area mode (which blurs)
+            latents_small = torch.nn.functional.interpolate(
+                batch.latents, size=(target_h, target_w), mode='bicubic', align_corners=False
             ).to(self.device_torch, dtype=torch_dtype)
+            
+            # Step 2: Reconstruct and downsample the noise
+            # For flow matching: noisy = (1-t)*clean + t*noise, so: noise = (noisy - (1-t)*clean) / t
+            # Get timestep fraction (0 to 1) by normalizing timesteps (0 to 1000)
+            with torch.no_grad():
+                t_frac = (timesteps.float() / 1000.0).to(noisy_latents.device, dtype=noisy_latents.dtype)
+                if len(noisy_latents.shape) == 4:
+                    t_frac = t_frac.view(-1, 1, 1, 1)
+                elif len(noisy_latents.shape) == 5:
+                    t_frac = t_frac.view(-1, 1, 1, 1, 1)
+                
+                # Reconstruct noise from full-resolution noisy latents
+                # Clamp t_frac to avoid division by zero (at t=0, noisy_latents = clean_latents, noise undefined)
+                t_frac_safe = torch.clamp(t_frac, min=1e-6)
+                noise_reconstructed = (noisy_latents - (1.0 - t_frac) * batch.latents) / t_frac_safe
+                
+            # Downsample the reconstructed noise
+            noise_small = torch.nn.functional.interpolate(
+                noise_reconstructed, size=(target_h, target_w), mode='bicubic', align_corners=False
+            ).to(self.device_torch, dtype=torch_dtype)
+            
+            # Step 3: Apply noise schedule at small resolution to create properly-noised small latents
+            # noisy_small = (1-t)*latents_small + t*noise_small
+            with torch.no_grad():
+                noisy_small = (1.0 - t_frac) * latents_small + t_frac * noise_small
+            
+            # Step 4: Generate both predictions at the same small resolution
+            # CRITICAL: Always generate prior_small at small resolution, never downsample a full-res prior.
+            # For DOP to work correctly, both predictions must be generated at the same resolution
+            # from the same properly-noised small latents.
             prior_small = None
-            if prior_pred is not None:
-                prior_small = torch.nn.functional.interpolate(
-                    prior_pred, size=(target_h, target_w), mode='area'
-                ).to(self.device_torch, dtype=torch_dtype)
-            else:
-                # No full-res prior available (we skipped it); compute a reduced prior prediction
-                # at the smaller latent size so preservation loss can be evaluated.
-                # Use preservation_embeds (class-only) since prior should be base model + class
-                try:
-                    prior_small = self.get_prior_prediction(
-                        noisy_latents=noisy_small,
-                        conditional_embeds=preservation_embeds.to(self.device_torch, dtype=torch_dtype),
-                        match_adapter_assist=match_adapter_assist,
-                        network_weight_list=network_weight_list if network_weight_list is not None else [],
-                        timesteps=timesteps,
-                        pred_kwargs=local_pred_kwargs,
-                        batch=batch,
-                        noise=None,
-                        unconditional_embeds=unconditional_embeds,
-                    )
-                except Exception:
-                    prior_small = None
+            try:
+                prior_small = self.get_prior_prediction(
+                    noisy_latents=noisy_small,
+                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=torch_dtype),
+                    match_adapter_assist=match_adapter_assist,
+                    network_weight_list=network_weight_list if network_weight_list is not None else [],
+                    timesteps=timesteps,
+                    pred_kwargs=local_pred_kwargs,
+                    batch=batch,
+                    noise=None,
+                    unconditional_embeds=unconditional_embeds,
+                )
+            except Exception:
+                prior_small = None
 
             preservation_pred_small = self.predict_noise(
                 noisy_latents=noisy_small,
@@ -3528,6 +3553,14 @@ class SDTrainer(BaseSDTrainProcess):
         Returns the preservation_loss tensor.
         """
         try:
+            # Validate that both predictions are at the same resolution for fair comparison
+            if prior_pred is not None and preservation_pred.shape != prior_pred.shape:
+                try:
+                    print_acc(f"[DOP] Warning: resolution mismatch detected! preservation_pred shape {preservation_pred.shape} != prior_pred shape {prior_pred.shape}. This can cause DOP to fail at enforcing zero LoKr effect without trigger words.")
+                except Exception:
+                    pass
+                # Don't fail, but this indicates a bug in the DOP implementation
+            
             # Ensure both tensors are on the same device and dtype to avoid dtype/device mismatch errors
             if prior_pred is not None:
                 # Move to same device first

@@ -6,20 +6,43 @@ Functions:
 These return lists of length `num_total_blocks` (LoRANetwork.NUM_OF_BLOCKS * 2 + 1).
 """
 from typing import List, Tuple
-from toolkit.kohya_lora import LoRANetwork
+try:
+    from toolkit.kohya_lora import LoRANetwork
+except Exception:
+    # Fallback minimal stub for environments where kohya_lora or heavy deps
+    # (transformers, torch) may not be importable during lightweight tests
+    class LoRANetwork:
+        NUM_OF_BLOCKS = 12
 
 
 def _make_filled(n: int, fill: int) -> List[int]:
     return [int(fill) for _ in range(n)]
 
 
-def build_splitflux_block_dims(train_config) -> Tuple[List[int], List[int]]:
-    """Build per-block rank vectors for content and style LoRAs based on train_config.
+def build_splitflux_block_dims(train_config, job_size: int = None, job_alpha: int = None) -> Tuple[List[int], List[int], List[int], List[int]]:
+    """Build per-block rank vectors AND alpha vectors for content and style LoRAs based on train_config.
 
-    Returns: (content_block_dims, style_block_dims)
+    If `job_size` / `job_alpha` are provided (e.g., when target is LoKr or RCA is enabled), some RCA-specific
+    adjustments are made:
+      - blocks 1..19 (the early UNet blocks commonly frozen by RCA) are set to 0
+      - content blocks are set to `job_size` and their alphas to `job_alpha` (if provided)
+      - style primary and content primary use `job_size`/`job_alpha` where requested
+      - spatial constrained ranks (blocks 30,31) are set to `job_size//2` and alpha to `job_alpha//2` when `job_size` is provided
+
+    Returns: (content_block_dims, content_block_alphas, style_block_dims, style_block_alphas)
     """
     content_blocks = list(getattr(train_config, 'splitflux_content_blocks', list(range(20, 30))))
     style_blocks = list(getattr(train_config, 'splitflux_style_blocks', list(range(30, 58))))
+
+    # Treat configured block numbers as 1-based (user-facing). Convert to 0-based indices for internal arrays.
+    try:
+        content_blocks = [int(b) - 1 for b in content_blocks]
+    except Exception:
+        pass
+    try:
+        style_blocks = [int(b) - 1 for b in style_blocks]
+    except Exception:
+        pass
 
     # Ensure list length covers any explicitly referenced block indices in config
     default_blocks = LoRANetwork.NUM_OF_BLOCKS * 2 + 1
@@ -38,11 +61,37 @@ def build_splitflux_block_dims(train_config) -> Tuple[List[int], List[int]]:
     spatial_rank = int(getattr(train_config, 'splitflux_spatial_rank', 32))
     style_primary = int(getattr(train_config, 'splitflux_style_primary_rank', 64))
 
+    # If a job_size is given (e.g., RCA for LoKr), prefer that for the configured ranks
+    if job_size is not None:
+        # Per-request: first 19 blocks should be set to 0 when RCA is active
+        # Use block indices 0..18 (inclusive) to represent the first 19 UNet blocks
+        early_block_indices = list(range(0, 19))
+        # set content/style primary to job size
+        content_primary = int(job_size)
+        style_primary = int(job_size)
+        # if a separate alpha was provided prefer that for block alphas
+        if job_alpha is not None:
+            content_alpha_primary = int(job_alpha)
+            style_alpha_primary = int(job_alpha)
+        else:
+            content_alpha_primary = content_primary
+            style_alpha_primary = style_primary
+        # spatial rank should be job_size // 2 and corresponding alpha halved (rounded down)
+        spatial_rank = max(1, int(job_size // 2))
+        spatial_alpha = max(1, int((job_alpha // 2) if job_alpha is not None else spatial_rank))
+    else:
+        content_alpha_primary = content_primary
+        style_alpha_primary = style_primary
+        spatial_alpha = spatial_rank
     content_bd = _make_filled(num_total_blocks, sec)
     style_bd = _make_filled(num_total_blocks, sec)
 
-    content_blocks = list(getattr(train_config, 'splitflux_content_blocks', list(range(20, 30))))
-    style_blocks = list(getattr(train_config, 'splitflux_style_blocks', list(range(30, 58))))
+    # default alphas use secondary rank / network defaults
+    content_ba = _make_filled(num_total_blocks, sec)
+    style_ba = _make_filled(num_total_blocks, sec)
+
+    # content_blocks and style_blocks were already read and converted to 0-based indices above
+    # (do not re-read to avoid undoing the 1-based -> 0-based conversion)
 
     # clamp indices to valid range
     def clamp_idx(i):
@@ -51,21 +100,35 @@ def build_splitflux_block_dims(train_config) -> Tuple[List[int], List[int]]:
     # assign content primary
     for b in content_blocks:
         content_bd[clamp_idx(b)] = content_primary
+        content_ba[clamp_idx(b)] = content_alpha_primary
 
     # assign style primary for style blocks
     for b in style_blocks:
         style_bd[clamp_idx(b)] = style_primary
+        style_ba[clamp_idx(b)] = style_alpha_primary
 
     # assign spatial constrained ranks (override content/style where applicable)
-    for b in [30, 31]:
+    # Spatial blocks correspond to 30/31 (1-based) => indices 29 and 30 (0-based)
+    for b in [29, 30]:
         if 0 <= b < num_total_blocks:
             content_bd[clamp_idx(b)] = spatial_rank
             style_bd[clamp_idx(b)] = spatial_rank
+            content_ba[clamp_idx(b)] = spatial_alpha
+            style_ba[clamp_idx(b)] = spatial_alpha
+
+    # Apply early block zeroing for RCA if job_size is provided
+    if job_size is not None:
+        for bi in early_block_indices:
+            if 0 <= bi < num_total_blocks:
+                content_bd[bi] = 0
+                style_bd[bi] = 0
+                content_ba[bi] = 0
+                style_ba[bi] = 0
 
     # Note: paper decomposes content primary into CNT/RES (48 + 16). This helper returns the top-level ranks.
     # The CNT/RES split will be handled by the Visual‑Gated LoRA wrapper later.
 
-    return content_bd, style_bd
+    return content_bd, content_ba, style_bd, style_ba
 
 
 def _module_name_matches_block(name: str, block_idx: int) -> bool:
@@ -103,16 +166,62 @@ def freeze_unet_blocks(unet: object, block_indices: List[int]) -> List[str]:
     return frozen
 
 
-def build_rca_combined_block_dims(train_config) -> List[int]:
-    """Return a single per-block dims vector representing the max rank required by content or style LoRA.
+def rca_supported_arch(model_config, sd=None) -> bool:
+    """Return True if RCA (SplitFlux) should be enabled for the given model architecture.
 
-    This is useful for configuring a single LoRA network that will be split later.
+    Currently RCA is only supported for the original Flux architecture (Flux1).
+    Flux2, Z-Image and other transformer variants use different single/double
+    stream layouts and therefore should not enable Flux1-style RCA by default.
     """
-    content_bd, style_bd = build_splitflux_block_dims(train_config)
-    if len(content_bd) != len(style_bd):
-        raise ValueError("content/style block dims length mismatch")
-    combined = [max(int(c), int(s)) for c, s in zip(content_bd, style_bd)]
-    return combined
+    try:
+        arch = getattr(model_config, 'arch', None)
+        if isinstance(arch, str) and arch.lower() == 'flux':
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def build_rca_combined_block_dims(train_config, network_config=None) -> Tuple[List[int], List[float]]:
+    """Return a single per-block dims vector and alphas vector representing the max rank required by content or style LoRA.
+
+    If `network_config` is provided and indicates LoKr (or any network), we will use the network-configured
+    linear and linear_alpha as the job size/alpha to shape RCA defaults (first 19 zeros,
+    spatial rank = job_size//2, content/style primaries = job_size).
+    """
+    job_size = None
+    job_alpha = None
+    if network_config is not None:
+        try:
+            # Handle LoKr 'full_rank' sentinel: prefer the original rank stored in 'rank' when 'lokr_full_rank' is True
+            if getattr(network_config, 'lokr_full_rank', False):
+                cand = getattr(network_config, 'rank', None)
+                if cand is not None and cand > 0 and cand < 1000000:
+                    job_size = int(cand)
+                # prefer an explicit linear_alpha if it looks sane
+                cand_alpha = getattr(network_config, 'linear_alpha', None)
+                if cand_alpha is not None and cand_alpha > 0 and cand_alpha < 1000000:
+                    job_alpha = int(cand_alpha)
+                else:
+                    job_alpha = job_size
+            else:
+                # prefer the linear rank and alpha from the network config when present and sane
+                cand = getattr(network_config, 'linear', None)
+                if cand is not None and cand > 0 and cand < 1000000:
+                    job_size = int(cand)
+                cand_alpha = getattr(network_config, 'linear_alpha', None)
+                if cand_alpha is not None and cand_alpha > 0 and cand_alpha < 1000000:
+                    job_alpha = int(cand_alpha)
+        except Exception:
+            job_size = None
+            job_alpha = None
+
+    content_bd, content_ba, style_bd, style_ba = build_splitflux_block_dims(train_config, job_size=job_size, job_alpha=job_alpha)
+    if len(content_bd) != len(style_bd) or len(content_ba) != len(style_ba):
+        raise ValueError("content/style block dims/alphas length mismatch")
+    combined_dims = [max(int(c), int(s)) for c, s in zip(content_bd, style_bd)]
+    combined_alphas = [max(float(ca), float(sa)) for ca, sa in zip(content_ba, style_ba)]
+    return combined_dims, combined_alphas
 
 
 def complementary_loss(

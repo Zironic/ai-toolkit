@@ -2674,21 +2674,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # RCA toggle: freeze early blocks and compute combined block dims when enabled
                 rca_block_dims = None
+                rca_block_alphas = None
                 if getattr(self.train_config, 'rca_enabled', False):
-                    try:
-                        from toolkit.splitflux import freeze_unet_blocks, build_rca_combined_block_dims
-                        frozen = freeze_unet_blocks(self.sd.get_model_to_train(), list(range(1, 20)))
+                    # Only enable RCA for Flux1 (arch == 'flux'). Flux2 and other DiT
+                    # variants (e.g., Z-Image) use different block layouts and should not
+                    # use the Flux1-targeted RCA defaults.
+                    from toolkit.splitflux import rca_supported_arch
+                    if not rca_supported_arch(self.model_config, sd=self.sd):
                         try:
-                            print_acc(f"[RCA] Enabled: frozen early blocks 1-19; frozen params: {len(frozen)}")
-                        except Exception:
-                            pass
-                        rca_block_dims = build_rca_combined_block_dims(self.train_config)
-                    except Exception as e:
-                        try:
-                            print(f"[RCA] helper failed: {e}")
+                            print_acc(f"[RCA] Disabled: RCA is only supported for Flux1 (arch='flux'); detected arch={getattr(self.model_config, 'arch', None)}")
                         except Exception:
                             pass
                         rca_block_dims = None
+                        rca_block_alphas = None
+                    else:
+                        try:
+                            from toolkit.splitflux import freeze_unet_blocks, build_rca_combined_block_dims
+                            frozen = freeze_unet_blocks(self.sd.get_model_to_train(), list(range(0, 19)))
+                            try:
+                                print_acc(f"[RCA] Enabled: frozen early blocks 0-18; frozen params: {len(frozen)}")
+                            except Exception:
+                                pass
+                            rca_block_dims, rca_block_alphas = build_rca_combined_block_dims(self.train_config, network_config=self.network_config)
+                        except Exception as e:
+                            try:
+                                print(f"[RCA] helper failed: {e}")
+                            except Exception:
+                                pass
+                            rca_block_dims = None
+                            rca_block_alphas = None
 
                 self.network = NetworkClass(
                     text_encoder=text_encoder,
@@ -2701,6 +2715,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     conv_lora_dim=self.network_config.conv,
                     conv_alpha=self.network_config.conv_alpha,
                     block_dims=rca_block_dims,
+                    block_alphas=rca_block_alphas,
                     is_sdxl=self.model_config.is_xl or self.model_config.is_ssd,
                     is_v2=self.model_config.is_v2,
                     is_v3=self.model_config.is_v3,
