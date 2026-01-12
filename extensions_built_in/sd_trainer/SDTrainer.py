@@ -3393,41 +3393,6 @@ class SDTrainer(BaseSDTrainProcess):
             local_pred_kwargs.pop('down_block_additional_residuals', None)
             local_pred_kwargs.pop('mid_block_additional_residual', None)
 
-        # CRITICAL: LoKr networks are incompatible with downsampled DOP due to their scale-sensitive
-        # Kronecker product structure. Downsampling causes the Kronecker factors to learn spatial
-        # patterns at the reduced resolution, which don't generalize to full-resolution inference.
-        # For LoKr: always force full-resolution DOP. For LoRA: downsampling is safe.
-        effective_preservation_resolution = preservation_resolution
-        if preservation_resolution is not None and self.network is not None:
-            try:
-                # Check if network uses LoKr modules (scale-sensitive Kronecker factorization)
-                network_class_name = self.network.__class__.__name__
-                is_lokr = 'lokr' in network_class_name.lower()
-                
-                # Also check module types if network has a module list
-                if not is_lokr and hasattr(self.network, 'modules'):
-                    try:
-                        for module in self.network.modules():
-                            module_class = module.__class__.__name__.lower()
-                            if 'lokr' in module_class:
-                                is_lokr = True
-                                break
-                    except Exception:
-                        pass
-                
-                # If LoKr detected and downsampling requested, override to full resolution
-                if is_lokr and preservation_resolution < 9999:
-                    try:
-                        print_acc(f"[DOP Safety] LoKr network detected. Overriding DOP resolution from {preservation_resolution}px to full resolution.")
-                        print_acc(f"[DOP Safety] Reason: LoKr's Kronecker structure is sensitive to training resolution and causes blur when downsampled.")
-                    except Exception:
-                        pass
-                    effective_preservation_resolution = None  # None = full resolution
-                # For non-LoKr networks (LoRA, etc.), downsampling is safe - use requested resolution
-            except Exception:
-                # Non-fatal: if detection fails, use requested resolution
-                pass
-
         # If no resolution requested, do the normal full-res predict (using cleaned local kwargs)
         if effective_preservation_resolution is None:
             with self.timer(timer_base):

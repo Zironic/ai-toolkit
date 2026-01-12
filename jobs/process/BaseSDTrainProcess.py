@@ -878,13 +878,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return
         flush()
         
-        # CRITICAL DIAGNOSTIC: What's the network state before sampling?
-        print_acc(f"[SAMPLE-ENTRY] step={step}, is_first={is_first}")
-        print_acc(f"[SAMPLE-ENTRY] self.network = {self.network}")
-        print_acc(f"[SAMPLE-ENTRY] self.sd.network = {self.sd.network}")
-        if self.network is not None:
-            print_acc(f"[SAMPLE-ENTRY] network type = {type(self.network).__name__}")
-            print_acc(f"[SAMPLE-ENTRY] network param count = {len(list(self.network.parameters()))}")
+
         
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
