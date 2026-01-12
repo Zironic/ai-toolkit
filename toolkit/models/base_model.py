@@ -391,6 +391,8 @@ class BaseModel:
                 can_merge_in = True
                 merge_multiplier = unique_network_weights.pop()
                 network.merge_in(merge_weight=merge_multiplier)
+            else:
+                print_acc(f"[GEN-DEBUG] NOT merging network (unique_weights={len(unique_network_weights)}, can_merge={network.can_merge_in})")
         else:
             network = BlankNetwork()
 

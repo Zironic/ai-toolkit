@@ -11,10 +11,13 @@ def get_accelerator() -> Accelerator:
     return global_accelerator
 
 def unwrap_model(model):
+    if model is None:
+        return None
     try:
         accelerator = get_accelerator()
-        model = accelerator.unwrap_model(model)
-        model = model._orig_mod if is_compiled_module(model) else model
+        unwrapped = accelerator.unwrap_model(model)
+        unwrapped = unwrapped._orig_mod if is_compiled_module(unwrapped) else unwrapped
+        return unwrapped
     except Exception as e:
-        pass
-    return model
+        # If unwrapping fails, return the original model instead of None
+        return model

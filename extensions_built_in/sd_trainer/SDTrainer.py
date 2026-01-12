@@ -3393,20 +3393,39 @@ class SDTrainer(BaseSDTrainProcess):
             local_pred_kwargs.pop('down_block_additional_residuals', None)
             local_pred_kwargs.pop('mid_block_additional_residual', None)
 
-        # Every 5 timesteps, if DOP resolution is < 512, boost to 512 for that step
-        # This helps maintain quality at higher resolutions while keeping most steps fast
+        # CRITICAL: LoKr networks are incompatible with downsampled DOP due to their scale-sensitive
+        # Kronecker product structure. Downsampling causes the Kronecker factors to learn spatial
+        # patterns at the reduced resolution, which don't generalize to full-resolution inference.
+        # For LoKr: always force full-resolution DOP. For LoRA: downsampling is safe.
         effective_preservation_resolution = preservation_resolution
-        if preservation_resolution is not None and preservation_resolution < 512:
-            # Check if any timestep in the batch is divisible by 5
-            # timesteps is a tensor, check if any value % 5 == 0
+        if preservation_resolution is not None and self.network is not None:
             try:
-                if torch.any((timesteps % 5) == 0):
-                    effective_preservation_resolution = 512
+                # Check if network uses LoKr modules (scale-sensitive Kronecker factorization)
+                network_class_name = self.network.__class__.__name__
+                is_lokr = 'lokr' in network_class_name.lower()
+                
+                # Also check module types if network has a module list
+                if not is_lokr and hasattr(self.network, 'modules'):
                     try:
-                        print_acc(f"[DOP] Timestep divisible by 5 detected; boosting DOP resolution from {preservation_resolution} to 512")
+                        for module in self.network.modules():
+                            module_class = module.__class__.__name__.lower()
+                            if 'lokr' in module_class:
+                                is_lokr = True
+                                break
                     except Exception:
                         pass
+                
+                # If LoKr detected and downsampling requested, override to full resolution
+                if is_lokr and preservation_resolution < 9999:
+                    try:
+                        print_acc(f"[DOP Safety] LoKr network detected. Overriding DOP resolution from {preservation_resolution}px to full resolution.")
+                        print_acc(f"[DOP Safety] Reason: LoKr's Kronecker structure is sensitive to training resolution and causes blur when downsampled.")
+                    except Exception:
+                        pass
+                    effective_preservation_resolution = None  # None = full resolution
+                # For non-LoKr networks (LoRA, etc.), downsampling is safe - use requested resolution
             except Exception:
+                # Non-fatal: if detection fails, use requested resolution
                 pass
 
         # If no resolution requested, do the normal full-res predict (using cleaned local kwargs)
@@ -3862,9 +3881,30 @@ class SDTrainer(BaseSDTrainProcess):
         # If a preservation loss was recorded this step, expose it separately so graphs stay readable
         if hasattr(self, '_last_preservation_loss') and self._last_preservation_loss is not None:
             loss_dict['preservation'] = float(self._last_preservation_loss)
-        # Also expose the normal (non-preservation) loss if available
+        # Also expose the normalized loss if available (normal loss weighted by noise level)
         if hasattr(self, '_last_normal_loss') and self._last_normal_loss is not None:
-            loss_dict['normal'] = float(self._last_normal_loss)
+            normal_loss = float(self._last_normal_loss)
+            # Normalize by noise level: multiply by (1 - mean_sigma) to show loss proportional to signal strength
+            # At high noise (sigma near 1), normalized_loss is small; at low noise (sigma near 0), it's close to normal_loss
+            if hasattr(self, 'last_noise_sigmas') and self.last_noise_sigmas is not None:
+                try:
+                    noise_sigma_mean = float(self.last_noise_sigmas.mean().item())
+                    # Linear de-weighting: loss × (1 - sigma)
+                    loss_dict['normalized_loss'] = normal_loss * (1.0 - noise_sigma_mean)
+                    # Less aggressive quadratic scaling: loss × (1 - sigma²)
+                    loss_dict['normalized_loss_2'] = normal_loss * (1.0 - noise_sigma_mean ** 2)
+                    # More aggressive quadratic scaling: loss × (1 - sigma)²
+                    loss_dict['normalized_loss_3'] = normal_loss * ((1.0 - noise_sigma_mean) ** 2)
+                except Exception:
+                    # Fallback: if sigma computation fails, use raw normal loss
+                    loss_dict['normalized_loss'] = normal_loss
+                    loss_dict['normalized_loss_2'] = normal_loss
+                    loss_dict['normalized_loss_3'] = normal_loss
+            else:
+                # No sigma data available; use raw normal loss
+                loss_dict['normalized_loss'] = normal_loss
+                loss_dict['normalized_loss_2'] = normal_loss
+                loss_dict['normalized_loss_3'] = normal_loss
 
         # Control-related metrics (diagnostics & monitoring)
         try:
@@ -3947,10 +3987,7 @@ class SDTrainer(BaseSDTrainProcess):
         try:
             if getattr(self, 'last_noise_norms', None) is not None:
                 mean_noise = float(self.last_noise_norms.mean().item())
-                loss_over_noise_mean = float(self.last_loss_over_noise.mean().item()) if getattr(self, 'last_loss_over_noise', None) is not None else None
                 loss_dict['train/noise_mean'] = mean_noise
-                if loss_over_noise_mean is not None:
-                    loss_dict['train/loss_over_noise'] = loss_over_noise_mean
                 # optional: include sigma mean if it exists
                 if getattr(self, 'last_noise_sigmas', None) is not None:
                     try:
@@ -3960,8 +3997,6 @@ class SDTrainer(BaseSDTrainProcess):
                 # concise log line
                 try:
                     lmsg = f"mean_noise={mean_noise:.6g}"
-                    if loss_over_noise_mean is not None:
-                        lmsg = lmsg + f" mean_loss_over_noise={loss_over_noise_mean:.6g}"
                     print_acc(f"[NOISE] {lmsg}")
                 except Exception:
                     pass

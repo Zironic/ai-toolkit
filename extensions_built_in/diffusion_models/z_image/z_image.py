@@ -1176,7 +1176,24 @@ class ZImageModel(BaseModel):
         if getattr(self, 'vae', None) is not None:
             vae = unwrap_model(self.vae)
         if getattr(self, 'transformer', None) is not None:
-            transformer = unwrap_model(self.transformer)
+            # CRITICAL: Don't unwrap if there's a training network - we need the LoKr hooks!
+            if hasattr(self, 'network') and self.network is not None:
+                from toolkit.print import print_acc
+                print_acc("[PIPELINE-FIX] Using wrapped transformer to preserve LoKr hooks")
+                transformer = self.transformer
+                # DEBUG: Check if transformer has modified forward methods
+                import inspect
+                layer_count = 0
+                modified_count = 0
+                for name, module in transformer.named_modules():
+                    if hasattr(module, 'forward'):
+                        layer_count += 1
+                        # Check if forward is a bound method of a different object (indicating hook)
+                        if hasattr(module.forward, '__self__') and module.forward.__self__ is not module:
+                            modified_count += 1
+                print_acc(f"[HOOK-CHECK] Transformer has {modified_count}/{layer_count} layers with modified forward")
+            else:
+                transformer = unwrap_model(self.transformer)
 
         # Convert dict-style `vae.config` used in some tests to a simple namespace
         # so that downstream pipeline constructors expecting attribute access work.
@@ -1256,8 +1273,27 @@ class ZImageModel(BaseModel):
     ):
         # Some tests and minimal usage may not instantiate `self.model`; guard accordingly
         if hasattr(self, 'model') and self.model is not None:
+            # Debug: check if forward hooks are preserved before .to()
+            if hasattr(self, 'network') and self.network is not None:
+                sample_module = None
+                for module in self.network.unet_loras:
+                    sample_module = module
+                    break
+                if sample_module is not None:
+                    orig_forward_before = sample_module.org_module[0].forward
+                    
             self.model.to(self.device_torch, dtype=self.torch_dtype)
             self.model.to(self.device_torch)
+            
+            # Debug: check if forward hooks are still there after .to()
+            if hasattr(self, 'network') and self.network is not None and sample_module is not None:
+                orig_forward_after = sample_module.org_module[0].forward
+                from toolkit.print import print_acc
+                if orig_forward_before != orig_forward_after:
+                    print_acc(f"[HOOK-BUG] Forward hook was LOST after .to() call!")
+                    print_acc(f"[HOOK-BUG] Before: {type(orig_forward_before)}, After: {type(orig_forward_after)}")
+                else:
+                    print_acc(f"[HOOK-OK] Forward hook preserved after .to()")
 
         sc = self.get_bucket_divisibility()
         gen_config.width = int(gen_config.width // sc * sc)
@@ -2041,24 +2077,72 @@ def precompute_zimage_control_contexts(sd, data_loader):
         except Exception:
             pass
 
+        # PRE-CHECK: Count how many files already have valid caches
+        # This avoids expensive encoding when resuming from checkpoint
+        files_needing_encode = []
+        files_cached = 0
+        cache_to_disk = getattr(cfg, 'cache_control_contexts_to_disk', False)
+        
+        for fi in ds.file_list:
+            if not getattr(fi, 'has_control_image', False) and getattr(fi, 'control_tensor', None) is None:
+                continue
+            
+            # Check if already in memory
+            existing = getattr(fi, '_preencoded_zimage_control_contexts', None)
+            if existing is not None and isinstance(existing, dict) and len(existing) > 0:
+                files_cached += 1
+                continue
+            
+            # Check if cached to disk
+            if cache_to_disk and hasattr(fi, 'get_control_context_path'):
+                try:
+                    from toolkit.cache_utils import find_cached_file
+                    from pathlib import Path
+                    ctrl_path = Path(fi.get_control_context_path(recalculate=True))
+                    cached = find_cached_file(ctrl_path)
+                    if cached:
+                        # Load into memory if cached to disk
+                        try:
+                            from safetensors.torch import load_file
+                            state_dict = load_file(str(cached), device='cpu')
+                            fi._preencoded_zimage_control_contexts = {}
+                            for key, tensor in state_dict.items():
+                                if key.startswith('context_'):
+                                    size = int(key.replace('context_', ''))
+                                    fi._preencoded_zimage_control_contexts[size] = tensor
+                            fi.is_control_context_cached = True
+                            files_cached += 1
+                            continue
+                        except Exception as e:
+                            try:
+                                print_acc(f"[PRECOMPUTE] Warning: Failed to load cached control context for {fi.path}: {e}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            
+            files_needing_encode.append(fi)
+        
+        total_files = len([fi for fi in ds.file_list if getattr(fi, 'has_control_image', False) or getattr(fi, 'control_tensor', None) is not None])
+        try:
+            print_acc(f"[PRECOMPUTE] Control context cache: {files_cached}/{total_files} files cached, {len(files_needing_encode)} need encoding")
+        except Exception:
+            pass
+        
+        # If everything is cached, skip encoding
+        if len(files_needing_encode) == 0:
+            try:
+                print_acc(f"[PRECOMPUTE] All control contexts already cached for dataset, skipping encoding")
+            except Exception:
+                pass
+            continue
+
         try:
             sd.set_device_state_preset('cache_latents')
         except Exception:
             pass
 
-        for fi in ds.file_list:
-            if not getattr(fi, 'has_control_image', False) and getattr(fi, 'control_tensor', None) is None:
-                continue
-            try:
-                existing = getattr(fi, '_preencoded_zimage_control_contexts', None)
-                if existing is not None and isinstance(existing, dict) and len(existing) > 0:
-                    try:
-                        print_acc(f"[PRECOMPUTE] Skipping precompute for {fi.path}: already cached sizes={sorted(existing.keys())}")
-                    except Exception:
-                        pass
-                    continue
-            except Exception:
-                pass
+        for fi in files_needing_encode:
 
             try:
                 if getattr(fi, 'control_tensor', None) is None:

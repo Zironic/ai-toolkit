@@ -258,6 +258,12 @@ class ToolkitModuleMixin:
     def forward(self: Module, x, *args, **kwargs):
         skip = False
         network: Network = self.network_ref()
+        
+        # Debug: track if forward is being called
+        if not hasattr(network, '_forward_call_count'):
+            network._forward_call_count = 0
+        network._forward_call_count += 1
+        
         if network.is_lorm:
             # we are doing lorm
             return self.lorm_forward(x, *args, **kwargs)
@@ -276,6 +282,8 @@ class ToolkitModuleMixin:
 
         if skip:
             # network is not active, avoid doing anything
+            if network._forward_call_count <= 5:
+                print(f"[FORWARD-SKIP] Module {self.__class__.__name__} skipping (is_active={network.is_active}, is_merged={network.is_merged_in}, mult={network._multiplier})")
             return self.org_forward(x, *args, **kwargs)
 
         # if self.__class__.__name__ == "DoRAModule":
@@ -283,6 +291,9 @@ class ToolkitModuleMixin:
         #     return self.dora_forward(x, *args, **kwargs)
         
         if self.__class__.__name__ == "LokrModule":
+            # LokrModule has its own forward logic that handles the entire computation
+            if network._forward_call_count <= 5:
+                print(f"[FORWARD-LOKR] Applying LoKr module (multiplier={network._multiplier}, is_active={network.is_active})")
             return self._call_forward(x)
 
         org_forwarded = self.org_forward(x, *args, **kwargs)

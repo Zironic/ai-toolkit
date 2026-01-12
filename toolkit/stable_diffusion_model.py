@@ -1124,18 +1124,37 @@ class StableDiffusion:
             sampler=None,
             pipeline: Union[None, StableDiffusionPipeline, StableDiffusionXLPipeline] = None,
     ):
-        network = unwrap_model(self.network)
+        # FIXED: Don't use unwrap_model() which silently fails and returns None
+        # Just use self.network directly - it's already the correct object
+        network = self.network
         merge_multiplier = 1.0
         flush()
+        
+        # CRITICAL DIAGNOSTIC: Is the network detected?
+        print_acc(f"[SAMPLE-DEBUG] self.network = {self.network}")
+        print_acc(f"[SAMPLE-DEBUG] unwrapped network = {network}")
+        print_acc(f"[SAMPLE-DEBUG] network type = {type(network).__name__ if network is not None else 'None'}")
+        if network is not None:
+            print_acc(f"[SAMPLE-DEBUG] network has {len(list(network.parameters()))} parameter tensors")
+            print_acc(f"[SAMPLE-DEBUG] network.is_active = {getattr(network, 'is_active', 'no is_active attr')}")
+        
         # if using assistant, unfuse it
+        # BUT: if we're training a network (LoRA/LoKr), disable the assistant during sampling
+        # so we see the training network's effect, not assistant+training
         if self.model_config.assistant_lora_path is not None:
-            print_acc("Unloading assistant lora")
-            if self.invert_assistant_lora:
-                self.assistant_lora.is_active = True
-                # move weights on to the device
-                self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
-            else:
+            if network is not None:
+                # Training a network - disable assistant so samples show training network only
+                print_acc("Disabling assistant lora during sampling (training network active)")
                 self.assistant_lora.is_active = False
+            else:
+                # Not training a network - use assistant normally
+                print_acc("Unloading assistant lora")
+                if self.invert_assistant_lora:
+                    self.assistant_lora.is_active = True
+                    # move weights on to the device
+                    self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
+                else:
+                    self.assistant_lora.is_active = False
                 
         if self.model_config.inference_lora_path is not None:
             print_acc("Loading inference lora")

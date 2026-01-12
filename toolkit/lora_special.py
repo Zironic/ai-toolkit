@@ -264,9 +264,13 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         if self.network_type.lower() == "dora":
             self.module_class = DoRAModule
             module_class = DoRAModule
+            print(f"[LORA-SPECIAL] Selected DoRAModule for network_type={network_type}")
         elif self.network_type.lower() == "lokr":
             self.module_class = LokrModule
             module_class = LokrModule
+            print(f"[LORA-SPECIAL] Selected LokrModule for network_type={network_type}")
+        else:
+            print(f"[LORA-SPECIAL] Using default LoRAModule for network_type={network_type}")
         self.network_config: NetworkConfig = kwargs.get("network_config", None)
 
         self.peft_format = peft_format
@@ -468,7 +472,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
 
         # create LoRA for text encoder
         # 毎回すべてのモジュールを作るのは無駄なので要検討
-        self.text_encoder_loras = []
+        text_encoder_loras_list = []
         skipped_te = []
         if train_text_encoder:
             for i, text_encoder in enumerate(text_encoders):
@@ -489,8 +493,9 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                     replace_modules = ["T5EncoderModel"]
 
                 text_encoder_loras, skipped = create_modules(False, index, text_encoder, replace_modules)
-                self.text_encoder_loras.extend(text_encoder_loras)
+                text_encoder_loras_list.extend(text_encoder_loras)
                 skipped_te += skipped
+        self.text_encoder_loras = torch.nn.ModuleList(text_encoder_loras_list)
         print(f"create LoRA for Text Encoder: {len(self.text_encoder_loras)} modules.")
 
         # extend U-Net target modules if conv2d 3x3 is enabled, or load from weights
@@ -514,9 +519,10 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             target_modules = ["Lumina2Transformer2DModel"]
 
         if train_unet:
-            self.unet_loras, skipped_un = create_modules(True, None, unet, target_modules)
+            unet_loras_list, skipped_un = create_modules(True, None, unet, target_modules)
+            self.unet_loras = torch.nn.ModuleList(unet_loras_list)
         else:
-            self.unet_loras = []
+            self.unet_loras = torch.nn.ModuleList([])
             skipped_un = []
         print(f"create LoRA for U-Net: {len(self.unet_loras)} modules.")
 

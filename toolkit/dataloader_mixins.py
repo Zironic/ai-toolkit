@@ -2054,13 +2054,15 @@ class LatentCachingMixin:
                 print_acc(" - Saving latents to disk")
             if to_memory:
                 print_acc(" - Keeping latents in memory")
-            # move sd items to cpu except for vae
-            self.sd.set_device_state_preset('cache_latents')
 
-            # use tqdm to show progress
-            i = 0
-            for file_item in tqdm(self.file_list, desc=f'Caching latents{" to disk" if to_disk else ""}'):
-                # set latent space version
+            # PRE-CHECK: Count how many files already have valid caches
+            # This avoids expensive VAE encoding when resuming from checkpoint
+            from toolkit.cache_utils import find_cached_file
+            files_needing_encode = []
+            files_cached = 0
+            
+            for file_item in self.file_list:
+                # Set up latent space version for each file
                 if self.sd.model_config.latent_space_version is not None:
                     file_item.latent_space_version = self.sd.model_config.latent_space_version
                 elif self.sd.is_xl:
@@ -2075,60 +2077,85 @@ class LatentCachingMixin:
                     file_item.latent_space_version = 'sdxl'
                 else:
                     file_item.latent_space_version = self.sd.model_config.arch
+                
                 file_item.is_caching_to_disk = to_disk
                 file_item.is_caching_to_memory = to_memory
                 file_item.latent_load_device = self.sd.device
 
                 latent_path = Path(file_item.get_latent_path(recalculate=True))
-                from toolkit.cache_utils import find_cached_file, atomic_write
-                # check if a cached file exists (hashed or legacy fallback)
                 cached = find_cached_file(latent_path)
                 if cached:
+                    files_cached += 1
                     if to_memory:
-                        state_dict = load_file(str(cached), device='cpu')
-                        file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
+                        # Load into memory during this pass
+                        try:
+                            from safetensors.torch import load_file
+                            state_dict = load_file(str(cached), device='cpu')
+                            file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
+                            file_item.is_latent_cached = True
+                        except Exception as e:
+                            print_acc(f"Warning: Failed to load cached latent for {file_item.path}: {e}")
+                            files_needing_encode.append(file_item)
+                            files_cached -= 1
+                    else:
+                        file_item.is_latent_cached = True
                 else:
-                    # not saved to disk, calculate
-                    # load the image first
-                    file_item.load_and_process_image(self.transform, only_load_latents=True)
-                    dtype = self.sd.torch_dtype
-                    device = self.sd.device_torch
-                    # add batch dimension
-                    try:
-                        imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                        latent = self.sd.encode_images(imgs).squeeze(0)
-                    except Exception as e:
-                        print_acc(f"Error processing image: {file_item.path}")
-                        print_acc(f"Error: {str(e)}")
-                        raise e
-                    # save_latent
-                    if to_disk:
-                        state_dict = OrderedDict([
-                            ('latent', latent.clone().detach().cpu()),
-                        ])
-                        # metadata
-                        meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
-                        os.makedirs(latent_path.parent, exist_ok=True)
-                        # race re-check
-                        cached = find_cached_file(latent_path)
-                        if cached:
-                            if to_memory:
-                                state_dict = load_file(str(cached), device='cpu')
-                                file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
-                        else:
-                            def _writer(p: Path):
-                                save_file(state_dict, str(p), metadata=meta)
-                            atomic_write(latent_path, _writer)
+                    files_needing_encode.append(file_item)
+            
+            # Report cache hit rate
+            total_files = len(self.file_list)
+            print_acc(f"Latent cache: {files_cached}/{total_files} files cached, {len(files_needing_encode)} need encoding")
+            
+            # If everything is cached, we're done!
+            if len(files_needing_encode) == 0:
+                print_acc("All latents already cached, skipping encoding")
+                return
+            
+            # Only set device state if we actually need to encode
+            # move sd items to cpu except for vae
+            self.sd.set_device_state_preset('cache_latents')
 
-                    if to_memory:
-                        # keep it in memory
-                        file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
+            # use tqdm to show progress (only for files that need encoding)
+            i = 0
+            for file_item in tqdm(files_needing_encode, desc=f'Caching latents{" to disk" if to_disk else ""}'):
+                # Note: latent space version and cache settings already set during pre-check
+                latent_path = Path(file_item.get_latent_path(recalculate=True))
+                from toolkit.cache_utils import atomic_write
+                # We know this file needs encoding (pre-check determined it's not cached)
+                # load the image first
+                file_item.load_and_process_image(self.transform, only_load_latents=True)
+                dtype = self.sd.torch_dtype
+                device = self.sd.device_torch
+                # add batch dimension
+                try:
+                    imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
+                    latent = self.sd.encode_images(imgs).squeeze(0)
+                except Exception as e:
+                    print_acc(f"Error processing image: {file_item.path}")
+                    print_acc(f"Error: {str(e)}")
+                    raise e
+                # save_latent
+                if to_disk:
+                    state_dict = OrderedDict([
+                        ('latent', latent.clone().detach().cpu()),
+                    ])
+                    # metadata
+                    meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
+                    os.makedirs(latent_path.parent, exist_ok=True)
+                    # atomic write (no race re-check needed since we pre-checked)
+                    def _writer(p: Path):
+                        save_file(state_dict, str(p), metadata=meta)
+                    atomic_write(latent_path, _writer)
 
-                    del imgs
-                    del latent
-                    del file_item.tensor
+                if to_memory:
+                    # keep it in memory
+                    file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
 
-                    # flush(garbage_collect=False)
+                del imgs
+                del latent
+                del file_item.tensor
+
+                # flush(garbage_collect=False)
                 file_item.is_latent_cached = True
                 i += 1
                 # flush every 100
@@ -2441,62 +2468,82 @@ class TextEmbeddingCachingMixin:
                 except Exception as e:
                     raise RuntimeError(f"Failed to save split prompt embedding for dataset {self.dataset_path}: {e}") from e
 
-            did_move = False
-
-            # use tqdm to show progress
-            i = 0
-            for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
+            # PRE-CHECK: Count how many files already have valid text embedding caches
+            from toolkit.cache_utils import find_cached_file
+            files_needing_encode = []
+            files_cached = 0
+            
+            for file_item in self.file_list:
                 file_item.text_embedding_space_version = self.sd.model_config.arch
                 file_item.latent_load_device = self.sd.device
-
-                from toolkit.cache_utils import find_cached_file, wait_for_cached_file
+                
                 text_embedding_path = Path(file_item.get_text_embedding_path(recalculate=True))
-                # check for hashed or legacy cache
                 cached = find_cached_file(text_embedding_path)
-                if not cached:
-                    # load if not loaded
-                    if not did_move:
-                        self.sd.set_device_state_preset('cache_text_encoder')
-                        did_move = True
-                        
-                    if file_item.encode_control_in_text_embeddings:
-                        if file_item.control_path is None:
-                            raise Exception(f"Could not find a control image for {file_item.path} which is needed for this model")
-                        ctrl_img_list = []
-                        control_path_list = file_item.control_path
-                        if not isinstance(file_item.control_path, list):
-                            control_path_list = [control_path_list]
-                        for i in range(len(control_path_list)):
-                            try:
-                                img = Image.open(control_path_list[i]).convert("RGB")
-                                img = exif_transpose(img)
-                                # convert to 0 to 1 tensor
-                                img = (
-                                    TF.to_tensor(img)
-                                    .unsqueeze(0)
-                                    .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                                )
-                                ctrl_img_list.append(img)
-                            except Exception as e:
-                                print_acc(f"Error: {e}")
-                                print_acc(f"Error loading control image: {control_path_list[i]}")
-                        
-                        if len(ctrl_img_list) == 0:
-                            ctrl_img = None
-                        elif not self.sd.has_multiple_control_images:
-                            ctrl_img = ctrl_img_list[0]
-                        else:
-                            ctrl_img = ctrl_img_list
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+                if cached:
+                    files_cached += 1
+                    file_item.is_text_embedding_cached = True
+                else:
+                    files_needing_encode.append(file_item)
+            
+            # Report cache hit rate
+            total_files = len(self.file_list)
+            print_acc(f"Text embedding cache: {files_cached}/{total_files} files cached, {len(files_needing_encode)} need encoding")
+            
+            # If everything is cached, we're done!
+            if len(files_needing_encode) == 0:
+                print_acc("All text embeddings already cached, skipping encoding")
+                return
+
+            did_move = False
+
+            # use tqdm to show progress (only for files that need encoding)
+            i = 0
+            for file_item in tqdm(files_needing_encode, desc='Caching text embeddings to disk'):
+                # Note: text_embedding_space_version already set during pre-check
+                text_embedding_path = Path(file_item.get_text_embedding_path(recalculate=True))
+                
+                # We know this file needs encoding (pre-check determined it's not cached)
+                # load if not loaded
+                if not did_move:
+                    self.sd.set_device_state_preset('cache_text_encoder')
+                    did_move = True
+                
+                if file_item.encode_control_in_text_embeddings:
+                    if file_item.control_path is None:
+                        raise Exception(f"Could not find a control image for {file_item.path} which is needed for this model")
+                    ctrl_img_list = []
+                    control_path_list = file_item.control_path
+                    if not isinstance(file_item.control_path, list):
+                        control_path_list = [control_path_list]
+                    for i in range(len(control_path_list)):
+                        try:
+                            img = Image.open(control_path_list[i]).convert("RGB")
+                            img = exif_transpose(img)
+                            # convert to 0 to 1 tensor
+                            img = (
+                                TF.to_tensor(img)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(img)
+                        except Exception as e:
+                            print_acc(f"Error: {e}")
+                            print_acc(f"Error loading control image: {control_path_list[i]}")
+                    
+                    if len(ctrl_img_list) == 0:
+                        ctrl_img = None
+                    elif not self.sd.has_multiple_control_images:
+                        ctrl_img = ctrl_img_list[0]
                     else:
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
-                    # race re-check
-                    cached = find_cached_file(text_embedding_path)
-                    if not cached:
-                        # atomic write to avoid partial files
-                        from toolkit.cache_utils import atomic_write
-                        atomic_write(text_embedding_path, lambda p: prompt_embeds.save(str(p)))
-                    del prompt_embeds
+                        ctrl_img = ctrl_img_list
+                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+                else:
+                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
+                
+                # atomic write to avoid partial files (no race re-check needed since we pre-checked)
+                from toolkit.cache_utils import atomic_write
+                atomic_write(text_embedding_path, lambda p: prompt_embeds.save(str(p)))
+                del prompt_embeds
                 file_item.is_text_embedding_cached = True
                 i += 1
             # restore device state

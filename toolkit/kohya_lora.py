@@ -876,7 +876,7 @@ class LoRANetwork(torch.nn.Module):
 
         # create LoRA for text encoder
         # 毎回すべてのモジュールを作るのは無駄なので要検討
-        self.text_encoder_loras = []
+        self.text_encoder_loras = torch.nn.ModuleList([])
         skipped_te = []
         for i, text_encoder in enumerate(text_encoders):
             if len(text_encoders) > 1:
@@ -896,7 +896,8 @@ class LoRANetwork(torch.nn.Module):
         if modules_dim is not None or self.conv_lora_dim is not None or conv_block_dims is not None:
             target_modules += LoRANetwork.UNET_TARGET_REPLACE_MODULE_CONV2D_3X3
 
-        self.unet_loras, skipped_un = create_modules(True, None, unet, target_modules)
+        unet_loras_list, skipped_un = create_modules(True, None, unet, target_modules)
+        self.unet_loras = torch.nn.ModuleList(unet_loras_list)
         print(f"create LoRA for U-Net: {len(self.unet_loras)} modules.")
 
         skipped = skipped_te + skipped_un
@@ -938,12 +939,12 @@ class LoRANetwork(torch.nn.Module):
         if apply_text_encoder:
             print("enable LoRA for text encoder")
         else:
-            self.text_encoder_loras = []
+            self.text_encoder_loras = torch.nn.ModuleList([])
 
         if apply_unet:
             print("enable LoRA for U-Net")
         else:
-            self.unet_loras = []
+            self.unet_loras = torch.nn.ModuleList([])
 
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.apply_to()
@@ -965,12 +966,12 @@ class LoRANetwork(torch.nn.Module):
         if apply_text_encoder:
             print("enable LoRA for text encoder")
         else:
-            self.text_encoder_loras = []
+            self.text_encoder_loras = torch.nn.ModuleList([])
 
         if apply_unet:
             print("enable LoRA for U-Net")
         else:
-            self.unet_loras = []
+            self.unet_loras = torch.nn.ModuleList([])
 
         for lora in self.text_encoder_loras + self.unet_loras:
             sd_for_lora = {}

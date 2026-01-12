@@ -103,6 +103,8 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         self.use_w2 = False
         self.can_merge_in = True
 
+        print(f"[LOKR-DEBUG] Creating LoKr module '{lora_name}' with lora_dim={lora_dim}, alpha={alpha}, factor={factor}")
+
         self.shape = org_module.weight.shape
         if org_module.__class__.__name__ == 'Conv2d':
             in_dim = org_module.in_channels
@@ -129,6 +131,7 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
                 self.use_w2 = True
                 self.lokr_w2 = nn.Parameter(torch.empty(
                     shape[0][1], shape[1][1], *k_size))
+                print(f"[LOKR-DEBUG] Conv2d: Created lokr_w2 with shape {self.lokr_w2.shape}")
             elif self.cp:
                 self.lokr_t2 = nn.Parameter(torch.empty(
                     lora_dim, lora_dim, shape[2], shape[3]))
@@ -183,6 +186,7 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
                 self.use_w2 = True
                 self.lokr_w2 = nn.Parameter(
                     torch.empty(shape[0][1], shape[1][1]))
+                print(f"[LOKR-DEBUG] Linear: Created lokr_w2 with shape {self.lokr_w2.shape}")
 
             self.op = F.linear
             self.extra_args = {}
@@ -215,6 +219,9 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         else:
             torch.nn.init.kaiming_uniform_(self.lokr_w1_a, a=math.sqrt(5))
             torch.nn.init.kaiming_uniform_(self.lokr_w1_b, a=math.sqrt(5))
+
+        print(f"[LOKR-DEBUG] Finished creating module '{self.lora_name}', use_w1={self.use_w1}, use_w2={self.use_w2}")
+        print(f"[LOKR-DEBUG] Module has {len(list(self.parameters()))} parameters")
 
         self.multiplier = multiplier
         self.org_module = [org_module]
@@ -326,6 +333,13 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             return bias.data.detach()
 
     def _call_forward(self, x):
+        # Track if this is being called during sampling
+        network = self.network_ref()
+        if not hasattr(network, '_sampling_forward_count'):
+            network._sampling_forward_count = 0
+            network._sampling_forward_first_module = self.lora_name
+        network._sampling_forward_count += 1
+        
         if isinstance(x, QTensor) or isinstance(x, QBytesTensor):
             x = x.dequantize()
 
@@ -335,11 +349,72 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         lokr_weight = self.get_weight(orig_weight).to(dtype=orig_weight.dtype)
         multiplier = self.network_ref().torch_multiplier
 
+        # Debug: track weight evolution AND verify we're using the same parameter objects
+        network = self.network_ref()
+        if not hasattr(network, '_lokr_debug_count'):
+            network._lokr_debug_count = 0
+            network._first_module_name = self.lora_name
+            network._lokr_weight_history = []
+            # Store the parameter ID to verify it's the same object across calls
+            if hasattr(self, 'lokr_w1'):
+                network._first_param_id = id(self.lokr_w1)
+                network._first_param_value = self.lokr_w1.data.clone().cpu()
+            elif hasattr(self, 'lokr_w1_a'):
+                network._first_param_id = id(self.lokr_w1_a)
+                network._first_param_value = self.lokr_w1_a.data.clone().cpu()
+            print(f"[LOKR-INIT] First module '{self.lora_name[:40]}' param_id={network._first_param_id}")
+        
+        # Only track the first module to avoid spam
+        if self.lora_name == network._first_module_name:
+            lokr_norm = torch.norm(lokr_weight).item()
+            network._lokr_weight_history.append(lokr_norm)
+            
+            # Verify parameter object identity
+            current_param_id = None
+            if hasattr(self, 'lokr_w1'):
+                current_param_id = id(self.lokr_w1)
+                current_value = self.lokr_w1.data
+            elif hasattr(self, 'lokr_w1_a'):
+                current_param_id = id(self.lokr_w1_a)
+                current_value = self.lokr_w1_a.data
+                
+            if current_param_id != network._first_param_id:
+                print(f"[PARAM-BUG] Parameter object CHANGED! Was {network._first_param_id}, now {current_param_id}")
+            
+            # Check if value changed since init
+            if hasattr(network, '_first_param_value'):
+                value_diff = torch.norm(current_value.cpu() - network._first_param_value).item()
+                if len(network._lokr_weight_history) % 100 == 1:
+                    orig_norm = torch.norm(orig_weight).item()
+                    print(f"[LOKR-TRACK] Sample#{len(network._lokr_weight_history)}: lokr_norm={lokr_norm:.6f}, param_changed_from_init={value_diff:.8f}")
+
         if x.dtype != orig_weight.dtype:
             x = x.to(dtype=orig_weight.dtype)
 
         # we do not currently support split batch multipliers for lokr. Just do a mean
         multiplier = torch.mean(multiplier)
+        
+        # Debug: Check multiplier value during sampling
+        network = self.network_ref()
+        if not hasattr(network, '_multiplier_checked'):
+            network._multiplier_checked = True
+
+            def _fmt_mult(x):
+                # format numbers, tensors (scalar or shaped), lists/tuples and None safely
+                try:
+                    if x is None:
+                        return "None"
+                    if isinstance(x, (list, tuple)):
+                        return str(x)
+                    if isinstance(x, torch.Tensor):
+                        if x.numel() == 1:
+                            return f"{x.item():.6f}"
+                        return f"tensor(shape={tuple(x.shape)})"
+                    return f"{float(x):.6f}"
+                except Exception:
+                    return repr(x)
+
+            print(f"[MULTIPLIER-DEBUG] LoKr multiplier={_fmt_mult(multiplier)}, network.multiplier={_fmt_mult(network.multiplier)}, network.torch_multiplier={_fmt_mult(network.torch_multiplier)}")
 
         weight = (
             orig_weight

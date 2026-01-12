@@ -877,6 +877,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if not self.accelerator.is_main_process:
             return
         flush()
+        
+        # CRITICAL DIAGNOSTIC: What's the network state before sampling?
+        print_acc(f"[SAMPLE-ENTRY] step={step}, is_first={is_first}")
+        print_acc(f"[SAMPLE-ENTRY] self.network = {self.network}")
+        print_acc(f"[SAMPLE-ENTRY] self.sd.network = {self.sd.network}")
+        if self.network is not None:
+            print_acc(f"[SAMPLE-ENTRY] network type = {type(self.network).__name__}")
+            print_acc(f"[SAMPLE-ENTRY] network param count = {len(list(self.network.parameters()))}")
+        
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
 
@@ -2648,8 +2657,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         self.hook_after_model_load()
         flush()
+        print(f"[NETWORK-DEBUG] is_fine_tuning={self.is_fine_tuning}, network_config={self.network_config}")
+        if self.network_config is not None:
+            print(f"[NETWORK-DEBUG] network_config.type={self.network_config.type}")
         if not self.is_fine_tuning:
+            print(f"[NETWORK-DEBUG] NOT fine-tuning, checking network_config...")
             if self.network_config is not None:
+                print(f"[NETWORK-DEBUG] Creating network with type={self.network_config.type}")
                 # TODO should we completely switch to LycorisSpecialNetwork?
                 network_kwargs = self.network_config.network_kwargs
                 is_lycoris = False
@@ -2659,6 +2673,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.network_config.type.lower() == 'locon' or self.network_config.type.lower() == 'lycoris':
                     NetworkClass = LycorisSpecialNetwork
                     is_lycoris = True
+                print(f"[NETWORK-DEBUG] Selected NetworkClass={NetworkClass.__name__}")
 
                 if is_lorm:
                     network_kwargs['ignore_if_contains'] = lorm_ignore_if_contains
@@ -2704,6 +2719,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             rca_block_dims = None
                             rca_block_alphas = None
 
+                print(f"[NETWORK-DEBUG] About to create network instance...")
                 self.network = NetworkClass(
                     text_encoder=text_encoder,
                     unet=self.sd.get_model_to_train(),
@@ -2738,6 +2754,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     **network_kwargs
                 )
 
+                print(f"[NETWORK-DEBUG] Network created successfully! Network type: {self.network_config.type}, Class: {self.network.__class__.__name__}")
+                print(f"[NETWORK-DEBUG] Network has {len(list(self.network.parameters()))} parameter tensors")
 
                 # todo switch everything to proper mixed precision like this
                 self.network.force_to(self.device_torch, dtype=torch.float32)
@@ -3054,6 +3072,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
 
         start_step_num = self.step_num
+        
+        # Clean up any future steps in the loss log database that shouldn't exist
+        # (e.g., if we're resuming from step 500 but the DB has steps up to 1000 from a previous run)
+        if self.logger is not None and hasattr(self.logger, 'cleanup_future_steps'):
+            self.logger.cleanup_future_steps(start_step_num)
+        
         did_first_flush = False
         flush_next = False
         for step in range(start_step_num, self.train_config.steps):
@@ -3175,6 +3199,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("")
             else:
                 self.num_consecutive_oom = 0
+                
+            # Debug: Check if LoKr weights are updating after training step
+            if self.step_num in [1, 2, 100, 250, 500, 750,800,850, 1000] and hasattr(self, 'network') and self.network is not None:
+                try:
+                    first_module = None
+                    for module in self.network.unet_loras:
+                        if module.__class__.__name__ == "LokrModule":
+                            first_module = module
+                            break
+                    if first_module is not None:
+                        if hasattr(first_module, 'lokr_w1'):
+                            param = first_module.lokr_w1
+                        elif hasattr(first_module, 'lokr_w1_a'):
+                            param = first_module.lokr_w1_a
+                        else:
+                            param = None
+                        
+                        if param is not None:
+                            param_norm = torch.norm(param.data).item()
+                            grad_norm = torch.norm(param.grad).item() if param.grad is not None else 0.0
+                            print_acc(f"[TRAIN-CHECK] Step {self.step_num}: First LoKr param norm={param_norm:.6f}, grad_norm={grad_norm:.8f}")
+                except Exception as e:
+                    print_acc(f"[TRAIN-CHECK] Error checking weights: {e}")
+            
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()

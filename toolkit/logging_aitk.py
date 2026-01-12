@@ -296,6 +296,65 @@ class UILogger:
         self._pending_key_minmax.clear()
         self._last_flush = time.time()
 
+    def cleanup_future_steps(self, current_step: int) -> None:
+        """Remove any logged steps that are greater than the current training step.
+        
+        This should be called after checkpoint loading, when we know what step we're resuming from.
+        If training resumed from step 500 but the database has steps up to 1000 (from a previous run),
+        this will remove steps 501-1000.
+        
+        Args:
+            current_step: The step number that training is starting/resuming from
+        """
+        if not self._con:
+            return
+        
+        try:
+            con = self._con
+            
+            # Get the maximum step in the database
+            cursor = con.execute("SELECT MAX(step) FROM steps")
+            row = cursor.fetchone()
+            
+            if row is None or row[0] is None:
+                # No data in database, nothing to clean
+                return
+            
+            max_step = row[0]
+            
+            if max_step > current_step:
+                # We have future steps that shouldn't exist
+                steps_to_remove = max_step - current_step
+                print(f"[UILogger] Resuming from step {current_step}, removing {steps_to_remove} future steps (>{current_step}) from loss log...")
+                
+                con.execute("BEGIN;")
+                con.execute("DELETE FROM metrics WHERE step > ?;", (current_step,))
+                con.execute("DELETE FROM steps WHERE step > ?;", (current_step,))
+                con.execute("COMMIT;")
+                
+                # Update metric_keys ranges to reflect the cleanup
+                con.execute("BEGIN;")
+                con.execute("""
+                    UPDATE metric_keys
+                    SET last_seen_step = (
+                        SELECT MAX(step) FROM metrics m 
+                        WHERE m.key = metric_keys.key
+                    )
+                    WHERE last_seen_step > ?;
+                """, (current_step,))
+                con.execute("DELETE FROM metric_keys WHERE last_seen_step IS NULL;")
+                con.execute("COMMIT;")
+                
+                print(f"[UILogger] Cleanup complete. Loss log now contains steps 0-{current_step}.")
+        except Exception as e:
+            # Non-fatal: if cleanup fails, continue with training
+            print(f"[UILogger] Warning: failed to clean up future steps: {e}")
+            try:
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                pass
+
 
 # create logger based on the logging config
 def create_logger(
