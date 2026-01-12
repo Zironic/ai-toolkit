@@ -86,8 +86,12 @@ flux_config = {
   "max_shift": 1.15,
   "num_train_timesteps": 1000,
   "shift": 3.0,
-  "use_dynamic_shifting": True
-}
+  "use_dynamic_shifting": True,
+  # Qwen dynamic-shift settings (defaults): center at 512x512 and clamp exponent range
+  "qwen_ref_pixels": 262144,  # 512**2
+  "qwen_min_exp": 0.3333333333333333,
+  "qwen_max_exp": 3.0
+}},{ 
 
 sd_flow_config = {
   "_class_name": "FlowMatchEulerDiscreteScheduler",
@@ -98,6 +102,10 @@ sd_flow_config = {
   "max_shift": 1.15,
   "num_train_timesteps": 1000,
   "shift": 3.0,
+  # Qwen dynamic-shift settings (defaults): center at 512x512 and clamp exponent range
+  "qwen_ref_pixels": 262144,  # 512**2
+  "qwen_min_exp": 0.3333333333333333,
+  "qwen_max_exp": 3.0,
   "use_dynamic_shifting": False
 }
 

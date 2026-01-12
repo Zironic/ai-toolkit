@@ -149,16 +149,34 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 w = latents.shape[3]
                 image_seq_len = h * w // (patch_size**2)
 
-                mu = calculate_shift(
-                    image_seq_len,
-                    self.config.get("base_image_seq_len", 256),
-                    self.config.get("max_image_seq_len", 4096),
-                    self.config.get("base_shift", 0.5),
-                    self.config.get("max_shift", 1.16),
-                )
+                # Qwen-style log-pixels μ mapping, centered at configurable reference and clamped
+                pixels = float(h * w)
+                ref_pixels = float(self.config.get('qwen_ref_pixels', 512 ** 2))
+                mu_raw = math.log(max(pixels, 1.0) / ref_pixels)
+                min_exp = float(self.config.get('qwen_min_exp', 0.34))
+                max_exp = float(self.config.get('qwen_max_exp', 3.0))
+                mu_min = math.log(min_exp)
+                mu_max = math.log(max_exp)
+                mu = max(min(mu_raw, mu_max), mu_min)
+
                 sigmas = self.time_shift(mu, 1.0, sigmas)
             else:
-                sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
+                # Prefer Qwen log-pixels mapping even when dynamic shifting is disabled
+                if latents is not None:
+                    h = latents.shape[2]
+                    w = latents.shape[3]
+                    pixels = float(h * w)
+                    ref_pixels = float(self.config.get('qwen_ref_pixels', 512 ** 2))
+                    mu_raw = math.log(max(pixels, 1.0) / ref_pixels)
+                    min_exp = float(self.config.get('qwen_min_exp', 0.2))
+                    max_exp = float(self.config.get('qwen_max_exp', 4.0))
+                    mu_min = math.log(min_exp)
+                    mu_max = math.log(max_exp)
+                    mu = max(min(mu_raw, mu_max), mu_min)
+                    sigmas = self.time_shift(mu, 1.0, sigmas)
+                else:
+                    # fallback: multiplicative global shift mapping
+                    sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
 
             if self.config.shift_terminal:
                 sigmas = self.stretch_shift_to_terminal(sigmas)

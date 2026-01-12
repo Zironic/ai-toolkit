@@ -3393,6 +3393,13 @@ class SDTrainer(BaseSDTrainProcess):
             local_pred_kwargs.pop('down_block_additional_residuals', None)
             local_pred_kwargs.pop('mid_block_additional_residual', None)
 
+        # CRITICAL: LoKr networks are incompatible with downsampled DOP due to their scale-sensitive
+        # Kronecker product structure. Downsampling causes the Kronecker factors to learn spatial
+        # patterns at the reduced resolution, which don't generalize to full-resolution inference.
+        # For LoKr: always force full-resolution DOP. For LoRA: downsampling is safe.
+        effective_preservation_resolution = preservation_resolution
+
+
         # If no resolution requested, do the normal full-res predict (using cleaned local kwargs)
         if effective_preservation_resolution is None:
             with self.timer(timer_base):
@@ -3860,6 +3867,25 @@ class SDTrainer(BaseSDTrainProcess):
                     loss_dict['normalized_loss_2'] = normal_loss * (1.0 - noise_sigma_mean ** 2)
                     # More aggressive quadratic scaling: loss × (1 - sigma)²
                     loss_dict['normalized_loss_3'] = normal_loss * ((1.0 - noise_sigma_mean) ** 2)
+                    # Per-example inverse-variance normalization (preferred when per-sample data is available).
+                    # Use robust defaults: eps to avoid divide-by-zero, clamp sigmas and clamp weights to avoid huge values.
+                    try:
+                        eps_norm = 1e-8
+                        min_sigma = 1e-6
+                        max_weight = 1e3
+                        if hasattr(self, 'last_example_losses') and self.last_example_losses is not None and hasattr(self, 'last_noise_sigmas') and self.last_noise_sigmas is not None and len(self.last_example_losses) == len(self.last_noise_sigmas):
+                            per_loss = self.last_example_losses.to(torch.float64)
+                            per_sigma = self.last_noise_sigmas.to(torch.float64)
+                            sigma_clamped = per_sigma.clamp(min=min_sigma)
+                            weights = (1.0 / (sigma_clamped ** 2 + eps_norm)).clamp(max=max_weight)
+                            norm_val = float((per_loss * weights).mean().item())
+                            loss_dict['normalized_loss_4'] = norm_val
+                        else:
+                            # Fallback: scalar mean division (less accurate than per-sample normalization)
+                            loss_dict['normalized_loss_4'] = normal_loss / (noise_sigma_mean ** 2 + eps_norm)
+                    except Exception:
+                        # keep original loss if diagnostics fail
+                        loss_dict['normalized_loss_4'] = normal_loss
                 except Exception:
                     # Fallback: if sigma computation fails, use raw normal loss
                     loss_dict['normalized_loss'] = normal_loss
