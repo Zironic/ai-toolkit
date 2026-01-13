@@ -977,6 +977,20 @@ export default function SimpleJob({
                           />
                         </>
                       )}
+                      {(jobConfig.config.process[0].model.controlnet_enabled && (dataset.control_path || dataset.control_path_1 || dataset.control_path_2 || dataset.control_path_3)) && (
+                        <NumberInput
+                          label="Control Strength"
+                          docKey="datasets.control_conditioning_scale"
+                          value={dataset.control_conditioning_scale ?? 1.0}
+                          className="pt-2"
+                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].control_conditioning_scale`)}
+                          placeholder="eg. 1.0"
+                          min={0.0}
+                          max={1.0}
+                          step={0.1}
+                          tooltip="Strength of control signal for this dataset (0.0 = disabled, 1.0 = full strength)"
+                        />
+                      )}
                       <NumberInput
                         label="LoRA Weight"
                         value={dataset.network_weight}

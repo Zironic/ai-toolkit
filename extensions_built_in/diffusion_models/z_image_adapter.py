@@ -44,34 +44,20 @@ def load_videox_control_adapter(
 
     This helper is intended for testing and local integration.
     """
-    # Import the vendored class at call time to surface import-time errors here
+    # Import the control transformer (extends diffusers' base transformer)
     try:
         from .z_image_transformer2d_control import ZImageControlTransformer2DModel
     except Exception as e:
         tb = traceback.format_exc()
-        try:
-            from toolkit.print import print_acc
-            print_acc(f"[VIDEOX-ADAPTER] Failed to import vendored VideoX adapter: {e}\n{tb}")
-        except Exception:
-            pass
-        # As a testing fallback, allow the current module to provide
-        # `ZImageControlTransformer2DModel` (tests may monkeypatch it there).
-        try:
-            import importlib
-            mod = importlib.import_module(__name__)
-            model_cls = getattr(mod, 'ZImageControlTransformer2DModel', None)
-            if model_cls is not None and callable(model_cls):
-                print_acc(f"[VIDEOX-ADAPTER] Using fallback ZImageControlTransformer2DModel from adapter module")
-            else:
-                raise RuntimeError(f"Failed to import vendored VideoX adapter from 'z_image_transformer2d_control.py': {e}\n{tb}")
-        except Exception as e2:
-            raise RuntimeError(f"Failed to import vendored VideoX adapter from 'z_image_transformer2d_control.py': {e}\n{tb}") from e2
+        raise RuntimeError(
+            f"Failed to import ZImageControlTransformer2DModel from z_image_transformer2d_control.py: {e}\n{tb}"
+        ) from e
 
     model_cls = ZImageControlTransformer2DModel
 
-    # Guard: ensure vendor provides a callable model class
+    # Guard: ensure we have a callable model class
     if model_cls is None or not callable(model_cls):
-        raise RuntimeError("Vendored VideoX adapter present but missing callable 'ZImageControlTransformer2DModel' class. Ensure 'z_image_transformer2d_control.py' exports the class.")
+        raise RuntimeError("Z-Image control transformer missing or not callable. Ensure 'z_image_transformer2d_control.py' exports ZImageControlTransformer2DModel.")
 
     # Determine target device for materialization
     # If we're going to quantize, load directly to GPU to avoid CPU->GPU copy

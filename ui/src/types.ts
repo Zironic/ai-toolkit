@@ -106,6 +106,7 @@ export interface DatasetConfig {
   control_path_1?: string | null;
   control_path_2?: string | null;
   control_path_3?: string | null;
+  control_conditioning_scale?: number;  // Per-dataset control strength (0.0-1.0)
 } 
 
 export interface EMAConfig {

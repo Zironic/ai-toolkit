@@ -196,6 +196,11 @@ class ZImageModel(BaseModel):
 
         self.print_and_status_update("Loading transformer")
 
+        # Detect if controlnet is requested
+        is_controlnet_enabled = getattr(self.model_config, 'controlnet_enabled', False)
+        controlnet_path = getattr(self.model_config, 'controlnet_name_or_path', None) if is_controlnet_enabled else None
+
+        # Determine transformer path and model class
         transformer_path = model_path
         transformer_subfolder = "transformer"
         if os.path.exists(transformer_path):
@@ -207,17 +212,49 @@ class ZImageModel(BaseModel):
             if os.path.exists(te_folder_path):
                 base_model_path = model_path
 
-        # Support test monkeypatches which may replace the class with a simple factory (without from_pretrained)
-        if hasattr(ZImageTransformer2DModel, 'from_pretrained'):
-            transformer = ZImageTransformer2DModel.from_pretrained(
-                transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
-            )
+        # Choose the appropriate model class
+        if is_controlnet_enabled and controlnet_path:
+            # Load control-patched transformer
+            from diffusers.models.transformers import ZImageControlTransformer2DModel
+            transformer_class = ZImageControlTransformer2DModel
+            self.print_and_status_update(f"Loading control-patched transformer from {controlnet_path}")
+
+            # Use controlnet path as primary, base model path for base weights
+            actual_transformer_path = controlnet_path
+            # Support test monkeypatches
+            if hasattr(transformer_class, 'from_pretrained'):
+                transformer = transformer_class.from_pretrained(
+                    actual_transformer_path,
+                    torch_dtype=dtype,
+                    # TODO: Add load_control_only=True and base_transformer_path=transformer_path
+                    # once we verify diffusers supports these parameters
+                )
+            else:
+                # Call as factory
+                try:
+                    transformer = transformer_class()
+                except Exception as e:
+                    raise RuntimeError(f"Failed to instantiate control transformer: {e}")
+
+            # Mark that this is a controlnet model
+            self.is_controlnet_model = True
+            self.is_controlnet_enabled = True
         else:
-            # Call as factory
-            try:
-                transformer = ZImageTransformer2DModel()
-            except Exception as e:
-                raise RuntimeError(f"Failed to instantiate transformer: {e}")
+            # Load base transformer
+            transformer_class = ZImageTransformer2DModel
+            # Support test monkeypatches which may replace the class with a simple factory (without from_pretrained)
+            if hasattr(transformer_class, 'from_pretrained'):
+                transformer = transformer_class.from_pretrained(
+                    transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
+                )
+            else:
+                # Call as factory
+                try:
+                    transformer = transformer_class()
+                except Exception as e:
+                    raise RuntimeError(f"Failed to instantiate transformer: {e}")
+
+            self.is_controlnet_model = False
 
 
         # load assistant lora if specified
@@ -311,113 +348,8 @@ class ZImageModel(BaseModel):
                 # Fail fast: if pipeline creation fails, raise a clear runtime error to match upstream behavior
                 raise RuntimeError(f"Failed to create generation pipeline: {e}")
 
-        # If requested, load a ControlNet transformer now (VideoX-Fun pattern)
-        if getattr(self.model_config, 'controlnet_enabled', False):
-            # Helper to validate the loaded adapter; defined here to use `self` context
-            def _validate_adapter_presence(adapter, cpath):
-                if adapter is None:
-                    raise RuntimeError(f"ControlNet load failed: 'controlnet' is None after attempting to load from '{cpath}'. Check that the identifier/path is correct and that diffusers.ControlNetModel.from_pretrained did not fail.")
-                # Ensure adapter has expected attributes to avoid silent misconfiguration
-                if getattr(adapter, 'name_or_path', None) is None:
-                    raise RuntimeError(f"ControlNet adapter loaded from '{cpath}' is missing required attribute 'name_or_path'. This likely indicates a partial or failed load.")
-
-            # Attach as an instance method for reuse in tests
-            self.validate_controlnet = lambda cpath: _validate_adapter_presence(getattr(self, 'controlnet', None), cpath)
-
-            cpath = getattr(self.model_config, 'controlnet_name_or_path', None)
-            cfile = getattr(self.model_config, 'controlnet_file', None)
-            # Support two styles:
-            # 1) separate path + file (legacy VideoX-Fun pattern)
-            # 2) a single identifier in `controlnet_name_or_path` pointing to an HF repo or safetensors file
-            if not cpath:
-                raise RuntimeError("controlnet_enabled is True but controlnet_name_or_path is not set")
-
-            # If both path and file provided, prefer streaming-safe loader
-            if cfile:
-                # Attempt to load; let errors propagate as fail-fast
-                self.load_controlnet_transformer(cpath, cfile, freeze=True, offload_strategy=self.model_config.controlnet_offload_strategy)
-            else:
-                # Try direct `from_pretrained` on the identifier in cpath (handles repo or single-file ids)
-                try:
-                    self.print_and_status_update(f"Attempting to load ControlNet from identifier: {cpath}")
-                    from diffusers import ControlNetModel
-                    # Use model's configured torch dtype (avoid referencing external TrainConfig on the model)
-                    self.controlnet = ControlNetModel.from_pretrained(cpath, torch_dtype=self.torch_dtype)
-
-                    # If Accelerate is available, infer an auto device map for this ControlNet and
-                    # attach it to the instance for later dispatch/inspection. This is a non-fatal
-                    # best-effort configuration step: failures are logged but do not abort model load.
-                    try:
-                        import accelerate
-                        try:
-                            device_map = accelerate.infer_auto_device_map(self.controlnet, dtype=self.torch_dtype)
-                            # attach for diagnostics and potential later dispatch
-                            self._controlnet_auto_device_map = device_map
-                            try:
-                                from toolkit.print import print_acc
-                                print_acc(f"[CONTROLNET-LOAD] infer_auto_device_map produced {len(device_map)} entries for '{cpath}'")
-                            except Exception:
-                                pass
-                        except Exception as e:
-                            try:
-                                from toolkit.print import print_acc
-                                print_acc(f"[CONTROLNET-LOAD] infer_auto_device_map failed: {e}")
-                            except Exception:
-                                pass
-                    except Exception:
-                        # Accelerate not available or import failed; silently continue (no heuristics)
-                        self._controlnet_auto_device_map = None
-
-                    # Default behavior: keep it frozen unless explicitly configured otherwise elsewhere
-                    for p in self.controlnet.parameters():
-                        p.requires_grad = False
-
-                    # Ensure adapter exposes a stable control_in_dim attribute for downstream
-                    # assembly and adaptation logic. This helper is best-effort and will not
-                    # fail the load if it cannot determine a value.
-                    try:
-                        from toolkit.control_util import ensure_control_in_dim, enforce_zimage_control_in_dim
-
-                        # In Z-Image/VideoX loading we prefer deterministic behavior.
-                        # First, ensure there is a control_in_dim (fallback to 33). Then enforce
-                        # Z-Image parity by forcing 33 for known Z-Image adapters (hard override).
-                        ensure_control_in_dim(self.controlnet, strict=False, fallback=33)
-                        enforce_zimage_control_in_dim(self.controlnet, expected=33, force=True)
-                        # Ensure the adapter advertises a name/path for easier debugging; set it when missing
-                        try:
-                            from toolkit.control_util import set_adapter_name_if_missing
-                            set_adapter_name_if_missing(self.controlnet, cpath)
-                        except Exception:
-                            pass
-                        # Diagnostic: report the effective control_in_dim so job logs make intent visible
-                        try:
-                            from toolkit.print import print_acc
-                            print_acc(f"[CONTROLNET-LOAD] effective control_in_dim={getattr(self.controlnet, 'control_in_dim', None)} name_or_path={getattr(self.controlnet, 'name_or_path', None)} forced={getattr(self.controlnet, '_control_in_dim_forced', False)}")
-                        except Exception:
-                            pass
-                    except Exception:
-                        # If anything else goes wrong, re-raise to make failures visible during load
-                        raise
-
-                    # Wrap in VideoXControlnetWrapper for consistent interface
-                    try:
-                        from toolkit.controlnet_compat import VideoXControlnetWrapper
-                        if not isinstance(self.controlnet, VideoXControlnetWrapper):
-                            self.controlnet = VideoXControlnetWrapper(self.controlnet)
-                            self.print_and_status_update("Wrapped ControlNet in VideoXControlnetWrapper")
-                    except Exception as e:
-                        self.print_and_status_update(f"Warning: Could not wrap ControlNet in VideoXControlnetWrapper: {e}")
-
-                    self.is_controlnet_enabled = True
-                    self.print_and_status_update(f"[CONTROLNET] Loaded ControlNet adapter from '{cpath}' (frozen). To finetune, set model_config.controlnet_train = True or adapter.train = True in your config.")
-                    # Validate that the loaded adapter is well-formed; fail fast if not.
-                    try:
-                        self.validate_controlnet(cpath)
-                    except Exception:
-                        # Re-raise to make failures visible during load
-                        raise
-                except Exception as e:
-                    raise RuntimeError(f"Failed to load ControlNet from '{cpath}': {e}")
+        # NOTE: Controlnet loading is now handled in the transformer loading section above.
+        # The transformer IS the controlnet when controlnet_enabled=True - no separate loading needed.
 
     def encode_control_images(self, images, height: Optional[int] = None, width: Optional[int] = None, tile: bool = False):
         """Encode images into VAE latents following strict VideoX (Z-Image) flow.
@@ -1518,49 +1450,15 @@ def predict_noise_zimage(sd, latents: torch.Tensor, text_embeddings, timestep: t
         # Behavior: prefer an explicitly supplied `zimage_controlnet` argument; else use
         # `sd.controlnet` if present; else attempt to load from `sd.model_config.controlnet_name_or_path`.
         # Fail-fast on load errors to keep behavior deterministic.
+        # NOTE: Lazy loading removed. Controlnet is now loaded during model initialization.
+        # The controlnet IS the transformer when sd.is_controlnet_model=True.
         if zimage_controlnet is None:
-            zimage_controlnet = getattr(sd, 'controlnet', None)
-            if zimage_controlnet is None:
-                try:
-                    model_cfg = getattr(sd, 'model_config', None)
-                    cpath = getattr(model_cfg, 'controlnet_name_or_path', None) if model_cfg is not None else None
-                    if cpath:
-                        from types import SimpleNamespace
-                        from toolkit.control_util import prepare_controlnet_adapter
-
-                        # Load adapter strictly; require Z-Image compatibility
-                        zimage_controlnet = prepare_controlnet_adapter(
-                            sd, cpath, adapter_config=SimpleNamespace(controlnet_mode='zimage'), train_config=getattr(sd, 'train_config', None), strict=True, require_zimage_model=True
-                        )
-                        # Attach to sd for reuse
-                        try:
-                            sd.controlnet = zimage_controlnet
-                        except Exception:
-                            pass
-
-                        # Try to infer an auto device map for accelerate-based dispatch (best-effort)
-                        try:
-                            import accelerate
-                            try:
-                                device_map = accelerate.infer_auto_device_map(zimage_controlnet, dtype=getattr(sd, 'torch_dtype', None))
-                                sd._controlnet_auto_device_map = device_map
-                                try:
-                                    from toolkit.print import print_acc
-                                    print_acc(f"[CONTROLNET-LAZY-LOAD] infer_auto_device_map produced {len(device_map)} entries for '{cpath}'")
-                                except Exception:
-                                    pass
-                            except Exception as e:
-                                try:
-                                    from toolkit.print import print_acc
-                                    print_acc(f"[CONTROLNET-LAZY-LOAD] infer_auto_device_map failed: {e}")
-                                except Exception:
-                                    pass
-                        except Exception:
-                            # Accelerate not present; leave map as-is
-                            sd._controlnet_auto_device_map = getattr(sd, '_controlnet_auto_device_map', None)
-                except Exception as e:
-                    # Keep behavior deterministic: fail fast when lazy-loading fails
-                    raise RuntimeError(f"Z-Image: failed to load controlnet adapter lazily: {e}") from e
+            # If controlnet is enabled, the transformer itself IS the controlnet
+            if getattr(sd, 'is_controlnet_model', False):
+                zimage_controlnet = sd.transformer
+            else:
+                # No controlnet available - this is fine for regular inference
+                zimage_controlnet = None
     finally:
         # Ensure the I/O timer is stopped before the adapter forward begins (or on early return/exception)
         if _io_timer_started:
@@ -1744,147 +1642,24 @@ def predict_noise_zimage(sd, latents: torch.Tensor, text_embeddings, timestep: t
         except Exception:
             pass
 
-    # Call adapter (if provided) to compute residuals (run under autocast)
-    down_block_additional_residuals = None
-    mid_block_additional_residual = None
-    if zimage_controlnet is not None:
-        sample_for_adapter = latents
-        expected_in_ch = getattr(zimage_controlnet, 'control_in_dim', None)
-        if expected_in_ch is not None and isinstance(sample_for_adapter, torch.Tensor) and sample_for_adapter.ndim == 4 and sample_for_adapter.shape[1] != expected_in_ch:
-            # Do not silently fallback; require proper adapter or pre-adapted input
-            raise RuntimeError(f"Z-Image: adapter expects control_in_dim={expected_in_ch} but latents have {sample_for_adapter.shape[1]} channels; pre-adapt latents before calling model-side routing")
+    # NOTE: Separate adapter call removed. The controlnet IS the transformer when
+    # sd.is_controlnet_model=True. Control signals are passed via control_context parameter.
 
-        # Emit per-call debug (dataset opt-in) so callers can see whether adapter call will happen
-        if dataset_controlnet_debug:
-            try:
-                from toolkit.print import print_acc
-                print_acc(f"[CONTROLNET-DEBUG] adapter_call preparing: adapter={getattr(zimage_controlnet,'name_or_path',None) or getattr(zimage_controlnet,'name',None)} sample_shape={getattr(sample_for_adapter,'shape',None)} control_context_shape={getattr(control_context,'shape',None)} timestep_shape={getattr(timestep_model_input,'shape',None)} conditioning_scale={zimage_conditioning_scale}")
-            except Exception:
-                pass
-
-        # Time the adapter invocation for accurate ControlNet accounting
-        timer_ctx = (sd.timer('controlnet_zimage_forward') if hasattr(sd, 'timer') else nullcontext())
-        with timer_ctx:
-            with autocast_ctx:
-                # Mark that an adapter call is about to occur (for observability)
-                try:
-                    sd._last_zimage_adapter_call_ts = time.time()
-                    sd._last_zimage_adapter_called = False
-                except Exception:
-                    pass
-                # Require adapter to accept `conditioning_scale` kwarg (no heuristics)
-                try:
-                    adapter_out = zimage_controlnet(sample_for_adapter, timestep_model_input, control_context, conditioning_scale=zimage_conditioning_scale)
-                except TypeError as e:
-                    raise RuntimeError("Z-Image: ControlNet adapter must accept `conditioning_scale` kwarg; update adapter signature to `forward(latents, timestep, control_context, conditioning_scale=...)`") from e
-                except Exception as e:
-                    raise RuntimeError(f"Z-Image adapter call failed: {e}") from e
-                # Record adapter execution
-                try:
-                    sd._last_zimage_adapter_called = True
-                    sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0) + 1
-                    sd._last_zimage_adapter_last_return_ts = time.time()
-                except Exception:
-                    pass
-
-        if adapter_out is None:
-            sd._last_zimage_control_hints_present = False
-            sd._last_zimage_control_hints_shapes = None
-            raise RuntimeError("Z-Image adapter returned None (no control hints); an adapter that returns control hints is required for model-side Z-Image routing")
-
-        sd._last_zimage_control_hints_present = True
-
-        # Record detailed debug shapes and optionally print them when dataset_controlnet_debug is enabled.
-        try:
-            down_shapes = None
-            mid_shape = None
-            if isinstance(adapter_out, tuple) and len(adapter_out) == 2:
-                if isinstance(adapter_out[0], (list, tuple)):
-                    down_shapes = [tuple(getattr(d, 'shape', None)) for d in adapter_out[0] if torch.is_tensor(d)]
-                elif torch.is_tensor(adapter_out[0]):
-                    down_shapes = [tuple(adapter_out[0].shape)]
-                if torch.is_tensor(adapter_out[1]):
-                    mid_shape = tuple(adapter_out[1].shape)
-            elif torch.is_tensor(adapter_out):
-                down_shapes = [tuple(adapter_out.shape)]
-            else:
-                try:
-                    l = list(adapter_out)
-                    down_shapes = [tuple(getattr(d, 'shape', None)) for d in l if torch.is_tensor(d)]
-                except Exception:
-                    down_shapes = None
-            sd._last_zimage_control_debug_detail = {
-                'adapter_name': getattr(zimage_controlnet,'name_or_path',None) or getattr(zimage_controlnet,'name',None) or str(type(zimage_controlnet)),
-                'down_shapes': down_shapes,
-                'mid_shape': mid_shape,
-                'conditioning_scale': float(zimage_conditioning_scale),
-            }
-            if dataset_controlnet_debug:
-                try:
-                    from toolkit.print import print_acc
-                    print_acc(f"[CONTROLNET-DEBUG] adapter_return: adapter={sd._last_zimage_control_debug_detail['adapter_name']} down_shapes={down_shapes} mid_shape={mid_shape} conditioning_scale={sd._last_zimage_control_debug_detail['conditioning_scale']}")
-                except Exception:
-                    pass
-        except Exception:
-            # never fail the main flow for bookkeeping
-            pass
-
-        # Normalize adapter outputs: require list-of-tensors or (down, mid) tuple
-        down = None
-        mid = None
-        if isinstance(adapter_out, tuple) and len(adapter_out) == 2:
-            down, mid = adapter_out
-        elif torch.is_tensor(adapter_out):
-            down = [adapter_out]
-        else:
-            try:
-                down = list(adapter_out)
-            except Exception:
-                raise RuntimeError("Z-Image adapter returned an unsupported type; expected (down_residuals, mid_residual) tuple, a list of tensors, or a single tensor")
-
-        # Validate and move down residuals
-        if down is not None:
-            validated_down = []
-            for d in (down if isinstance(down, (list, tuple)) else [down]):
-                if not torch.is_tensor(d):
-                    raise RuntimeError("Z-Image adapter down residuals must be torch.Tensors")
-                # Ensure correct device/dtype (use job dtype)
-                d = d.to(dtype=job_torch_dtype, device=latents.device)
-                validated_down.append(d)
-            down_block_additional_residuals = validated_down
-            sd._last_zimage_control_hints_shapes = [tuple(d.shape) for d in down_block_additional_residuals]
-            sd._last_zimage_fellback_to_down_blocks = True
-
-        if mid is not None:
-            if not torch.is_tensor(mid):
-                raise RuntimeError("Z-Image adapter mid residual must be a torch.Tensor or None")
-            mid_block_additional_residual = mid.to(dtype=job_torch_dtype, device=latents.device)
-
-    # Prepare transformer kwargs
+    # Prepare transformer kwargs - always pass control_context when available
     transformer_kwargs = {}
-    if down_block_additional_residuals is not None:
-        transformer_kwargs['down_block_additional_residuals'] = down_block_additional_residuals
-        if mid_block_additional_residual is not None:
-            transformer_kwargs['mid_block_additional_residual'] = mid_block_additional_residual
-    else:
+    if control_context is not None:
         transformer_kwargs['control_context'] = control_context
         transformer_kwargs['control_context_scale'] = float(zimage_conditioning_scale)
 
-    # Emit local debug info (records presence/shape of residuals) before main transformer call
-    _emit_local_control_debug(sd, down_block_additional_residuals, mid_block_additional_residual)
-
-    # Before calling transformer, mark adapter allowed for offload when present (used by offload manager)
-    if zimage_controlnet is not None:
+    # Debug logging
+    if dataset_controlnet_debug and control_context is not None:
         try:
-            zimage_controlnet._allow_offload = True
-            sd._controlnet_allowed_offload = True
-            try:
-                from toolkit.print import print_acc
-                print_acc("[CONTROLNET] marked adapter allowed for offload (main path)")
-            except Exception:
-                pass
+            from toolkit.print import print_acc
+            print_acc(f"[CONTROLNET-DEBUG] control_context: shape={control_context.shape} scale={zimage_conditioning_scale} is_controlnet_model={getattr(sd, 'is_controlnet_model', False)}")
         except Exception:
             pass
+
+    # NOTE: Offload marking removed - no separate adapter to offload
 
     # Time the transformer/model invocation so it contributes to 'Model' in PERF SUMMARY
     model_timer = (sd.timer('predict_unet') if hasattr(sd, 'timer') else nullcontext())
@@ -2351,285 +2126,3 @@ def encode_and_assemble_zimage_controls(sd, control_context):
     return assemble_zimage_control_context(control_latents, control_in_dim=ctl_dim)
 
 
-def compute_zimage_adapter_residuals(sd, noisy_latents: torch.Tensor, timesteps: torch.Tensor, zimage_controlnet=None, zimage_control_images=None, zimage_control_context=None, zimage_conditioning_scale: float = 1.0, train_dtype=None, dataset_controlnet_debug: bool = False, batch=None, adapter_path: str = None):
-    """Compute adapter residuals for Z-Image (VideoX) adapters and return
-    (down_block_additional_residuals, mid_block_additional_residual, control_context, raw_out).
-
-    adapter_path: Optional path to adapter weights for meta tensor materialization.
-
-    This extracts the adapter invocation and normalization logic from
-    `predict_noise_zimage` into a focused helper that the trainer and wrapper can
-    call to compute residuals or delegate the adapter invocation.
-
-    Behavior mirrors `predict_noise_zimage` for dtype/device normalization,
-    timing, diagnostics, and error handling.
-    """
-    from toolkit.controlnet_offload import bring_adapter, offload_adapter
-    
-    # Prepare diagnostics/timers
-    try:
-        sd._last_zimage_adapter_called = False
-        sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0)
-    except Exception:
-        pass
-
-    # Determine target device and dtype
-    target_device = noisy_latents.device
-    job_torch_dtype = get_torch_dtype(train_dtype) or getattr(sd, 'torch_dtype', None)
-    if job_torch_dtype == torch.bfloat16 and target_device.type == 'cpu':
-        job_torch_dtype = torch.float32
-
-    # Get offload strategy from train_config if available
-    offload_strategy = 'none'
-    try:
-        train_config = getattr(sd, 'train_config', None)
-        if train_config is not None:
-            offload_strategy = getattr(train_config, 'controlnet_offload_strategy', 'none') or 'none'
-    except Exception:
-        pass
-
-    # Helper to check if module has meta tensors
-    def _has_meta_tensors(module):
-        try:
-            for p in module.parameters():
-                if p.device.type == 'meta':
-                    return True
-            for b in module.buffers():
-                if b.device.type == 'meta':
-                    return True
-        except Exception:
-            pass
-        return False
-
-    # Helper to materialize meta tensors in-place using accelerate's efficient method
-    def _materialize_meta_tensors_inplace(module, device, dtype, fallback_path=None):
-        """Materialize meta tensors in-place using accelerate.set_module_tensor_to_device.
-        
-        This is memory efficient - it loads weights directly into the correct device
-        without creating intermediate copies.
-        """
-        # Find the weights path - try module attrs first, then fallback
-        weights_path = (
-            fallback_path or
-            getattr(module, 'name_or_path', None) or 
-            getattr(module, '_name_or_path', None)
-        )
-        if weights_path is None:
-            config = getattr(module, 'config', None)
-            if config is not None:
-                weights_path = getattr(config, '_name_or_path', None)
-        
-        if weights_path is None:
-            return False
-            
-        import os
-        
-        # Find the actual weights file
-        weights_file = None
-        if os.path.isdir(weights_path):
-            for fname in ['diffusion_pytorch_model.safetensors', 'pytorch_model.safetensors', 
-                          'model.safetensors', 'diffusion_pytorch_model.bin', 'pytorch_model.bin']:
-                fpath = os.path.join(weights_path, fname)
-                if os.path.exists(fpath):
-                    weights_file = fpath
-                    break
-        elif os.path.isfile(weights_path):
-            weights_file = weights_path
-        
-        if weights_file is None:
-            return False
-        
-        try:
-            from toolkit.print import print_acc
-            print_acc(f"[ZIMAGE] Materializing meta tensors from {weights_file}")
-            
-            # Load weights
-            if weights_file.endswith('.safetensors'):
-                from safetensors.torch import load_file
-                state_dict = load_file(weights_file, device='cpu')
-            else:
-                state_dict = torch.load(weights_file, map_location='cpu')
-            
-            # Use accelerate's efficient set_module_tensor_to_device
-            # IMPORTANT: Load to CPU first to avoid CUDA OOM, then move to target device
-            try:
-                from accelerate.utils import set_module_tensor_to_device
-                # First materialize to CPU
-                for name, param in state_dict.items():
-                    try:
-                        set_module_tensor_to_device(module, name, 'cpu', value=param)
-                    except Exception:
-                        pass  # Skip keys that don't exist in model
-                print_acc(f"[ZIMAGE] Materialized {len(state_dict)} keys to CPU using accelerate")
-                # Now move to target device and dtype
-                target_dev = device if device is not None else 'cpu'
-                if target_dev != 'cpu' or dtype is not None:
-                    module.to(device=target_dev, dtype=dtype)
-                return True
-            except ImportError:
-                # Fallback to to_empty + load_state_dict
-                print_acc("[ZIMAGE] accelerate.set_module_tensor_to_device not available, using fallback")
-                module.to_empty(device='cpu')
-                module.load_state_dict(state_dict, strict=False)
-                # Move to target device/dtype
-                target_dev = device if device is not None else 'cpu'
-                module.to(device=target_dev, dtype=dtype)
-                return True
-            
-        except Exception as e:
-            from toolkit.print import print_acc
-            print_acc(f"[ZIMAGE] Failed to materialize meta tensors: {e}")
-            return False
-
-    # Bring adapter to compute device (handle meta tensors if present)
-    # If offload_strategy is 'none', skip explicit moves - let Windows shared GPU memory handle it
-    if offload_strategy in ('none', None, ''):
-        # Only materialize meta tensors if present; otherwise leave adapter where it is
-        if _has_meta_tensors(zimage_controlnet):
-            if not _materialize_meta_tensors_inplace(zimage_controlnet, target_device, job_torch_dtype, fallback_path=adapter_path):
-                raise RuntimeError(
-                    f"Z-Image controlnet has meta tensors but could not be materialized. "
-                    f"Adapter name_or_path: {getattr(zimage_controlnet, 'name_or_path', 'unknown')}. "
-                    f"Fallback path: {adapter_path or 'None'}. "
-                    f"Ensure the adapter checkpoint is accessible."
-                )
-        # else: adapter is already on some device - let shared memory handle transfers implicitly
-    else:
-        # Non-none strategy: explicit device management
-        if _has_meta_tensors(zimage_controlnet):
-            # Try to materialize in-place (this is how accelerate's lazy loading works)
-            if not _materialize_meta_tensors_inplace(zimage_controlnet, target_device, job_torch_dtype, fallback_path=adapter_path):
-                raise RuntimeError(
-                    f"Z-Image controlnet has meta tensors but could not be materialized. "
-                    f"Adapter name_or_path: {getattr(zimage_controlnet, 'name_or_path', 'unknown')}. "
-                    f"Fallback path: {adapter_path or 'None'}. "
-                    f"Ensure the adapter checkpoint is accessible."
-                )
-        else:
-            # Normal case - just move to device
-            try:
-                bring_adapter(zimage_controlnet, device=target_device, strategy=offload_strategy)
-            except Exception as e:
-                # Fallback: try direct .to() if bring_adapter fails
-                try:
-                    zimage_controlnet.to(target_device, dtype=job_torch_dtype)
-                except Exception:
-                    raise RuntimeError(f"Failed to move Z-Image controlnet to {target_device}: {e}") from e
-
-    # Assemble or normalize control_context
-    control_context = None
-    if zimage_control_context is not None:
-        control_context = zimage_control_context
-    elif zimage_control_images is not None:
-        try:
-            # Reuse the central encoding/assembly helper. It accepts lists or 4/5D tensors.
-            control_context = encode_and_assemble_zimage_controls(sd, zimage_control_images)
-        except Exception as e:
-            raise RuntimeError(f"Failed to encode/assemble zimage control images: {e}") from e
-    else:
-        raise RuntimeError('Z-Image adapter residual helper requires `zimage_control_images` or a preassembled `zimage_control_context`.')
-
-    # Ensure control_context on correct device/dtype
-    try:
-        control_context = control_context.to(dtype=job_torch_dtype, device=target_device)
-    except Exception:
-        try:
-            control_context = control_context.to(device=target_device)
-        except Exception:
-            pass
-
-    # Ensure noisy_latents and timesteps are on target device with correct dtype
-    noisy_latents = noisy_latents.to(dtype=job_torch_dtype, device=target_device)
-    timesteps = timesteps.to(device=target_device)
-
-    # Optional per-call debug notice
-    if dataset_controlnet_debug:
-        try:
-            from toolkit.print import print_acc
-            print_acc(f"[CONTROLNET-DEBUG] compute_zimage_adapter_residuals: adapter={getattr(zimage_controlnet,'name_or_path',None) or getattr(zimage_controlnet,'name',None)} sample_shape={getattr(noisy_latents,'shape',None)} control_context_shape={getattr(control_context,'shape',None)} conditioning_scale={zimage_conditioning_scale}")
-        except Exception:
-            pass
-
-    # Time the adapter invocation
-    timer_ctx = (sd.timer('controlnet_zimage_forward') if hasattr(sd, 'timer') else nullcontext())
-    raw_out = None
-    try:
-        with timer_ctx:
-            acc = getattr(sd, 'accelerator', None)
-            autocast_ctx = (acc.autocast() if (acc is not None and hasattr(acc, 'autocast')) else nullcontext())
-            with autocast_ctx:
-                try:
-                    sd._last_zimage_adapter_call_ts = time.time()
-                except Exception:
-                    pass
-                # Enforce conditioning_scale kwarg signature
-                try:
-                    raw_out = zimage_controlnet(noisy_latents, timesteps, control_context, conditioning_scale=zimage_conditioning_scale)
-                except TypeError as e:
-                    raise RuntimeError("Z-Image: ControlNet adapter must accept `conditioning_scale` kwarg; update adapter signature to `forward(latents, timestep, control_context, conditioning_scale=...)`") from e
-                except Exception as e:
-                    raise RuntimeError(f"Z-Image adapter call failed: {e}") from e
-                try:
-                    sd._last_zimage_adapter_called = True
-                    sd._last_zimage_adapter_call_count = getattr(sd, '_last_zimage_adapter_call_count', 0) + 1
-                    sd._last_zimage_adapter_last_return_ts = time.time()
-                except Exception:
-                    pass
-    finally:
-        # Offload adapter back if using an offload strategy
-        if offload_strategy not in ('none', None, ''):
-            try:
-                offload_adapter(zimage_controlnet, strategy=offload_strategy)
-            except Exception:
-                pass
-
-    if raw_out is None:
-        raise RuntimeError("Z-Image adapter returned None (no control hints); an adapter that returns control hints is required for model-side routing")
-
-    # Normalize outputs into (down list, mid tensor)
-    down = None
-    mid = None
-    if isinstance(raw_out, tuple) and len(raw_out) == 2:
-        down, mid = raw_out
-    elif torch.is_tensor(raw_out):
-        down = [raw_out]
-    else:
-        try:
-            down = list(raw_out)
-        except Exception:
-            raise RuntimeError('Z-Image adapter returned an unsupported type; expected (down_residuals, mid_residual) tuple, a list of tensors, or a single tensor')
-
-    # Validate and move down residuals to target device
-    down_validated = None
-    if down is not None:
-        down_validated = []
-        for d in (down if isinstance(down, (list, tuple)) else [down]):
-            if not torch.is_tensor(d):
-                raise RuntimeError('Z-Image adapter down residuals must be torch.Tensors')
-            # Detach and clone to avoid meta tensor issues, then move to target
-            if d.device.type == 'meta':
-                raise RuntimeError('Z-Image adapter returned meta tensors; ensure adapter is properly materialized on compute device')
-            d = d.detach().to(dtype=job_torch_dtype, device=target_device)
-            down_validated.append(d)
-        try:
-            sd._last_zimage_control_hints_shapes = [tuple(d.shape) for d in down_validated]
-            sd._last_zimage_fellback_to_down_blocks = True
-        except Exception:
-            pass
-
-    if mid is not None:
-        if not torch.is_tensor(mid):
-            raise RuntimeError('Z-Image adapter mid residual must be a torch.Tensor or None')
-        if mid.device.type == 'meta':
-            raise RuntimeError('Z-Image adapter returned meta tensor for mid residual; ensure adapter is properly materialized')
-        mid = mid.detach().to(dtype=job_torch_dtype, device=target_device)
-
-    # Bookkeeping
-    try:
-        sd._last_zimage_control_hints_present = True
-        sd._last_zimage_control_context_passed = True
-        sd._last_zimage_control_context_shape = tuple(control_context.shape)
-    except Exception:
-        pass
-
-    return down_validated, mid, control_context, raw_out

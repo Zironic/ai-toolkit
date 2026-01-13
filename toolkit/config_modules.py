@@ -998,6 +998,8 @@ class DatasetConfig:
         
         # color for transparent reigon of control images with transparency
         self.control_transparent_color: List[int] = kwargs.get('control_transparent_color', [0, 0, 0])
+        # per-dataset control strength (0.0 = disabled, 1.0 = full strength)
+        self.control_conditioning_scale: float = float(kwargs.get('control_conditioning_scale', 1.0))
         # inpaint images should be webp/png images with alpha channel. The alpha 0 (invisible) section will
         # be the part conditioned to be inpainted. The alpha 1 (visible) section will be the part that is ignored
         self.inpaint_path: Union[str,List[str]] = kwargs.get('inpaint_path', None)

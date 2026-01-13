@@ -2919,66 +2919,48 @@ class SDTrainer(BaseSDTrainProcess):
                         self.adapter.add_extra_values(torch.zeros_like(batch.extra_values.detach()),
                                                       is_unconditional=True)
 
-                if has_adapter_img:
-                    # Z-Image adapter handling: if adapter is explicitly a Z-Image controlnet, run it and collect residuals
-                    # We don't train controlnets, so always run with gradients disabled
-                    if is_zimage_adapter(self.adapter, self.adapter_config) or is_zimage_adapter(self.assistant_adapter, self.adapter_config):
-                        adapter = self.adapter if is_zimage_adapter(self.adapter, self.adapter_config) else self.assistant_adapter
-                        # Get adapter path for meta tensor materialization fallback
-                        adapter_path = (
-                            getattr(adapter, 'name_or_path', None) or
-                            getattr(adapter, '_name_or_path', None) or
-                            (getattr(self.adapter_config, 'name_or_path', None) if self.adapter_config else None) or
-                            getattr(self.train_config, 'adapter_assist_name_or_path', None)
-                        )
-                        if self.train_config.do_cfg:
-                            raise ValueError("Z-Image ControlNet is not supported with CFG")
-                        
-                        # Try to use precomputed control_context (avoids VAE encoding every timestep)
-                        precomputed_context = self._collect_preencoded_zimage_context_for_batch(batch)
-                        
-                        with torch.no_grad():
-                            from extensions_built_in.diffusion_models.z_image.z_image import compute_zimage_adapter_residuals
-                            
-                            if precomputed_context is not None:
-                                # Use precomputed context - skip VAE encoding
-                                down, mid, control_context, _raw = compute_zimage_adapter_residuals(
-                                    self.sd,
-                                    noisy_latents,
-                                    timesteps,
-                                    zimage_controlnet=adapter,
-                                    zimage_control_context=precomputed_context.to(self.device_torch, dtype=dtype),
-                                    zimage_conditioning_scale=getattr(self.sd, 'controlnet_guidance_scale', 1.0),
-                                    train_dtype=dtype,
-                                    batch=batch,
-                                    adapter_path=adapter_path,
-                                )
-                            else:
-                                # No precomputed context - encode images (slower)
-                                adapter_images_dev = adapter_images.to(self.device_torch, dtype=dtype)
-                                down, mid, control_context, _raw = compute_zimage_adapter_residuals(
-                                    self.sd,
-                                    noisy_latents,
-                                    timesteps,
-                                    zimage_controlnet=adapter,
-                                    zimage_control_images=adapter_images_dev,
-                                    zimage_conditioning_scale=getattr(self.sd, 'controlnet_guidance_scale', 1.0),
-                                    train_dtype=dtype,
-                                    batch=batch,
-                                    adapter_path=adapter_path,
-                                )
-                            # Z-Image uses control_context passed to transformer, not down/mid block residuals
-                            if control_context is not None:
-                                pred_kwargs['control_context'] = control_context
-                                pred_kwargs['control_context_scale'] = getattr(self.sd, 'controlnet_guidance_scale', 1.0)
-                            # Also pass down/mid if they were returned (for compatibility)
-                            if down is not None:
-                                pred_kwargs['down_block_additional_residuals'] = down
-                            if mid is not None:
-                                pred_kwargs['mid_block_additional_residual'] = mid
+                # Handle datasets with/without control images when controlnet is enabled
+                if getattr(self.sd, 'is_controlnet_model', False):
+                    if has_adapter_img:
+                        # Dataset has control images - use them
+                        control_context = self._collect_preencoded_zimage_context_for_batch(batch)
+                        if control_context is None:
+                            control_context = self._encode_and_assemble_zimage_controls(adapter_images)
 
-                    # Standard ControlNetModel handling (non-Z-Image)
-                    elif (self.adapter and isinstance(self.adapter, ControlNetModel)) or (
+                        # Move to correct device/dtype
+                        control_context = control_context.to(self.device_torch, dtype=dtype)
+
+                        # Get per-dataset control strength, fallback to global setting
+                        control_scale = getattr(self.sd, 'controlnet_guidance_scale', 1.0)
+                        try:
+                            # Check if batch has dataset_config with per-dataset control strength
+                            if hasattr(batch, 'file_items') and len(batch.file_items) > 0:
+                                dataset_cfg = getattr(batch.file_items[0], 'dataset_config', None)
+                                if dataset_cfg is not None:
+                                    # Use dataset-specific control strength if set
+                                    control_scale = getattr(dataset_cfg, 'control_conditioning_scale', control_scale)
+                        except Exception:
+                            pass  # Fall back to global scale
+                    else:
+                        # Dataset has NO control images - pass zero tensor and scale=0
+                        # This ensures model forward pass works but control has no effect
+                        B = noisy_latents.shape[0]
+                        H, W = noisy_latents.shape[2], noisy_latents.shape[3]
+                        control_context = torch.zeros(
+                            B, 33, H, W,  # 33 channels for Z-Image control
+                            device=noisy_latents.device,
+                            dtype=noisy_latents.dtype
+                        )
+                        control_scale = 0.0  # Explicitly disable control influence
+
+                    pred_kwargs['control_context'] = control_context
+                    pred_kwargs['control_context_scale'] = control_scale
+
+                # Standard ControlNetModel handling (non-Z-Image) - legacy path for old adapter-based code
+                if has_adapter_img and not getattr(self.sd, 'is_controlnet_model', False):
+                    # This path is for legacy separate adapter usage (not Z-Image controlnet)
+                    # Z-Image now uses is_controlnet_model=True and passes control_context above
+                    if (self.adapter and isinstance(self.adapter, ControlNetModel)) or (
                             self.assistant_adapter and isinstance(self.assistant_adapter, ControlNetModel)):
                         if self.train_config.do_cfg:
                             raise ValueError("ControlNetModel is not supported with CFG")
@@ -3389,9 +3371,12 @@ class SDTrainer(BaseSDTrainProcess):
         # removal of adapter residuals for preservation predictions when requested.
         local_pred_kwargs = dict(pred_kwargs) if pred_kwargs is not None else {}
         if match_adapter_assist:
+            # Remove controlnet influence for preservation loss
             local_pred_kwargs.pop('down_intrablock_additional_residuals', None)
             local_pred_kwargs.pop('down_block_additional_residuals', None)
             local_pred_kwargs.pop('mid_block_additional_residual', None)
+            # For Z-Image controlnet (unified model), disable by setting scale=0
+            local_pred_kwargs['control_context_scale'] = 0.0
 
         # CRITICAL: LoKr networks are incompatible with downsampled DOP due to their scale-sensitive
         # Kronecker product structure. Downsampling causes the Kronecker factors to learn spatial
