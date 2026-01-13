@@ -368,7 +368,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         for p in self.sd.controlnet.parameters():
                             p.requires_grad = False
                         self.sd.is_controlnet_enabled = True
-                        self.print_and_status_update(f"[CONTROLNET] Lazily loaded ControlNet adapter from '{cpath}' (frozen).")
+                        self.print_and_status_update(f"[CONTROLNET] Lazily loaded ControlNet adapter from '{os.path.basename(cpath)}' (frozen).")
 
                         # If the process-level adapter_config is missing, copy our synthesized one
                         try:
@@ -3253,7 +3253,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     prog_bar_string = self._format_progress_bar(learning_rate, loss_dict)
 
                     if self.progress_bar is not None:
-                        self.progress_bar.set_postfix_str(prog_bar_string)
+                        # Show the current filename being trained on (first file in first batch of the accumulation)
+                        filename = ''
+                        try:
+                            first_batch = batch_list[0] if len(batch_list) > 0 else None
+                            if isinstance(first_batch, DataLoaderBatchDTO) and len(first_batch.file_items) > 0:
+                                filename = os.path.basename(getattr(first_batch.file_items[0], 'path', '') or '')
+                        except Exception:
+                            filename = ''
+                        postfix = f"{prog_bar_string} {filename}" if filename else prog_bar_string
+                        self.progress_bar.set_postfix_str(postfix)
 
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
                 if isinstance(batch, DataLoaderBatchDTO):

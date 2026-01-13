@@ -1200,7 +1200,7 @@ class ControlFileItemDTOMixin:
                 top = (new_h - target_h) // 2
                 img = img.crop((left, top, left + target_w, top + target_h))
                 try:
-                    print_acc(f"[CONTROL] loaded control from {control_path} (original={w}x{h}) -> resized={new_w}x{new_h} -> target={target_w}x{target_h}")
+                    print_acc(f"[CONTROL] loaded control from {Path(control_path).name} (original={w}x{h}) -> resized={new_w}x{new_h} -> target={target_w}x{target_h}")
                 except Exception:
                     pass
 
@@ -1225,7 +1225,7 @@ class ControlFileItemDTOMixin:
                         self.crop_y + self.crop_height
                     ))
                     try:
-                        print_acc(f"[CONTROL] loaded control from {control_path}: scaled=({self.scale_to_width}x{self.scale_to_height}) crop=({self.crop_width}x{self.crop_height}) final=({self.crop_height}x{self.crop_width})")
+                        print_acc(f"[CONTROL] loaded control from {Path(control_path).name}: scaled=({self.scale_to_width}x{self.scale_to_height}) crop=({self.crop_width}x{self.crop_height}) final=({self.crop_height}x{self.crop_width})")
                     except Exception:
                         pass
                 else:

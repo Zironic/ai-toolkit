@@ -3474,38 +3474,11 @@ class SDTrainer(BaseSDTrainProcess):
         # Downsampling already-noisy latents produces corrupted signals because interpolation
         # doesn't commute with the noise addition formula: downsample(clean + noise) ≠ downsample(clean) + downsample(noise)
         with self.timer(f"{timer_base}_downsampled"):
-            torch_dtype = get_torch_dtype(dtype)
-            
-            # Step 1: Downsample clean latents using bicubic interpolation
-            # Bicubic preserves high-frequency information better than area mode (which blurs)
-            latents_small = torch.nn.functional.interpolate(
-                batch.latents, size=(target_h, target_w), mode='bicubic', align_corners=False
-            ).to(self.device_torch, dtype=torch_dtype)
-            
-            # Step 2: Reconstruct and downsample the noise
-            # For flow matching: noisy = (1-t)*clean + t*noise, so: noise = (noisy - (1-t)*clean) / t
-            # Get timestep fraction (0 to 1) by normalizing timesteps (0 to 1000)
-            with torch.no_grad():
-                t_frac = (timesteps.float() / 1000.0).to(noisy_latents.device, dtype=noisy_latents.dtype)
-                if len(noisy_latents.shape) == 4:
-                    t_frac = t_frac.view(-1, 1, 1, 1)
-                elif len(noisy_latents.shape) == 5:
-                    t_frac = t_frac.view(-1, 1, 1, 1, 1)
-                
-                # Reconstruct noise from full-resolution noisy latents
-                # Clamp t_frac to avoid division by zero (at t=0, noisy_latents = clean_latents, noise undefined)
-                t_frac_safe = torch.clamp(t_frac, min=1e-6)
-                noise_reconstructed = (noisy_latents - (1.0 - t_frac) * batch.latents) / t_frac_safe
-                
-            # Downsample the reconstructed noise
-            noise_small = torch.nn.functional.interpolate(
-                noise_reconstructed, size=(target_h, target_w), mode='bicubic', align_corners=False
-            ).to(self.device_torch, dtype=torch_dtype)
-            
-            # Step 3: Apply noise schedule at small resolution to create properly-noised small latents
-            # noisy_small = (1-t)*latents_small + t*noise_small
-            with torch.no_grad():
-                noisy_small = (1.0 - t_frac) * latents_small + t_frac * noise_small
+            # Delegate to helper so the downsampling + noise generation can be unit-tested
+            latents_small, noise_small, noisy_small = self._create_downsampled_noisy_latents(
+                batch.latents, timesteps, target_h, target_w, dtype
+            )
+
             
             # Step 4: Generate both predictions at the same small resolution
             # CRITICAL: Always generate prior_small at small resolution, never downsample a full-res prior.
@@ -3515,7 +3488,7 @@ class SDTrainer(BaseSDTrainProcess):
             try:
                 prior_small = self.get_prior_prediction(
                     noisy_latents=noisy_small,
-                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=torch_dtype),
+                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
                     match_adapter_assist=match_adapter_assist,
                     network_weight_list=network_weight_list if network_weight_list is not None else [],
                     timesteps=timesteps,
@@ -3530,13 +3503,46 @@ class SDTrainer(BaseSDTrainProcess):
             preservation_pred_small = self.predict_noise(
                 noisy_latents=noisy_small,
                 timesteps=timesteps,
-                conditional_embeds=preservation_embeds.to(self.device_torch, dtype=torch_dtype),
+                conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
                 unconditional_embeds=unconditional_embeds,
                 batch=batch,
                 **local_pred_kwargs
             )
         # Return both small preds so loss can be computed at this resolution
         return (preservation_pred_small, prior_small)
+
+    def _create_downsampled_noisy_latents(self, original_latents: torch.Tensor, timesteps: torch.Tensor, target_h: int, target_w: int, dtype: str):
+        """Downsample `original_latents` to (target_h, target_w), sample noise at that resolution
+        and create a scheduler-consistent `noisy_small` tensor. Returns (latents_small, noise_small, noisy_small).
+
+        This helper is factored out for unit testing (CPU-only tests can call this directly and
+        monkeypatch `self.sd.add_noise` to assert behavior).
+        """
+        torch_dtype = get_torch_dtype(dtype)
+        # Downsample clean latents using bicubic interpolation
+        latents_small = torch.nn.functional.interpolate(
+            original_latents, size=(target_h, target_w), mode='bicubic', align_corners=False
+        ).to(self.device_torch, dtype=torch_dtype)
+
+        # Sample fresh noise at the reduced resolution
+        noise_small = torch.randn_like(latents_small, device=self.device_torch, dtype=latents_small.dtype)
+
+        try:
+            noisy_small = self.sd.add_noise(latents_small, noise_small, timesteps.to(self.device_torch))
+            try:
+                if getattr(self.train_config, 'debug_dump_dop', False):
+                    print_acc(f"[DOP DEBUG] _create_downsampled_noisy_latents using scheduler: size={target_h}x{target_w}, latents_small.dtype={latents_small.dtype}")
+            except Exception:
+                pass
+        except Exception as e:
+            # Fail-fast: scheduler failure is critical for DOP correctness. Abort instead of silently using no noise.
+            raise RuntimeError(f"[DOP] failed to construct noisy_small via scheduler: {e}") from e
+
+        # Sanity check: noisy_small must be defined here
+        if noisy_small is None:
+            raise RuntimeError("[DOP] noisy_small was not constructed by scheduler (unexpected)")
+
+        return latents_small, noise_small, noisy_small
 
     def _compute_and_apply_preservation_loss(self, preservation_pred, prior_pred, multiplier: float):
         """Compute preservation loss, record diagnostics, and apply backward.

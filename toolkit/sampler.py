@@ -90,8 +90,12 @@ flux_config = {
   # Qwen dynamic-shift settings (defaults): center at 512x512 and clamp exponent range
   "qwen_ref_pixels": 262144,  # 512**2
   "qwen_min_exp": 0.3333333333333333,
-  "qwen_max_exp": 3.0
-}},{ 
+  "qwen_max_exp": 3.0,
+  # Timestep sigmoid bias presets: 'balanced'|'high_noise'|'low_noise'|'mid_noise'
+  "timestep_bias": "balanced",
+  "timestep_bias_offset": 0.5,    # offset applied for high/low noise presets
+  "timestep_mid_scale": 0.4        # scale applied for mid_noise preset (std < 1 concentrates around 0.5)
+} , 
 
 sd_flow_config = {
   "_class_name": "FlowMatchEulerDiscreteScheduler",
@@ -106,8 +110,12 @@ sd_flow_config = {
   "qwen_ref_pixels": 262144,  # 512**2
   "qwen_min_exp": 0.3333333333333333,
   "qwen_max_exp": 3.0,
+  # Timestep sigmoid bias presets: 'balanced'|'high_noise'|'low_noise'|'mid_noise'
+  "timestep_bias": "balanced",
+  "timestep_bias_offset": 0.5,
+  "timestep_mid_scale": 0.4,
   "use_dynamic_shifting": False
-}
+} 
 
 lumina2_config = {
   "_class_name": "FlowMatchEulerDiscreteScheduler",

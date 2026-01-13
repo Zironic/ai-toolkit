@@ -119,8 +119,23 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             return timesteps
         elif timestep_type == 'sigmoid':
             # distribute them closer to center. Inference distributes them as a bias toward first
-            # Generate values from 0 to 1
-            t = torch.sigmoid(torch.randn((num_timesteps,), device=device))
+            # Generate normal samples and apply optional preset bias/scale to get different shapes
+            r = torch.randn((num_timesteps,), device=device)
+
+            bias_mode = str(self.config.get('timestep_bias', 'balanced'))
+            if bias_mode == 'high_noise':
+                offset = float(self.config.get('timestep_bias_offset', 0.5))
+                r = r - offset
+            elif bias_mode == 'low_noise':
+                offset = float(self.config.get('timestep_bias_offset', 0.5))
+                r = r + offset
+            elif bias_mode == 'mid_noise':
+                scale = float(self.config.get('timestep_mid_scale', 0.4))
+                r = r * scale
+            # 'balanced' or unknown modes fall back to raw r
+
+            # Map through sigmoid to 0..1
+            t = torch.sigmoid(r)
 
             # Scale and reverse the values to go from 1000 to 0
             timesteps = ((1 - t) * 1000)
@@ -168,8 +183,8 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                     pixels = float(h * w)
                     ref_pixels = float(self.config.get('qwen_ref_pixels', 512 ** 2))
                     mu_raw = math.log(max(pixels, 1.0) / ref_pixels)
-                    min_exp = float(self.config.get('qwen_min_exp', 0.2))
-                    max_exp = float(self.config.get('qwen_max_exp', 4.0))
+                    min_exp = float(self.config.get('qwen_min_exp', 0.34))
+                    max_exp = float(self.config.get('qwen_max_exp', 3.0))
                     mu_min = math.log(min_exp)
                     mu_max = math.log(max_exp)
                     mu = max(min(mu_raw, mu_max), mu_min)
