@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "Bash(venvScriptspython.exe -c \"from diffusers.models.transformers.transformer_z_image import ZImageTransformerBlock; print\\(''ZImageTransformerBlock found in diffusers''\\)\")",
+      "Bash(cmd /c \"venv\\\\Scripts\\\\activate.bat && python -c \"\"from extensions_built_in.diffusion_models.z_image_transformer2d_control import ZImageControlTransformer2DModel; print\\(''Import successful''\\)\"\"\")",
+      "Bash(python -m py_compile:*)"
     ]
   }
 }

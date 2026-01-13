@@ -14,7 +14,11 @@ from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from diffusers.models.attention_processor import Attention, AttentionProcessor
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import RMSNorm
-from diffusers.models.transformers import ZImageTransformer2DModel
+from diffusers.models.transformers.transformer_z_image import (
+    ZImageTransformer2DModel,
+    ZImageTransformerBlock,
+    FinalLayer
+)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.utils import (USE_PEFT_BACKEND, is_torch_version, logging,
                              scale_lora_layers, unscale_lora_layers)
@@ -23,42 +27,6 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
-
-
-# Minimal ZImageTransformerBlock for control blocks to extend
-# This provides the base signature that control blocks need
-class ZImageTransformerBlock(nn.Module):
-    """Minimal transformer block base class for Z-Image control adapter.
-
-    This provides the necessary interface for control blocks to extend.
-    The actual diffusers ZImageTransformer2DModel has its own internal blocks.
-    """
-
-    def __init__(
-        self,
-        layer_id: int,
-        dim: int,
-        n_heads: int,
-        n_kv_heads: int,
-        norm_eps: float,
-        qk_norm: bool,
-        modulation=True,
-    ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.dim = dim
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.norm_eps = norm_eps
-        self.qk_norm = qk_norm
-        self.modulation = modulation
-
-        # Basic attributes expected by downstream code
-        self.head_dim = max(1, dim // max(1, n_heads))
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        # Base implementation - subclasses will override
-        return x
 
 
 class ZImageControlTransformerBlock(ZImageTransformerBlock):

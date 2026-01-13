@@ -44,13 +44,14 @@ def load_videox_control_adapter(
 
     This helper is intended for testing and local integration.
     """
-    # Import the control transformer (extends diffusers' base transformer)
+    # Import the control transformer from our local extensions
+    # (extends diffusers' ZImageTransformer2DModel)
     try:
         from .z_image_transformer2d_control import ZImageControlTransformer2DModel
     except Exception as e:
         tb = traceback.format_exc()
         raise RuntimeError(
-            f"Failed to import ZImageControlTransformer2DModel from z_image_transformer2d_control.py: {e}\n{tb}"
+            f"Failed to import ZImageControlTransformer2DModel from local z_image_transformer2d_control.py: {e}\n{tb}"
         ) from e
 
     model_cls = ZImageControlTransformer2DModel

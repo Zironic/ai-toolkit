@@ -27,10 +27,11 @@ from diffusers import AutoencoderKL
 try:
     from diffusers import ZImagePipeline
     from diffusers.models.transformers import ZImageTransformer2DModel
+    # Control transformer is in our local extensions, not in diffusers
     try:
-        from diffusers.models.transformers import ZImageControlTransformer2DModel
+        from ..z_image_transformer2d_control import ZImageControlTransformer2DModel
     except Exception:
-        # Control transformer may not be available in older diffusers; allow fallback
+        # Control transformer may not be available; allow fallback
         ZImageControlTransformer2DModel = None
 except ImportError:
     raise ImportError(
