@@ -215,8 +215,10 @@ class ZImageModel(BaseModel):
 
         # Choose the appropriate model class
         if is_controlnet_enabled and controlnet_path:
-            # Load control-patched transformer
-            from diffusers.models.transformers import ZImageControlTransformer2DModel
+            # Load control-patched transformer from our local extensions
+            # (it extends diffusers' ZImageTransformer2DModel)
+            if ZImageControlTransformer2DModel is None:
+                raise RuntimeError("ZImageControlTransformer2DModel is not available. Ensure z_image_transformer2d_control.py is present.")
             transformer_class = ZImageControlTransformer2DModel
             self.print_and_status_update(f"Loading control-patched transformer from {controlnet_path}")
 
