@@ -213,51 +213,124 @@ class ZImageModel(BaseModel):
             if os.path.exists(te_folder_path):
                 base_model_path = model_path
 
-        # Choose the appropriate model class
+        # Choose transformer class based on whether controlnet is enabled
         if is_controlnet_enabled and controlnet_path:
-            # Load control-patched transformer from our local extensions
-            # (it extends diffusers' ZImageTransformer2DModel)
             if ZImageControlTransformer2DModel is None:
                 raise RuntimeError("ZImageControlTransformer2DModel is not available. Ensure z_image_transformer2d_control.py is present.")
-            transformer_class = ZImageControlTransformer2DModel
-            self.print_and_status_update(f"Loading control-patched transformer from {controlnet_path}")
 
-            # Use controlnet path as primary, base model path for base weights
-            actual_transformer_path = controlnet_path
-            # Support test monkeypatches
-            if hasattr(transformer_class, 'from_pretrained'):
-                transformer = transformer_class.from_pretrained(
-                    actual_transformer_path,
+            self.print_and_status_update("Loading ZImageControlTransformer2DModel (controlnet enabled)")
+
+            # Resolve controlnet path first so we can inspect it for config hints
+            controlnet_safetensors_path = self._resolve_controlnet_path(controlnet_path)
+
+            # Inspect controlnet safetensors to determine control architecture
+            from .controlnet_config import ZImageControlNetConfigGenerator
+            controlnet_dir = os.path.dirname(controlnet_safetensors_path)
+            controlnet_file = os.path.basename(controlnet_safetensors_path)
+            config_gen = ZImageControlNetConfigGenerator(controlnet_dir, controlnet_file)
+            control_hints = config_gen._inspect_keys(controlnet_safetensors_path)
+
+            # Determine control_layers_places from inspection
+            n_layers = 30  # Z-Image standard
+            num_control_layers = control_hints.get('num_control_layers', None)
+            if num_control_layers is not None:
+                control_layers_places = [i * 2 for i in range(num_control_layers) if i * 2 < n_layers]
+                if not control_layers_places:
+                    control_layers_places = list(range(min(num_control_layers, n_layers)))
+            else:
+                control_layers_places = [i for i in range(0, n_layers, 2)]
+
+            self.print_and_status_update(f"Control config: {len(control_layers_places)} control layer places, control_in_dim=33")
+
+            # VideoX-Fun pattern: use from_pretrained with control kwargs to override config
+            # diffusers' from_pretrained uses whatever class it's called on (ignores _class_name in config)
+            # and kwargs override config values. Missing keys (control layers) just produce warnings.
+            #
+            # We use low_cpu_mem_usage=True for efficient sharded loading with progress bars,
+            # but then we need to materialize the control-specific layers that don't exist in base checkpoint.
+            if hasattr(ZImageControlTransformer2DModel, 'from_pretrained'):
+                transformer = ZImageControlTransformer2DModel.from_pretrained(
+                    transformer_path,
+                    subfolder=transformer_subfolder,
                     torch_dtype=dtype,
-                    # TODO: Add load_control_only=True and base_transformer_path=transformer_path
-                    # once we verify diffusers supports these parameters
+                    low_cpu_mem_usage=True,
+                    # Control-specific kwargs that override/augment base config
+                    control_layers_places=control_layers_places,
+                    control_in_dim=33,  # control_latent(16) + mask(1) + inpaint(16)
+                    add_control_noise_refiner=control_hints.get('has_control_noise_refiner', False),
                 )
             else:
-                # Call as factory
+                # Test fallback
                 try:
-                    transformer = transformer_class()
+                    transformer = ZImageControlTransformer2DModel()
                 except Exception as e:
                     raise RuntimeError(f"Failed to instantiate control transformer: {e}")
+
+            # Load controlnet-specific weights (control_layers, control_all_x_embedder, etc.)
+            # These weights will also materialize any meta tensors left from low_cpu_mem_usage loading
+            self.print_and_status_update(f"Loading controlnet weights from: {controlnet_safetensors_path}")
+            from safetensors.torch import load_file
+            control_state = load_file(controlnet_safetensors_path, device='cpu')
+
+            # With low_cpu_mem_usage=True, control-specific layers are on meta device
+            # Use accelerate to properly materialize them with the controlnet weights
+            from accelerate.utils import set_module_tensor_to_device
+            materialized_count = 0
+            for name, param in list(transformer.named_parameters()):
+                if param.device.type == 'meta':
+                    if name in control_state:
+                        set_module_tensor_to_device(transformer, name, 'cpu', value=control_state[name])
+                        materialized_count += 1
+                    else:
+                        # This shouldn't happen - control layer not in controlnet checkpoint
+                        self.print_and_status_update(f"  Warning: {name} is meta but not in controlnet weights")
+                        # Initialize with zeros as fallback
+                        zeros = torch.zeros(param.shape, dtype=dtype, device='cpu')
+                        set_module_tensor_to_device(transformer, name, 'cpu', value=zeros)
+                        materialized_count += 1
+
+            if materialized_count > 0:
+                self.print_and_status_update(f"Materialized {materialized_count} control layer tensors")
+
+            # Now load remaining controlnet weights (may override some base weights)
+            m, u = transformer.load_state_dict(control_state, strict=False)
+            self.print_and_status_update(f"Controlnet weights loaded: {len(m)} base-only keys, {len(u)} unexpected")
+            del control_state
+            torch.cuda.empty_cache()
 
             # Mark that this is a controlnet model
             self.is_controlnet_model = True
             self.is_controlnet_enabled = True
+            self.controlnet = transformer
+
+            # Update target_lora_modules to match the control transformer class
+            # Otherwise LoRA network creation will find 0 modules
+            actual_class_name = transformer.__class__.__name__
+            self.print_and_status_update(f"Transformer class: {actual_class_name}")
+            self.target_lora_modules = [actual_class_name]
         else:
-            # Load base transformer
+            # Standard base transformer loading
+            self.print_and_status_update("Loading ZImageTransformer2DModel")
             transformer_class = ZImageTransformer2DModel
-            # Support test monkeypatches which may replace the class with a simple factory (without from_pretrained)
+
+            # Support test monkeypatches which may replace the class with a simple factory
             if hasattr(transformer_class, 'from_pretrained'):
                 transformer = transformer_class.from_pretrained(
-                    transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
+                    transformer_path,
+                    subfolder=transformer_subfolder,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
                 )
             else:
-                # Call as factory
                 try:
                     transformer = transformer_class()
                 except Exception as e:
                     raise RuntimeError(f"Failed to instantiate transformer: {e}")
 
             self.is_controlnet_model = False
+
+        # Store transformer
+        self.transformer = transformer
 
 
         # load assistant lora if specified
@@ -790,6 +863,240 @@ class ZImageModel(BaseModel):
                 del t
         return state
 
+    def _resolve_controlnet_path(self, controlnet_path: str) -> str:
+        """Resolve controlnet path to a local safetensors file, downloading from HuggingFace if needed.
+
+        Returns the absolute path to the safetensors file.
+        """
+        from toolkit.model_utils import resolve_local_model_path
+        from toolkit.paths import MODELS_PATH
+
+        # First, check if this is a HuggingFace pattern: "repo/filename" without .safetensors
+        is_hf_pattern = '/' in controlnet_path and not controlnet_path.endswith('.safetensors')
+
+        if is_hf_pattern:
+            # Extract the filename part (everything after the first /)
+            parts = controlnet_path.split('/', 1)
+            if len(parts) == 2:
+                filename = parts[1] + '.safetensors'
+                self.print_and_status_update(f"Checking for local file: {filename}")
+
+                # Search common controlnet directories
+                search_dirs = []
+                if MODELS_PATH:
+                    search_dirs.extend([
+                        os.path.join(MODELS_PATH, 'Personalized_Model'),
+                        os.path.join(MODELS_PATH, 'controlnet'),
+                        os.path.join(MODELS_PATH, 'ControlNet'),
+                        MODELS_PATH,
+                    ])
+
+                for search_dir in search_dirs:
+                    if os.path.exists(search_dir):
+                        candidate = os.path.join(search_dir, filename)
+                        if os.path.exists(candidate):
+                            self.print_and_status_update(f"Found local controlnet: {candidate}")
+                            return candidate
+
+                # Not found locally - download from HuggingFace
+                self.print_and_status_update(f"Not found locally, downloading from HuggingFace...")
+                return self._download_controlnet_from_hf(controlnet_path)
+        else:
+            # Try standard path resolution
+            resolved = resolve_local_model_path(controlnet_path)
+            if resolved is not None and os.path.exists(resolved):
+                return resolved
+
+            # Try searching subdirectories
+            if controlnet_path.endswith('.safetensors'):
+                filename = os.path.basename(controlnet_path)
+                search_dirs = []
+                if MODELS_PATH:
+                    search_dirs.extend([
+                        os.path.join(MODELS_PATH, 'Personalized_Model'),
+                        os.path.join(MODELS_PATH, 'controlnet'),
+                        os.path.join(MODELS_PATH, 'ControlNet'),
+                        MODELS_PATH,
+                    ])
+
+                for search_dir in search_dirs:
+                    if os.path.exists(search_dir):
+                        candidate = os.path.join(search_dir, filename)
+                        if os.path.exists(candidate):
+                            self.print_and_status_update(f"Found controlnet file: {candidate}")
+                            return candidate
+
+            # Path resolution failed - try as HuggingFace model ID
+            self.print_and_status_update(f"Could not resolve locally, trying HuggingFace: {controlnet_path}")
+            return self._download_controlnet_from_hf(controlnet_path)
+
+    def _download_controlnet_from_hf(self, controlnet_path: str) -> str:
+        """Download controlnet from HuggingFace and return local path."""
+        import huggingface_hub
+        from huggingface_hub import list_models
+
+        self.print_and_status_update(f"Resolving HuggingFace repo for: {controlnet_path}")
+
+        if '/' not in controlnet_path:
+            raise RuntimeError(f"Invalid controlnet path format: {controlnet_path}. Expected 'org/model' format.")
+
+        org, model_variant = controlnet_path.split('/', 1)
+
+        # Try to find the actual repo by checking for longest matching repo name
+        try:
+            repos = list(list_models(author=org))
+            best_match = None
+            best_match_len = 0
+
+            for repo in repos:
+                repo_name = repo.id
+                if repo_name.startswith(f"{org}/"):
+                    repo_suffix = repo_name[len(org)+1:]
+                    if model_variant.startswith(repo_suffix) and len(repo_suffix) > best_match_len:
+                        best_match = repo_name
+                        best_match_len = len(repo_suffix)
+
+            if best_match:
+                repo_id = best_match
+                filename = model_variant + '.safetensors' if not model_variant.endswith('.safetensors') else model_variant
+
+                self.print_and_status_update(f"Found repo: {repo_id}, filename: {filename}")
+
+                downloaded_path = huggingface_hub.hf_hub_download(repo_id=repo_id, filename=filename)
+                self.print_and_status_update(f"Downloaded {filename} from {repo_id}")
+                return downloaded_path
+            else:
+                raise RuntimeError(f"Could not find matching repo in {org} for {model_variant}")
+
+        except Exception as e:
+            if isinstance(e, RuntimeError) and "Could not" in str(e):
+                raise
+
+            # Fallback: try common filenames
+            self.print_and_status_update(f"Could not list repos ({e}), trying common filenames...")
+            for try_filename in ['diffusion_pytorch_model.safetensors', 'controlnet.safetensors', 'model.safetensors']:
+                try:
+                    downloaded_path = huggingface_hub.hf_hub_download(repo_id=controlnet_path, filename=try_filename)
+                    self.print_and_status_update(f"Downloaded {try_filename} from {controlnet_path}")
+                    return downloaded_path
+                except Exception:
+                    continue
+
+            raise RuntimeError(f"Could not download controlnet from {controlnet_path}")
+
+    def _load_controlnet_weights(self, safetensors_path: str, base_transformer):
+        """Load controlnet weights into a control transformer, reusing base transformer weights.
+
+        Memory-optimized approach:
+        1. Create control transformer on 'meta' device (no memory allocation)
+        2. Copy base transformer weights directly to control transformer
+        3. Load control-specific weights from safetensors
+        4. Delete base transformer to free memory
+        """
+        from safetensors.torch import load_file
+        import gc
+
+        self.print_and_status_update(f"Loading controlnet weights from: {safetensors_path}")
+
+        # Get config from base transformer
+        # Config may be a FrozenDict or have to_dict() method
+        base_config = base_transformer.config
+        if hasattr(base_config, 'to_dict'):
+            config = base_config.to_dict()
+        else:
+            config = dict(base_config)
+
+        # Filter to valid control params and ensure control_in_dim=33
+        valid_control_params = {
+            'control_layers_places', 'control_refiner_layers_places', 'control_in_dim',
+            'add_control_noise_refiner', 'add_control_noise_refiner_correctly',
+            'all_patch_size', 'all_f_patch_size', 'in_channels', 'dim', 'n_layers',
+            'n_refiner_layers', 'n_heads', 'n_kv_heads', 'norm_eps', 'qk_norm',
+            'cap_feat_dim', 'rope_theta', 't_scale', 'axes_dims', 'axes_lens',
+        }
+        config = {k: v for k, v in config.items() if k in valid_control_params}
+
+        # Ensure control_in_dim=33 for Z-Image union controlnets
+        config['control_in_dim'] = 33
+        self.print_and_status_update(f"Using control_in_dim=33")
+
+        # Remember device and dtype
+        target_device = base_transformer.device
+        target_dtype = base_transformer.dtype
+
+        # Create control transformer on meta device (no memory allocation)
+        self.print_and_status_update("Creating control transformer architecture on meta device...")
+        with torch.device('meta'):
+            control_transformer = ZImageControlTransformer2DModel(**config)
+
+        # Get the base transformer state dict and move base to CPU to free GPU memory
+        self.print_and_status_update("Moving base transformer to CPU to free GPU memory...")
+        base_transformer.to('cpu')
+        torch.cuda.empty_cache()
+
+        # Now get state dict from CPU - much safer memory-wise
+        self.print_and_status_update("Getting base transformer weights...")
+        base_state = base_transformer.state_dict()
+
+        # Load control-specific weights
+        self.print_and_status_update("Loading control-specific weights from disk...")
+        control_state = load_file(safetensors_path, device='cpu')
+
+        # Merge: base state provides most weights, control state provides control-specific
+        # Control state keys override base state keys
+        merged_state = {**base_state, **control_state}
+        del base_state
+        del control_state
+        gc.collect()
+
+        # Delete base transformer now that we have its weights
+        self.print_and_status_update("Freeing base transformer memory...")
+        del base_transformer
+        self.transformer = None  # Clear reference
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Now materialize the control transformer with merged weights
+        self.print_and_status_update("Materializing control transformer with merged weights...")
+
+        # Use accelerate's set_module_tensor_to_device for memory-efficient loading
+        try:
+            from accelerate.utils import set_module_tensor_to_device
+
+            # First, create empty tensors on CPU
+            control_transformer.to_empty(device='cpu')
+
+            # Load weights tensor by tensor
+            loaded_keys = set()
+            for key, tensor in merged_state.items():
+                try:
+                    set_module_tensor_to_device(control_transformer, key, 'cpu', value=tensor)
+                    loaded_keys.add(key)
+                except Exception:
+                    pass  # Key doesn't exist in control transformer (expected for some base-only keys)
+
+            del merged_state
+            gc.collect()
+
+            # Move to target device
+            self.print_and_status_update(f"Moving control transformer to {target_device}...")
+            control_transformer.to(target_device, dtype=target_dtype)
+
+        except ImportError:
+            # Fallback without accelerate - less memory efficient but works
+            self.print_and_status_update("accelerate not available, using standard loading...")
+            control_transformer = ZImageControlTransformer2DModel(**config)
+            control_transformer.load_state_dict(merged_state, strict=False)
+            del merged_state
+            gc.collect()
+            control_transformer.to(target_device, dtype=target_dtype)
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        self.print_and_status_update("Control transformer ready")
+        return control_transformer
+
     def load_controlnet_transformer(self, controlnet_path: str, controlnet_file: str, freeze: bool = True, offload_strategy: str = 'none'):
         """Load ControlNet transformer using VideoX-Fun pattern.
 
@@ -810,45 +1117,69 @@ class ZImageModel(BaseModel):
         if not os.path.exists(safetensors_path):
             raise FileNotFoundError(f"ControlNet file not found: {safetensors_path}")
 
-        # Load or generate config.json in controlnet_path (left as plan step)
+        # Load or generate config.json in controlnet_path
         config_path = os.path.join(controlnet_path, 'config.json')
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 config = json.load(f)
         else:
-            # Fall back to copying base transformer config as template
-            try:
-                base_transformer = ZImageTransformer2DModel.from_pretrained(self.model_config.name_or_path, subfolder='transformer', torch_dtype=self.torch_dtype)
-                config = base_transformer.config.to_dict()
-                # write out a config.json into the controlnet repo so future loads can re-use it
-                try:
-                    with open(config_path, 'w') as cf:
-                        import json
+            # Try to get config from already-loaded transformer (fast path)
+            # or generate from safetensors inspection (also fast)
+            config = None
 
-                        json.dump(config, cf)
+            # Fast path 1: reuse already-loaded base transformer config
+            if hasattr(self, 'transformer') and self.transformer is not None:
+                try:
+                    config = self.transformer.config.to_dict()
+                    self.print_and_status_update("Reusing base transformer config for controlnet...")
                 except Exception:
-                    # non-fatal; continue
                     pass
-                del base_transformer
-            except Exception as e:
-                # If we can't load a base transformer config, attempt to generate a
-                # minimal config programmatically from the safetensors file so tests
-                # and low-memory hosts can still proceed. This is a conservative
-                # fallback and will write a `config.json` into the controlnet path.
+
+            # Fast path 2: generate config from safetensors inspection
+            if config is None:
                 try:
                     from extensions_built_in.diffusion_models.z_image.controlnet_config import ZImageControlNetConfigGenerator
                     gen = ZImageControlNetConfigGenerator(controlnet_path, controlnet_file)
                     config = gen.generate()
+                    self.print_and_status_update("Generated controlnet config from safetensors inspection...")
+                except Exception as e:
+                    # Last resort: try loading base transformer (slow path)
                     try:
-                        with open(config_path, 'w') as cf:
-                            import json
+                        self.print_and_status_update("Loading base transformer for config (slow path)...")
+                        base_transformer = ZImageTransformer2DModel.from_pretrained(
+                            self.model_config.name_or_path, subfolder='transformer', torch_dtype=self.torch_dtype
+                        )
+                        config = base_transformer.config.to_dict()
+                        del base_transformer
+                    except Exception as e2:
+                        raise RuntimeError(f"Failed to generate controlnet config: {e}; base transformer load failed: {e2}")
 
-                            json.dump(config, cf)
-                    except Exception:
-                        # non-fatal; continue
-                        pass
-                except Exception as e2:
-                    raise RuntimeError(f"No config.json found in controlnet repo and failed to load base transformer config: {e}; fallback generator failed: {e2}")
+            # Write config for future loads (non-fatal if fails)
+            try:
+                with open(config_path, 'w') as cf:
+                    json.dump(config, cf)
+            except Exception:
+                pass
+
+        # Filter config to only include valid ZImageControlTransformer2DModel parameters
+        # This handles both old config files with invalid keys and new generated configs
+        valid_control_params = {
+            # Control-specific parameters
+            'control_layers_places', 'control_refiner_layers_places', 'control_in_dim',
+            'add_control_noise_refiner', 'add_control_noise_refiner_correctly',
+            # Base transformer parameters
+            'all_patch_size', 'all_f_patch_size', 'in_channels', 'dim', 'n_layers',
+            'n_refiner_layers', 'n_heads', 'n_kv_heads', 'norm_eps', 'qk_norm',
+            'cap_feat_dim', 'rope_theta', 't_scale', 'axes_dims', 'axes_lens',
+        }
+        config = {k: v for k, v in config.items() if k in valid_control_params}
+
+        # Ensure control_in_dim=33 for Z-Image union controlnets
+        # control_in_dim = control_latent(16) + mask(1) + inpaint(16) = 33
+        # Old cached configs may have wrong values (e.g., 1 or 16), so always enforce 33
+        if config.get('control_in_dim') is None or config.get('control_in_dim') != 33:
+            self.print_and_status_update(f"Setting control_in_dim=33 (was {config.get('control_in_dim')})")
+            config['control_in_dim'] = 33
 
         # Instantiate control transformer - use meta tensors to avoid memory allocation
         control_cls = globals().get('ZImageControlTransformer2DModel', None) or ZImageTransformer2DModel
@@ -900,11 +1231,21 @@ class ZImageModel(BaseModel):
         # Only copy base transformer weights if the controlnet file is small (control-only weights)
         if not is_full_model:
             try:
-                base = ZImageTransformer2DModel.from_pretrained(self.model_config.name_or_path, subfolder='transformer', torch_dtype=self.torch_dtype)
-                base_state = base.state_dict()
-                m, u = self.controlnet.load_state_dict(base_state, strict=False)
-                self.print_and_status_update(f"Base→Control copy: {len(m)} missing, {len(u)} unexpected")
-                del base, base_state
+                # Reuse already-loaded base transformer if available (much faster than loading again)
+                if hasattr(self, 'transformer') and self.transformer is not None:
+                    self.print_and_status_update("Reusing already-loaded base transformer weights...")
+                    base_state = self.transformer.state_dict()
+                    m, u = self.controlnet.load_state_dict(base_state, strict=False)
+                    self.print_and_status_update(f"Base→Control copy: {len(m)} missing, {len(u)} unexpected")
+                    del base_state
+                else:
+                    # Fallback: load base transformer (slow path)
+                    self.print_and_status_update("Loading base transformer for weight copy (slow path)...")
+                    base = ZImageTransformer2DModel.from_pretrained(self.model_config.name_or_path, subfolder='transformer', torch_dtype=self.torch_dtype)
+                    base_state = base.state_dict()
+                    m, u = self.controlnet.load_state_dict(base_state, strict=False)
+                    self.print_and_status_update(f"Base→Control copy: {len(m)} missing, {len(u)} unexpected")
+                    del base, base_state
                 torch.cuda.empty_cache()
             except Exception as e:
                 # Non-fatal; continue but warn
@@ -1516,6 +1857,13 @@ def predict_noise_zimage(sd, latents: torch.Tensor, text_embeddings, timestep: t
     latent_model_input = latents.unsqueeze(2)  # [B, C, 1, H, W]
     latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
+    # Convert text embeddings to list format (transformer expects cap_feats: List[torch.Tensor])
+    # te shape: [B, seq_len, dim] -> list of [seq_len, dim] tensors
+    if te.ndim >= 2:
+        te_list = list(te.unbind(dim=0))
+    else:
+        te_list = [te]
+
     timestep_model_input = (1000 - timestep) / 1000.0
     # normalize timestep to device/dtype for transformer
     try:
@@ -1649,16 +1997,26 @@ def predict_noise_zimage(sd, latents: torch.Tensor, text_embeddings, timestep: t
     # sd.is_controlnet_model=True. Control signals are passed via control_context parameter.
 
     # Prepare transformer kwargs - always pass control_context when available
+    # IMPORTANT: The transformer's forward() expects control_context as a LIST of tensors
+    # (one per batch item), matching how latent_model_input_list is structured.
     transformer_kwargs = {}
     if control_context is not None:
-        transformer_kwargs['control_context'] = control_context
+        # Convert batched tensor to list of per-sample tensors
+        # assemble_zimage_control_context returns [B, C, H, W] or [B, C, 1, H, W]
+        # Transformer expects list of [C, F, H, W] tensors (one per batch item)
+        if control_context.ndim == 4:
+            # [B, C, H, W] -> add frame dim -> [B, C, 1, H, W]
+            control_context = control_context.unsqueeze(2)
+        # Now [B, C, F, H, W] -> list of [C, F, H, W]
+        control_context_list = list(control_context.unbind(dim=0))
+        transformer_kwargs['control_context'] = control_context_list
         transformer_kwargs['control_context_scale'] = float(zimage_conditioning_scale)
 
     # Debug logging
     if dataset_controlnet_debug and control_context is not None:
         try:
             from toolkit.print import print_acc
-            print_acc(f"[CONTROLNET-DEBUG] control_context: shape={control_context.shape} scale={zimage_conditioning_scale} is_controlnet_model={getattr(sd, 'is_controlnet_model', False)}")
+            print_acc(f"[CONTROLNET-DEBUG] control_context: list of {len(control_context_list)} tensors, shape={control_context_list[0].shape} scale={zimage_conditioning_scale}")
         except Exception:
             pass
 
@@ -1669,7 +2027,7 @@ def predict_noise_zimage(sd, latents: torch.Tensor, text_embeddings, timestep: t
     with model_timer:
         # Call transformer under autocast and normalize output
         with autocast_ctx:
-            t_out = sd.transformer(latent_model_input_list, timestep_model_input, te, return_dict=False, **transformer_kwargs)
+            t_out = sd.transformer(latent_model_input_list, timestep_model_input, te_list, return_dict=False, **transformer_kwargs)
 
     # Normalize transformer output
     model_out_list = None

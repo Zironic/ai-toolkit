@@ -1,9 +1,5 @@
 import pytest
-try:
-    import torch
-except Exception:
-    pytest.skip("Skipping: PyTorch import failed in this environment", allow_module_level=True)
-
+pytest.importorskip("torch")
 from toolkit.controlnet_compat import VideoXControlnetWrapper
 import toolkit.control_channels as cc
 

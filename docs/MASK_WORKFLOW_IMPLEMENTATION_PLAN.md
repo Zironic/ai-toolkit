@@ -101,7 +101,7 @@ Leverage existing mask infrastructure, add SAM3 generation CLI, enhance UI with 
 # Mask support (new workflow)
 self.mask_enabled: bool = kwargs.get('mask_enabled', False)
 self.mask_strength: float = kwargs.get('mask_strength', 1.0)  # 0.0-1.0; 1.0 = fully zero non-masked regions
-self.mask_subfolder: str = kwargs.get('mask_subfolder', '_masks')  # relative to dataset folder
+self.mask_subfolder: str = kwargs.get('mask_subfolder', 'masks')  # relative to dataset folder
 ```
 
 **Validation:**
@@ -126,8 +126,8 @@ class FileItemDTO:
 **File:** `toolkit/dataloader_mixins.py` (or new `toolkit/mask_utils.py`)
 **Add helper:**
 ```python
-def load_mask_for_image(image_path: str, mask_subfolder: str = '_masks') -> Optional[torch.Tensor]:
-    """Load binary mask for given image from _masks subfolder.
+def load_mask_for_image(image_path: str, mask_subfolder: str = 'masks') -> Optional[torch.Tensor]:
+    """Load binary mask for given image from masks subfolder.
     
     Args:
         image_path: Full path to image file
@@ -313,12 +313,12 @@ transformers>=4.30.0  # (likely already present)
 """Generate binary masks for a dataset using SAM3 (Segment Anything Model 3).
 
 Usage:
-    python scripts/generate_masks_sam3.py --dataset datasets/my_dataset --prompts "person,gun" --output-subfolder _masks
+    python scripts/generate_masks_sam3.py --dataset datasets/my_dataset --prompts "person,gun" --output-subfolder masks
 
 This will:
 1. Load images from the dataset folder
 2. Use SAM3 to segment objects matching the text prompts
-3. Save binary masks to dataset/_masks/ with matching filenames
+3. Save binary masks to dataset/masks/ with matching filenames
 """
 
 import argparse
@@ -390,7 +390,7 @@ def process_dataset(dataset_path: str, prompts: List[str], output_subfolder: str
     Args:
         dataset_path: Path to dataset folder
         prompts: List of text prompts for segmentation
-        output_subfolder: Name of subfolder to save masks (e.g., "_masks")
+        output_subfolder: Name of subfolder to save masks (e.g., "masks")
         device: Device string
     """
     dataset_path = Path(dataset_path)
@@ -453,8 +453,8 @@ def main():
         help="Comma-separated text prompts for segmentation (e.g., 'person,gun')"
     )
     parser.add_argument(
-        "--output-subfolder", "-o", default="_masks",
-        help="Name of subfolder to save masks (default: _masks)"
+        "--output-subfolder", "-o", default="masks",
+        help="Name of subfolder to save masks (default: masks)"
     )
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
@@ -496,7 +496,7 @@ subparsers = parser.add_subparsers(dest='command')
 mask_parser = subparsers.add_parser('generate-masks', help='Generate masks using SAM3')
 mask_parser.add_argument('--dataset', '-d', required=True, help='Dataset path')
 mask_parser.add_argument('--prompts', '-p', required=True, help='Comma-separated prompts')
-mask_parser.add_argument('--output-subfolder', '-o', default='_masks', help='Output subfolder')
+mask_parser.add_argument('--output-subfolder', '-o', default='masks', help='Output subfolder')
 
 # In main():
 if args.command == 'generate-masks':
@@ -545,13 +545,13 @@ interface DatasetConfig {
   <TextInput
     label="Mask Subfolder"
     className="pt-2"
-    value={dataset.mask_subfolder || '_masks'}
+    value={dataset.mask_subfolder || 'masks'}
     onChange={value => updateDataset({ mask_subfolder: value })}
     disabled={!dataset.mask_enabled}
     helperText="Subfolder containing mask images"
   />
   <div className="pt-2 text-sm text-gray-600">
-    <p>Masks should be binary PNG images in the '{dataset.mask_subfolder || '_masks'}' subfolder.</p>
+    <p>Masks should be binary PNG images in the '{dataset.mask_subfolder || 'masks'}' subfolder.</p>
     <p>Generate masks using: <code>python scripts/generate_masks_sam3.py --dataset {dataset.path} --prompts "your,prompts"</code></p>
   </div>
 </FormGroup>
@@ -594,14 +594,14 @@ def test_load_mask_for_image_found():
         Image.new('RGB', (256, 256)).save(img_path)
         
         # Create mask
-        mask_dir = os.path.join(tmpdir, "_masks")
+        mask_dir = os.path.join(tmpdir, "masks")
         os.makedirs(mask_dir)
         mask_path = os.path.join(mask_dir, "test.png")
         mask_np = np.random.randint(0, 2, (256, 256), dtype=np.uint8) * 255
         Image.fromarray(mask_np, mode='L').save(mask_path)
         
         # Load
-        mask = load_mask_for_image(img_path, "_masks")
+        mask = load_mask_for_image(img_path, "masks")
         
         assert mask is not None
         assert mask.shape == (1, 256, 256)
@@ -616,7 +616,7 @@ def test_load_mask_for_image_not_found():
         img_path = os.path.join(tmpdir, "test.jpg")
         Image.new('RGB', (256, 256)).save(img_path)
         
-        mask = load_mask_for_image(img_path, "_masks")
+        mask = load_mask_for_image(img_path, "masks")
         assert mask is None
 ```
 
@@ -690,7 +690,7 @@ def test_generate_masks_sam3_creates_files():
     """Test that SAM3 script creates mask files."""
     # Create temp dataset with images
     # Run generate_masks_sam3.process_dataset()
-    # Verify masks are created in _masks subfolder
+    # Verify masks are created in masks subfolder
     # (May need to mock SAM3 model to avoid heavy download)
     pass
 ```
@@ -707,7 +707,7 @@ def test_generate_masks_sam3_creates_files():
 
 **What changed:**
 - Removed masked reconstruction feature (toolkit/masked_recon.py and all related code)
-- Implemented new mask workflow: masks are pre-generated and stored in _masks subfolder
+- Implemented new mask workflow: masks are pre-generated and stored in masks subfolder
 - Masks are applied as negative multipliers during training (configurable per-dataset)
 
 **Why:**
@@ -745,7 +745,7 @@ Use the SAM3-based mask generator:
 python scripts/generate_masks_sam3.py --dataset datasets/my_dataset --prompts "person,gun"
 ```
 
-This creates binary masks in `datasets/my_dataset/_masks/`.
+This creates binary masks in `datasets/my_dataset/masks/`. 
 
 ### Enabling Masks
 
@@ -771,7 +771,7 @@ A UI for drawing masks manually is planned for a future release.
 ### 8.1 Manual Mask Drawing UI
 - Add canvas-based mask editor to dataset view
 - Allow brush/eraser tools with size controls
-- Save directly to _masks subfolder
+- Save directly to masks subfolder
 
 ### 8.2 Per-Sample Mask Strength
 - Support mixed datasets with different mask_strength values

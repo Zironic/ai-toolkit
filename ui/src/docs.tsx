@@ -77,6 +77,15 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'datasets.control_conditioning_scale': {
+    title: 'Control Strength',
+    description: (
+      <>
+        Per-dataset control conditioning strength (0.0 = disabled, 1.0 = full strength). Defaults to 0.35 (35%), a
+        conservative training default to avoid the control dominating the learning signal during training.
+      </>
+    ),
+  },
   'datasets.num_frames': {
     title: 'Number of Frames',
     description: (
@@ -280,11 +289,20 @@ const docs: { [key: string]: ConfigDoc } = {
     ),
   },
   'train.diff_output_preservation_every': {
-    title: 'DOP Every N steps',
+    title: 'Full resolution every N steps',
     description: (
       <>
-        Run Differential Output Preservation only every N training steps. Set to 1 to run every step.
-        Use this to reduce the overhead of DOP by computing preservation only at intervals. Must be an integer &gt;= 1.
+        Force a full-resolution preservation pass (bypassing any reduced-resolution preservation) every N training steps.
+        Default is 10 to periodically clean up artifacts that may slip past reduced-resolution preservation. Must be an integer &gt;= 1.
+      </>
+    ),
+  },
+  'train.diff_output_preservation_after_steps': {
+    title: 'Run DOP after N steps',
+    description: (
+      <>
+        Defer running Differential Output Preservation (DOP) until the training step count reaches N. Set to 0 to run DOP from the start.
+        Use this to only apply DOP during the final stages of training when desired.
       </>
     ),
   },

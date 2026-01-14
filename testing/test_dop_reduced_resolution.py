@@ -25,7 +25,8 @@ class DummyTrainer(SDTrainer):
         # minimal train_config stub
         self.train_config = types.SimpleNamespace(
             diff_output_preservation=False,
-            diff_output_preservation_every=1,
+            diff_output_preservation_every=1,  # full-resolution schedule (default for backward compatibility in tests)
+            diff_output_preservation_after_steps=0,
             diff_output_preservation_resolution=None,
             blank_prompt_preservation=False,
             blank_prompt_preservation_resolution=None,
@@ -39,7 +40,7 @@ def test_dop_runs_at_reduced_resolution(monkeypatch):
 
     # set config to request DOP at 256px (latent target long-side = 256/8 = 32)
     t.train_config.diff_output_preservation = True
-    t.train_config.diff_output_preservation_every = 1
+    t.train_config.diff_output_preservation_after_steps = 0
     t.train_config.diff_output_preservation_resolution = 256
 
     # construct a full-res latent (H=64, W=64)
@@ -81,7 +82,7 @@ def test_dop_runs_at_128_resolution(monkeypatch):
 
     # set config to request DOP at 128px (latent target long-side = 128/8 = 16)
     t.train_config.diff_output_preservation = True
-    t.train_config.diff_output_preservation_every = 1
+    t.train_config.diff_output_preservation_after_steps = 0
     t.train_config.diff_output_preservation_resolution = 128
 
     noisy = torch.zeros((1, 4, 64, 64))

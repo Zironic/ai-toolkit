@@ -141,6 +141,7 @@ export interface TrainConfig {
   diff_output_preservation_multiplier: number;
   diff_output_preservation_class: string;
   diff_output_preservation_every?: number;
+  diff_output_preservation_after_steps?: number;
   diff_output_preservation_resolution?: number | null;
   blank_prompt_preservation?: boolean;
   blank_prompt_preservation_multiplier?: number;

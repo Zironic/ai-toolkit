@@ -35,7 +35,8 @@ def test_dop_timer_recorded(monkeypatch):
 
     # enable DOP and prepare embeddings
     trainer.train_config.diff_output_preservation = True
-    trainer.train_config.diff_output_preservation_every = 1
+    trainer.train_config.diff_output_preservation_after_steps = 0
+    trainer.train_config.diff_output_preservation_every = 1  # full-res schedule (compat)
 
     # set a small dummy prior_pred and noisy_latents
     prior_pred = torch.zeros((1, 4))

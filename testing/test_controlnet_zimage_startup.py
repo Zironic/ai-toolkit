@@ -1,12 +1,7 @@
 import sys
 import pytest
 # Skip these tests when a compatible PyTorch is not available in the test environment.
-try:
-    import torch  # noqa: F401
-except Exception:
-    import pytest
-
-    pytest.skip("Skipping: PyTorch import failed in this environment", allow_module_level=True)
+pytest.importorskip("torch")
 from types import SimpleNamespace
 
 from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess

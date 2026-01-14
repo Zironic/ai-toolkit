@@ -115,3 +115,16 @@ def test_run_preservation_forward_computes_reduced_prior_when_none(monkeypatch):
     preservation_pred, prior_small = result
     assert preservation_pred.shape[-2:] == (32, 32)
     assert prior_small.shape[-2:] == (32, 32)
+
+
+def test_do_not_skip_on_full_res_schedule():
+    """If a full-resolution schedule is configured and we're on a scheduled step,
+    _should_skip_full_prior should return False (i.e., do full-resolution prior).
+    """
+    t = DummyTrainer()
+    noisy = torch.zeros((1, 4, 64, 64))
+    # choose preservation_resolution that would normally downsample
+    # configure full-resolution every 2 steps and set current batch=2
+    t.train_config.diff_output_preservation_every = 2
+    t._total_batch_count = 2
+    assert t._should_skip_full_prior(noisy, preservation_resolution=256) is False

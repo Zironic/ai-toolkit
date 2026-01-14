@@ -24,9 +24,11 @@ export default function GenerateMasksModal({
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [mergeTexts, setMergeTexts] = useState(true);
+  const [mode, setMode] = useState<'sam3' | 'background'>('sam3');
+  const [color, setColor] = useState('#ffffff');
 
   const handleGenerate = async () => {
-    if (!identifiers.trim()) {
+    if (mode === 'sam3' && !identifiers.trim()) {
       setError('Please enter at least one identifier');
       return;
     }
@@ -35,12 +37,20 @@ export default function GenerateMasksModal({
     setError(null);
 
     try {
-      const response = await apiClient.post('/api/masks/generate', {
+      const payload: any = {
         datasetName,
         imagePath: imagePath || null,
-        identifiers: identifiers.split(',').map(id => id.trim()).filter(id => id),
-        merge_texts: mergeTexts,
-      });
+        mode,
+      };
+
+      if (mode === 'sam3') {
+        payload.identifiers = identifiers.split(',').map((id) => id.trim()).filter((id) => id);
+        payload.merge_texts = mergeTexts;
+      } else if (mode === 'background') {
+        payload.color = color; // hex string like '#ffffff'
+      }
+
+      const response = await apiClient.post('/api/masks/generate', payload);
 
       if (response.data.success) {
         onClose();
@@ -93,29 +103,59 @@ export default function GenerateMasksModal({
                     Enter comma-separated text identifiers (e.g., "woman, person, character")
                   </p>
 
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Identifiers<span className="text-red-500">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    value={identifiers}
-                    onChange={(e) => setIdentifiers(e.target.value)}
-                    placeholder="woman, person, character"
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Method</label>
+                  <select
+                    value={mode}
+                    onChange={(e) => setMode(e.target.value as 'sam3' | 'background')}
                     disabled={isGenerating}
                     className="w-full rounded bg-gray-700 text-white p-2 border border-gray-600 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
-                  />
+                  >
+                    <option value="sam3">SAM3</option>
+                    <option value="background">Background Mask</option>
+                  </select>
 
-                  <div className="mt-3 flex items-center gap-2">
-                    <input
-                      id="merge_texts"
-                      type="checkbox"
-                      checked={mergeTexts}
-                      onChange={(e) => setMergeTexts(e.target.checked)}
-                      disabled={isGenerating}
-                      className="h-4 w-4 rounded bg-gray-700 border-gray-600 text-emerald-500 focus:ring-emerald-500 disabled:opacity-50"
-                    />
-                    <label htmlFor="merge_texts" className="text-sm text-gray-300">Merge identifiers into a single mask (default)</label>
-                  </div>
+                  {mode === 'sam3' && (
+                    <>
+                      <label className="block text-sm font-medium text-gray-300 mb-2 mt-3">
+                        Identifiers<span className="text-red-500">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={identifiers}
+                        onChange={(e) => setIdentifiers(e.target.value)}
+                        placeholder="woman, person, character"
+                        disabled={isGenerating}
+                        className="w-full rounded bg-gray-700 text-white p-2 border border-gray-600 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                      />
+
+                      <div className="mt-3 flex items-center gap-2">
+                        <input
+                          id="merge_texts"
+                          type="checkbox"
+                          checked={mergeTexts}
+                          onChange={(e) => setMergeTexts(e.target.checked)}
+                          disabled={isGenerating}
+                          className="h-4 w-4 rounded bg-gray-700 border-gray-600 text-emerald-500 focus:ring-emerald-500 disabled:opacity-50"
+                        />
+                        <label htmlFor="merge_texts" className="text-sm text-gray-300">Merge identifiers into a single mask (default)</label>
+                      </div>
+                    </>
+                  )}
+
+                  {mode === 'background' && (
+                    <div className="mt-3">
+                      <label className="block text-sm font-medium text-gray-300 mb-2">Pick background color to match (exact)</label>
+                      <input
+                        type="color"
+                        value={color}
+                        onChange={(e) => setColor(e.target.value)}
+                        disabled={isGenerating}
+                        className="h-10 w-16 p-1 rounded border border-gray-600 bg-white"
+                        aria-label="Background color"
+                      />
+                      <p className="text-xs text-gray-500 mt-2">Exact color match (hex). The generated mask will mark non-matching pixels (foreground). Default: white.</p>
+                    </div>
+                  )}
 
                   {error && (
                     <p className="text-sm text-red-500 mt-2">{error}</p>

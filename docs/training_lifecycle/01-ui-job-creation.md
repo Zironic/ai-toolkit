@@ -54,3 +54,8 @@ Files read (high-level)
 
 Notes & uncertainties
 - Some UI code paths (e.g., advanced job templates) have multiple implementations; if you rely on a specific UI flow, note that both `new` and `import` flows exist and may differ in payload shape.
+
+## Search hints
+- `rg "POST /api/jobs|startJob|spawnJobProcess" -n ui/` — search UI handlers and spawn helpers
+- `rg "Job" ui/prisma schema.prisma -n` — inspect DB model references
+- Limit searches to `ui/` and `scripts/` unless you suspect server-side job loader code in `run.py` or `jobs/`.

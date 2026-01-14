@@ -1,7 +1,8 @@
 import pytest
 # This module requires full optional dependencies (diffusers/optimum/etc.) to be present.
-# Mark as integration-only to avoid import-time failures during fast unit test runs.
-pytest.skip("integration-only: requires full diffusers+optimum environment", allow_module_level=True)
+# Use import-based conditional skip so tests run when the deps are available.
+pytest.importorskip("diffusers")
+pytest.importorskip("optimum")
 import torch
 from types import SimpleNamespace
 import pytest

@@ -255,6 +255,56 @@ class SDTrainer(BaseSDTrainProcess):
         return float(val)
         self._last_batch_offload_active = False
 
+    @staticmethod
+    def compute_mask_multiplier(mask_tensor, noisy_latents_shape, device, dtype, mask_strength=1.0, eps=1e-6):
+        """Create a mask multiplier that matches noisy latents and normalizes per-sample.
+
+        mask_tensor: expected shape (B,1,H,W) or (B,4,H,W) etc. If None returns ones.
+        noisy_latents_shape: shape tuple of noisy_latents.
+        """
+        B = noisy_latents_shape[0]
+        C = noisy_latents_shape[1]
+        if mask_tensor is None:
+            return torch.ones((B, 1, 1, 1), device=device, dtype=dtype)
+        mask_multiplier = mask_tensor.to(device, dtype=torch.float16).detach()
+        if len(noisy_latents_shape) == 5:
+            h = noisy_latents_shape[3]
+            w = noisy_latents_shape[4]
+        else:
+            h = noisy_latents_shape[2]
+            w = noisy_latents_shape[3]
+        mask_multiplier = torch.nn.functional.interpolate(mask_multiplier, size=(h, w))
+        mask_multiplier = mask_multiplier.expand(-1, C, -1, -1)
+        mask_multiplier = mask_multiplier.to(device, dtype=dtype).detach()
+        # apply mask_strength blending for [0.0, 1.0]
+        if 0.0 <= mask_strength <= 1.0 and mask_strength != 1.0:
+            mask_multiplier = mask_multiplier + (1.0 - mask_multiplier) * (1.0 - mask_strength)
+        # normalize per-sample to mean 1.0
+        dims = tuple(range(1, mask_multiplier.ndim))
+        mean = mask_multiplier.mean(dim=dims, keepdim=True)
+        mask_multiplier = mask_multiplier / mean.clamp_min(eps)
+        return mask_multiplier
+
+    @staticmethod
+    def compute_prior_mask_multiplier(prior_mask_multiplier, eps=1e-6):
+        """Normalize prior mask multiplier per-sample and return it.
+
+        prior_mask_multiplier: already computed (e.g., 1.0 - prior_mask)
+        """
+        if prior_mask_multiplier is None:
+            return None
+        dims = tuple(range(1, prior_mask_multiplier.ndim))
+        mean = prior_mask_multiplier.mean(dim=dims, keepdim=True)
+        return prior_mask_multiplier / mean.clamp_min(eps)
+
+    @staticmethod
+    def apply_turbo_channel_slice(mask_multiplier):
+        # Safely select turbo mask channel (fallback if channels < 4)
+        if mask_multiplier.shape[1] >= 4:
+            return mask_multiplier[:, 3:4, :, :]
+        else:
+            return mask_multiplier[:, :1, :, :]
+
 
     def before_model_load(self):
         pass
@@ -267,22 +317,30 @@ class SDTrainer(BaseSDTrainProcess):
         """
 
     def _is_dop_scheduled(self, for_encoding: bool = False) -> bool:
-        """Return True if a diff_output_preservation step is scheduled.
+        """Return True if a diff_output_preservation (DOP) step should run.
+
+        New behavior:
+        - `diff_output_preservation_after_steps` (default 0) defers the start of DOP until the
+          training step >= that value. This lets you only run DOP in the final stages.
+        - DOP itself runs on every step after the `after_steps` threshold (unless `diff_output_preservation`
+          is disabled).
 
         - for_encoding=True uses (total_batch_count + 1) to decide, which is useful when preparing
-          embeddings *before* the batch counter is incremented.
-        - for_encoding=False uses the current total batch counter (the usual sense during loss
-          calculation where the counter has been incremented).
+          embeddings *before* the batch counter is incremented. That means the encode pass will
+          prepare DOP embeds only when an upcoming training step will actually run DOP.
         """
         if not getattr(self.train_config, 'diff_output_preservation', False):
             return False
-        every = int(getattr(self.train_config, 'diff_output_preservation_every', 1))
-        if every < 1:
+        # Respect the 'start after' threshold
+        after_steps = int(getattr(self.train_config, 'diff_output_preservation_after_steps', 0))
+        if after_steps < 0:
             return False
         total = int(getattr(self, '_total_batch_count', 0))
         if for_encoding:
-            return ((total + 1) % every) == 0
-        return (total % every) == 0
+            # Prepare embeddings only if the upcoming step will have DOP enabled
+            return ((total + 1) >= after_steps)
+        # Runtime decision: run DOP if we've passed the threshold
+        return (total >= after_steps)
 
     def _maybe_move_embeds(self, embeds, device, dtype=None):
         """Safely move prompt embed-like objects to device/dtype.
@@ -1361,7 +1419,7 @@ class SDTrainer(BaseSDTrainProcess):
             loss = loss + (torch.nn.functional.mse_loss(pred.float(), prior_pred.float(), reduction="none") * -1.0)
 
         if self.train_config.train_turbo:
-            mask_multiplier = mask_multiplier[:, 3:, :, :]
+            mask_multiplier = SDTrainer.apply_turbo_channel_slice(mask_multiplier)
             # resize to the size of the loss
             mask_multiplier = torch.nn.functional.interpolate(mask_multiplier, size=(pred.shape[2], pred.shape[3]), mode='nearest')
 
@@ -1795,6 +1853,10 @@ class SDTrainer(BaseSDTrainProcess):
                 prior_pred_kwargs.pop('down_intrablock_additional_residuals', None)
                 prior_pred_kwargs.pop('down_block_additional_residuals', None)
                 prior_pred_kwargs.pop('mid_block_additional_residual', None)
+                # For Z-Image controlnet, remove control context entirely to avoid
+                # expensive preprocessing in predict_noise_zimage
+                prior_pred_kwargs.pop('control_context', None)
+                prior_pred_kwargs['control_context_scale'] = 0.0
 
             prior_pred = self.sd.predict_noise(
                 latents=noisy_latents.to(self.device_torch, dtype=dtype).detach(),
@@ -2227,37 +2289,13 @@ class SDTrainer(BaseSDTrainProcess):
                     if batch.clip_image_tensor is not None:
                         clip_images = batch.clip_image_tensor.to(self.device_torch, dtype=dtype).detach()
 
-            mask_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
-            if batch.mask_tensor is not None:
-                with self.timer('get_mask_multiplier'):
-                    # upsampling no supported for bfloat16
-                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=torch.float16).detach()
-                    # scale down to the size of the latents, mask multiplier shape(bs, 1, width, height), noisy_latents shape(bs, channels, width, height)
-                    if len(noisy_latents.shape) == 5:
-                        # video B,C,T,H,W
-                        h = noisy_latents.shape[3]
-                        w = noisy_latents.shape[4]
-                    else:
-                        h = noisy_latents.shape[2]
-                        w = noisy_latents.shape[3]
-                    mask_multiplier = torch.nn.functional.interpolate(
-                        mask_multiplier, size=(h, w)
-                    )
-                    # expand to match latents
-                    mask_multiplier = mask_multiplier.expand(-1, noisy_latents.shape[1], -1, -1)
-                    mask_multiplier = mask_multiplier.to(self.device_torch, dtype=dtype).detach()
-                    
-                    # Apply mask_strength blending (get from first file item's dataset config)
-                    if len(batch.file_items) > 0:
-                        mask_strength = float(getattr(batch.file_items[0].dataset_config, 'mask_strength', 1.0))
-                        if 0.0 < mask_strength < 1.0:
-                            # Blend: masked regions (1.0) get full weight, non-masked (0.0) get reduced weight
-                            # Formula: final = mask * 1.0 + (1-mask) * (1-strength)
-                            #        = mask + (1-mask) * (1-strength)
-                            mask_multiplier = mask_multiplier + (1.0 - mask_multiplier) * (1.0 - mask_strength)
-                    
-                    # make avg 1.0
-                    mask_multiplier = mask_multiplier / mask_multiplier.mean()
+            mask_multiplier = SDTrainer.compute_mask_multiplier(
+                getattr(batch, 'mask_tensor', None),
+                noisy_latents.shape,
+                device=self.device_torch,
+                dtype=dtype,
+                mask_strength=(float(getattr(batch.file_items[0].dataset_config, 'mask_strength', 1.0)) if len(batch.file_items) > 0 else 1.0),
+            )
 
         def get_adapter_multiplier():
             # Delegate to class-level helper which uses torch RNG for reproducibility
@@ -2497,7 +2535,9 @@ class SDTrainer(BaseSDTrainProcess):
                                 if not is_dop_scheduled_for_encode:
                                     # Skip preparing DOP embeddings for this batch to save compute
                                     self.diff_output_preservation_embeds = None
-                                    print_acc(f"[DOP] Skipping diff_output_preservation embedding prep this batch (every={getattr(self.train_config, 'diff_output_preservation_every', 1)})")
+                                    # Note: `diff_output_preservation_every` now controls the full-resolution scheduling; DOP embedding
+                                    # prep is gated by `diff_output_preservation_after_steps` (start threshold).
+                                    print_acc(f"[DOP] Skipping diff_output_preservation embedding prep this batch (run_after={getattr(self.train_config, 'diff_output_preservation_after_steps', 0)})")
                                 else:
                                     # If text embeddings are cached to disk, prefer loading per-file DOP embeds to avoid
                                     # re-encoding each training timestep. Otherwise fall back to encoding the DOP prompts.
@@ -2863,15 +2903,12 @@ class SDTrainer(BaseSDTrainProcess):
                                 target_w = max(patch_min, int(round(target_w / patch_min)) * patch_min)
                             return (target_h < H) or (target_w < W)
 
-                        skip_full_prior = False
-                        if preservation_resolution is not None and _would_downsample(preservation_resolution, noisy_latents):
-                            # ensure no other features require full-resolution prior
-                            if not getattr(self.train_config, 'do_prior_divergence', False) and not getattr(self.train_config, 'inverted_mask_prior', False) and not getattr(self.train_config, 'correct_pred_norm', False) and not do_reg_prior:
-                                skip_full_prior = True
+                        # Decide via helper whether we can skip the full-resolution prior.
+                        skip_full_prior = self._should_skip_full_prior(noisy_latents, preservation_resolution, do_reg_prior=do_reg_prior)
 
                         if skip_full_prior:
                             try:
-                                print_acc(f"[DOP] Skipping full-res prior for {preservation_kind} preservation; will run reduced prediction at {preservation_resolution}px area (sqrt={int(math.sqrt((preservation_resolution**2)))}px)")
+                                print_acc(f"[DOP] Skipping full-res prior for {preservation_kind} preservation; will run reduced prediction at {preservation_resolution}px area")
                             except Exception:
                                 pass
                             prior_pred = None
@@ -2931,7 +2968,9 @@ class SDTrainer(BaseSDTrainProcess):
                         control_context = control_context.to(self.device_torch, dtype=dtype)
 
                         # Get per-dataset control strength, fallback to global setting
-                        control_scale = getattr(self.sd, 'controlnet_guidance_scale', 1.0)
+                        # Default 0.35 (35%) - Z-Image controlnets are often overfitted (docs recommend 65% for inference)
+                        # For training, even lower is better to avoid the controlnet dominating the learning signal
+                        control_scale = getattr(self.sd, 'controlnet_guidance_scale', 0.35)
                         try:
                             # Check if batch has dataset_config with per-dataset control strength
                             if hasattr(batch, 'file_items') and len(batch.file_items) > 0:
@@ -3165,7 +3204,8 @@ class SDTrainer(BaseSDTrainProcess):
                             noise = noise.to(self.device_torch, dtype=dtype).detach()
                             prior_to_calculate_loss = prior_pred
                             # Determine whether preservation will run for this batch. For diff_output_preservation
-                            # this is gated by `diff_output_preservation_every` and uses the current batch counter.
+                            # DOP runtime gating: DOP will run only once `diff_output_preservation_after_steps` is reached.
+                            # (The `diff_output_preservation_every` flag now controls forced full-resolution scheduling separately.)
                             do_dop_this_step = self._is_dop_scheduled(for_encoding=False)
                             doing_preservation = do_dop_this_step or self.train_config.blank_prompt_preservation
                             if doing_preservation and not do_inverted_masked_prior:
@@ -3219,9 +3259,9 @@ class SDTrainer(BaseSDTrainProcess):
                             if self.diff_output_preservation_embeds is None:
                                 raise RuntimeError(
                                     "Scheduled diff_output_preservation step but embeds are not prepared. "
-                                    "Ensure 'diff_output_preservation_every' and precompute settings are correct. "
+                                    "Ensure DOP precompute & start-step (diff_output_preservation_after_steps) are configured correctly. "
                                     f"Current batch count: {getattr(self, '_total_batch_count', 0)}, "
-                                    f"DOP every: {getattr(self.train_config, 'diff_output_preservation_every', 1)}"
+                                    f"DOP run_after: {getattr(self.train_config, 'diff_output_preservation_after_steps', 0)}"
                                 )
                             preservation_embeds = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
                             # record execution count for diagnostics
@@ -3375,7 +3415,10 @@ class SDTrainer(BaseSDTrainProcess):
             local_pred_kwargs.pop('down_intrablock_additional_residuals', None)
             local_pred_kwargs.pop('down_block_additional_residuals', None)
             local_pred_kwargs.pop('mid_block_additional_residual', None)
-            # For Z-Image controlnet (unified model), disable by setting scale=0
+            # For Z-Image controlnet (unified model), remove control context entirely.
+            # Setting scale=0 is not enough - we also need to remove the tensor to avoid
+            # expensive preprocessing in predict_noise_zimage (unsqueeze, unbind, etc.)
+            local_pred_kwargs.pop('control_context', None)
             local_pred_kwargs['control_context_scale'] = 0.0
 
         # CRITICAL: LoKr networks are incompatible with downsampled DOP due to their scale-sensitive
@@ -3649,6 +3692,16 @@ class SDTrainer(BaseSDTrainProcess):
         # will downsample if either target dimension strictly less than current
         will_downsample = (target_h < H) or (target_w < W)
         if not will_downsample:
+            return False
+        # If user configured a "full resolution every N steps" schedule, do not skip the
+        # full-resolution prior prediction on those scheduled steps. Avoid scheduling step 0
+        # as a forced full-res run (i.e., require total > 0).
+        try:
+            full_every = int(getattr(self.train_config, 'diff_output_preservation_every', 10))
+        except Exception:
+            full_every = 10
+        total = int(getattr(self, '_total_batch_count', 0))
+        if full_every >= 1 and total > 0 and (total % full_every) == 0:
             return False
         # check feature flags that require full-res prior
         if getattr(self.train_config, 'do_prior_divergence', False):

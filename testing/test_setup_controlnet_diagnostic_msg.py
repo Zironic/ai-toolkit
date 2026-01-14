@@ -1,8 +1,5 @@
 import pytest
-try:
-    import torch
-except Exception:
-    pytest.skip("Skipping: PyTorch import failed in this environment", allow_module_level=True)
+pytest.importorskip("torch")
 
 from types import SimpleNamespace
 from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess

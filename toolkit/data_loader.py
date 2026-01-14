@@ -435,7 +435,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 file_list = list(self.caption_dict.keys())
                 
         # remove items in the _controls_ and masks folders (exclude from dataset scanning)
-        excluded_folders = ["_controls", "masks", "_masks"]
+        excluded_folders = ["_controls", "masks"]
         file_list = [x for x in file_list if os.path.basename(os.path.dirname(x)) not in excluded_folders]
 
         if self.dataset_config.num_repeats > 1:

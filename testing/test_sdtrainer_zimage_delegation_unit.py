@@ -6,9 +6,16 @@ import pytest
 # Ensure project root is on sys.path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Prevent heavy torch import at collection time by stubbing a minimal module when needed
+# Prevent heavy torch import at collection time by stubbing a minimal module only if importing real torch fails
 import types as _types
-if 'torch' not in sys.modules:
+try:
+    import importlib
+    importlib.import_module('torch')
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
+
+if not TORCH_AVAILABLE:
     fake_torch = _types.ModuleType('torch')
     fake_torch.Tensor = object
     fake_torch.is_tensor = lambda x: hasattr(x, '__class__')

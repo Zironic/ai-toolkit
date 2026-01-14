@@ -1,5 +1,7 @@
 # Training Job Lifecycle — Master Guide ✅
 
+**Agents & automated tooling:** consult the canonical skill first: `.claude/skills/training-lifecycle/SKILL.md` — the skill is the PRIMARY INDEX and maps documentation to exact code locations you should inspect before performing broad searches or edits. When running searches, prefer using a subagent (e.g., Raptor Mini) to execute targeted queries and return compact `file:line` results so you avoid loading unrelated files into the agent context.
+
 This document links the chaptered guides that explain the full lifespan of a training job in this repo — from UI creation through DB, scheduling, pipeline setup, training, checkpointing and troubleshooting.
 
 Chapters
@@ -45,5 +47,16 @@ Verification checklist (quick start tests & checks)
 How to extend this guide
 - Add more chapter sections if you add new job types, new adapter formats, or new storage backends (e.g., S3/HF dataset staging).
 - Add integration tests under `testing/` for the concurrency/edge cases noted here.
+
+## Search hints (if broad searches are necessary)
+
+If you must run broad searches, prefer symbol-focused queries and limit the directory scope to minimize noise. Examples:
+
+- `rg "preservation_loss|_compute_and_apply_preservation_loss" extensions_built_in -n`
+- `rg "apply_lora|assistant_lora_path|LoRA" toolkit extensions_built_in ui -n`
+- `rg "run.py|JobLoader|load_job_from_config" -n run.py jobs toolkit`
+- Use `rg -g '!ui/**'` or `rg -g '!tests/**'` to exclude noisy directories when appropriate.
+
+Also consult `.claude/skills/training-lifecycle/references/CODE_MAP.md` first — it is a curated mapping that often yields the correct file without a broad search.
 
 If you want, I can: generate a combined manifest of all files consulted and a summarized 'uncertainties & TODO' list for maintainers, or scaffold the recommended tests and submit them as a PR. Which do you prefer?

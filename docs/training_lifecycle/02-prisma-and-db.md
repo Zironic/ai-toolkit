@@ -14,6 +14,11 @@ Exact files & symbols referenced
 - Scripts and tooling:
   - `scripts/prisma/push.sh` or `package.json` scripts referencing `npx prisma db push` or `prisma generate`.
 
+## Search hints
+- `rg "model Job|P2002|queue_position" prisma -n`
+- `rg "create\(|update\(|prisma\.job" -n ui server`
+- Start with DB schema (`ui/prisma/schema.prisma`) and then search server handlers in `ui/src/server/`.
+
 Schema highlights
 - The `Job` model includes:
   - `id` (PK), `name` (unique), `job_config` (JSON), `status` (string), `queue_position` (int), `created_at`, `updated_at`.

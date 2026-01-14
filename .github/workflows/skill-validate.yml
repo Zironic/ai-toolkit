@@ -1,0 +1,25 @@
+name: Validate skill
+
+on:
+  push:
+    paths:
+      - 'skills/**/SKILL.md'
+      - '.claude/skills/**/SKILL.md'
+  pull_request:
+    paths:
+      - 'skills/**/SKILL.md'
+      - '.claude/skills/**/SKILL.md'
+
+jobs:
+  validate-skill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run skill validator
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 .claude/skills/training-lifecycle/scripts/validate_skill.py .claude/skills/training-lifecycle
+      - name: Run skill tests
+        run: |
+          python3 -m pip install --upgrade pip pytest
+          python3 -m pytest testing -q

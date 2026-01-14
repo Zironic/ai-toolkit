@@ -10,6 +10,11 @@ Files & symbols referenced
 - `run.py` — Python entrypoint invoked by spawned processes
 - `extensions_built_in/sd_trainer/SDTrainer.py` — trainer extension paths invoked by `run.py` (job-specific classes)
 
+## Search hints
+- `rg "spawnJobProcess|spawn_worker|cron" -n ui/ workers/ scripts/`
+- `rg "queue_position|return_to_queue|status='queued'" -n`
+- Prefer scanning `ui/src/server/cron.ts`, `scripts/` and `workers/` before a broad repo search.
+
 Runtime flow (detailed)
 1. User action or API call triggers `POST /api/jobs/{id}/start`:
    - Handler computes `queue_position = (max existing) + 1000`, sets `status = 'queued'`, and writes DB via Prisma. (See `route.ts` start handler.)

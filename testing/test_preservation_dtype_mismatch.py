@@ -36,7 +36,8 @@ def test_preservation_loss_with_dtype_mismatch(monkeypatch):
     trainer = SDTrainer(0, job, cfg)
 
     trainer.train_config.diff_output_preservation = True
-    trainer.train_config.diff_output_preservation_every = 1
+    trainer.train_config.diff_output_preservation_after_steps = 0
+    trainer.train_config.diff_output_preservation_every = 1  # remains as full-res scheduling value
 
     # set prepared preservation embeds
     trainer.diff_output_preservation_embeds = DummyEmbeds(torch.zeros((1,4)))

@@ -1976,6 +1976,21 @@ class StableDiffusion:
             zcs = kwargs.pop('zimage_conditioning_scale', 1.0)
             return self._predict_noise_zimage(latents, text_embeddings, timestep, zimage_controlnet=zcn, zimage_control_images=zci, zimage_conditioning_scale=zcs, **kwargs)
 
+        # NEW: Route to Z-Image when model is a controlnet model and control_context is provided
+        # This is the new unified architecture where the transformer IS the controlnet
+        if getattr(self, 'is_controlnet_model', False) and 'control_context' in kwargs:
+            # Translate control_context -> zimage_control_context for predict_noise_zimage
+            zimage_control_context = kwargs.pop('control_context')
+            zimage_conditioning_scale = kwargs.pop('control_context_scale', 1.0)
+            return self._predict_noise_zimage(
+                latents, text_embeddings, timestep,
+                zimage_controlnet=None,  # Will use sd.transformer internally
+                zimage_control_images=None,  # Already encoded
+                zimage_conditioning_scale=zimage_conditioning_scale,
+                zimage_control_context=zimage_control_context,
+                **kwargs
+            )
+
         def scale_model_input(model_input, timestep_tensor):
             if is_input_scaled:
                 return model_input

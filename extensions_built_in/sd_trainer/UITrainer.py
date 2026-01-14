@@ -190,7 +190,8 @@ class UITrainer(SDTrainer):
             if self.should_save_before_stop():
                 self._run_async_operation(
                     self._update_status("running", "Saving before stop..."))
-                self.save()
+                # Force save without re-checking stop to avoid recursion
+                self.save(self.step_num, force=True)
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
             self.is_stopping = True
@@ -349,8 +350,9 @@ class UITrainer(SDTrainer):
         self.maybe_stop()
         self.update_status("running", "Training")
 
-    def save(self, step=None):
-        self.maybe_stop()
+    def save(self, step=None, force=False):
+        if not force:
+            self.maybe_stop()
         self.update_status("running", "Saving model")
         super().save(step)
         self.maybe_stop()

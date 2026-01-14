@@ -764,14 +764,23 @@ export default function SimpleJob({
                           placeholder="eg. woman"
                         />
                         <NumberInput
-                          label="DOP Every N steps"
+                          label="Full resolution every N steps"
                           className="pt-2 pb-4"
                           value={
-                            (jobConfig.config.process[0].train.diff_output_preservation_every as number) || 1
+                            (jobConfig.config.process[0].train.diff_output_preservation_every as number) || 10
                           }
                           onChange={value => setJobConfig(value, 'config.process[0].train.diff_output_preservation_every')}
-                          placeholder="eg. 1"
+                          placeholder="eg. 10"
                           min={1}
+                        />
+
+                        <NumberInput
+                          label="Run DOP after N steps"
+                          className="pt-2 pb-4"
+                          value={(jobConfig.config.process[0].train.diff_output_preservation_after_steps as number) ?? 0}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.diff_output_preservation_after_steps')}
+                          placeholder="eg. 0"
+                          min={0}
                         />
                         <SelectInput
                           label="DOP Resolution"
@@ -977,20 +986,7 @@ export default function SimpleJob({
                           />
                         </>
                       )}
-                      {(jobConfig.config.process[0].model.controlnet_enabled && (dataset.control_path || dataset.control_path_1 || dataset.control_path_2 || dataset.control_path_3)) && (
-                        <NumberInput
-                          label="Control Strength"
-                          docKey="datasets.control_conditioning_scale"
-                          value={dataset.control_conditioning_scale ?? 1.0}
-                          className="pt-2"
-                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].control_conditioning_scale`)}
-                          placeholder="eg. 1.0"
-                          min={0.0}
-                          max={1.0}
-                          step={0.1}
-                          tooltip="Strength of control signal for this dataset (0.0 = disabled, 1.0 = full strength)"
-                        />
-                      )}
+
                       <NumberInput
                         label="LoRA Weight"
                         value={dataset.network_weight}
@@ -1048,6 +1044,20 @@ export default function SimpleJob({
                               }}
                             />
                           ))}
+
+                          {/* Show Control Strength alongside the control options */}
+                          <NumberInput
+                            label="Control Strength"
+                            docKey="datasets.control_conditioning_scale"
+                            value={dataset.control_conditioning_scale ?? 0.35}
+                            className="pt-2"
+                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].control_conditioning_scale`)}
+                            placeholder="eg. 0.35"
+                            min={0.0}
+                            max={1.0}
+                            step={0.05}
+                            tooltip="Strength of control signal for this dataset (0.0 = disabled, 1.0 = full strength). Default 0.35"
+                          />
                         </FormGroup>
                       )}
                       {modelArch?.additionalSections?.includes('datasets.num_frames') && (

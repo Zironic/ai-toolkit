@@ -63,6 +63,7 @@ A concise index of common helpers and where to find them. Check here first befor
   - `docs/training_lifecycle/07-training-loop.md` — Training loop, optimizer, mixed precision, EMA
   - `docs/training_lifecycle/08-checkpoints.md` — Checkpoint saving, metadata, push-to-hub
   - `docs/training_lifecycle/09-repro-troubleshoot.md` — Repro, troubleshooting, and best practices
+  - `/.claude/skills/training-lifecycle` — Packaged skill: quick checklists, step-by-step guidance, and helper scripts (`.claude/skills/training-lifecycle/SKILL.md`).
   
   (Agents: read the master first, then the chapter(s) relevant to your task.)
 - **Keep changes small & testable**; add a focused unit test and a short eval smoke run before larger refactors.

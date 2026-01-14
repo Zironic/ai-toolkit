@@ -8,7 +8,11 @@ TL;DR
 ## Files & Symbols Referenced 🔧
 - `extensions_built_in/sd_trainer/SDTrainer.py`
   - `SDTrainer::hook_before_train_loop()` — init canvas & embedding caching, control net checks (lines ~450-500)
-  - `SDTrainer::train_single_accumulation()` — per-accumulation-step forward, loss, backward (lines ~2420-3040)
+
+## Search hints
+- `rg "preservation_loss|_compute_and_apply_preservation_loss" -n extensions_built_in`
+- `rg "train_single_accumulation|hook_train_loop|accelerator.backward" -n extensions_built_in jobs`
+- Limit searches to `extensions_built_in/`, `jobs/process/`, and `toolkit/` for precise results.  - `SDTrainer::train_single_accumulation()` — per-accumulation-step forward, loss, backward (lines ~2420-3040)
   - `SDTrainer::hook_train_loop()` — collects batch(es), handles optimizer step, clipping, EMA update, scheduler step (lines ~4360-4670)
   - `self.accelerator.backward(loss)` usages (backward via Accelerator) — see occurrences around lines ~1524, ~4040, ~4296
   - Timers around critical stages: `with self.timer('...')` (many places; examples: `step_total_python` at ~2444, `predict_unet` ~3951, `after_unet_predict` ~2309)

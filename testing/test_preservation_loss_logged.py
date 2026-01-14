@@ -34,7 +34,8 @@ def test_preservation_loss_recorded_and_logged(monkeypatch):
 
     # enable DOP and prepare embeddings
     trainer.train_config.diff_output_preservation = True
-    trainer.train_config.diff_output_preservation_every = 1
+    trainer.train_config.diff_output_preservation_after_steps = 0
+    trainer.train_config.diff_output_preservation_every = 1  # remains as full-res scheduling value (not DOP frequency)
 
     # set minimal tensors
     prior_pred = torch.zeros((1, 4))

@@ -949,30 +949,8 @@ class ImageProcessingDTOMixin:
                                 control_img = None
                             if control_img is None:
                                 continue
-                            # resize if requested
-                            # Use dataset resolution as default when control_size is not explicitly set so
-                            # control images match per-dataset bucket targets instead of a fixed 512.
-                            control_size = getattr(self.dataset_config, 'control_size', None) or self.dataset_config.resolution
-                            if not self.full_size_control_images:
-                                # Resize using dataloader bucket logic (area-based): scale preserving aspect so that
-                                # final image exactly matches the bucket dimensions computed for `control_size`.
-                                from toolkit.buckets import get_bucket_for_image_size
-                                w, h = control_img.size
-                                bucket = get_bucket_for_image_size(w, h, resolution=control_size)
-                                target_w, target_h = bucket['width'], bucket['height']
-                                # scale preserving aspect so both dimensions >= target dims
-                                scale = max(target_w / w, target_h / h) if w > 0 and h > 0 else 1.0
-                                new_w = max(1, int(round(w * scale)))
-                                new_h = max(1, int(round(h * scale)))
-                                control_img = control_img.resize((new_w, new_h), Image.BICUBIC)
-                                # center-crop to exact bucket dims
-                                left = (new_w - target_w) // 2
-                                top = (new_h - target_h) // 2
-                                control_img = control_img.crop((left, top, left + target_w, top + target_h))
-                                try:
-                                    print_acc(f"[CONTROL] generated control (original={w}x{h}) -> resized={new_w}x{new_h} -> target={target_w}x{target_h}")
-                                except Exception:
-                                    pass
+                            # On-the-fly generated controls are derived from the already-bucketed source image,
+                            # so they are already at the correct size - no re-bucketing needed.
                             # convert to tensor, applying spatial replay transforms if present
                             transform_fn = transforms.Compose([transforms.ToTensor()])
                             if self.aug_replay_spatial_transforms:
@@ -1182,29 +1160,7 @@ class ControlFileItemDTOMixin:
                 print_acc(f"Error: {e}")
                 print_acc(f"Error loading image: {control_path}")
             
-            if not self.full_size_control_images:
-                # Resize using dataloader bucket logic (area-based): scale preserving aspect so that
-                # final image exactly matches the bucket dimensions computed for `control_size`.
-                from toolkit.buckets import get_bucket_for_image_size
-                # default control_size to the dataset resolution when not explicitly provided
-                control_size = getattr(self.dataset_config, 'control_size', None) or getattr(self.dataset_config, 'resolution', None) or 256
-                w, h = img.size
-                bucket = get_bucket_for_image_size(w, h, resolution=control_size)
-                target_w, target_h = bucket['width'], bucket['height']
-                scale = max(target_w / w, target_h / h) if w > 0 and h > 0 else 1.0
-                new_w = max(1, int(round(w * scale)))
-                new_h = max(1, int(round(h * scale)))
-                img = img.resize((new_w, new_h), Image.BICUBIC)
-                # center-crop to exact bucket dims
-                left = (new_w - target_w) // 2
-                top = (new_h - target_h) // 2
-                img = img.crop((left, top, left + target_w, top + target_h))
-                try:
-                    print_acc(f"[CONTROL] loaded control from {Path(control_path).name} (original={w}x{h}) -> resized={new_w}x{new_h} -> target={target_w}x{target_h}")
-                except Exception:
-                    pass
-
-            elif not self.use_raw_control_images:
+            if not self.use_raw_control_images:
                 w, h = img.size
                 if self.flip_x:
                     # do a flip
@@ -1225,7 +1181,7 @@ class ControlFileItemDTOMixin:
                         self.crop_y + self.crop_height
                     ))
                     try:
-                        print_acc(f"[CONTROL] loaded control from {Path(control_path).name}: scaled=({self.scale_to_width}x{self.scale_to_height}) crop=({self.crop_width}x{self.crop_height}) final=({self.crop_height}x{self.crop_width})")
+                        print_acc(f"[CONTROL] loaded control from {Path(control_path).name}: scaled=({self.scale_to_width}x{self.scale_to_height}) crop=({self.crop_width}x{self.crop_height}) final=({self.crop_width}x{self.crop_height})")
                     except Exception:
                         pass
                 else:

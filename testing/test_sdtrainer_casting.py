@@ -1,9 +1,5 @@
 import pytest
-try:
-    import torch
-except Exception:
-    pytest.skip("torch import failed in this environment", allow_module_level=True)
-
+pytest.importorskip("torch")
 from toolkit.device_utils import _cast_and_move, _maybe_log_cast
 
 

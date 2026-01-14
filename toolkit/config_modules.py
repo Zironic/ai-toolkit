@@ -516,10 +516,16 @@ class TrainConfig:
         self.diff_output_preservation_multiplier = kwargs.get('diff_output_preservation_multiplier', 1.0)
         # If the trigger word is in the prompt, we will use this class name to replace it eg. "sks woman" -> "woman"
         self.diff_output_preservation_class = kwargs.get('diff_output_preservation_class', '')
-        # Run differential output preservation only every N steps. Set to 1 to run every step.
-        self.diff_output_preservation_every = int(kwargs.get('diff_output_preservation_every', 1))
+        # Run full-resolution preservation only every N steps. Default 10 to run full-res periodically.
+        # NOTE: this setting now controls when a full-resolution prior is forced (bypasses reduced-resolution
+        # preservation). To defer when DOP itself runs, use `diff_output_preservation_after_steps`.
+        self.diff_output_preservation_every = int(kwargs.get('diff_output_preservation_every', 10))
         if self.diff_output_preservation_every < 1:
             raise ValueError('diff_output_preservation_every must be >= 1')
+        # Defer running DOP until the given training step. 0 = start immediately.
+        self.diff_output_preservation_after_steps = int(kwargs.get('diff_output_preservation_after_steps', 0))
+        if self.diff_output_preservation_after_steps < 0:
+            raise ValueError('diff_output_preservation_after_steps must be >= 0')
         # Debug: when true, print before/after DOP caption mappings during precompute/runtime steps
         self.diff_output_preservation_debug = kwargs.get('diff_output_preservation_debug', False)
         
@@ -999,7 +1005,8 @@ class DatasetConfig:
         # color for transparent reigon of control images with transparency
         self.control_transparent_color: List[int] = kwargs.get('control_transparent_color', [0, 0, 0])
         # per-dataset control strength (0.0 = disabled, 1.0 = full strength)
-        self.control_conditioning_scale: float = float(kwargs.get('control_conditioning_scale', 1.0))
+        # Default to 0.35 (35%) as a conservative training default to avoid control dominating the signal.
+        self.control_conditioning_scale: float = float(kwargs.get('control_conditioning_scale', 0.35))
         # inpaint images should be webp/png images with alpha channel. The alpha 0 (invisible) section will
         # be the part conditioned to be inpainted. The alpha 1 (visible) section will be the part that is ignored
         self.inpaint_path: Union[str,List[str]] = kwargs.get('inpaint_path', None)

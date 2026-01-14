@@ -83,7 +83,8 @@ class BaseZImageTransformerBlock(ZImageTransformerBlock):
 
     def forward(self, hidden_states, hints=None, context_scale=1.0, **kwargs):
         hidden_states = super().forward(hidden_states, **kwargs)
-        if self.block_id is not None:
+        # Only apply hints if both block_id and hints are available
+        if self.block_id is not None and hints is not None:
             hidden_states = hidden_states + hints[self.block_id] * context_scale
         return hidden_states
     
@@ -180,6 +181,10 @@ class ZImageControlTransformer2DModel(ZImageTransformer2DModel):
         self.control_all_x_embedder = nn.ModuleDict(all_x_embedder)
         self.add_control_noise_refiner = add_control_noise_refiner
         self.add_control_noise_refiner_correctly = add_control_noise_refiner_correctly
+
+        # Sequence parallelism attributes - default to single GPU (no parallelism)
+        self.sp_world_size = 1
+        self.sp_world_rank = 0
         if self.add_control_noise_refiner:
             del self.noise_refiner
             self.noise_refiner = nn.ModuleList(
@@ -484,24 +489,52 @@ class ZImageControlTransformer2DModel(ZImageTransformer2DModel):
         for i, seq_len in enumerate(x_item_seqlens):
             x_attn_mask[i, :seq_len] = 1
 
-        if self.add_control_noise_refiner:
+        # When control_context is None, skip control paths entirely (behave like base transformer)
+        # This allows the control transformer to be used for sampling without control images
+        use_control = control_context is not None and control_context_scale > 0.0
+
+        # Track control usage for diagnostics - only during training (grad enabled)
+        if torch.is_grad_enabled():
+            if not hasattr(self, '_control_call_stats'):
+                self._control_call_stats = {'with_control': 0, 'without_control': 0, 'last_logged': 0}
+            if use_control:
+                self._control_call_stats['with_control'] += 1
+            else:
+                self._control_call_stats['without_control'] += 1
+            # Log every 100 calls during training
+            total_calls = self._control_call_stats['with_control'] + self._control_call_stats['without_control']
+            if total_calls - self._control_call_stats['last_logged'] >= 100:
+                self._control_call_stats['last_logged'] = total_calls
+                try:
+                    from toolkit.print import print_acc
+                    wc = self._control_call_stats['with_control']
+                    woc = self._control_call_stats['without_control']
+                    print_acc(f"[CONTROL-STATS] Transformer forward calls - with_control: {wc}, without_control: {woc}")
+                except Exception:
+                    pass
+
+        if self.add_control_noise_refiner and use_control:
             kwargs = dict(
                 attn_mask=x_attn_mask,
-                freqs_cis=x_freqs_cis, 
+                freqs_cis=x_freqs_cis,
                 adaln_input=adaln_input,
             )
             refiner_hints, control_context, control_context_item_seqlens = self.forward_control_2_0_refiner(
                 x, cap_feats, control_context, kwargs, t=t, patch_size=patch_size, f_patch_size=f_patch_size,
             )
+        else:
+            refiner_hints = None
+            control_context_item_seqlens = None
 
         for layer in self.noise_refiner:
             # Arguments
             kwargs = dict(
                 attn_mask=x_attn_mask,
-                freqs_cis=x_freqs_cis, 
+                freqs_cis=x_freqs_cis,
                 adaln_input=adaln_input,
             )
-            if self.add_control_noise_refiner:
+            # Only pass hints if control is active and we have refiner hints
+            if self.add_control_noise_refiner and use_control and refiner_hints is not None:
                 kwargs["hints"] = refiner_hints
                 kwargs["context_scale"] = control_context_scale
 
@@ -592,27 +625,33 @@ class ZImageControlTransformer2DModel(ZImageTransformer2DModel):
         # Arguments
         kwargs = dict(
             attn_mask=unified_attn_mask,
-            freqs_cis=unified_freqs_cis, 
+            freqs_cis=unified_freqs_cis,
             adaln_input=adaln_input,
         )
-        if self.add_control_noise_refiner:
-            hints = self.forward_control_2_0_layers(
-                unified, cap_feats, control_context, control_context_item_seqlens, kwargs, 
-            )
-        else:
-            hints = self.forward_control_1_0(
-                unified, cap_feats, control_context, kwargs, t=t, patch_size=patch_size, f_patch_size=f_patch_size,
-            )
+
+        # Only compute control hints if control is active
+        hints = None
+        if use_control:
+            if self.add_control_noise_refiner:
+                hints = self.forward_control_2_0_layers(
+                    unified, cap_feats, control_context, control_context_item_seqlens, kwargs,
+                )
+            else:
+                hints = self.forward_control_1_0(
+                    unified, cap_feats, control_context, kwargs, t=t, patch_size=patch_size, f_patch_size=f_patch_size,
+                )
 
         for layer in self.layers:
             # Arguments
             kwargs = dict(
                 attn_mask=unified_attn_mask,
-                freqs_cis=unified_freqs_cis, 
+                freqs_cis=unified_freqs_cis,
                 adaln_input=adaln_input,
-                hints=hints,
-                context_scale=control_context_scale
             )
+            # Only pass hints if control is active
+            if use_control and hints is not None:
+                kwargs['hints'] = hints
+                kwargs['context_scale'] = control_context_scale
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 def create_custom_forward(module, **static_kwargs):
                     def custom_forward(*inputs):

@@ -19,7 +19,8 @@ class DummyTrainer(SDTrainer):
         self.train_config.diff_output_preservation = True
         self.train_config.blank_prompt_preservation = False
         self.train_config.diff_output_preservation_class = 'cat'
-        self.train_config.diff_output_preservation_every = 1
+        self.train_config.diff_output_preservation_after_steps = 0
+        self.train_config.diff_output_preservation_every = 1  # compatibility: full-res schedule
         self.train_config.diff_output_preservation_resolution = None
 
 
