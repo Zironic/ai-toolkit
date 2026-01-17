@@ -2,8 +2,24 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) Alibaba, Inc. and its affiliates.
 
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from diffusers.configuration_utils import register_to_config
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.utils import (USE_PEFT_BACKEND, is_torch_version,
+                             scale_lora_layers, unscale_lora_layers)
+import glob
+import inspect
+import json
+import os
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,18 +27,15 @@ from torch.nn.utils.rnn import pad_sequence
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
-from diffusers.models.attention_processor import Attention, AttentionProcessor
+from diffusers.models.attention_processor import Attention
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import RMSNorm
-from diffusers.models.transformers.transformer_z_image import (
-    ZImageTransformer2DModel,
-    ZImageTransformerBlock,
-    FinalLayer
-)
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.utils.torch_utils import maybe_allow_in_graph
+from diffusers.models.attention_processor import Attention, AttentionProcessor
 from diffusers.utils import (USE_PEFT_BACKEND, is_torch_version, logging,
                              scale_lora_layers, unscale_lora_layers)
-from diffusers.utils.torch_utils import maybe_allow_in_graph
+from .videox_z_image_transformer2d import (ZImageTransformer2DModel, FinalLayer,
+                                      ZImageTransformerBlock)
 
 
 ADALN_EMBED_DIM = 256
@@ -83,8 +96,7 @@ class BaseZImageTransformerBlock(ZImageTransformerBlock):
 
     def forward(self, hidden_states, hints=None, context_scale=1.0, **kwargs):
         hidden_states = super().forward(hidden_states, **kwargs)
-        # Only apply hints if both block_id and hints are available
-        if self.block_id is not None and hints is not None:
+        if self.block_id is not None:
             hidden_states = hidden_states + hints[self.block_id] * context_scale
         return hidden_states
     
@@ -181,10 +193,6 @@ class ZImageControlTransformer2DModel(ZImageTransformer2DModel):
         self.control_all_x_embedder = nn.ModuleDict(all_x_embedder)
         self.add_control_noise_refiner = add_control_noise_refiner
         self.add_control_noise_refiner_correctly = add_control_noise_refiner_correctly
-
-        # Sequence parallelism attributes - default to single GPU (no parallelism)
-        self.sp_world_size = 1
-        self.sp_world_rank = 0
         if self.add_control_noise_refiner:
             del self.noise_refiner
             self.noise_refiner = nn.ModuleList(
@@ -446,11 +454,36 @@ class ZImageControlTransformer2DModel(ZImageTransformer2DModel):
         x: List[torch.Tensor],
         t,
         cap_feats: List[torch.Tensor],
+        control_context=None,  # 4th positional arg - matches pipeline's control_image
+        conditioning_scale=None,  # Diffusers pipeline compatibility
         patch_size=2,
         f_patch_size=1,
-        control_context=None,
         control_context_scale=1.0,
+        **kwargs,  # Catch any other unexpected args from pipeline
     ):
+        # Diffusers uses 'conditioning_scale', VideoX uses 'control_context_scale'
+        if conditioning_scale is not None:
+            control_context_scale = conditioning_scale
+
+        # Convert tensors to scalars if needed (diffusers may pass tensors)
+        import torch
+        if isinstance(patch_size, torch.Tensor):
+            if patch_size.numel() == 1:
+                patch_size = patch_size.item()
+            else:
+                # Multi-element tensor passed as patch_size - this shouldn't happen
+                # Check if it's actually something else passed incorrectly
+                print(f"WARNING: patch_size is a tensor with {patch_size.numel()} elements, shape {patch_size.shape}")
+                print(f"WARNING: This is likely a bug - using default patch_size=2")
+                patch_size = 2
+        if isinstance(f_patch_size, torch.Tensor):
+            if f_patch_size.numel() == 1:
+                f_patch_size = f_patch_size.item()
+            else:
+                print(f"WARNING: f_patch_size is a tensor with {f_patch_size.numel()} elements, shape {f_patch_size.shape}")
+                print(f"WARNING: This is likely a bug - using default f_patch_size=1")
+                f_patch_size = 1
+
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
@@ -489,52 +522,24 @@ class ZImageControlTransformer2DModel(ZImageTransformer2DModel):
         for i, seq_len in enumerate(x_item_seqlens):
             x_attn_mask[i, :seq_len] = 1
 
-        # When control_context is None, skip control paths entirely (behave like base transformer)
-        # This allows the control transformer to be used for sampling without control images
-        use_control = control_context is not None and control_context_scale > 0.0
-
-        # Track control usage for diagnostics - only during training (grad enabled)
-        if torch.is_grad_enabled():
-            if not hasattr(self, '_control_call_stats'):
-                self._control_call_stats = {'with_control': 0, 'without_control': 0, 'last_logged': 0}
-            if use_control:
-                self._control_call_stats['with_control'] += 1
-            else:
-                self._control_call_stats['without_control'] += 1
-            # Log every 100 calls during training
-            total_calls = self._control_call_stats['with_control'] + self._control_call_stats['without_control']
-            if total_calls - self._control_call_stats['last_logged'] >= 100:
-                self._control_call_stats['last_logged'] = total_calls
-                try:
-                    from toolkit.print import print_acc
-                    wc = self._control_call_stats['with_control']
-                    woc = self._control_call_stats['without_control']
-                    print_acc(f"[CONTROL-STATS] Transformer forward calls - with_control: {wc}, without_control: {woc}")
-                except Exception:
-                    pass
-
-        if self.add_control_noise_refiner and use_control:
+        if self.add_control_noise_refiner:
             kwargs = dict(
                 attn_mask=x_attn_mask,
-                freqs_cis=x_freqs_cis,
+                freqs_cis=x_freqs_cis, 
                 adaln_input=adaln_input,
             )
             refiner_hints, control_context, control_context_item_seqlens = self.forward_control_2_0_refiner(
                 x, cap_feats, control_context, kwargs, t=t, patch_size=patch_size, f_patch_size=f_patch_size,
             )
-        else:
-            refiner_hints = None
-            control_context_item_seqlens = None
 
         for layer in self.noise_refiner:
             # Arguments
             kwargs = dict(
                 attn_mask=x_attn_mask,
-                freqs_cis=x_freqs_cis,
+                freqs_cis=x_freqs_cis, 
                 adaln_input=adaln_input,
             )
-            # Only pass hints if control is active and we have refiner hints
-            if self.add_control_noise_refiner and use_control and refiner_hints is not None:
+            if self.add_control_noise_refiner:
                 kwargs["hints"] = refiner_hints
                 kwargs["context_scale"] = control_context_scale
 
@@ -625,42 +630,27 @@ class ZImageControlTransformer2DModel(ZImageTransformer2DModel):
         # Arguments
         kwargs = dict(
             attn_mask=unified_attn_mask,
-            freqs_cis=unified_freqs_cis,
+            freqs_cis=unified_freqs_cis, 
             adaln_input=adaln_input,
         )
-
-        # Only compute control hints if control is active
-        hints = None
-        if use_control:
-            print(f"[CONTROL-FORWARD] use_control=True, control_context_scale={control_context_scale}, add_control_noise_refiner={self.add_control_noise_refiner}")
-            if self.add_control_noise_refiner:
-                hints = self.forward_control_2_0_layers(
-                    unified, cap_feats, control_context, control_context_item_seqlens, kwargs,
-                )
-            else:
-                hints = self.forward_control_1_0(
-                    unified, cap_feats, control_context, kwargs, t=t, patch_size=patch_size, f_patch_size=f_patch_size,
-                )
-            if hints is not None:
-                print(f"[CONTROL-FORWARD] Computed hints, type={type(hints)}, len={len(hints) if isinstance(hints, (list, tuple)) else 'N/A'}")
-                if isinstance(hints, (list, tuple)) and len(hints) > 0:
-                    print(f"[CONTROL-FORWARD] hints[0] shape: {hints[0].shape}")
+        if self.add_control_noise_refiner:
+            hints = self.forward_control_2_0_layers(
+                unified, cap_feats, control_context, control_context_item_seqlens, kwargs, 
+            )
         else:
-            print(f"[CONTROL-FORWARD] use_control=False (control_context={control_context is not None}, control_context_scale={control_context_scale})")
+            hints = self.forward_control_1_0(
+                unified, cap_feats, control_context, kwargs, t=t, patch_size=patch_size, f_patch_size=f_patch_size,
+            )
 
-        hints_passed_count = 0
         for layer in self.layers:
             # Arguments
             kwargs = dict(
                 attn_mask=unified_attn_mask,
-                freqs_cis=unified_freqs_cis,
+                freqs_cis=unified_freqs_cis, 
                 adaln_input=adaln_input,
+                hints=hints,
+                context_scale=control_context_scale
             )
-            # Only pass hints if control is active
-            if use_control and hints is not None:
-                kwargs['hints'] = hints
-                kwargs['context_scale'] = control_context_scale
-                hints_passed_count += 1
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 def create_custom_forward(module, **static_kwargs):
                     def custom_forward(*inputs):
@@ -691,86 +681,3 @@ class ZImageControlTransformer2DModel(ZImageTransformer2DModel):
 
         x = torch.stack(x)
         return x, {}
-
-
-    def unpatchify(self, x: List[torch.Tensor], size: List[Tuple], patch_size, f_patch_size) -> List[torch.Tensor]:
-        pH = pW = patch_size
-        pF = f_patch_size
-        bsz = len(x)
-        assert len(size) == bsz
-        for i in range(bsz):
-            F, H, W = size[i]
-            ori_len = (F // pF) * (H // pH) * (W // pW)
-            # "f h w pf ph pw c -> c (f pf) (h ph) (w pw)"
-            x[i] = (
-                x[i][:ori_len]
-                .view(F // pF, H // pH, W // pW, pF, pH, pW, self.out_channels)
-                .permute(6, 0, 3, 1, 4, 2, 5)
-                .reshape(self.out_channels, F, H, W)
-            )
-        return x
-    def patchify(
-        self,
-        all_image: List[torch.Tensor],
-        patch_size: int,
-        f_patch_size: int,
-        cap_padding_len: int,
-    ):
-        pH = pW = patch_size
-        pF = f_patch_size
-        device = all_image[0].device
-
-        all_image_out = []
-        all_image_size = []
-        all_image_pos_ids = []
-        all_image_pad_mask = []
-
-        for i, image in enumerate(all_image):
-            ### Process Image
-            C, F, H, W = image.size()
-            all_image_size.append((F, H, W))
-            F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
-
-            image = image.view(C, F_tokens, pF, H_tokens, pH, W_tokens, pW)
-            # "c f pf h ph w pw -> (f h w) (pf ph pw c)"
-            image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(F_tokens * H_tokens * W_tokens, pF * pH * pW * C)
-
-            image_ori_len = len(image)
-            image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
-
-            image_ori_pos_ids = self.create_coordinate_grid(
-                size=(F_tokens, H_tokens, W_tokens),
-                start=(cap_padding_len + 1, 0, 0),
-                device=device,
-            ).flatten(0, 2)
-            image_padding_pos_ids = (
-                self.create_coordinate_grid(
-                    size=(1, 1, 1),
-                    start=(0, 0, 0),
-                    device=device,
-                )
-                .flatten(0, 2)
-                .repeat(image_padding_len, 1)
-            )
-            image_padded_pos_ids = torch.cat([image_ori_pos_ids, image_padding_pos_ids], dim=0)
-            all_image_pos_ids.append(image_padded_pos_ids)
-            # pad mask
-            all_image_pad_mask.append(
-                torch.cat(
-                    [
-                        torch.zeros((image_ori_len,), dtype=torch.bool, device=device),
-                        torch.ones((image_padding_len,), dtype=torch.bool, device=device),
-                    ],
-                    dim=0,
-                )
-            )
-            # padded feature
-            image_padded_feat = torch.cat([image, image[-1:].repeat(image_padding_len, 1)], dim=0)
-            all_image_out.append(image_padded_feat)
-
-        return (
-            all_image_out,
-            all_image_size,
-            all_image_pos_ids,
-            all_image_pad_mask,
-        )

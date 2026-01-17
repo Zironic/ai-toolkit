@@ -1,7 +1,7 @@
 """Compatibility helpers for VideoX/zimage-style ControlNets.
 
 Provide a thin shim that adapts a VideoX-style controlnet to an object
-that can be called by `StableDiffusion._predict_noise_zimage` and
+that can be called by `StableDiffusion.get_noise_prediction` and
 by trainer routing code. The wrapper tries common call signatures
 and normalizes return values for robustness in mixed environments.
 """
@@ -247,8 +247,8 @@ class VideoXControlnetWrapper(torch.nn.Module):
 
             # If control_context appears to be raw pixel images, this indicates a
             # misrouted call: the caller should either provide pre-encoded control
-            # latents (VAE-encoded) or route through `StableDiffusion._predict_noise_zimage`
-            # which performs auto-encoding when supported. Fail fast with an actionable
+            # latents (VAE-encoded) or call `StableDiffusion.get_noise_prediction` / use
+            # sd.encode_control_images so the model can perform auto-encoding when supported. Fail fast with an actionable
             # error to avoid silent mismatches later.
             def _looks_like_pixel_images_for_wrapper(obj):
                 try:
@@ -272,7 +272,7 @@ class VideoXControlnetWrapper(torch.nn.Module):
                 adapter_name = getattr(self.inner, 'name_or_path', getattr(self.inner, 'name', None))
                 adapter_cfg_dim = getattr(self.inner, 'control_in_dim', None)
                 raise RuntimeError(
-                    f"VideoXControlnetWrapper received raw pixel images for adapter={adapter_name!r} (control_in_dim={adapter_cfg_dim!r}); provide pre-encoded control latents via sd.encode_control_images or call StableDiffusion._predict_noise_zimage"
+                    f"VideoXControlnetWrapper received raw pixel images for adapter={adapter_name!r} (control_in_dim={adapter_cfg_dim!r}); provide pre-encoded control latents via sd.encode_control_images or call StableDiffusion.get_noise_prediction"
                 )
 
             # Strict handling: accept only the exact expected forms and fail otherwise.

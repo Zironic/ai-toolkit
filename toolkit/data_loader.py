@@ -336,27 +336,17 @@ class PairedImageDataset(Dataset):
             )
 
             # images will be same base dimension, but may be trimmed. We need to shrink and then central crop
-            if bucket_resolution['width'] > bucket_resolution['height']:
-                img1_scale_to_height = bucket_resolution["height"]
-                img1_scale_to_width = int(img1.width * (bucket_resolution["height"] / img1.height))
-                img2_scale_to_height = bucket_resolution["height"]
-                img2_scale_to_width = int(img2.width * (bucket_resolution["height"] / img2.height))
-            else:
-                img1_scale_to_width = bucket_resolution["width"]
-                img1_scale_to_height = int(img1.height * (bucket_resolution["width"] / img1.width))
-                img2_scale_to_width = bucket_resolution["width"]
-                img2_scale_to_height = int(img2.height * (bucket_resolution["width"] / img2.width))
-
-            img1_crop_height = bucket_resolution["height"]
-            img1_crop_width = bucket_resolution["width"]
-            img2_crop_height = bucket_resolution["height"]
-            img2_crop_width = bucket_resolution["width"]
-
-            # scale then center crop images
-            img1 = img1.resize((img1_scale_to_width, img1_scale_to_height), Image.BICUBIC)
-            img1 = transforms.CenterCrop((img1_crop_height, img1_crop_width))(img1)
-            img2 = img2.resize((img2_scale_to_width, img2_scale_to_height), Image.BICUBIC)
-            img2 = transforms.CenterCrop((img2_crop_height, img2_crop_width))(img2)
+            # Use shared tensor-based bucket resize helper to perform the same
+            # algorithmic resize+center-crop used elsewhere. Convert PIL images to
+            # tensors and delegate to `resize_tensor_to_bucket_exact` to keep the
+            # code path identical for dataset and control images.
+            img1_t = transforms.ToTensor()(img1)
+            img2_t = transforms.ToTensor()(img2)
+            img1_out = resize_tensor_to_bucket_exact(img1_t, bucket_resolution['width'], bucket_resolution['height'])
+            img2_out = resize_tensor_to_bucket_exact(img2_t, bucket_resolution['width'], bucket_resolution['height'])
+            # convert back to PIL to preserve downstream expectations
+            img1 = TF.to_pil_image(img1_out)
+            img2 = TF.to_pil_image(img2_out)
 
             # combine them side by side
             img = Image.new('RGB', (img1.width + img2.width, max(img1.height, img2.height)))

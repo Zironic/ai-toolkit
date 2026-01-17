@@ -27,9 +27,8 @@ Goal: Make the ControlNet / VideoX / Z-Image code paths clean, deterministic and
 ## Files & code locations to inspect and clean (line references are approximate — search for key symbols if line numbers drift)
 
 - extensions_built_in/sd_trainer/SDTrainer.py
-  - Precompute and registration of Z-Image contexts: ~lines **560–610** (search for `_precompute_zimage_control_contexts`, `[PRECOMPUTE]` messages).  
-    - Clean: remove noisy warnings, centralize precompute error handling.
-  - `_collect_preencoded_zimage_context_for_batch`: ~**1860–1920** 
+  - Precompute and registration of Z-Image contexts: ~lines **560–610** — **Removed** (precompute support deprecated and trainer helpers cleaned).
+  - `_collect_preencoded_zimage_context_for_batch`: ~**1860–1920** — **Removed** (deprecated and replaced with a compatibility stub in `SDTrainer`) 
     - Clean: simplify caching logic, clarify error behavior when precomputed contexts missing.
   - Adapter per-batch / encode adapter block (standard ControlNet forward): ~**3050–3135** (search for `with self.timer('controlnet_forward')` and adapter(adapter_images_dev))
     - Clean: ensure adapter forward is always timed and device/dtype safe.

@@ -2606,7 +2606,7 @@ class SDTrainer(BaseSDTrainProcess):
 
                 # flush()
                 # Propagate dataset-level controlnet debug opt-in into model-side routing so
-                # `predict_noise_zimage` can emit additional diagnostics when enabled.
+                # `get_noise_prediction` can emit additional diagnostics when enabled.
                 try:
                     dataset_controlnet_debug = False
                     if batch is not None and getattr(batch, 'file_items', None):
@@ -3061,15 +3061,15 @@ class SDTrainer(BaseSDTrainProcess):
                                         pred_kwargs['zimage_conditioning_scale'] = getattr(self.sd, 'controlnet_guidance_scale', 1.0)
 
                                         # Enforce that the model implements the Z-Image hook when required (fail-fast)
-                                        if not hasattr(self.sd, '_predict_noise_zimage'):
+                                        if not hasattr(self.sd, 'get_noise_prediction'):
                                             if getattr(self.train_config, 'require_zimage_model', True):
                                                 raise RuntimeError(
-                                                    'Z-Image adapter detected but StableDiffusion instance does not implement `_predict_noise_zimage`. '
+                                                    'Z-Image adapter detected but StableDiffusion instance does not implement `get_noise_prediction`. '
                                                     'Set `train.require_zimage_model=False` to allow trainer-side fallback (deprecated) or use an SD variant that supports model-side routing.'
                                                 )
                                             else:
                                                 try:
-                                                    print_acc('[CONTROLNET] SD lacks _predict_noise_zimage but `require_zimage_model` is False; trainer-side fallback has been removed — please update your SD instance to support model-side routing.')
+                                                    print_acc('[CONTROLNET] SD lacks `get_noise_prediction` but `require_zimage_model` is False; trainer-side fallback has been removed — please update your SD instance to support model-side routing.')
                                                 except Exception:
                                                     pass
                                     else:
@@ -3455,7 +3455,7 @@ class SDTrainer(BaseSDTrainProcess):
 
                         # Note: for Z‑Image routing the trainer intentionally does NOT compute per-block residuals;
                         # absence of down_present here is expected. To verify the controlnet actually ran, check model
-                        # logs produced by StableDiffusion._predict_noise_zimage (e.g., [ZIMAGE] control_hints shapes).
+                        # logs produced by the model-side `get_noise_prediction` (e.g., [ZIMAGE] control_hints shapes).
                         note = "Z-Image routing: trainer skips per-block residuals; verify model-side [ZIMAGE] logs for control_hints"
                     else:
                         note = None
@@ -3484,7 +3484,7 @@ class SDTrainer(BaseSDTrainProcess):
                     except Exception as e:
                         details.append(f"down_info_failed={e}")
 
-                    # Model-side Z-Image diagnostics (set by _predict_noise_zimage when zimage routing used)
+                    # Model-side Z-Image diagnostics (set by model-side `get_noise_prediction` when zimage routing used)
                     try:
                         sd = getattr(self, 'sd', None)
                         zimage_model_hints = getattr(sd, '_last_zimage_control_hints_present', None)

@@ -136,16 +136,7 @@ class FileItemDTO(
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
 
-        # If not found in in-process registry, attempt to load precomputed control contexts from disk
-        try:
-            if getattr(self, '_preencoded_zimage_control_contexts', None) is None and getattr(self.dataset_config, 'cache_control_contexts_to_disk', False):
-                if hasattr(self, 'load_control_contexts') and callable(getattr(self, 'load_control_contexts')):
-                    loaded = self.load_control_contexts()
-                    if loaded is not None:
-                        self._preencoded_zimage_control_contexts = loaded
-        except Exception:
-            # best-effort; ignore load failures
-            pass
+
 
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg

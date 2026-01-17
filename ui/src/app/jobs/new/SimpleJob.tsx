@@ -1466,6 +1466,32 @@ export default function SimpleJob({
                             }}
                             placeholder={`1.0 (default)`}
                           />
+                          {(jobConfig.config.process[0].model.controlnet_enabled || modelArch?.additionalSections?.includes('datasets.multi_control_paths') || modelArch?.additionalSections?.includes('sample.ctrl_img')) && (
+                            <TextInput
+                              label={`Control Scale`}
+                              value={sample.control_conditioning_scale ? `${sample.control_conditioning_scale}` : ''}
+                              onChange={value => {
+                                // remove any non-numeric, - or . characters
+                                value = value.replace(/[^0-9.-]/g, '');
+                                if (value === '') {
+                                  // remove the key from the config if empty
+                                  let newConfig = objectCopy(jobConfig);
+                                  if (newConfig.config.process[0].sample.samples[i]) {
+                                    delete newConfig.config.process[0].sample.samples[i].control_conditioning_scale;
+                                    setJobConfig(
+                                      newConfig.config.process[0].sample.samples,
+                                      'config.process[0].sample.samples',
+                                    );
+                                  }
+                                } else {
+                                  // set it as a string
+                                  setJobConfig(value, `config.process[0].sample.samples[${i}].control_conditioning_scale`);
+                                  return;
+                                }
+                              }}
+                              placeholder={`1.0 (default)`}
+                            />
+                          )}
                         </div>
                       </div>
                       {(jobConfig.config.process[0].model.controlnet_enabled || modelArch?.additionalSections?.includes('datasets.multi_control_paths')) && (

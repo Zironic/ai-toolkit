@@ -387,47 +387,19 @@ class BucketsMixin:
             return True
 
         # If using cached control images, ensure cache path exists and contains control files.
-        # If the dataset is configured to precompute controls (`control_precompute_control=True`) and
-        # no cache path was supplied, create a sensible default under the dataset folder and allow
-        # precompute to populate it (do not fail immediately).
+        # Precompute is not supported; require an explicit cache path and files when
+        # `generate_control_on_the_fly` is False.
         if not config.generate_control_on_the_fly:
             cache_path = config.control_cache_path
-            precompute = getattr(config, 'control_precompute_control', False)
-
-            # If there's no explicit cache path but precompute is enabled, create a default cache dir
-            # next to the dataset (dataset_path/_controls or dataset_path/control_cache)
             if not cache_path:
-                if precompute:
-                    default_cache = os.path.join(self.dataset_path, 'control_cache')
-                    config.control_cache_path = default_cache
-                    cache_path = default_cache
-                    os.makedirs(cache_path, exist_ok=True)
-                    print_acc(f"Info: No control_cache_path set — created default at {cache_path} because control_precompute_control=True")
-                    # Note: SDTrainer's Z-Image precompute caches encoder latents **in memory only** on FileItemDTO
-                    # objects for the process lifetime and does NOT write these latents to `control_cache_path`.
-                    # The `control_cache_path` is available for other workflows or optional persistence but
-                    # SDTrainer does not persist precomputed latents by default.
-                else:
-                    raise RuntimeError(
-                        f"Dataset {getattr(config, 'name', self.dataset_path)}: control_cache_path is not set but generate_control_on_the_fly=False. "
-                        "Set `control_cache_path` in your dataset config or enable on-the-fly generation by setting `generate_control_on_the_fly=True`. "
-                        "Alternatively, set `control_precompute_control=True` to allow creating a default cache directory. Aborting setup.")
-
-            # If the cache path does not exist, create it if precompute is enabled, otherwise error
+                raise RuntimeError(
+                    f"Dataset {getattr(config, 'name', self.dataset_path)}: control_cache_path is not set but generate_control_on_the_fly=False. "
+                    "Set `control_cache_path` in your dataset config or enable on-the-fly generation by setting `generate_control_on_the_fly=True`. Aborting setup.")
             if not os.path.isdir(cache_path):
-                if precompute:
-                    os.makedirs(cache_path, exist_ok=True)
-                    print_acc(f"Info: Created control cache directory {cache_path} for precompute.")
-                else:
-                    raise RuntimeError(f"Control cache path does not exist: {cache_path}. Aborting setup.")
-
-            # If there are no control files yet and precompute is enabled, do not fail — precompute will generate them.
+                raise RuntimeError(f"Control cache path does not exist: {cache_path}. Aborting setup.")
             control_files = glob.glob(os.path.join(cache_path, '**', '*_control.*'), recursive=True)
             if len(control_files) == 0:
-                if precompute:
-                    print_acc(f"Info: Control cache path {cache_path} contains no control files yet; precompute (control_precompute_control=True) will generate them.")
-                else:
-                    raise RuntimeError(f"Control cache path {cache_path} contains no control files. Aborting setup.")
+                raise RuntimeError(f"Control cache path {cache_path} contains no control files. Aborting setup.")
 
         # If control_type is openpose/pose, ensure controlnet_aux is available
         if str(getattr(config, 'control_type', '')).lower() in ('openpose', 'pose'):
@@ -2498,9 +2470,24 @@ class TextEmbeddingCachingMixin:
                 
                 # atomic write to avoid partial files (no race re-check needed since we pre-checked)
                 from toolkit.cache_utils import atomic_write
-                atomic_write(text_embedding_path, lambda p: prompt_embeds.save(str(p)))
-                del prompt_embeds
-                file_item.is_text_embedding_cached = True
+                try:
+                    atomic_write(text_embedding_path, lambda p: prompt_embeds.save(str(p)))
+                    file_item.is_text_embedding_cached = True
+                except Exception as e:
+                    # Surface a clear error instead of failing silently — include dataset and file for diagnostics
+                    try:
+                        import traceback
+                        print_acc(f"Error: failed to save text embedding for {file_item.path} to {text_embedding_path}: {e}")
+                        print_acc(traceback.format_exc())
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"Text embedding caching failed for dataset {self.dataset_path} on file {file_item.path}: {e}") from e
+                finally:
+                    # ensure we drop the prompt embeds reference to avoid leaking tensors even on error
+                    try:
+                        del prompt_embeds
+                    except Exception:
+                        pass
                 i += 1
             # restore device state
             # if did_move:

@@ -365,8 +365,8 @@ def prepare_controlnet_adapter(sd, adapter_spec_or_obj, adapter_config=None, tra
             if sd is None:
                 missing.append("StableDiffusion instance (sd) was not provided for validation")
             else:
-                if not hasattr(sd, '_predict_noise_zimage') or not callable(getattr(sd, '_predict_noise_zimage')):
-                    missing.append("model-side hook `_predict_noise_zimage` is missing on the loaded SD instance")
+                if not hasattr(sd, 'get_noise_prediction') or not callable(getattr(sd, 'get_noise_prediction')):
+                    missing.append("model-side hook `get_noise_prediction` is missing on the loaded SD instance")
                 if not hasattr(sd, 'encode_control_images') or not callable(getattr(sd, 'encode_control_images')):
                     missing.append("SD instance lacks `encode_control_images` required for Z-Image routing")
 
@@ -374,7 +374,7 @@ def prepare_controlnet_adapter(sd, adapter_spec_or_obj, adapter_config=None, tra
                 msg = (
                     "Z-Image adapter requires a Z-Image aware SD model. "
                     "The following issues were detected: " + "; ".join(missing) + ". "
-                    "Remediation: load an SD variant that supports VideoX/Z-Image routing (model transformer with control_in_dim=33 and `_predict_noise_zimage`) or set `train_config.require_zimage_model=False` to allow trainer-side fallback."
+                    "Remediation: load an SD variant that supports VideoX/Z-Image routing (model transformer with control_in_dim=33 and `get_noise_prediction`) or set `train_config.require_zimage_model=False` to allow trainer-side fallback."
                 )
                 raise RuntimeError(f"[CONTROLNET-LOAD] {msg}")
     except Exception as e:

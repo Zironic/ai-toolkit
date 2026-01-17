@@ -1535,7 +1535,59 @@ class StableDiffusion:
                     conditional_embeds = conditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
                     unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
 
-                    if self.is_xl:
+                    # Z-Image Controlnet: Use custom sampling loop that supports control_context
+                    if getattr(self, 'is_controlnet_model', False) and self.model_config.model_type == 'z_image' and 'control_context' in extra:
+                        print(f"[CONTROL-DEBUG] Using custom Z-Image controlnet sampling loop")
+                        from diffusers import FlowMatchEulerDiscreteScheduler
+
+                        # Get or create scheduler
+                        scheduler = pipeline.scheduler if hasattr(pipeline, 'scheduler') else FlowMatchEulerDiscreteScheduler.from_pretrained(
+                            self.model_config.name_or_path,
+                            subfolder="scheduler"
+                        )
+
+                        # Prepare latents
+                        if gen_config.latents is None:
+                            latents = self.get_latent_noise(
+                                pixel_height=gen_config.height,
+                                pixel_width=gen_config.width,
+                                batch_size=1,
+                                num_channels=self.transformer.config.in_channels
+                            ).to(self.device_torch, dtype=self.transformer.dtype)
+                        else:
+                            latents = gen_config.latents.to(self.device_torch, dtype=self.transformer.dtype)
+
+                        # Set timesteps
+                        scheduler.set_timesteps(gen_config.num_inference_steps, device=self.device_torch)
+                        timesteps = scheduler.timesteps
+
+                        # Denoising loop
+                        for i, t in enumerate(timesteps):
+                            # Prepare model input with CFG
+                            latent_model_input = torch.cat([latents] * 2) if gen_config.guidance_scale > 1.0 else latents
+
+                            # Predict noise using our custom predict_noise that supports control
+                            noise_pred = self.predict_noise(
+                                latent_model_input,
+                                concat_prompt_embeds([unconditional_embeds, conditional_embeds]) if gen_config.guidance_scale > 1.0 else conditional_embeds,
+                                t,
+                                control_context=extra['control_context'],
+                                control_context_scale=extra.get('control_context_scale', 1.0)
+                            )
+
+                            # Perform CFG
+                            if gen_config.guidance_scale > 1.0:
+                                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                                noise_pred = noise_pred_uncond + gen_config.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                            # Scheduler step
+                            latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                        # Decode latents
+                        img = self.decode_latents(latents)[0]
+                        print(f"[CONTROL-DEBUG] Custom sampling complete, image shape: {img.size if hasattr(img, 'size') else 'unknown'}")
+
+                    elif self.is_xl:
                         # fix guidance rescale for sdxl
                         # was trained on 0.7 (I believe)
 
@@ -1766,6 +1818,58 @@ class StableDiffusion:
 
         flush()
 
+    def _load_control_images_for_sample(self, gen_config):
+        """
+        Load control image from GenerateImageConfig file path for Z-Image ControlNet.
+        Returns tensor [1, C, 1, H, W] with control image in VideoX format, or None if no control.
+        Only supports single control image (uses ctrl_img_1, fallback to ctrl_img).
+
+        Follows official VideoX-Fun preprocessing: uses get_image_latent() logic which resizes
+        to sample_size and normalizes to [0, 1] range.
+        """
+        from PIL import Image
+
+        # Get first available control image path (prefer ctrl_img_1 for consistency)
+        control_path = None
+        if hasattr(gen_config, 'ctrl_img_1') and gen_config.ctrl_img_1:
+            control_path = gen_config.ctrl_img_1
+        elif hasattr(gen_config, 'ctrl_img') and gen_config.ctrl_img:
+            control_path = gen_config.ctrl_img
+
+        if not control_path:
+            return None
+
+        # Target size matches output dimensions (not latent size)
+        sample_size = (gen_config.height, gen_config.width)  # (H, W) format
+
+        try:
+            # Load image
+            img = Image.open(control_path).convert('RGB')
+
+            # Resize to output size (matches official VideoX-Fun get_image_latent logic)
+            # Note: PIL resize expects (width, height)
+            img = img.resize((sample_size[1], sample_size[0]), Image.LANCZOS)
+
+            # Convert to tensor and normalize to [0, 1] range
+            # Following VideoX-Fun: torch.from_numpy(np.array(img)).unsqueeze(0).permute([3, 0, 1, 2]).unsqueeze(0) / 255
+            import numpy as np
+            img_array = np.array(img).astype(np.float32) / 255.0  # [H, W, C] in [0, 1]
+
+            # Convert to tensor and add dimensions to match VideoX format: [1, C, 1, H, W]
+            # VideoX uses: .unsqueeze(0).permute([3, 0, 1, 2]).unsqueeze(0)
+            # Which transforms: [H,W,C] -> [1,H,W,C] -> [C,1,H,W] -> [1,C,1,H,W]
+            img_tensor = torch.from_numpy(img_array)  # [H, W, C]
+            img_tensor = img_tensor.unsqueeze(0)  # [1, H, W, C]
+            img_tensor = img_tensor.permute(3, 0, 1, 2)  # [C, 1, H, W]
+            img_tensor = img_tensor.unsqueeze(0)  # [1, C, 1, H, W]
+
+            print(f"[CONTROL-DEBUG] Loaded control image from {control_path}, final shape: {img_tensor.shape}")
+            return img_tensor
+
+        except Exception as e:
+            print(f"Warning: Failed to load control image {control_path}: {e}")
+            return None
+
     def get_latent_noise(
             self,
             height=None,
@@ -1974,22 +2078,26 @@ class StableDiffusion:
             zcn = kwargs.pop('zimage_controlnet')
             zci = kwargs.pop('zimage_control_images')
             zcs = kwargs.pop('zimage_conditioning_scale', 1.0)
-            return self._predict_noise_zimage(latents, text_embeddings, timestep, zimage_controlnet=zcn, zimage_control_images=zci, zimage_conditioning_scale=zcs, **kwargs)
+            # Use the model's get_noise_prediction. If an explicit adapter is passed
+            # via `zimage_controlnet`, temporarily attach it to `self.controlnet` to
+            # maintain compatibility with caller expectations.
+            old_cn = getattr(self, 'controlnet', None)
+            try:
+                if zcn is not None:
+                    self.controlnet = zcn
+                return self.get_noise_prediction(latents, timestep, text_embeddings, control_image=zci, control_context_scale=zcs, **kwargs)
+            finally:
+                if zcn is not None:
+                    self.controlnet = old_cn
 
         # NEW: Route to Z-Image when model is a controlnet model and control_context is provided
         # This is the new unified architecture where the transformer IS the controlnet
         if getattr(self, 'is_controlnet_model', False) and 'control_context' in kwargs:
-            # Translate control_context -> zimage_control_context for predict_noise_zimage
+            # Translate control_context -> model-side get_noise_prediction call
             zimage_control_context = kwargs.pop('control_context')
             zimage_conditioning_scale = kwargs.pop('control_context_scale', 1.0)
-            return self._predict_noise_zimage(
-                latents, text_embeddings, timestep,
-                zimage_controlnet=None,  # Will use sd.transformer internally
-                zimage_control_images=None,  # Already encoded
-                zimage_conditioning_scale=zimage_conditioning_scale,
-                zimage_control_context=zimage_control_context,
-                **kwargs
-            )
+            print(f"[CONTROL-DEBUG] predict_noise routing to get_noise_prediction with control_context shape: {zimage_control_context.shape if zimage_control_context is not None else None}, scale: {zimage_conditioning_scale}")
+            return self.get_noise_prediction(latents, timestep, text_embeddings, control_context=zimage_control_context, control_context_scale=zimage_conditioning_scale, **kwargs)
 
         def scale_model_input(model_input, timestep_tensor):
             if is_input_scaled:
@@ -2397,39 +2505,6 @@ class StableDiffusion:
                 pass
         return noise_pred
 
-    def _predict_noise_zimage(self, latents: torch.Tensor, text_embeddings, timestep: torch.Tensor, zimage_controlnet=None, zimage_control_images=None, zimage_conditioning_scale: float = 1.0, **kwargs):
-        """Delegate Z-Image routing to the canonical implementation in the
-        extensions module to avoid duplication and centralize behavior.
-        """
-        # Ensure a `unet` alias exists for transformer-style models so the shared
-        # implementation can call `self.unet` as expected.
-        try:
-            if not hasattr(self, 'unet') or getattr(self, 'unet') is None:
-                self.unet = getattr(self, 'transformer', None)
-        except Exception:
-            pass
-
-        # Emit a concise model-level diagnostic about the adapter and inputs.
-        try:
-            from toolkit.print import print_acc
-            ad_name = getattr(zimage_controlnet, 'name_or_path', None) or getattr(zimage_controlnet, 'name', None) or str(type(zimage_controlnet))
-            ci_shape = None
-            try:
-                if zimage_control_images is not None and hasattr(zimage_control_images, 'shape'):
-                    ci_shape = tuple(zimage_control_images.shape)
-            except Exception:
-                ci_shape = None
-            print_acc(f"[ZIMAGE] _predict_noise_zimage delegating: adapter={ad_name!r} control_images_shape={ci_shape}")
-        except Exception:
-            pass
-
-        # Import and call the canonical implementation from the extension module.
-        try:
-            from extensions_built_in.diffusion_models.z_image.z_image import predict_noise_zimage
-        except Exception as e:
-            raise RuntimeError(f"Failed to import Z-Image routing implementation: {e}") from e
-
-        return predict_noise_zimage(self, latents, text_embeddings, timestep, zimage_controlnet=zimage_controlnet, zimage_control_images=zimage_control_images, zimage_conditioning_scale=zimage_conditioning_scale, **kwargs)
 
 
  

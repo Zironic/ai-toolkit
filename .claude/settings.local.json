@@ -4,7 +4,15 @@
       "Bash(python -c:*)",
       "Bash(venvScriptspython.exe -c \"from diffusers.models.transformers.transformer_z_image import ZImageTransformerBlock; print\\(''ZImageTransformerBlock found in diffusers''\\)\")",
       "Bash(cmd /c \"venv\\\\Scripts\\\\activate.bat && python -c \"\"from extensions_built_in.diffusion_models.z_image_transformer2d_control import ZImageControlTransformer2DModel; print\\(''Import successful''\\)\"\"\")",
-      "Bash(python -m py_compile:*)"
+      "Bash(python -m py_compile:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(venv/Scripts/python:*)",
+      "Bash(dir \"C:\\\\Users\\\\johan\\\\Documents\\\\ComfyUI\\\\custom_nodes\\\\videox-fun\\\\videox_fun\\\\models\")",
+      "Bash(dir \"C:\\\\Users\\\\johan\\\\Documents\\\\ComfyUI\\\\custom_nodes\\\\videox-fun\\\\videox_fun\")",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(venv\\\\Scripts\\\\python.exe:*)",
+      "Bash(.\\\\venv\\\\Scripts\\\\python.exe:*)"
     ]
   }
 }

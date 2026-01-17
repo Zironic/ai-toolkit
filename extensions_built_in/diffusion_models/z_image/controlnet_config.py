@@ -63,10 +63,27 @@ class ZImageControlNetConfigGenerator:
                 if control_layer_indices:
                     info['num_control_layers'] = len(control_layer_indices)
                     info['max_control_layer_idx'] = max(control_layer_indices)
+                    # Store the actual indices found (not just the count)
+                    info['control_layer_indices'] = sorted(list(control_layer_indices))
 
-                # Check for control_noise_refiner presence
+                # Check for control_noise_refiner presence and count refiner layers
                 if any('control_noise_refiner' in k for k in keys):
                     info['has_control_noise_refiner'] = True
+
+                # Count control_noise_refiner layers by looking for control_noise_refiner.N patterns
+                refiner_layer_indices = set()
+                for k in keys:
+                    if 'control_noise_refiner.' in k:
+                        # Extract layer index from patterns like "control_noise_refiner.0.after_proj.weight"
+                        parts = k.split('control_noise_refiner.')
+                        if len(parts) > 1:
+                            idx_part = parts[1].split('.')[0]
+                            if idx_part.isdigit():
+                                refiner_layer_indices.add(int(idx_part))
+
+                if refiner_layer_indices:
+                    info['num_refiner_layers'] = len(refiner_layer_indices)
+                    info['max_refiner_layer_idx'] = max(refiner_layer_indices)
 
                 # Check for standard 30-layer vs lite 5-layer by looking at layers count
                 layer_indices = set()
@@ -102,20 +119,34 @@ class ZImageControlNetConfigGenerator:
         # Determine number of layers from inspection or use defaults
         n_layers = hints.get('num_layers', 30)  # Default to 30 (standard) or detected
         num_control_layers = hints.get('num_control_layers', None)
+        num_refiner_layers = hints.get('num_refiner_layers', 2)  # Default to 2, detect from checkpoint
 
         # Build control_layers_places from detected count
-        # Standard pattern: every other layer starting from 0 (0, 2, 4, ...)
-        # For lite (5-layer control), this might be different - infer from actual indices
+        # Pattern inference based on known model variants:
+        # - Standard (15 control layers on 30-layer transformer): [0, 2, 4, ..., 28] (every 2nd layer)
+        # - Lite (3 control layers on 30-layer transformer): [0, 10, 20] (every 10th layer)
+        # - General pattern: evenly distribute N control layers across n_layers
         if num_control_layers is not None:
-            # Build places list: for N control layers, use [0, 2, 4, ..., 2*(N-1)]
-            # But if n_layers is smaller (lite model), adjust accordingly
-            control_layers_places = [i * 2 for i in range(num_control_layers) if i * 2 < n_layers]
-            if not control_layers_places:
-                # Fallback: just use available indices
-                control_layers_places = list(range(min(num_control_layers, n_layers)))
+            if num_control_layers == 3 and n_layers == 30:
+                # Lite model: 3 control layers at [0, 10, 20]
+                control_layers_places = [0, 10, 20]
+            elif num_control_layers == 15 and n_layers == 30:
+                # Standard model: 15 control layers at [0, 2, 4, ..., 28]
+                control_layers_places = [i * 2 for i in range(15)]
+            elif num_control_layers > 0:
+                # General case: evenly distribute control layers
+                # Calculate stride to evenly space control layers across transformer layers
+                stride = n_layers // num_control_layers
+                control_layers_places = [i * stride for i in range(num_control_layers)]
+            else:
+                control_layers_places = []
         else:
-            # Default: every other layer
+            # Default: every other layer (standard pattern)
             control_layers_places = [i for i in range(0, n_layers, 2)]
+
+        # Build control_refiner_layers_places from detected refiner layer count
+        # Standard: [0, 1] for 2 refiners, [0, 1, 2] for 3 refiners
+        control_refiner_layers_places = list(range(num_refiner_layers))
 
         # Minimal defaults that satisfy ZImageControlTransformer2DModel.__init__
         cfg = {
@@ -123,7 +154,7 @@ class ZImageControlNetConfigGenerator:
             'in_channels': 16,  # Z-Image uses 16 channels
             'dim': 3840,
             'n_layers': n_layers,
-            'n_refiner_layers': 2,
+            'n_refiner_layers': num_refiner_layers,  # Detect from checkpoint (2 or 3)
             'n_heads': 30,
             'n_kv_heads': 30,
             'norm_eps': 1e-5,
@@ -137,10 +168,12 @@ class ZImageControlNetConfigGenerator:
             'all_f_patch_size': [1],  # JSON-serializable list, will be converted to tuple
             # Control-specific parameters
             'control_layers_places': control_layers_places,
+            'control_refiner_layers_places': control_refiner_layers_places,
             # control_in_dim=33 for single control: control_latent(16) + mask(1) + inpaint(16)
             # Union models technically have control_in_dim=132 (4 controls), but we use single control
             'control_in_dim': 33,
-            'add_control_noise_refiner': hints.get('has_control_noise_refiner', False),
+            # Diffusers expects "control_layers" or "control_noise_refiner", not boolean
+            'add_control_noise_refiner': "control_noise_refiner" if hints.get('has_control_noise_refiner', False) else None,
         }
 
         return cfg

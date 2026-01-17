@@ -1,3 +1,4 @@
+from calendar import c
 import copy
 import gc
 import inspect
@@ -17,6 +18,7 @@ from tqdm import tqdm
 from torchvision.transforms import Resize, transforms
 
 from toolkit.clip_vision_adapter import ClipVisionAdapter
+from toolkit.config import get_config
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.ip_adapter import IPAdapter
 from toolkit.config_modules import ModelConfig, GenerateImageConfig, ModelArch
@@ -37,7 +39,7 @@ from diffusers import \
 from diffusers import PixArtAlphaPipeline
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextModelWithProjection
 from torchvision.transforms import functional as TF
-
+from diffusers.utils import load_image
 from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
@@ -444,7 +446,7 @@ class BaseModel:
                             validation_image = validation_image.resize(
                                 (gen_config.width, gen_config.height))
                             extra['image'] = validation_image
-                            extra['controlnet_conditioning_scale'] = gen_config.adapter_conditioning_scale
+                            extra['adapter_conditioning_scale'] = gen_config.adapter_conditioning_scale
                         if isinstance(self.adapter, CustomAdapter) and self.adapter.control_lora is not None:
                             validation_image = validation_image.resize((gen_config.width, gen_config.height))
                             extra['control_image'] = validation_image
@@ -644,14 +646,53 @@ class BaseModel:
                     unconditional_embeds = unconditional_embeds.to(
                         self.device_torch, dtype=self.unet.dtype)
 
-                    img = self.generate_single_image(
-                        pipeline,
-                        gen_config,
-                        conditional_embeds,
-                        unconditional_embeds,
-                        generator,
-                        extra,
-                    )
+                    # Z-Image Controlnet: Load and encode control images if configured
+                    # For Z-Image models, is_controlnet_model flag indicates controlnet variant
+                    # SKIP for z_image - it handles control loading in its own generate_images override
+                    # Check if this is a ZImageModel by checking class name
+                    model_type = getattr(getattr(self, 'model_config', None), 'model_type', None)
+                    print(f"[BASE-MODEL-DEBUG] is_controlnet_model={getattr(self, 'is_controlnet_model', False)}, model_type={model_type}")
+                    if getattr(self, 'is_controlnet_model', False) and model_type != 'z_image':
+                        ctrl_img_path = getattr(gen_config, 'ctrl_img_1', None) or getattr(gen_config, 'ctrl_img', None)
+                        if ctrl_img_path:
+                            print(f"[CONTROL-DEBUG] Loading control image from: {ctrl_img_path}")
+
+
+                            # Load control image
+                            img_ctrl = load_image(ctrl_img_path)
+
+                            # Get control scale from gen_config.adapter_conditioning_scale (used for controlnet too)
+                            control_scale = gen_config.adapter_conditioning_scale
+                            print(f"[CONTROL-DEBUG] Set control_conditioning_scale={control_scale}")
+                            img = pipeline(
+                                prompt_embeds=conditional_embeds.text_embeds, 
+                                control_image=img_ctrl, 
+                                controlnet_conditioning_scale=control_scale, 
+                                height=gen_config.height, 
+                                width=gen_config.width, 
+                                num_inference_steps=gen_config.num_inference_steps, 
+                                guidance_scale=0, 
+                                generator=generator).images[0]
+                        else:
+                            img = self.generate_single_image(
+                                pipeline,
+                                gen_config,
+                                conditional_embeds,
+                                unconditional_embeds,
+                                generator,
+                                extra,
+                        )
+
+                    else:
+                            img = self.generate_single_image(
+                                pipeline,
+                                gen_config,
+                                conditional_embeds,
+                                unconditional_embeds,
+                                generator,
+                                extra,
+                            )
+
 
                     gen_config.save_image(img, i)
                     gen_config.log_image(img, i)

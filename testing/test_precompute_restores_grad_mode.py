@@ -1,6 +1,5 @@
-import torch
-import types
-from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
+import pytest
+pytest.skip('precompute tests removed: skipping')
 from toolkit.data_transfer_object.data_loader import FileItemDTO
 from toolkit.config_modules import DatasetConfig
 

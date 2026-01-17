@@ -8,9 +8,10 @@
 				"git+https://github.com/oraios/serena",
 				"serena",
 				"start-mcp-server",
-				"serena==latest",
+				"--project",
+				"${workspaceFolder}",
 				"--context",
-				"ide-assistant"
+				"ide"
 			],
 			"gallery": "https://api.mcp.github.com",
 			"version": "1.0.0"

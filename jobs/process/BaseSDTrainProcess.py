@@ -564,36 +564,44 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             break
 
                 if is_zimage:
-                    # don't double-wrap
+                    # Check if we're using VideoX's native transformer (no wrapper needed)
                     try:
-                        from toolkit.controlnet_compat import VideoXControlnetWrapper
-                        try:
-                            print_acc(f"[CONTROLNET] Unconditional wrapper step: current adapter class={getattr(self, 'adapter').__class__.__name__}, adapter_config_mode={getattr(self, 'adapter_config', None) and getattr(self.adapter_config, 'controlnet_mode', None)}")
-                        except Exception as e:
-                            raise RuntimeError(f"Failed to print unconditional wrapper step info: {e}") from e
-                        if not isinstance(getattr(self, 'adapter', None), VideoXControlnetWrapper):
-                            # Ensure adapter is present: do not attempt to wrap a missing/None adapter.
-                            if getattr(self, 'adapter', None) is None:
-                                raise RuntimeError("ControlNet adapter is missing (None). Cannot apply VideoX wrapper — ensure the model provided a ControlNet or assign `self.adapter` before zimage routing.")
-                            try:
-                                print_acc("[CONTROLNET] Attempting unconditional VideoXControlnetWrapper application")
-                            except Exception as e:
-                                raise RuntimeError(f"Failed to print unconditional wrapper attempt: {e}") from e
-                            try:
-                                self.adapter = VideoXControlnetWrapper(self.adapter)
-                                try:
-                                    print_acc('[CONTROLNET] Wrapped zimage controlnet with VideoXControlnetWrapper for signature compatibility.')
-                                except Exception as e:
-                                    raise RuntimeError(f"Failed to print VideoX wrapper success message: {e}") from e
-                            except Exception as e:
-                                # Do not attempt legacy shims or fallbacks; fail fast and surface
-                                # the original wrapping error so callers can correct their adapter.
-                                raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping failed: {e}") from e
+                        adapter_class_name = getattr(self, 'adapter').__class__.__name__ if getattr(self, 'adapter', None) else None
+                        print_acc(f"[CONTROLNET] Z-Image adapter class: {adapter_class_name}")
+
+                        # If using VideoX's actual transformer, skip wrapping
+                        if adapter_class_name == 'ZImageControlTransformer2DModel' and 'videox_fun' in str(type(getattr(self, 'adapter', None)).__module__):
+                            print_acc('[CONTROLNET] Using VideoX native transformer, skipping wrapper')
                         else:
+                            # Legacy path: wrap non-VideoX transformers
+                            from toolkit.controlnet_compat import VideoXControlnetWrapper
                             try:
-                                print_acc('[CONTROLNET] Adapter already wrapped with VideoXControlnetWrapper; skipping')
+                                print_acc(f"[CONTROLNET] Unconditional wrapper step: current adapter class={adapter_class_name}, adapter_config_mode={getattr(self, 'adapter_config', None) and getattr(self.adapter_config, 'controlnet_mode', None)}")
                             except Exception as e:
-                                raise RuntimeError(f"Failed to print adapter already wrapped message: {e}") from e
+                                raise RuntimeError(f"Failed to print unconditional wrapper step info: {e}") from e
+                            if not isinstance(getattr(self, 'adapter', None), VideoXControlnetWrapper):
+                                # Ensure adapter is present: do not attempt to wrap a missing/None adapter.
+                                if getattr(self, 'adapter', None) is None:
+                                    raise RuntimeError("ControlNet adapter is missing (None). Cannot apply VideoX wrapper — ensure the model provided a ControlNet or assign `self.adapter` before zimage routing.")
+                                try:
+                                    print_acc("[CONTROLNET] Attempting unconditional VideoXControlnetWrapper application")
+                                except Exception as e:
+                                    raise RuntimeError(f"Failed to print unconditional wrapper attempt: {e}") from e
+                                try:
+                                    self.adapter = VideoXControlnetWrapper(self.adapter)
+                                    try:
+                                        print_acc('[CONTROLNET] Wrapped zimage controlnet with VideoXControlnetWrapper for signature compatibility.')
+                                    except Exception as e:
+                                        raise RuntimeError(f"Failed to print VideoX wrapper success message: {e}") from e
+                                except Exception as e:
+                                    # Do not attempt legacy shims or fallbacks; fail fast and surface
+                                    # the original wrapping error so callers can correct their adapter.
+                                    raise RuntimeError(f"ControlNet detected as VideoX/zimage-style but wrapping failed: {e}") from e
+                            else:
+                                try:
+                                    print_acc('[CONTROLNET] Adapter already wrapped with VideoXControlnetWrapper; skipping')
+                                except Exception as e:
+                                    raise RuntimeError(f"Failed to print adapter already wrapped message: {e}") from e
                     except Exception as e:
                         raise RuntimeError(f"ControlNet zimage detection failed during unconditional wrapper step: {e}") from e
 
@@ -629,7 +637,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     try:
                         require_hook = getattr(self.train_config, 'require_zimage_model', True)
                         if require_hook:
-                            if not hasattr(self.sd, '_predict_noise_zimage'):
+                            if not hasattr(self.sd, 'get_noise_prediction'):
                                 # Gather diagnostics to help users understand why the model is incompatible
                                 sd_cls = type(self.sd).__name__
                                 sd_mod = type(self.sd).__module__
@@ -645,7 +653,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     f"has_unet={has_unet} model_name={model_name} arch={arch}"
                                 )
                                 raise RuntimeError(
-                                    "Z-Image routing requires the model to implement `_predict_noise_zimage`, "
+                                    "Z-Image routing requires the model to implement `get_noise_prediction`, "
                                     "but the current StableDiffusion instance does not provide it. "
                                     "Aborting training to avoid non-deterministic fallback behavior. "
                                     "If you intentionally want the trainer to compute control hints instead, "
@@ -945,7 +953,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 network_multiplier=sample_item.network_multiplier,
                 output_path=output_path,
                 output_ext=sample_config.ext,
-                adapter_conditioning_scale=sample_config.adapter_conditioning_scale,
+                adapter_conditioning_scale=sample_item.control_conditioning_scale,
                 refiner_start_at=sample_config.refiner_start_at,
                 extra_values=sample_config.extra_values,
                 logger=self.logger,
@@ -2660,6 +2668,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print(f"[NETWORK-DEBUG] Creating network with type={self.network_config.type}")
                 # TODO should we completely switch to LycorisSpecialNetwork?
                 network_kwargs = self.network_config.network_kwargs
+                # Ensure network_kwargs is a dict (guard against explicit null in config)
+                if network_kwargs is None:
+                    network_kwargs = {}
+                    self.network_config.network_kwargs = network_kwargs
                 is_lycoris = False
                 is_lorm = self.network_config.type.lower() == 'lorm'
                 # default to LoCON if there are any conv layers or if it is named

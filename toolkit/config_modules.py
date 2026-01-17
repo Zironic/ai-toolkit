@@ -61,7 +61,17 @@ class SampleItem:
         self.ctrl_img_1: Optional[str] = kwargs.get('ctrl_img_1', self.ctrl_img)
         self.ctrl_img_2: Optional[str] = kwargs.get('ctrl_img_2', None)
         self.ctrl_img_3: Optional[str] = kwargs.get('ctrl_img_3', None)
-        
+
+        # Per-sample control conditioning scale (defaults to SampleConfig value)
+        self.control_conditioning_scale: float = kwargs.get('control_conditioning_scale', sample_config.control_conditioning_scale)
+        # Convert to float if it's a string (YAML might parse as string if quoted)
+        if isinstance(self.control_conditioning_scale, str):
+            try:
+                self.control_conditioning_scale = float(self.control_conditioning_scale)
+            except:
+                print(f"Invalid control_conditioning_scale {self.control_conditioning_scale}, defaulting to {sample_config.control_conditioning_scale}")
+                self.control_conditioning_scale = sample_config.control_conditioning_scale
+
         self.network_multiplier: float = kwargs.get('network_multiplier', sample_config.network_multiplier)
         # convert to a number if it is a string
         if isinstance(self.network_multiplier, str):
@@ -88,7 +98,7 @@ class SampleConfig:
         self.network_multiplier = kwargs.get('network_multiplier', 1)
         self.guidance_rescale = kwargs.get('guidance_rescale', 0.0)
         self.ext: ImgExt = kwargs.get('format', 'jpg')
-        self.adapter_conditioning_scale = kwargs.get('adapter_conditioning_scale', 1.0)
+        self.adapter_conditioning_scale = kwargs.get('adapter_conditioning_scale', 0.65)
         self.refiner_start_at = kwargs.get('refiner_start_at',
                                            0.5)  # step to start using refiner on sample if it exists
         self.extra_values = kwargs.get('extra_values', [])
@@ -99,7 +109,7 @@ class SampleConfig:
             self.ext = 'webp'
         
         # ControlNet sampling options
-        self.control_conditioning_scale: float = kwargs.get('control_conditioning_scale', 1.0)
+        self.control_conditioning_scale: float = kwargs.get('control_conditioning_scale', 0.65)
         self.control_images = kwargs.get('control_images', None)  # optional per-sample control images
 
         prompts: list[str] = kwargs.get('prompts', [])
@@ -435,7 +445,7 @@ class TrainConfig:
         # instead of computing adapter outputs to avoid shortcut learning.
         self.controlnet_reroute: str = kwargs.get('controlnet_reroute', 'none')
 
-        # Whether to require the model to implement the Z-Image model hook (`_predict_noise_zimage`) when
+        # Whether to require the model to implement the Z-Image model hook (`get_noise_prediction`) when
         # Z-Image (VideoX) routing is used. Default: True (fail-fast). Set to False to allow the trainer to
         # perform a deterministic fallback for models that do not expose the hook.
         self.require_zimage_model: bool = kwargs.get('require_zimage_model', True)

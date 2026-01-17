@@ -22,6 +22,7 @@ import weakref
 import torch
 
 from .control_util import infer_expected_in_ch
+from .buckets import resize_tensor_to_bucket_exact
 from .print import print_acc
 
 # Channel constants (explicit and authoritative)
@@ -156,6 +157,110 @@ def _collapse_frames_if_present(t: torch.Tensor) -> torch.Tensor:
     tag_tensor(out, 'collapse_frames:mean')
     print_acc(f"[CONTROL_CHANNELS] collapse_frames:mean input_shape={tuple(t.shape)} -> out_shape={tuple(out.shape)}")
     return out
+
+
+def encode_controls_via_dataloader(sd, control_images, target_pixel_dims: tuple = None):
+    """Encode control pixel images using the same dataloader bucketing + VAE encode path.
+
+    This function accepts:
+      - torch.Tensor [B, C, H, W] or [C, H, W]
+      - torch.Tensor [B, C, F, H, W]
+      - list of per-image tensors
+
+    It performs:
+      - frame collapse (if 5D)
+      - channel validation (expect RGB pixel inputs; raise on pre-encoded latents)
+      - exact resize to `target_pixel_dims` using `resize_tensor_to_bucket_exact`
+      - VAE encode via `sd.encode_images` (same call used by dataset)
+
+    Returns: torch.Tensor [B, C_lat, H_lat, W_lat]
+    """
+    # Normalize to list of [C,H,W] tensors
+    imgs = []
+    is_batched = True
+    try:
+        if isinstance(control_images, torch.Tensor):
+            if control_images.ndim == 5:
+                # collapse frames
+                tmp = _collapse_frames_if_present(control_images)
+                control_images = tmp
+            if control_images.ndim == 4:
+                # batch
+                is_batched = True
+                for i in range(control_images.shape[0]):
+                    imgs.append(control_images[i])
+            elif control_images.ndim == 3:
+                is_batched = False
+                imgs = [control_images]
+            else:
+                raise RuntimeError(f"Unsupported control_images tensor ndim={control_images.ndim}")
+        elif isinstance(control_images, (list, tuple)):
+            for it in control_images:
+                if isinstance(it, torch.Tensor):
+                    if it.ndim == 5:
+                        it = _collapse_frames_if_present(it)
+                    if it.ndim == 4:
+                        # assume [B,C,H,W] with B==1
+                        if it.shape[0] == 1:
+                            imgs.append(it.squeeze(0))
+                        else:
+                            raise RuntimeError("List elements must be per-image tensors, not batched tensors")
+                    elif it.ndim == 3:
+                        imgs.append(it)
+                    else:
+                        raise RuntimeError(f"Unsupported tensor ndim in list: {it.ndim}")
+                else:
+                    raise RuntimeError("Unsupported element type in control_images list; expected torch.Tensor")
+        else:
+            raise RuntimeError("Unsupported control_images type; expected torch.Tensor or list of tensors")
+
+        # Validate channels: expect RGB pixel images (3 channels)
+        for i, img in enumerate(imgs):
+            if img.shape[0] not in (1, 3):
+                raise RuntimeError(f"encode_controls_via_dataloader: expected pixel images with 3 channels, got C={img.shape[0]} for sample {i}. If you are passing pre-encoded latents, call assemble_zimage_control_context directly.")
+            # If single-channel images (1) promote to 3
+            if img.shape[0] == 1:
+                imgs[i] = img.repeat(3, 1, 1)
+
+        # If target pixel dims provided, make sure all images are resized to exact dims
+        if target_pixel_dims is not None:
+            tgt_h, tgt_w = int(target_pixel_dims[0]), int(target_pixel_dims[1])
+            resized = []
+            for img in imgs:
+                img_t = img.unsqueeze(0)  # [1,C,H,W]
+                img_r = resize_tensor_to_bucket_exact(img_t, tgt_w, tgt_h)
+                resized.append(img_r.squeeze(0))
+            imgs = resized
+
+        # Move to VAE device/dtype and encode via shared path
+        try:
+            device = sd.vae_device_torch
+            dtype = sd.vae_torch_dtype
+        except Exception:
+            device = None
+            dtype = None
+        if device is not None and dtype is not None:
+            imgs = [im.to(device, dtype=dtype) for im in imgs]
+
+        # Tag provenance and call shared encoder
+        try:
+            for im in imgs:
+                tag_tensor(im, 'encode_controls_via_dataloader:prepared')
+        except Exception:
+            pass
+
+        if len(imgs) == 0:
+            return None
+
+        encoded = sd.encode_images(imgs)
+        if isinstance(encoded, torch.Tensor):
+            return encoded
+        elif isinstance(encoded, (list, tuple)) and all(isinstance(e, torch.Tensor) for e in encoded):
+            return torch.stack(list(encoded), dim=0)
+        else:
+            raise RuntimeError('encode_controls_via_dataloader: unexpected return type from sd.encode_images')
+    except Exception as e:
+        raise RuntimeError(f"encode_controls_via_dataloader failed: {e}") from e
 
 
 def _trim_or_pad_tensor(ch_tensor: torch.Tensor, expected: int) -> torch.Tensor:
@@ -494,6 +599,48 @@ def assemble_zimage_control_context(
     if out.shape[1] != control_in_dim:
         raise RuntimeError(f"Assembled control_context channels {out.shape[1]} != requested control_in_dim {control_in_dim}")
     return out
+
+
+def ensure_latent_spatial(latents: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Ensure `latents` spatial dims match `target_h` x `target_w`.
+
+    If smaller, center-pad with zeros symmetrically. If larger, center-crop.
+    Tags tensor provenance indicating if padding or cropping was applied.
+    """
+    try:
+        import torch.nn.functional as F
+        B, C, H, W = latents.shape
+        if H == target_h and W == target_w:
+            return latents
+        # Pad when smaller
+        if H < target_h or W < target_w:
+            pad_w = max(0, target_w - W)
+            pad_h = max(0, target_h - H)
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            # pad format: (left, right, top, bottom)
+            out = F.pad(latents, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0.0)
+            try:
+                tag_tensor(out, 'ensure_latent_spatial:pad')
+            except Exception:
+                pass
+            print_acc(f"[CONTROL_CHANNELS] ensure_latent_spatial: padded {H}x{W} -> {target_h}x{target_w}")
+            return out
+        # Crop when larger
+        if H > target_h or W > target_w:
+            left = (W - target_w) // 2
+            top = (H - target_h) // 2
+            out = latents[:, :, top:top + target_h, left:left + target_w]
+            try:
+                tag_tensor(out, 'ensure_latent_spatial:crop')
+            except Exception:
+                pass
+            print_acc(f"[CONTROL_CHANNELS] ensure_latent_spatial: cropped {H}x{W} -> {target_h}x{target_w}")
+            return out
+    except Exception as e:
+        raise RuntimeError(f"ensure_latent_spatial failed: {e}") from e
 
 
 def adapt_noisy_latents_for_adapter(latents: torch.Tensor, expected_in: Optional[int]) -> torch.Tensor:

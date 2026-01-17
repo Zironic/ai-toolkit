@@ -41,8 +41,17 @@ from toolkit.buckets import get_bucket_for_image_size
 import torch.nn.functional as F
 
 
-def _resize_batch_to_bucket(batch_imgs: torch.Tensor, size: int, full_size_control_images: bool, pad_to_mult: int = 16):
-    """Resize a batch of control images (tensor [B,C,H,W]) to either full-size or bucket target.
+def _resize_batch_to_bucket(batch_imgs: torch.Tensor, size: int, full_size_control_images: bool, pad_to_mult: int = 16, target_dims: tuple = None):
+    """Resize a batch of control images (tensor [B,C,H,W]) to match the source image's bucket.
+
+    Args:
+        batch_imgs: Control image tensor [B,C,H,W]
+        size: Resolution hint (used only if target_dims not provided)
+        full_size_control_images: Whether controls are at full resolution
+        pad_to_mult: Pad dimensions to multiple of this value
+        target_dims: Tuple of (target_h, target_w) from the source image's bucket.
+                     If provided, resize/crop to these exact dimensions instead of
+                     computing a new bucket from the control image dimensions.
 
     Returns: batch_resized (float32 tensor), used_dataset_control (bool), meta dict with sizes
     meta keys: orig, resized, target
@@ -54,6 +63,23 @@ def _resize_batch_to_bucket(batch_imgs: torch.Tensor, size: int, full_size_contr
 
     def _pad_to_mult(x, m=16):
         return ((x + m - 1) // m) * m
+
+    # If target dimensions are provided, use them directly (matches source image's bucket)
+    if target_dims is not None:
+        target_h, target_w = target_dims
+        # If already at target size, return as-is
+        if H == target_h and W == target_w:
+            return batch_imgs_f, True, {'orig': orig, 'resized': (H, W), 'target': (target_h, target_w)}
+        # Scale preserving aspect so both dimensions >= target dims, then center-crop
+        scale = max(target_w / W, target_h / H) if W > 0 and H > 0 else 1.0
+        new_w = max(1, int(round(W * scale)))
+        new_h = max(1, int(round(H * scale)))
+        scaled = F.interpolate(batch_imgs_f, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        # center-crop to exact target dims
+        left = (new_w - target_w) // 2
+        top = (new_h - target_h) // 2
+        batch_resized = scaled[:, :, top:top + target_h, left:left + target_w]
+        return batch_resized, False, {'orig': orig, 'resized': (new_h, new_w), 'target': (target_h, target_w)}
 
     if full_size_control_images:
         current_long = max(H, W)
@@ -683,21 +709,10 @@ class SDTrainer(BaseSDTrainProcess):
             # surface descriptive failure to stop training early
             raise
 
-        # Precompute Z-Image (VideoX) control contexts if datasets requested it.
-        # This converts raw control images to the final assembled control_context tensor
-        # and stores it on the FileItemDTO as `_preencoded_zimage_control_context`.
-        # It avoids calling the VAE encoder per-step by caching assembled contexts.
-        try:
-            self._precomputed_zimage_controls_done = False
-            self._precompute_zimage_control_contexts()
-        except Exception:
-            # Non-fatal: log and continue; precompute optional
-            try:
-                print_acc("[PRECOMPUTE] Warning: failed to precompute zimage control contexts; continuing without precompute")
-            except Exception:
-                pass
+        # NOTE: Z-Image precompute support has been removed — control contexts are encoded on-the-fly.
+        # Precompute logic was deleted to avoid caching/nearest-size surprises and improve determinism.
 
-        # negative prompt loading continues...
+        # negative prompt loading continues... 
 
         if self.train_config.negative_prompt is not None:
             if os.path.exists(self.train_config.negative_prompt):
@@ -1854,7 +1869,7 @@ class SDTrainer(BaseSDTrainProcess):
                 prior_pred_kwargs.pop('down_block_additional_residuals', None)
                 prior_pred_kwargs.pop('mid_block_additional_residual', None)
                 # For Z-Image controlnet, remove control context entirely to avoid
-                # expensive preprocessing in predict_noise_zimage
+                # expensive preprocessing in model `get_noise_prediction`
                 prior_pred_kwargs.pop('control_context', None)
                 prior_pred_kwargs['control_context_scale'] = 0.0
 
@@ -1956,60 +1971,31 @@ class SDTrainer(BaseSDTrainProcess):
             return (h >= 64 and w >= 64 and c in (1, 3, 4))
 
     def _collect_preencoded_zimage_context_for_batch(self, batch: 'DataLoaderBatchDTO'):
-        """Delegate to z_image helper: collect precomputed zimage contexts for a batch."""
+        """DEPRECATED helper: precompute support has been removed.
+
+        This trainer helper is retained for API compatibility and always returns None.
+        Use on-the-fly encoding via `_encode_and_assemble_zimage_controls` instead.
+        """
         try:
-            from extensions_built_in.diffusion_models.z_image.z_image import collect_preencoded_zimage_context_for_batch as _helper
-            return _helper(batch)
+            print_acc("[PRECOMPUTE] precompute support removed — returning None (deprecated).")
         except Exception:
-            return None
+            pass
+        return None
 
+# Precompute helper removed: precompute_zimage_control_contexts was deleted as part of precompute removal.
 
-        if len(vals) != len(batch.file_items):
-            # Emit diagnostics for why precompute was not acceptable for the full batch
-            try:
-                print_acc(f"[PRECOMPUTE] precompute not usable for batch: {len(vals)}/{len(batch.file_items)} files usable; details:")
-                for d in diagnostics:
-                    print_acc(f"[PRECOMPUTE]   {d}")
-            except Exception:
-                print(f"[PRECOMPUTE] precompute not usable for batch: {len(vals)}/{len(batch.file_items)} files usable; details:")
-                for d in diagnostics:
-                    print(f"  {d}")
-            return None
-        try:
-            return torch.cat(vals, dim=0)
-        except Exception as e:
-            try:
-                import traceback
-                print_acc(f"[PRECOMPUTE] Failed to concat precomputed contexts: {e}\n{traceback.format_exc()}")
-            except Exception:
-                pass
-            return None
+    def _encode_and_assemble_zimage_controls(self, control_context, target_pixel_dims: tuple = None, target_latent_dims: tuple = None):
+        """Resize control images to `target_pixel_dims` using the trainer's bucket logic
+        and delegate to z_image helper to encode and assemble controls.
 
-    def _precompute_zimage_control_contexts(self):
-        """Delegate to z_image helper precompute routine."""
-        try:
-            from extensions_built_in.diffusion_models.z_image.z_image import precompute_zimage_control_contexts as _helper
-            return _helper(self.sd, self.data_loader)
-        except Exception:
-            return None
-
-
-
-
-            # Some third-party encoders or buggy implementations may have called
-            # torch.set_grad_enabled(False) without restoring; be defensive.
-
-            if not torch.is_grad_enabled():
-                print_acc("[PRECOMPUTE] Global grad mode was disabled after precompute; re-enabling")
-                torch.set_grad_enabled(True)
-
-        self._precomputed_zimage_controls_done = True
-
-    def _encode_and_assemble_zimage_controls(self, control_context):
-        """Delegate to z_image helper: encode and assemble zimage controls."""
+        This enforces that control images go through the same resizing/padding logic
+        used by dataset images so resulting latents match spatially.
+        """
         try:
             from extensions_built_in.diffusion_models.z_image.z_image import encode_and_assemble_zimage_controls as _helper
-            return _helper(self.sd, control_context)
+            # Delegate to the helper and pass the explicit target pixel dims and
+            # authoritative latent dims (None if unknown).
+            return _helper(self.sd, control_context, target_pixel_dims=target_pixel_dims, target_latent_dims=target_latent_dims)
         except Exception as e:
             raise RuntimeError(f"Failed to encode and assemble zimage controls: {e}") from e
 
@@ -2125,6 +2111,20 @@ class SDTrainer(BaseSDTrainProcess):
             guidance_embedding_scale = self._guidance_loss_target_batch
         cond_move = self._maybe_move_embeds(conditional_embeds, self.device_torch, dtype=dtype)
         uncond_move = self._maybe_move_embeds(unconditional_embeds, self.device_torch, dtype=dtype)
+
+        # Diagnostic: print which transformer will be invoked and a concise summary of args/kwargs
+        print_acc(f"[PREDICT] transformer={self.sd.__class__.__name__}, unet={(self.sd.unet.__class__.__name__ if hasattr(self.sd, 'unet') else 'None')}")
+        arg_summary = {
+            'latents': type(noisy_latents).__name__,
+            'timesteps': (repr(timesteps) if isinstance(timesteps, (int, float, str)) else type(timesteps).__name__),
+            'conditional_embeddings': (type(conditional_embeds).__name__ if conditional_embeds is not None else 'None'),
+            'unconditional_embeddings': (type(unconditional_embeds).__name__ if unconditional_embeds is not None else 'None'),
+            'batch': (type(batch).__name__ if batch is not None else 'None'),
+            'is_primary_pred': repr(is_primary_pred),
+        }
+        kwargs_summary = {k: (repr(v) if isinstance(v, (int, float, str, bool)) else type(v).__name__) for k, v in kwargs.items()}
+        print_acc(f"[PREDICT-ARGS] {arg_summary} kwargs={kwargs_summary}")
+
         return self.sd.predict_noise(
             latents=noisy_latents.to(self.device_torch, dtype=dtype),
             conditional_embeddings=cond_move,
@@ -2273,6 +2273,41 @@ class SDTrainer(BaseSDTrainProcess):
 
                         # Validate input early to fail fast if shapes are wrong
                         self._validate_adapter_images(adapter_images)
+
+                        # Ensure adapter images spatially match the training batch images.
+                        # If they differ, resize/adapt the adapter images transparently so
+                        # that encoded control latents will match noisy_latents spatial dims.
+                        try:
+                            if isinstance(adapter_images, torch.Tensor) and getattr(batch, 'tensor', None) is not None:
+                                # batch.tensor is [B, C, H, W]
+                                tgt_h, tgt_w = int(batch.tensor.shape[2]), int(batch.tensor.shape[3])
+                                # If per-sample control images differ, resize them to exact target dims
+                                if adapter_images.ndim == 4 and (int(adapter_images.shape[2]) != tgt_h or int(adapter_images.shape[3]) != tgt_w):
+                                    try:
+                                        print_acc(f"[CONTROL-TRACE] adapter_images spatial mismatch: adapter={tuple(adapter_images.shape[2:])} target={(tgt_h,tgt_w)}; resizing before encode")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        adapter_images, used_dataset_control, _meta = _resize_batch_to_bucket(adapter_images, size=tgt_h, full_size_control_images=getattr(batch.file_items[0], 'full_size_control_images', False), target_dims=(tgt_h, tgt_w))
+                                        try:
+                                            from toolkit.control_channels import tag_tensor
+                                            tag_tensor(adapter_images, 'trainer:adapter_images_resized')
+                                        except Exception:
+                                            pass
+                                        try:
+                                            # record resizing provenance on the batch for downstream diagnostics
+                                            pred_kwargs = getattr(self, '_last_pred_kwargs', None)
+                                            if pred_kwargs is not None:
+                                                pred_kwargs['control_image_resized_to_batch'] = {'from': tuple(adapter_images.shape[2:]), 'to': (tgt_h, tgt_w)}
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        # if resize fails, we still continue and let downstream checks catch mismatches
+                                        pass
+                        except Exception:
+                            # best-effort; don't fail the training loop here
+                            pass
+
                         # match in channels
                         if self.assistant_adapter is not None:
                             in_channels = self.assistant_adapter.config.in_channels
@@ -2613,7 +2648,7 @@ class SDTrainer(BaseSDTrainProcess):
 
                 # flush()
                 # Propagate dataset-level controlnet debug opt-in into model-side routing so
-                # `predict_noise_zimage` can emit additional diagnostics when enabled.
+                # model `get_noise_prediction` can emit additional diagnostics when enabled.
                 try:
                     dataset_controlnet_debug = False
                     if batch is not None and getattr(batch, 'file_items', None):
@@ -2959,13 +2994,75 @@ class SDTrainer(BaseSDTrainProcess):
                 # Handle datasets with/without control images when controlnet is enabled
                 if getattr(self.sd, 'is_controlnet_model', False):
                     if has_adapter_img:
-                        # Dataset has control images - use them
-                        control_context = self._collect_preencoded_zimage_context_for_batch(batch)
-                        if control_context is None:
-                            control_context = self._encode_and_assemble_zimage_controls(adapter_images)
+                        # Dataset has control images - encode controls on-the-fly (precompute removed)
+                        provenance = None
+                        # Use batch tensor pixel dims as the target so controls are bucketized identically
+                        try:
+                            if getattr(batch, 'tensor', None) is not None:
+                                tgt_h, tgt_w = int(batch.tensor.shape[2]), int(batch.tensor.shape[3])
+                            else:
+                                # fallback to noisy_latents-derived pixel dims if batch.tensor not available
+                                vae_sf = max(1, int(getattr(self.sd, 'vae_scale_factor', 8)))
+                                if noisy_latents.ndim == 5:
+                                    lat_h, lat_w = noisy_latents.shape[3], noisy_latents.shape[4]
+                                else:
+                                    lat_h, lat_w = noisy_latents.shape[2], noisy_latents.shape[3]
+                                tgt_h, tgt_w = lat_h * vae_sf, lat_w * vae_sf
+                        except Exception:
+                            tgt_h, tgt_w = None, None
+                        # Authoritative latent spatial dims (from noisy_latents) so we can pad/crop latents exactly once
+                        try:
+                            if noisy_latents.ndim == 5:
+                                lat_h, lat_w = noisy_latents.shape[3], noisy_latents.shape[4]
+                            else:
+                                lat_h, lat_w = noisy_latents.shape[2], noisy_latents.shape[3]
+                            target_latent_dims = (int(lat_h), int(lat_w))
+                        except Exception:
+                            target_latent_dims = None
+
+                        control_context = self._encode_and_assemble_zimage_controls(adapter_images, target_pixel_dims=(tgt_h, tgt_w), target_latent_dims=target_latent_dims)
+
+                        # Tag as encoded origin and log a concise trace
+                        try:
+                            from toolkit.control_channels import tag_tensor, format_origin, get_tensor_origin
+                            tag_tensor(control_context, 'trainer:encoded_control_context')
+                            provenance = {'origin': 'encoded', 'tensor_origin': format_origin(control_context), 'tensor_meta': get_tensor_origin(control_context), 'shape': tuple(control_context.shape)}
+                            print_acc(f"[CONTROL-TRACE] encoded control_context shape={tuple(control_context.shape)} origin={provenance['tensor_origin']}")
+                        except Exception:
+                            provenance = {'origin': 'encoded', 'shape': tuple(control_context.shape)}
 
                         # Move to correct device/dtype
                         control_context = control_context.to(self.device_torch, dtype=dtype)
+
+                        # Emit spatial mismatch diagnostics (do not fail here; just record)
+                        try:
+                            # get noisy latents spatial dims (support 4D and 5D latents)
+                            if hasattr(noisy_latents, 'ndim') and noisy_latents.ndim == 5:
+                                lat_h, lat_w = noisy_latents.shape[3], noisy_latents.shape[4]
+                            else:
+                                lat_h, lat_w = noisy_latents.shape[2], noisy_latents.shape[3]
+                            if control_context.ndim == 5:
+                                ctl_h, ctl_w = control_context.shape[3], control_context.shape[4]
+                            else:
+                                ctl_h, ctl_w = control_context.shape[2], control_context.shape[3]
+                            if (ctl_h != lat_h) or (ctl_w != lat_w):
+                                try:
+                                    print_acc(f"[CONTROL-TRACE] SPATIAL MISMATCH: noisy_latents={lat_h}x{lat_w} control_context={ctl_h}x{ctl_w} provenance={provenance}")
+                                except Exception:
+                                    pass
+                                try:
+                                    pred_kwargs['control_context_shape_mismatch'] = {'noisy_latents': (lat_h, lat_w), 'control_context': (ctl_h, ctl_w), 'provenance': provenance}
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # record provenance into pred_kwargs for downstream inspection
+                        try:
+                            pred_kwargs['control_context_provenance'] = provenance
+                            pred_kwargs['control_context_origin_meta'] = provenance.get('tensor_meta', None) if provenance is not None else None
+                        except Exception:
+                            pass
 
                         # Get per-dataset control strength, fallback to global setting
                         # Default 0.35 (35%) - Z-Image controlnets are often overfitted (docs recommend 65% for inference)
@@ -2980,6 +3077,31 @@ class SDTrainer(BaseSDTrainProcess):
                                     control_scale = getattr(dataset_cfg, 'control_conditioning_scale', control_scale)
                         except Exception:
                             pass  # Fall back to global scale
+
+                        # Pass through the original control image tensor (if dataset supplies it) so Z-Image helper
+                        # that expects a `control_image` can use the raw image instead of the preencoded context.
+                        control_image = getattr(batch, 'control_tensor', None)
+                        if control_image is not None:
+                            control_image = control_image.to(self.device_torch, dtype=dtype)
+                            try:
+                                from toolkit.control_channels import tag_tensor, format_origin, get_tensor_origin
+                                tag_tensor(control_image, 'trainer:control_image_pass_through')
+                                pred_kwargs['control_image_provenance'] = {'shape': tuple(control_image.shape), 'origin': format_origin(control_image), 'meta': get_tensor_origin(control_image)}
+                                print_acc(f"[CONTROL-TRACE] control_image.shape={tuple(control_image.shape)} origin={pred_kwargs['control_image_provenance']['origin']}")
+                            except Exception:
+                                pred_kwargs['control_image_provenance'] = {'shape': tuple(control_image.shape)}
+                        else:
+                            # Fallback to a black image if dataset did not supply a control tensor
+                            B = noisy_latents.shape[0]
+                            H, W = noisy_latents.shape[2], noisy_latents.shape[3]
+                            control_image = torch.zeros((B, 3, H, W), device=noisy_latents.device, dtype=noisy_latents.dtype)
+                            try:
+                                from toolkit.control_channels import tag_tensor
+                                tag_tensor(control_image, 'trainer:control_image_blank')
+                                pred_kwargs['control_image_provenance'] = {'shape': tuple(control_image.shape), 'origin': 'blank'}
+                                print_acc(f"[CONTROL-TRACE] control_image is blank shape={tuple(control_image.shape)}")
+                            except Exception:
+                                pred_kwargs['control_image_provenance'] = {'shape': tuple(control_image.shape), 'origin': 'blank'}
                     else:
                         # Dataset has NO control images - pass zero tensor and scale=0
                         # This ensures model forward pass works but control has no effect
@@ -2992,8 +3114,12 @@ class SDTrainer(BaseSDTrainProcess):
                         )
                         control_scale = 0.0  # Explicitly disable control influence
 
+                        # Also provide a zeroed control_image for consistency with z-image predict signature
+                        control_image = torch.zeros((B, 3, H, W), device=noisy_latents.device, dtype=noisy_latents.dtype)
+
                     pred_kwargs['control_context'] = control_context
                     pred_kwargs['control_context_scale'] = control_scale
+                    pred_kwargs['control_image'] = control_image
 
                 # Standard ControlNetModel handling (non-Z-Image) - legacy path for old adapter-based code
                 if has_adapter_img and not getattr(self.sd, 'is_controlnet_model', False):
@@ -3417,7 +3543,7 @@ class SDTrainer(BaseSDTrainProcess):
             local_pred_kwargs.pop('mid_block_additional_residual', None)
             # For Z-Image controlnet (unified model), remove control context entirely.
             # Setting scale=0 is not enough - we also need to remove the tensor to avoid
-            # expensive preprocessing in predict_noise_zimage (unsqueeze, unbind, etc.)
+            # expensive preprocessing in model `get_noise_prediction` (unsqueeze, unbind, etc.)
             local_pred_kwargs.pop('control_context', None)
             local_pred_kwargs['control_context_scale'] = 0.0
 
@@ -3946,16 +4072,7 @@ class SDTrainer(BaseSDTrainProcess):
             # Build debug flags as strings (so they are not treated as numeric loss scalars)
             debug_flags = {}
             try:
-                # Report whether any control usage occurred as a debug boolean (true/false)
-                control_usage = float(getattr(self, '_control_batch_count', 0.0)) / max(1.0, float(getattr(self, '_total_batch_count', 0.0)))
-                debug_flags['control_usage_rate'] = 'true' if control_usage > 0.0 else 'false'
-
-                debug_flags['controlnet_enabled'] = 'true' if getattr(self.sd, 'is_controlnet_enabled', False) else 'false'
-                debug_flags['batch_has_control'] = 'true' if getattr(self, '_last_batch_has_control', False) else 'false'
-                debug_flags['controlnet_offload_active'] = 'true' if getattr(self, '_last_batch_offload_active', False) else 'false'
-                debug_flags['splitprompt'] = 'true' if getattr(self, '_last_batch_has_splitprompt', False) else 'false'
-                debug_flags['splitprompt_dataset'] = str(getattr(self, '_last_batch_splitprompt_key', '') or '')
-                # If splitprompt is active, provide the source safetensor filename and configured block lists
+                # Only include splitprompt diagnostics when active (avoid emitting empty/false flags)
                 if getattr(self, '_last_batch_has_splitprompt', False):
                     try:
                         ds_key = getattr(self, '_last_batch_splitprompt_key', None)
@@ -3985,14 +4102,8 @@ class SDTrainer(BaseSDTrainProcess):
                             debug_flags['splitprompt_style_blocks'] = ','.join(str(x) for x in style_blocks)
                     except Exception:
                         pass
-                # expose whether noise diagnostics failed so it doesn't silently vanish
-                debug_flags['loss_over_noise_failed'] = 'true' if getattr(self, '_last_noise_diag_exc', None) is not None else 'false'
-                # expose whether loss calculation failed so it doesn't silently vanish
-                debug_flags['loss_calc_failed'] = 'true' if getattr(self, '_last_loss_calc_failed', False) else 'false'
             except Exception:
-                debug_flags = {'control_usage_rate': 'false', 'controlnet_enabled': 'false', 'batch_has_control': 'false', 'controlnet_offload_active': 'false', 'splitprompt': 'false', 'splitprompt_dataset': '', 'loss_over_noise_failed': 'false', 'loss_calc_failed': 'false'}
-
-            # Attach debug flags as a dictionary (strings) for diagnostics
+                debug_flags = {}
             loss_dict['debug_flags'] = debug_flags
 
             # Also emit a concise, separate log line for these flags
