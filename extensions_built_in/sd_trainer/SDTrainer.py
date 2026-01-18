@@ -2225,7 +2225,7 @@ class SDTrainer(BaseSDTrainProcess):
 
             adapter_images = None
             sigmas = None
-            if has_adapter_img and (self.adapter or self.assistant_adapter):
+            if has_adapter_img and (self.adapter or self.assistant_adapter) or getattr(self.sd, 'is_controlnet_model', False):
                 with self.timer('get_adapter_images'):
                     # todo move this to data loader
                     if batch.control_tensor is not None:

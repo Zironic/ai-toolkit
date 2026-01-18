@@ -5,7 +5,7 @@ from huggingface_hub import hf_hub_download
 from optimum.quanto import freeze, qfloat8, quantize
 from transformers import AutoModelForCausalLM, AutoTokenizer, QuantoConfig, BitsAndBytesConfig
 from diffusers.quantizers import PipelineQuantizationConfig
-
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 print("Loading controlnet...")
 quant_config = BitsAndBytesConfig(load_in_8bit=True)
 
@@ -15,13 +15,16 @@ pipeline_quant_config = PipelineQuantizationConfig(
     quant_kwargs={"load_in_8bit": True},
     components_to_quantize=["transformer", "text_encoder"],
 )
-controlnet = ZImageControlNetModel.from_single_file(
-    hf_hub_download(
-        "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
-        filename="Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors",
-    ),
-    torch_dtype=torch.bfloat16,
-)
+controlnet_file=hf_hub_download(
+            "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
+            filename="Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors",
+        )
+with init_empty_weights():
+    controlnet = ZImageControlNetModel.from_single_file(
+        controlnet_file,
+        torch_dtype=torch.bfloat16,
+    )
+controlnet = load_checkpoint_and_dispatch(controlnet, checkpoint=controlnet_file, dtype=torch.bfloat16, device_map="auto", no_split_module_classes=["ZImageTransformerBlock","ZImageControlTransformerBlock"])
 #controlnet = torch.compile(controlnet, mode="max-autotune", fullgraph=True)
 print("Loading pipeline on CPU first...")
 pipe = ZImageControlNetPipeline.from_pretrained(
@@ -32,8 +35,7 @@ pipe = ZImageControlNetPipeline.from_pretrained(
     quantization_config=pipeline_quant_config
     
 )
-
-pipe.to("cuda")
+pipe.enable_model_cpu_offload() 
 print("Moving to CUDA with CPU offload...")
 # Actually, let's not use cpu offload since everything is quantized
 # pipe.enable_model_cpu_offload()

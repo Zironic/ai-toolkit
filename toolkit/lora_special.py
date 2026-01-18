@@ -526,6 +526,17 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             skipped_un = []
         print(f"create LoRA for U-Net: {len(self.unet_loras)} modules.")
 
+        # Summary and safety check for LoKr usage (helps diagnose instability when ControlNet is strong)
+        total_loras = len(self.text_encoder_loras) + len(self.unet_loras)
+        sample_names = [getattr(l, 'lora_name', '<unknown>') for l in (self.text_encoder_loras + self.unet_loras)]
+        sample_preview = sample_names[:10]
+        print(f"[LORA-SUMMARY] Total LoRA/LoKr modules attached: {total_loras} (text={len(self.text_encoder_loras)}, unet={len(self.unet_loras)}). Preview (first 10): {sample_preview}")
+        if self.network_type.lower() == 'lokr':
+            if total_loras > 120:
+                print("[LORA-SUMMARY] ⚠️ Applying LoKr to many modules (full-rank). This can interact poorly with ControlNet at high conditioning strengths. Consider restricting with network_kwargs.only_if_contains to middle transformer layers (e.g., layers.8..layers.22).")
+            fk = getattr(self.network_config, 'lokr_factor', None)
+            print(f"[LORA-SUMMARY] LoKr settings: full_rank={self.network_config.lokr_full_rank}, lokr_factor={fk}, ignore_if_contains={getattr(self, 'ignore_if_contains', None)}, only_if_contains={getattr(self, 'only_if_contains', None)}")
+
         skipped = skipped_te + skipped_un
         if varbose and len(skipped) > 0:
             print(

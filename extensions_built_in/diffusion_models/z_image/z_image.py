@@ -1,3 +1,4 @@
+from email.mime import base
 import os
 import sys
 from typing import List, Optional
@@ -25,6 +26,7 @@ from safetensors.torch import load_file
 
 from transformers import AutoTokenizer, Qwen3ForCausalLM
 from diffusers import AutoencoderKL
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 # VideoX-Fun control pipeline and transformer are now copied locally
 # No need to add to Python path
@@ -314,20 +316,22 @@ class ZImageModel(BaseModel):
                     # Load the fully merged controlnet - this IS what we train!
                     # LoRA needs to attach to the controlnet-modified transformer for spatial guidance
                     self.print_and_status_update("Loading cached controlnet (will be used for training)...")
-                    controlnet = ZImageControlNetModel.from_pretrained(
-                        cache_model_dir,
-                        torch_dtype=dtype,
-                        low_cpu_mem_usage=True,
-                    )
-
+                    with init_empty_weights():
+                        controlnet = ZImageControlNetModel.from_pretrained(
+                            cache_model_dir,
+                            torch_dtype=dtype,
+                            low_cpu_mem_usage=True,
+                        )
+                    controlnet = load_checkpoint_and_dispatch(controlnet, cache_model_dir, device_map="auto", dtype=dtype, no_split_module_classes=["ZImageTransformerBlock","ZImageControlTransformerBlock"])
                     # Load base transformer separately (needed for assistant LoRA and training LoRA)
                     # The assistant LoRA was trained on standard ZImageTransformer2DModel, not controlnet
-                    base_transformer = ZImageTransformer2DModel.from_pretrained(
-                        transformer_path,
-                        subfolder=transformer_subfolder,
-                        torch_dtype=dtype,
-                    )
-
+                    with init_empty_weights():
+                        base_transformer = ZImageTransformer2DModel.from_pretrained(
+                            transformer_path,
+                            subfolder=transformer_subfolder,
+                            torch_dtype=dtype,
+                        )
+                    base_transformer = load_checkpoint_and_dispatch(base_transformer, transformer_path, device_map="auto", dtype=dtype, no_split_module_classes=["ZImageTransformerBlock"])
                     self.print_and_status_update("Merged controlnet loaded - base transformer loaded for LoRA")
                 else:
                     # First time loading - convert and cache using save_pretrained
@@ -345,6 +349,7 @@ class ZImageModel(BaseModel):
                     base_config = dict(base_transformer.config)
                     merged_config = base_config.copy()
                     merged_config.update(control_config)
+                    
                     controlnet = ZImageControlNetModel.from_config(merged_config)
 
                     # Load weights from original file (this is the slow part)
@@ -422,7 +427,7 @@ class ZImageModel(BaseModel):
                 def _is_gradient_checkpointing(self):
                     return False
                 controlnet.is_gradient_checkpointing = types.MethodType(_is_gradient_checkpointing, controlnet)
-
+            import torch
             self.print_and_status_update(f"ControlNet loaded successfully: {controlnet.__class__.__name__}")
         else:
             # Standard base transformer loading
@@ -1830,6 +1835,9 @@ class ZImageModel(BaseModel):
                 print(f"[Z-IMAGE-CFG-OVERRIDE] Forcing guidance_scale from {gen_config.guidance_scale} to 1.0 (Z-Image Turbo is distilled, no CFG)")
                 gen_config.guidance_scale = 1.0
 
+            # Ensure pipeline modules are on desired device before sampling
+            if hasattr(pipeline, "to"):
+                pipeline = pipeline.to(self.device_torch)
             img = pipeline(
                 prompt_embeds=conditional_embeds.text_embeds,
                 negative_prompt_embeds=unconditional_embeds.text_embeds,

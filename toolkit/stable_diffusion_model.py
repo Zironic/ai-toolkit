@@ -1535,59 +1535,9 @@ class StableDiffusion:
                     conditional_embeds = conditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
                     unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
 
-                    # Z-Image Controlnet: Use custom sampling loop that supports control_context
-                    if getattr(self, 'is_controlnet_model', False) and self.model_config.model_type == 'z_image' and 'control_context' in extra:
-                        print(f"[CONTROL-DEBUG] Using custom Z-Image controlnet sampling loop")
-                        from diffusers import FlowMatchEulerDiscreteScheduler
+    
 
-                        # Get or create scheduler
-                        scheduler = pipeline.scheduler if hasattr(pipeline, 'scheduler') else FlowMatchEulerDiscreteScheduler.from_pretrained(
-                            self.model_config.name_or_path,
-                            subfolder="scheduler"
-                        )
-
-                        # Prepare latents
-                        if gen_config.latents is None:
-                            latents = self.get_latent_noise(
-                                pixel_height=gen_config.height,
-                                pixel_width=gen_config.width,
-                                batch_size=1,
-                                num_channels=self.transformer.config.in_channels
-                            ).to(self.device_torch, dtype=self.transformer.dtype)
-                        else:
-                            latents = gen_config.latents.to(self.device_torch, dtype=self.transformer.dtype)
-
-                        # Set timesteps
-                        scheduler.set_timesteps(gen_config.num_inference_steps, device=self.device_torch)
-                        timesteps = scheduler.timesteps
-
-                        # Denoising loop
-                        for i, t in enumerate(timesteps):
-                            # Prepare model input with CFG
-                            latent_model_input = torch.cat([latents] * 2) if gen_config.guidance_scale > 1.0 else latents
-
-                            # Predict noise using our custom predict_noise that supports control
-                            noise_pred = self.predict_noise(
-                                latent_model_input,
-                                concat_prompt_embeds([unconditional_embeds, conditional_embeds]) if gen_config.guidance_scale > 1.0 else conditional_embeds,
-                                t,
-                                control_context=extra['control_context'],
-                                control_context_scale=extra.get('control_context_scale', 1.0)
-                            )
-
-                            # Perform CFG
-                            if gen_config.guidance_scale > 1.0:
-                                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                                noise_pred = noise_pred_uncond + gen_config.guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                            # Scheduler step
-                            latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-                        # Decode latents
-                        img = self.decode_latents(latents)[0]
-                        print(f"[CONTROL-DEBUG] Custom sampling complete, image shape: {img.size if hasattr(img, 'size') else 'unknown'}")
-
-                    elif self.is_xl:
+                    if self.is_xl:
                         # fix guidance rescale for sdxl
                         # was trained on 0.7 (I believe)
 
