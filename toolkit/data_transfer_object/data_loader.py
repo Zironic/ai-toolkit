@@ -5,7 +5,8 @@ import torch
 
 from PIL import Image
 from PIL.ImageOps import exif_transpose
-from toolkit.print import print_acc
+from toolkit.print import print_accimport av
+            
 from toolkit import image_utils
 from toolkit.basic import get_quick_signature_string
 from toolkit.dataloader_mixins import (
@@ -21,6 +22,7 @@ from toolkit.dataloader_mixins import (
     ClipImageFileItemDTOMixin,
     InpaintControlFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
+    AudioProcessingDTOMixin,
 )
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 
@@ -42,6 +44,7 @@ class FileItemDTO(
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
+    AudioProcessingDTOMixin,
     ControlFileItemDTOMixin,
     InpaintControlFileItemDTOMixin,
     ClipImageFileItemDTOMixin,
@@ -54,12 +57,19 @@ class FileItemDTO(
     def __init__(self, *args, **kwargs):
         self.path = kwargs.get("path", "")
         self.dataset_config: "DatasetConfig" = kwargs.get("dataset_config", None)
-        self.is_video = self.dataset_config.num_frames > 1
+        self.is_video = self.dataset_config.num_frames > 1 or self.dataset_config.auto_frame_count
+        self.is_audio_model = kwargs.get("is_audio_model", False)
+        self.sample_rate = kwargs.get("sample_rate", 48000)
+        self.num_frames = self.dataset_config.num_frames
+        self.temporal_compression = kwargs.get("temporal_compression", 8)
         size_database = kwargs.get("size_database", {})
         dataset_root = kwargs.get("dataset_root", None)
         self.encode_control_in_text_embeddings = kwargs.get(
             "encode_control_in_text_embeddings", False
         )
+        self.te_padding_side = kwargs.get("te_padding_side", "right")
+        self.latent_space_version = kwargs.get("latent_space_version", "sd1")
+        self.text_embedding_space_version = kwargs.get("text_embedding_space_version", "sd1")
         if dataset_root is not None:
             # remove dataset root from path
             file_key = self.path.replace(dataset_root, "")
@@ -79,8 +89,16 @@ class FileItemDTO(
                 and db_entry[2] == file_signature
             ):
                 use_db_entry = True
-
-        if use_db_entry:
+        if self.is_audio_model:
+            # get the length of the audio file in ms
+            with av.open(self.path) as c:
+                if c.duration is not None:
+                    w =  int(c.duration / 1_000)
+                else:
+                    s = c.streams.audio[0]
+                    w = int(float(s.duration * s.time_base) * 1_000)
+            h = 1
+        elif use_db_entry:
             w, h, _ = size_database[file_key]
         elif self.is_video:
             # Open the video file
@@ -194,6 +212,8 @@ class DataLoaderBatchDTO:
             # just for holding noise and preds during training
             self.audio_target: Union[torch.Tensor, None] = None
             self.audio_pred: Union[torch.Tensor, None] = None
+            
+            self.num_frames: int = self.file_items[0].num_frames
 
             if not is_latents_cached:
                 # only return a tensor if latents are not cached
@@ -399,7 +419,22 @@ class DataLoaderBatchDTO:
                         if not isinstance(y.text_embeds, list):
                             y.text_embeds = [y.text_embeds]
                     prompt_embeds_list.append(y)
-                self.prompt_embeds = concat_prompt_embeds(prompt_embeds_list)
+                padding_side = self.file_items[0].te_padding_side
+                
+                self.prompt_embeds = concat_prompt_embeds(prompt_embeds_list, padding_side=padding_side)
+
+            # DOP (Differential Output Preservation) embeddings collation
+            self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
+            if any([getattr(x, 'dop_prompt_embeds', None) is not None for x in self.file_items]):
+                dop_list = []
+                # Only collate if all items have DOP embeddings (all-or-nothing approach)
+                for x in self.file_items:
+                    if getattr(x, 'dop_prompt_embeds', None) is None:
+                        dop_list = None
+                        break
+                    dop_list.append(x.dop_prompt_embeds)
+                if dop_list is not None:
+                    self.dop_prompt_embeds = concat_prompt_embeds(dop_list)
 
             # DOP (Differential Output Preservation) embeddings collation
             self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
