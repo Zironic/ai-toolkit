@@ -1835,31 +1835,138 @@ class SDTrainer(BaseSDTrainProcess):
                         prior_embeds_to_use = conditional_embeds
                         # use diff_output_preservation embeds if doing dfe
                         if self.train_config.diff_output_preservation:
+                            # ensure we have DOP embeddings available; if not, try to load per-file cached embeddings
                             if self.diff_output_preservation_embeds is None:
-                                print_acc("[DOP WARNING] diff_output_preservation enabled but embeddings missing - skipping DOP this step")
-                            else:
+                                dop_embeds_list = []
+                                ok = True
+                                if getattr(batch, 'file_items', None) is not None and self.is_caching_text_embeddings:
+                                    with self.timer('dop_embed_load'):
+                                        for fi in batch.file_items:
+                                            dop_caption = fi.caption or ""
+                                            if hasattr(self, '_dop_replacements') and self._dop_replacements:
+                                                dop_caption = normalize_caption_separators(dop_caption)
+                                                for tr, cls in self._dop_replacements:
+                                                    if tr == '':
+                                                        continue
+                                                    pattern = rf"(?<!\S){re.escape(tr)}(?!\S)"
+                                                    dop_caption, n = re.subn(pattern, cls, dop_caption)
+                                                    if n == 0:
+                                                        dop_caption = dop_caption.replace(tr, cls)
+                                            try:
+                                                fi.load_dop_prompt_embedding(dop_caption)
+                                            except Exception:
+                                                pass
+                                            if fi.dop_prompt_embeds is None:
+                                                ok = False
+                                                break
+                                            dop_embeds_list.append(fi.dop_prompt_embeds)
+                                else:
+                                    ok = False
+
+                                if ok:
+                                    self.diff_output_preservation_embeds = concat_prompt_embeds(dop_embeds_list)
+                                    with self.timer('dop_embed_move'):
+                                        self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
+                                else:
+                                    # Fallback: encode DOP prompts on-the-fly using CSV mapping
+                                    dop_prompts = [normalize_caption_separators(self._map_triggers_to_classes_in_text(p)) for p in conditioned_prompts]
+                                    dop_prompts_2 = None
+                                    if prompt_2 is not None:
+                                        dop_prompts_2 = [normalize_caption_separators(self._map_triggers_to_classes_in_text(p)) for p in prompt_2]
+                                    with self.timer('dop_encode_fallback'):
+                                        self.diff_output_preservation_embeds = self.sd.encode_prompt(
+                                            dop_prompts, dop_prompts_2,
+                                            dropout_prob=self.train_config.prompt_dropout_prob,
+                                            long_prompts=self.do_long_prompts,
+                                            **pred_kwargs
+                                        )
+                                    with self.timer('dop_embed_move'):
+                                        self.diff_output_preservation_embeds = self._maybe_move_embeds(self.diff_output_preservation_embeds, self.device_torch, dtype=dtype)
+                            # For diff_output_preservation, use the DOP embeds as the prior target. Only use blank-preservation when
+                            # blank_prompt_preservation is explicitly enabled.
+                            if self.train_config.blank_prompt_preservation:
+                                blank_embeds = self.cached_blank_embeds.clone().detach().to(
+                                    self.device_torch, dtype=dtype
+                                )
+                                prior_embeds_to_use = concat_prompt_embeds(
+                                    [blank_embeds] * noisy_latents.shape[0]
+                                )
+                            elif getattr(self, 'diff_output_preservation_embeds', None) is not None:
                                 prior_embeds_to_use = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
                         
-                        if self.train_config.blank_prompt_preservation:
-                            blank_embeds = self.cached_blank_embeds.clone().detach().to(
-                                self.device_torch, dtype=dtype
+                        # Decide whether we can skip an expensive full-resolution prior prediction.
+                        # If preservation is scheduled (DOP or blank prompt preservation) and a reduced
+                        # preservation resolution is configured which would downsample the latents, and
+                        # if no other features require a full-res prior (e.g., prior divergence, inverted_mask_prior,
+                        # correct_pred_norm, or reg-prior), then skip the full-res prior and let
+                        # `_run_preservation_forward` compute the smaller prediction instead.
+                        preservation_resolution = None
+                        preservation_kind = None
+                        if self.train_config.diff_output_preservation and getattr(self, 'diff_output_preservation_embeds', None) is not None:
+                            preservation_resolution = getattr(self.train_config, 'diff_output_preservation_resolution', None)
+                            preservation_kind = 'dop'
+                        if preservation_resolution is None and self.train_config.blank_prompt_preservation:
+                            preservation_resolution = getattr(self.train_config, 'blank_prompt_preservation_resolution', None)
+                            preservation_kind = 'blank'
+
+                        def _would_downsample(resolution, noisy_latents):
+                            if resolution is None:
+                                return False
+                            try:
+                                vae = getattr(self.sd, 'vae', None)
+                                if vae is not None and hasattr(vae, 'config') and 'block_out_channels' in vae.config:
+                                    vae_scale = 2 ** (len(vae.config['block_out_channels']) - 1)
+                                else:
+                                    vae_scale = getattr(self.sd, 'vae_scale_factor', 8)
+                            except Exception:
+                                vae_scale = 8
+                            _, C, H, W = noisy_latents.shape
+                            # Calculate target dimensions based on pixel area, not side length
+                            import math
+                            target_latent_area = (resolution / vae_scale) ** 2
+                            aspect_ratio = H / W
+                            target_h = max(1, int(round(math.sqrt(target_latent_area * aspect_ratio))))
+                            target_w = max(1, int(round(math.sqrt(target_latent_area / aspect_ratio))))
+                            # transformer patch rounding
+                            try:
+                                tr = getattr(self.sd, 'transformer', None)
+                                if tr is not None:
+                                    all_patch = getattr(tr, 'all_patch_size', None)
+                                    if all_patch:
+                                        patch_min = int(min(all_patch))
+                                    else:
+                                        patch_min = 1
+                                else:
+                                    patch_min = 1
+                            except Exception:
+                                patch_min = 1
+                            if patch_min > 1:
+                                target_h = max(patch_min, int(round(target_h / patch_min)) * patch_min)
+                                target_w = max(patch_min, int(round(target_w / patch_min)) * patch_min)
+                            return (target_h < H) or (target_w < W)
+
+                        # Decide via helper whether we can skip the full-resolution prior.
+                        skip_full_prior = self._should_skip_full_prior(noisy_latents, preservation_resolution, do_reg_prior=do_reg_prior)
+
+                        if skip_full_prior:
+                            try:
+                                print_acc(f"[DOP] Skipping full-res prior for {preservation_kind} preservation; will run reduced prediction at {preservation_resolution}px area")
+                            except Exception:
+                                pass
+                            prior_pred = None
+                        else:
+                            prior_pred = self.get_prior_prediction(
+                                noisy_latents=noisy_latents,
+                                conditional_embeds=prior_embeds_to_use,
+                                match_adapter_assist=match_adapter_assist,
+                                network_weight_list=network_weight_list,
+                                timesteps=timesteps,
+                                pred_kwargs=pred_kwargs,
+                                noise=noise,
+                                batch=batch,
+                                unconditional_embeds=unconditional_embeds,
+                                conditioned_prompts=conditioned_prompts
                             )
-                            prior_embeds_to_use = concat_prompt_embeds(
-                                [blank_embeds] * noisy_latents.shape[0]
-                            )
-                        
-                        prior_pred = self.get_prior_prediction(
-                            noisy_latents=noisy_latents,
-                            conditional_embeds=prior_embeds_to_use,
-                            match_adapter_assist=match_adapter_assist,
-                            network_weight_list=network_weight_list,
-                            timesteps=timesteps,
-                            pred_kwargs=pred_kwargs,
-                            noise=noise,
-                            batch=batch,
-                            unconditional_embeds=unconditional_embeds,
-                            conditioned_prompts=conditioned_prompts
-                        )
                         if prior_pred is not None:
                             prior_pred = prior_pred.detach()
 
