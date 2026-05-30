@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, Dict, List, Union
 import cv2
 import torch
 
@@ -7,7 +7,8 @@ from PIL import Image
 from PIL.ImageOps import exif_transpose
 import av
 from toolkit.print import print_acc
-            
+
+
 from toolkit import image_utils
 from toolkit.basic import get_quick_signature_string
 from toolkit.dataloader_mixins import (
@@ -23,7 +24,6 @@ from toolkit.dataloader_mixins import (
     ClipImageFileItemDTOMixin,
     InpaintControlFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
-    AudioProcessingDTOMixin,
 )
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 
@@ -45,7 +45,6 @@ class FileItemDTO(
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
-    AudioProcessingDTOMixin,
     ControlFileItemDTOMixin,
     InpaintControlFileItemDTOMixin,
     ClipImageFileItemDTOMixin,
@@ -58,11 +57,7 @@ class FileItemDTO(
     def __init__(self, *args, **kwargs):
         self.path = kwargs.get("path", "")
         self.dataset_config: "DatasetConfig" = kwargs.get("dataset_config", None)
-        self.is_video = self.dataset_config.num_frames > 1 or self.dataset_config.auto_frame_count
-        self.is_audio_model = kwargs.get("is_audio_model", False)
-        self.sample_rate = kwargs.get("sample_rate", 48000)
-        self.num_frames = self.dataset_config.num_frames
-        self.temporal_compression = kwargs.get("temporal_compression", 8)
+        self.is_video = self.dataset_config.num_frames > 1
         size_database = kwargs.get("size_database", {})
         dataset_root = kwargs.get("dataset_root", None)
         self.encode_control_in_text_embeddings = kwargs.get(
@@ -90,16 +85,8 @@ class FileItemDTO(
                 and db_entry[2] == file_signature
             ):
                 use_db_entry = True
-        if self.is_audio_model:
-            # get the length of the audio file in ms
-            with av.open(self.path) as c:
-                if c.duration is not None:
-                    w =  int(c.duration / 1_000)
-                else:
-                    s = c.streams.audio[0]
-                    w = int(float(s.duration * s.time_base) * 1_000)
-            h = 1
-        elif use_db_entry:
+
+        if use_db_entry:
             w, h, _ = size_database[file_key]
         elif self.is_video:
             # Open the video file
@@ -157,6 +144,50 @@ class FileItemDTO(
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
 
+        # Per-sample loss config overrides (None = use global config)
+        self.identity_loss_weight: Union[float, None] = self.dataset_config.identity_loss_weight
+        self.identity_loss_min_t: Union[float, None] = self.dataset_config.identity_loss_min_t
+        self.identity_loss_max_t: Union[float, None] = self.dataset_config.identity_loss_max_t
+        self.identity_loss_min_cos: Union[float, None] = self.dataset_config.identity_loss_min_cos
+        self.identity_clean_cos: Union[float, None] = None  # set by SDTrainer for average mode targets
+        self.landmark_loss_weight: Union[float, None] = self.dataset_config.landmark_loss_weight
+        self.body_proportion_loss_weight: Union[float, None] = self.dataset_config.body_proportion_loss_weight
+        self.body_proportion_loss_min_t: Union[float, None] = self.dataset_config.body_proportion_loss_min_t
+        self.body_proportion_loss_max_t: Union[float, None] = self.dataset_config.body_proportion_loss_max_t
+        self.body_shape_loss_weight: Union[float, None] = self.dataset_config.body_shape_loss_weight
+        self.body_shape_loss_min_t: Union[float, None] = self.dataset_config.body_shape_loss_min_t
+        self.body_shape_loss_max_t: Union[float, None] = self.dataset_config.body_shape_loss_max_t
+        self.body_shape_loss_min_cos: Union[float, None] = self.dataset_config.body_shape_loss_min_cos
+        self.normal_loss_weight: Union[float, None] = self.dataset_config.normal_loss_weight
+        self.normal_loss_min_t: Union[float, None] = self.dataset_config.normal_loss_min_t
+        self.normal_loss_max_t: Union[float, None] = self.dataset_config.normal_loss_max_t
+        self.vae_anchor_loss_weight: Union[float, None] = self.dataset_config.vae_anchor_loss_weight
+        self.vae_anchor_loss_min_t: Union[float, None] = self.dataset_config.vae_anchor_loss_min_t
+        self.vae_anchor_loss_max_t: Union[float, None] = self.dataset_config.vae_anchor_loss_max_t
+        self.diffusion_loss_weight: Union[float, None] = self.dataset_config.diffusion_loss_weight
+        self.diffusion_loss_min_t: Union[float, None] = self.dataset_config.diffusion_loss_min_t
+        self.diffusion_loss_max_t: Union[float, None] = self.dataset_config.diffusion_loss_max_t
+        self.face_suppression_weight: Union[float, None] = self.dataset_config.face_suppression_weight
+        self.face_suppression_expand: Union[float, None] = self.dataset_config.face_suppression_expand
+        self.face_suppression_soft: Union[bool, None] = self.dataset_config.face_suppression_soft
+        self.latent_perceptual_loss_weight: Union[float, None] = self.dataset_config.latent_perceptual_loss_weight
+        self.latent_perceptual_loss_min_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_min_t
+        self.latent_perceptual_loss_max_t: Union[float, None] = self.dataset_config.latent_perceptual_loss_max_t
+        self.depth_loss_weight: Union[float, None] = self.dataset_config.depth_loss_weight
+        self.depth_loss_min_t: Union[float, None] = self.dataset_config.depth_loss_min_t
+        self.depth_loss_max_t: Union[float, None] = self.dataset_config.depth_loss_max_t
+        self.loss_split: Union[str, None] = self.dataset_config.loss_split
+        # Subject mask (Phase 2) per-dataset overrides; None = inherit global SubjectMaskConfig
+        self.background_loss_weight: Union[float, None] = self.dataset_config.background_loss_weight
+        self.clothing_loss_weight: Union[float, None] = self.dataset_config.clothing_loss_weight
+        self.body_loss_weight: Union[float, None] = self.dataset_config.body_loss_weight
+        self.perceptual_restrict_to_body: Union[bool, None] = self.dataset_config.perceptual_restrict_to_body
+        # Populated by cache_subject_masks (Phase 1) when subject_mask.enabled.
+        # bool tensors of shape (cache_resolution, cache_resolution), on CPU.
+        self.subject_mask: Union[torch.Tensor, None] = None
+        self.body_mask: Union[torch.Tensor, None] = None
+        self.clothing_mask: Union[torch.Tensor, None] = None
+
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
         self.prior_reg = self.dataset_config.prior_reg
@@ -209,12 +240,30 @@ class DataLoaderBatchDTO:
             self.audio_tensor: Union[torch.Tensor, None] = None
             self.first_frame_latents: Union[torch.Tensor, None] = None
             self.audio_latents: Union[torch.Tensor, None] = None
+            self.face_embedding: Union[torch.Tensor, None] = None
+            self.vision_face_embedding: Union[torch.Tensor, None] = None
+            self.body_embedding: Union[torch.Tensor, None] = None
+            self.identity_embedding: Union[torch.Tensor, None] = None
+            self.landmark_embedding: Union[torch.Tensor, None] = None
+            self.body_proportion_embedding: Union[torch.Tensor, None] = None
+            self.body_shape_embedding: Union[torch.Tensor, None] = None
+            # Depth consistency loss: per-image GT depth maps (variable shape)
+            self.depth_gt_list: Union[list, None] = None
+            # Depth consistency loss (video): per-video GT depth cubes, (T, H, W)
+            self.depth_gt_video_list: Union[list, None] = None
+            self.normal_embedding: Union[torch.Tensor, None] = None
+            self.vae_anchor_features: Union[Dict, None] = None  # per-level VAE encoder features
+            self.face_bboxes: Union[List, None] = None  # per-item face bboxes in original image coords
+            self.person_bboxes: Union[List, None] = None  # per-item person bboxes in original image coords
+            # Subject mask (Phase 2) stacked tensors, shape (B, 1, H_c, W_c), dtype bool, CPU.
+            # None when no file_item has cached masks.
+            self.subject_masks: Union[torch.Tensor, None] = None
+            self.body_masks: Union[torch.Tensor, None] = None
+            self.clothing_masks: Union[torch.Tensor, None] = None
 
             # just for holding noise and preds during training
             self.audio_target: Union[torch.Tensor, None] = None
             self.audio_pred: Union[torch.Tensor, None] = None
-            
-            self.num_frames: int = self.file_items[0].num_frames
 
             if not is_latents_cached:
                 # only return a tensor if latents are not cached
@@ -304,6 +353,117 @@ class DataLoaderBatchDTO:
 
             self.loss_multiplier_list: List[float] = [
                 x.loss_multiplier for x in self.file_items
+            ]
+
+            # Per-sample loss config overrides (None = use global config)
+            self.identity_loss_weight_list: List[Union[float, None]] = [
+                x.identity_loss_weight for x in self.file_items
+            ]
+            self.identity_loss_min_t_list: List[Union[float, None]] = [
+                x.identity_loss_min_t for x in self.file_items
+            ]
+            self.identity_loss_max_t_list: List[Union[float, None]] = [
+                x.identity_loss_max_t for x in self.file_items
+            ]
+            self.identity_loss_min_cos_list: List[Union[float, None]] = [
+                x.identity_loss_min_cos for x in self.file_items
+            ]
+            self.identity_clean_cos_list: List[Union[float, None]] = [
+                x.identity_clean_cos for x in self.file_items
+            ]
+            self.latent_perceptual_loss_weight_list: List[Union[float, None]] = [
+                x.latent_perceptual_loss_weight for x in self.file_items
+            ]
+            self.latent_perceptual_loss_min_t_list: List[Union[float, None]] = [
+                x.latent_perceptual_loss_min_t for x in self.file_items
+            ]
+            self.latent_perceptual_loss_max_t_list: List[Union[float, None]] = [
+                x.latent_perceptual_loss_max_t for x in self.file_items
+            ]
+            self.depth_loss_weight_list: List[Union[float, None]] = [
+                x.depth_loss_weight for x in self.file_items
+            ]
+            self.depth_loss_min_t_list: List[Union[float, None]] = [
+                x.depth_loss_min_t for x in self.file_items
+            ]
+            self.depth_loss_max_t_list: List[Union[float, None]] = [
+                x.depth_loss_max_t for x in self.file_items
+            ]
+            self.loss_split_list: List[Union[str, None]] = [
+                x.loss_split for x in self.file_items
+            ]
+            self.landmark_loss_weight_list: List[Union[float, None]] = [
+                x.landmark_loss_weight for x in self.file_items
+            ]
+            self.body_proportion_loss_weight_list: List[Union[float, None]] = [
+                x.body_proportion_loss_weight for x in self.file_items
+            ]
+            self.body_proportion_loss_min_t_list: List[Union[float, None]] = [
+                x.body_proportion_loss_min_t for x in self.file_items
+            ]
+            self.body_proportion_loss_max_t_list: List[Union[float, None]] = [
+                x.body_proportion_loss_max_t for x in self.file_items
+            ]
+            self.diffusion_loss_weight_list: List[Union[float, None]] = [
+                x.diffusion_loss_weight for x in self.file_items
+            ]
+            self.diffusion_loss_min_t_list: List[Union[float, None]] = [
+                x.diffusion_loss_min_t for x in self.file_items
+            ]
+            self.diffusion_loss_max_t_list: List[Union[float, None]] = [
+                x.diffusion_loss_max_t for x in self.file_items
+            ]
+            self.body_shape_loss_weight_list: List[Union[float, None]] = [
+                x.body_shape_loss_weight for x in self.file_items
+            ]
+            self.body_shape_loss_min_t_list: List[Union[float, None]] = [
+                x.body_shape_loss_min_t for x in self.file_items
+            ]
+            self.body_shape_loss_max_t_list: List[Union[float, None]] = [
+                x.body_shape_loss_max_t for x in self.file_items
+            ]
+            self.body_shape_loss_min_cos_list: List[Union[float, None]] = [
+                x.body_shape_loss_min_cos for x in self.file_items
+            ]
+            self.normal_loss_weight_list: List[Union[float, None]] = [
+                x.normal_loss_weight for x in self.file_items
+            ]
+            self.normal_loss_min_t_list: List[Union[float, None]] = [
+                x.normal_loss_min_t for x in self.file_items
+            ]
+            self.normal_loss_max_t_list: List[Union[float, None]] = [
+                x.normal_loss_max_t for x in self.file_items
+            ]
+            self.face_suppression_weight_list: List[Union[float, None]] = [
+                x.face_suppression_weight for x in self.file_items
+            ]
+            self.face_suppression_expand_list: List[Union[float, None]] = [
+                x.face_suppression_expand for x in self.file_items
+            ]
+            self.face_suppression_soft_list: List[Union[bool, None]] = [
+                x.face_suppression_soft for x in self.file_items
+            ]
+            self.vae_anchor_loss_weight_list: List[Union[float, None]] = [
+                x.vae_anchor_loss_weight for x in self.file_items
+            ]
+            self.vae_anchor_loss_min_t_list: List[Union[float, None]] = [
+                x.vae_anchor_loss_min_t for x in self.file_items
+            ]
+            self.vae_anchor_loss_max_t_list: List[Union[float, None]] = [
+                x.vae_anchor_loss_max_t for x in self.file_items
+            ]
+            # Subject mask (Phase 2) per-item weight overrides; None = inherit global
+            self.background_loss_weight_list: List[Union[float, None]] = [
+                getattr(x, 'background_loss_weight', None) for x in self.file_items
+            ]
+            self.clothing_loss_weight_list: List[Union[float, None]] = [
+                getattr(x, 'clothing_loss_weight', None) for x in self.file_items
+            ]
+            self.body_loss_weight_list: List[Union[float, None]] = [
+                getattr(x, 'body_loss_weight', None) for x in self.file_items
+            ]
+            self.perceptual_restrict_to_body_list: List[Union[bool, None]] = [
+                getattr(x, 'perceptual_restrict_to_body', None) for x in self.file_items
             ]
 
             if any([x.clip_image_tensor is not None for x in self.file_items]):
@@ -437,18 +597,171 @@ class DataLoaderBatchDTO:
                 if dop_list is not None:
                     self.dop_prompt_embeds = concat_prompt_embeds(dop_list)
 
-            # DOP (Differential Output Preservation) embeddings collation
-            self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
-            if any([getattr(x, 'dop_prompt_embeds', None) is not None for x in self.file_items]):
-                dop_list = []
-                # Only collate if all items have DOP embeddings (all-or-nothing approach)
+            # collect face embeddings (LoRA+ID)
+            if any([getattr(x, 'face_embedding', None) is not None for x in self.file_items]):
+                face_embeds = []
                 for x in self.file_items:
-                    if getattr(x, 'dop_prompt_embeds', None) is None:
-                        dop_list = None
+                    emb = getattr(x, 'face_embedding', None)
+                    if emb is not None:
+                        face_embeds.append(emb.unsqueeze(0))
+                    else:
+                        face_embeds.append(torch.zeros(1, 512))
+                self.face_embedding = torch.cat(face_embeds, dim=0)
+
+            # collect vision face embeddings (CLIP/DINOv2 face crops)
+            if any([getattr(x, 'vision_face_embedding', None) is not None for x in self.file_items]):
+                vision_embeds = []
+                # get shape from first non-None embedding
+                ref_emb = None
+                for x in self.file_items:
+                    ref_emb = getattr(x, 'vision_face_embedding', None)
+                    if ref_emb is not None:
                         break
-                    dop_list.append(x.dop_prompt_embeds)
-                if dop_list is not None:
-                    self.dop_prompt_embeds = concat_prompt_embeds(dop_list)
+                for x in self.file_items:
+                    emb = getattr(x, 'vision_face_embedding', None)
+                    if emb is not None:
+                        vision_embeds.append(emb.unsqueeze(0))
+                    else:
+                        vision_embeds.append(torch.zeros(1, *ref_emb.shape))
+                self.vision_face_embedding = torch.cat(vision_embeds, dim=0)
+
+            # collect identity embeddings (ArcFace, for identity loss)
+            if any([getattr(x, 'identity_embedding', None) is not None for x in self.file_items]):
+                id_embeds = []
+                for x in self.file_items:
+                    emb = getattr(x, 'identity_embedding', None)
+                    if emb is not None:
+                        id_embeds.append(emb.unsqueeze(0))
+                    else:
+                        id_embeds.append(torch.zeros(1, 512))
+                self.identity_embedding = torch.cat(id_embeds, dim=0)
+
+            # collect landmark embeddings (MediaPipe FaceMesh, for landmark shape loss)
+            if any([getattr(x, 'landmark_embedding', None) is not None for x in self.file_items]):
+                lm_embeds = []
+                for x in self.file_items:
+                    emb = getattr(x, 'landmark_embedding', None)
+                    if emb is not None:
+                        lm_embeds.append(emb.unsqueeze(0))
+                    else:
+                        lm_embeds.append(torch.zeros(1, 478, 2))
+                self.landmark_embedding = torch.cat(lm_embeds, dim=0)
+
+            # collect body proportion embeddings (ViTPose ratios, for body proportion loss)
+            if any([getattr(x, 'body_proportion_embedding', None) is not None for x in self.file_items]):
+                bp_embeds = []
+                # Infer embedding dim from first non-None embedding
+                ref_emb = next((getattr(x, 'body_proportion_embedding', None)
+                                for x in self.file_items
+                                if getattr(x, 'body_proportion_embedding', None) is not None), None)
+                bp_dim = ref_emb.shape[-1] if ref_emb is not None else 16
+                for x in self.file_items:
+                    emb = getattr(x, 'body_proportion_embedding', None)
+                    if emb is not None:
+                        bp_embeds.append(emb.unsqueeze(0))
+                    else:
+                        bp_embeds.append(torch.zeros(1, bp_dim))
+                self.body_proportion_embedding = torch.cat(bp_embeds, dim=0)
+
+            # collect body shape embeddings (HybrIK SMPL betas, for body shape loss)
+            if any([getattr(x, 'body_shape_embedding', None) is not None for x in self.file_items]):
+                bs_embeds = []
+                for x in self.file_items:
+                    emb = getattr(x, 'body_shape_embedding', None)
+                    if emb is not None:
+                        bs_embeds.append(emb.unsqueeze(0))
+                    else:
+                        bs_embeds.append(torch.zeros(1, 10))
+                self.body_shape_embedding = torch.cat(bs_embeds, dim=0)
+
+            # collect GT depth maps (variable per-image shape — kept as list)
+            if any([getattr(x, 'depth_gt', None) is not None for x in self.file_items]):
+                self.depth_gt_list = [
+                    getattr(x, 'depth_gt', None) for x in self.file_items
+                ]
+
+            # collect GT depth cubes for video items (T, H, W) float16 — list
+            if any([getattr(x, 'depth_gt_video', None) is not None for x in self.file_items]):
+                self.depth_gt_video_list = [
+                    getattr(x, 'depth_gt_video', None) for x in self.file_items
+                ]
+
+            # collect normal embeddings (Sapiens normal maps, for normal loss)
+            if any([getattr(x, 'normal_embedding', None) is not None for x in self.file_items]):
+                nm_embeds = []
+                for x in self.file_items:
+                    emb = getattr(x, 'normal_embedding', None)
+                    if emb is not None:
+                        nm_embeds.append(emb.unsqueeze(0))
+                    else:
+                        nm_embeds.append(torch.zeros(1, 3, 256, 256))
+                self.normal_embedding = torch.cat(nm_embeds, dim=0)
+
+            # collect VAE anchor features (multi-scale encoder features for perceptual anchor loss)
+            if any([getattr(x, 'vae_anchor_features', None) is not None for x in self.file_items]):
+                from toolkit.vae_anchor import FEATURE_LEVELS
+                ref_feats = None
+                for x in self.file_items:
+                    f = getattr(x, 'vae_anchor_features', None)
+                    if f is not None:
+                        ref_feats = f
+                        break
+                if ref_feats is not None:
+                    batch_feats = {}
+                    for level in FEATURE_LEVELS:
+                        level_tensors = []
+                        for x in self.file_items:
+                            f = getattr(x, 'vae_anchor_features', None)
+                            if f is not None and level in f:
+                                level_tensors.append(f[level].unsqueeze(0) if f[level].dim() == 3 else f[level])
+                            else:
+                                level_tensors.append(torch.zeros_like(ref_feats[level].unsqueeze(0) if ref_feats[level].dim() == 3 else ref_feats[level]))
+                        batch_feats[level] = torch.cat(level_tensors, dim=0)
+                    self.vae_anchor_features = batch_feats
+
+            # collect face bboxes (for identity loss face cropping at training time)
+            if any([getattr(x, 'face_bbox', None) is not None for x in self.file_items]):
+                self.face_bboxes = [getattr(x, 'face_bbox', None) for x in self.file_items]
+
+            # collect person bboxes (for body proportion loss person cropping at training time)
+            if any([getattr(x, 'person_bbox', None) is not None for x in self.file_items]):
+                self.person_bboxes = [getattr(x, 'person_bbox', None) for x in self.file_items]
+
+            # Stack cached subject masks, if any (Phase 2).
+            # Each file_item.subject_mask / body_mask / clothing_mask is a torch.bool
+            # tensor of shape (H_c, W_c) set by cache_subject_masks. Missing items
+            # are padded with zeros so the per-sample weight composition stays a no-op.
+            def _stack_mask(attr):
+                tensors = [getattr(x, attr, None) for x in self.file_items]
+                if not any(t is not None for t in tensors):
+                    return None
+                # Find a reference shape / dtype
+                ref = next(t for t in tensors if t is not None)
+                H, W = ref.shape[-2], ref.shape[-1]
+                filled = []
+                for t in tensors:
+                    if t is None:
+                        filled.append(torch.zeros((1, H, W), dtype=torch.bool))
+                    else:
+                        if t.dim() == 2:
+                            t = t.unsqueeze(0)  # (1, H, W)
+                        filled.append(t.to(torch.bool))
+                return torch.stack(filled, dim=0)  # (B, 1, H, W)
+
+            self.subject_masks = _stack_mask('subject_mask')
+            self.body_masks = _stack_mask('body_mask')
+            self.clothing_masks = _stack_mask('clothing_mask')
+
+            # collect body embeddings (SMPL betas)
+            if any([getattr(x, 'body_embedding', None) is not None for x in self.file_items]):
+                body_embeds = []
+                for x in self.file_items:
+                    emb = getattr(x, 'body_embedding', None)
+                    if emb is not None:
+                        body_embeds.append(emb.unsqueeze(0))
+                    else:
+                        body_embeds.append(torch.zeros(1, 10))
+                self.body_embedding = torch.cat(body_embeds, dim=0)
 
             if any([x.audio_tensor is not None for x in self.file_items]):
                 # find one to use as a base
@@ -495,6 +808,22 @@ class DataLoaderBatchDTO:
         del self.audio_pred
         del self.first_frame_latents
         del self.audio_latents
+        del self.face_embedding
+        del self.vision_face_embedding
+        del self.body_embedding
+        del self.identity_embedding
+        del self.landmark_embedding
+        del self.body_proportion_embedding
+        del self.body_shape_embedding
+        del self.depth_gt_list
+        del self.depth_gt_video_list
+        del self.normal_embedding
+        del self.vae_anchor_features
+        del self.face_bboxes
+        del self.person_bboxes
+        del self.subject_masks
+        del self.body_masks
+        del self.clothing_masks
         for file_item in self.file_items:
             file_item.cleanup()
 

@@ -1,7 +1,4 @@
-'use client';
-import { isMac } from '@/helpers/basic';
-import { defaultSampleConfig } from '@/helpers/defaultSamples';
-import { JobConfig, SampleConfig, DatasetConfig, SliderConfig } from '@/types';
+import { JobConfig, DatasetConfig, SliderConfig, FaceIDConfig, BodyIDConfig, SubjectMaskConfig, DepthConsistencyConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -20,6 +17,79 @@ export const defaultDatasetConfig: DatasetConfig = {
   flip_x: false,
   flip_y: false,
   num_repeats: 1,
+};
+
+export const defaultFaceIDConfig: FaceIDConfig = {
+  enabled: false,
+  num_tokens: 4,
+  dropout_prob: 0.1,
+  face_model: 'buffalo_l',
+  scale_lr_multiplier: 10,
+  init_scale: 0.01,
+  vision_enabled: false,
+  vision_model: 'openai/clip-vit-large-patch14',
+  vision_num_tokens: 4,
+  vision_crop_padding: 0.3,
+  identity_loss_weight: 0.0,
+  identity_loss_min_t: 0.0,
+  identity_loss_max_t: 1.0,
+  identity_loss_min_cos: 0.2,
+  identity_loss_use_average: true,
+  identity_loss_average_blend: 0.0,
+  identity_loss_use_random: false,
+  identity_loss_num_refs: 0,
+  identity_metrics: false,
+  landmark_loss_weight: 0.0,
+  body_proportion_loss_weight: 0.0,
+  body_proportion_loss_min_t: 0.0,
+  body_proportion_loss_max_t: 1.0,
+  body_proportion_include_head: false,
+  body_shape_loss_weight: 0.0,
+  body_shape_loss_min_t: 0.4,
+  body_shape_loss_max_t: 0.8,
+  normal_loss_weight: 0.0,
+  normal_loss_min_t: 0.4,
+  normal_loss_max_t: 0.8,
+  vae_anchor_loss_weight: 0,
+  vae_anchor_loss_min_t: 0,
+  vae_anchor_loss_max_t: 0.5,
+  vae_anchor_model_path: '',
+};
+
+export const defaultBodyIDConfig: BodyIDConfig = {
+  enabled: false,
+  num_tokens: 4,
+  dropout_prob: 0.1,
+  detection_threshold: 0.5,
+  scale_lr_multiplier: 10,
+  init_scale: 0.01,
+};
+
+export const defaultSubjectMaskConfig: SubjectMaskConfig = {
+  enabled: false,
+  yolo_ckpt: 'yolo11n.pt',
+  yolo_conf: 0.25,
+  primary_only: true,
+  sam_size: 'small',
+  segformer_res: 768,
+  cache_resolution: 256,
+  dtype: 'fp16',
+  perceptual_restrict_to_body: false,
+  save_debug_previews: false,
+};
+
+export const defaultDepthConsistencyConfig: DepthConsistencyConfig = {
+  loss_weight: 0.0,
+  loss_min_t: 0.0,
+  loss_max_t: 1.0,
+  model_id: 'depth-anything/Depth-Anything-V2-Small-hf',
+  input_size: 518,
+  ssi_weight: 1.0,
+  grad_weight: 0.5,
+  grad_scales: 4,
+  mask_source: 'subject',
+  grad_checkpoint: true,
+  preview_every: 100,
 };
 
 export const defaultSliderConfig: SliderConfig = {
@@ -55,12 +125,17 @@ export const defaultJobConfig: JobConfig = {
             ignore_if_contains: [],
           },
         },
+        face_id: { ...defaultFaceIDConfig },
+        body_id: { ...defaultBodyIDConfig },
+        subject_mask: { ...defaultSubjectMaskConfig },
+        depth_consistency: { ...defaultDepthConsistencyConfig },
         save: {
           dtype: 'bf16',
           save_every: 250,
           max_step_saves_to_keep: 4,
           save_format: 'diffusers',
           push_to_hub: false,
+          save_optimizer_per_checkpoint: false,
         },
         datasets: [defaultDatasetConfig],
         train: {
@@ -85,6 +160,12 @@ export const defaultJobConfig: JobConfig = {
             use_ema: false,
             ema_decay: 0.99,
           },
+          weight_noise: {
+            enabled: false,
+            mode: 'relative',
+            sigma: 0.00125,
+            log_every: 50,
+          },
           skip_first_sample: false,
           force_first_sample: false,
           disable_sampling: false,
@@ -96,6 +177,12 @@ export const defaultJobConfig: JobConfig = {
           blank_prompt_preservation_resolution: null,
           switch_boundary_every: 1,
           loss_type: 'mse',
+          diffusion_loss_weight: 1.0,
+          diffusion_loss_min_t: 0.0,
+          diffusion_loss_max_t: 1.0,
+          latent_perceptual_loss_weight: 0.0,
+          latent_perceptual_loss_min_t: 0.0,
+          latent_perceptual_loss_max_t: 0.5,
         },
         logging: {
           log_every: 1,
@@ -111,7 +198,54 @@ export const defaultJobConfig: JobConfig = {
           low_vram: false,
           model_kwargs: {},
         },
-        sample: defaultSampleConfig,
+        sample: {
+          sampler: 'flowmatch',
+          sample_every: 250,
+          width: 1024,
+          height: 1024,
+          samples: [
+            {
+              prompt: 'woman with red hair, playing chess at the park, bomb going off in the background',
+            },
+            {
+              prompt: 'a woman holding a coffee cup, in a beanie, sitting at a cafe',
+            },
+            {
+              prompt: 'a horse is a DJ at a night club, fish eye lens, smoke machine, lazer lights, holding a martini',
+            },
+            {
+              prompt:
+                'a man showing off his cool new t shirt at the beach, a shark is jumping out of the water in the background',
+            },
+            {
+              prompt: 'a bear building a log cabin in the snow covered mountains',
+            },
+            {
+              prompt: 'woman playing the guitar, on stage, singing a song, laser lights, punk rocker',
+            },
+            {
+              prompt: 'hipster man with a beard, building a chair, in a wood shop',
+            },
+            {
+              prompt:
+                'photo of a man, white background, medium shot, modeling clothing, studio lighting, white backdrop',
+            },
+            {
+              prompt: "a man holding a sign that says, 'this is a sign'",
+            },
+            {
+              prompt:
+                'a bulldog, in a post apocalyptic world, with a shotgun, in a leather jacket, in a desert, with a motorcycle',
+            },
+          ],
+          neg: '',
+          seed: 42,
+          walk_seed: true,
+          guidance_scale: 4,
+          sample_steps: 25,
+          num_frames: 1,
+          fps: 1,
+        },
       },
     ],
   },
@@ -157,9 +291,5 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
       use_ui_logger: true,
     };
   }
-  if (isMac()) {
-    jobConfig.config.process[0].device = 'mps';
-  }
-
   return jobConfig;
 };

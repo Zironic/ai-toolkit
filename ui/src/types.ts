@@ -51,7 +51,6 @@ export interface CpuInfo {
 
 export interface GPUApiResponse {
   hasNvidiaSmi: boolean;
-  isMac: boolean;
   gpus: GpuInfo[];
   error?: string;
 }
@@ -79,6 +78,12 @@ export interface SaveConfig {
   max_step_saves_to_keep: number;
   save_format: string;
   push_to_hub: boolean;
+  /** Write a stepped copy of the optimizer state alongside each checkpoint
+   *  (e.g. ``{job}_000000250_optimizer.pt``) so stateful optimizers can be
+   *  rolled back to a specific checkpoint. The canonical ``optimizer.pt`` is
+   *  still written for resume-from-latest. Stepped copies are pruned by
+   *  ``max_step_saves_to_keep``. Defaults to false. */
+  save_optimizer_per_checkpoint?: boolean;
 }
 
 export interface DatasetConfig {
@@ -104,16 +109,60 @@ export interface DatasetConfig {
   fps?: number;
   flip_x: boolean;
   flip_y: boolean;
-  num_repeats?: number;
+  num_repeats?: number | number[];
   control_path_1?: string | null;
   control_path_2?: string | null;
   control_path_3?: string | null;
-  auto_frame_count?: boolean;
+  // Per-dataset loss overrides (undefined = inherit global face_id config)
+  identity_loss_weight?: number;
+  identity_loss_min_t?: number;
+  identity_loss_max_t?: number;
+  identity_loss_min_cos?: number;
+  landmark_loss_weight?: number;
+  body_proportion_loss_weight?: number;
+  body_proportion_loss_min_t?: number;
+  body_proportion_loss_max_t?: number;
+  body_proportion_include_head?: boolean;
+  body_shape_loss_weight?: number;
+  body_shape_loss_min_t?: number;
+  body_shape_loss_max_t?: number;
+  body_shape_loss_min_cos?: number;
+  normal_loss_weight?: number;
+  normal_loss_min_t?: number;
+  normal_loss_max_t?: number;
+  vae_anchor_loss_weight?: number;
+  vae_anchor_loss_min_t?: number;
+  vae_anchor_loss_max_t?: number;
+  diffusion_loss_weight?: number;
+  diffusion_loss_min_t?: number;
+  diffusion_loss_max_t?: number;
+  face_suppression_weight?: number;
+  face_suppression_expand?: number;
+  face_suppression_soft?: boolean;
+  latent_perceptual_loss_weight?: number;
+  latent_perceptual_loss_min_t?: number;
+  latent_perceptual_loss_max_t?: number;
+  // Subject mask per-dataset overrides (undefined = inherit global subject_mask config)
+  background_loss_weight?: number;
+  clothing_loss_weight?: number;
+  body_loss_weight?: number;
+  perceptual_restrict_to_body?: boolean;
 }
 
 export interface EMAConfig {
   use_ema: boolean;
   ema_decay: number;
+}
+
+export interface WeightNoiseConfig {
+  /** Master toggle. When false the injector is a no-op regardless of other fields. */
+  enabled: boolean;
+  /** 'relative' (σ × per-param weight RMS) | 'absolute' (fixed σ everywhere). */
+  mode: 'relative' | 'absolute';
+  /** σ multiplier for 'relative', or fixed σ for 'absolute'. */
+  sigma: number;
+  /** Cadence for emitting the weight_noise_norm metric. 0 disables logging. */
+  log_every: number;
 }
 
 export interface TrainConfig {
@@ -126,10 +175,19 @@ export interface TrainConfig {
   gradient_checkpointing: boolean;
   noise_scheduler: string;
   timestep_type: string;
+  /** Inlined curve dict when timestep_type === 'custom'. Populated by the
+   *  CustomTimestepCurvePicker on job creation; the trainer evaluates it via
+   *  PCHIP at run time. See toolkit/timestep_weighing/custom_curve.py. */
+  custom_timestep_curve?: { points: { x: number; y: number }[]; normalize?: boolean; sourceName?: string } | null;
+  /** Inlined distribution curve when timestep_type === 'custom_distribution'.
+   *  Same shape as custom_timestep_curve but interpreted as an unnormalized
+   *  PDF — the trainer renormalizes and samples timesteps via inverse CDF. */
+  custom_timestep_distribution?: { points: { x: number; y: number }[]; normalize?: boolean; sourceName?: string } | null;
   content_or_style: string;
   optimizer: string;
   lr: number;
   ema_config?: EMAConfig;
+  weight_noise?: WeightNoiseConfig;
   dtype: string;
   unload_text_encoder: boolean;
   cache_text_embeddings: boolean;
@@ -148,6 +206,14 @@ export interface TrainConfig {
   blank_prompt_preservation_resolution?: number | null;
   switch_boundary_every: number;
   loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped';
+  diffusion_loss_weight?: number;
+  diffusion_loss_min_t?: number;
+  diffusion_loss_max_t?: number;
+  latent_perceptual_loss_weight?: number;
+  latent_perceptual_loss_min_t?: number;
+  latent_perceptual_loss_max_t?: number;
+  latent_perceptual_encoder?: string;
+  latent_perceptual_preview_every?: number;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;
@@ -221,6 +287,94 @@ export interface SliderConfig {
   anchor_class?: string | null;
 }
 
+export interface FaceIDConfig {
+  enabled: boolean;
+  num_tokens: number;
+  dropout_prob: number;
+  face_model: string;
+  scale_lr_multiplier: number;
+  init_scale: number;
+  vision_enabled?: boolean;
+  vision_model?: string;
+  vision_num_tokens?: number;
+  vision_crop_padding?: number;
+  identity_loss_weight?: number;
+  identity_loss_min_t?: number;
+  identity_loss_max_t?: number;
+  identity_loss_min_cos?: number;
+  identity_loss_use_average?: boolean;
+  identity_loss_average_blend?: number;
+  identity_loss_use_random?: boolean;
+  identity_loss_num_refs?: number;
+  identity_metrics?: boolean;
+  landmark_loss_weight?: number;
+  body_proportion_loss_weight?: number;
+  body_proportion_loss_min_t?: number;
+  body_proportion_loss_max_t?: number;
+  body_proportion_include_head?: boolean;
+  body_shape_loss_weight?: number;
+  body_shape_loss_min_t?: number;
+  body_shape_loss_max_t?: number;
+  normal_loss_weight?: number;
+  normal_loss_min_t?: number;
+  normal_loss_max_t?: number;
+  vae_anchor_loss_weight?: number;
+  vae_anchor_loss_min_t?: number;
+  vae_anchor_loss_max_t?: number;
+  vae_anchor_model_path?: string;
+  face_suppression_weight?: number;
+  face_suppression_expand?: number;
+  face_suppression_soft?: boolean;
+}
+
+export interface BodyIDConfig {
+  enabled: boolean;
+  num_tokens: number;
+  dropout_prob: number;
+  detection_threshold: number;
+  scale_lr_multiplier: number;
+  init_scale: number;
+}
+
+export interface SubjectMaskConfig {
+  enabled: boolean;
+  yolo_ckpt?: string;
+  yolo_conf?: number;
+  primary_only?: boolean;
+  sam_size?: 'tiny' | 'small' | 'base_plus' | 'large';
+  segformer_res?: number;
+  cache_resolution?: number;
+  dtype?: 'fp16' | 'bf16' | 'fp32';
+  // Region loss-weight knobs — undefined = no-op (no weighting applied)
+  background_loss_weight?: number;
+  clothing_loss_weight?: number;
+  body_loss_weight?: number;
+  perceptual_restrict_to_body?: boolean;
+  // Debug: when true, cache_subject_masks writes a 5-panel tile.png per image
+  // to _face_id_cache/_previews/ for visual inspection
+  save_debug_previews?: boolean;
+}
+
+export interface DepthConsistencyConfig {
+  // Enable by setting loss_weight > 0
+  loss_weight?: number;
+  loss_min_t?: number;
+  loss_max_t?: number;
+  // Frozen Depth-Anything-V2 perceptor
+  model_id?: string;
+  input_size?: number;
+  // Loss composition (MiDaS formulation)
+  ssi_weight?: number;
+  grad_weight?: number;
+  grad_scales?: number;
+  // Spatial mask source
+  mask_source?: 'none' | 'subject' | 'body';
+  // Memory controls
+  grad_checkpoint?: boolean;
+  // Preview cadence (steps); 0 disables
+  preview_every?: number;
+}
+
 export interface ProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -230,6 +384,10 @@ export interface ProcessConfig {
   device: string;
   network?: NetworkConfig;
   slider?: SliderConfig;
+  face_id?: FaceIDConfig;
+  body_id?: BodyIDConfig;
+  subject_mask?: SubjectMaskConfig;
+  depth_consistency?: DepthConsistencyConfig;
   save: SaveConfig;
   datasets: DatasetConfig[];
   train: TrainConfig;
@@ -252,36 +410,6 @@ export interface JobConfig {
   job: string;
   config: ConfigObject;
   meta: MetaConfig;
-}
-
-export interface CaptionProcessConfig {
-  type: string;
-  sqlite_db_path?: string;
-  device: string;
-  caption: {
-    model_name_or_path: string;
-    model_name_or_path2?: string;
-    dtype: string;
-    quantize: boolean;
-    qtype: string;
-    low_vram: boolean;
-    extensions: string[];
-    path_to_caption: string;
-    recaption: boolean;
-    caption_prompt?: string;
-    max_res?: number;
-    max_new_tokens?: number;
-  }
-}
-
-export interface CaptionConfigObject {
-  name: string;
-  process: CaptionProcessConfig[];
-}
-
-export interface CaptionJobConfig {
-  job: string;
-  config: CaptionConfigObject;
 }
 
 export interface ConfigDoc {

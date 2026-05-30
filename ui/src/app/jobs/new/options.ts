@@ -1,6 +1,5 @@
 import { GroupedSelectOption, SelectOption, JobConfig } from '@/types';
 import { defaultSliderConfig } from './jobConfig';
-import { defaultAudioSampleConfig, defaultSampleConfig } from '@/helpers/defaultSamples';
 
 type Control = 'depth' | 'line' | 'pose' | 'inpaint';
 
@@ -21,7 +20,6 @@ type AdditionalSections =
   | 'datasets.do_audio'
   | 'datasets.audio_normalize'
   | 'datasets.audio_preserve_pitch'
-  | 'datasets.auto_frame_count'
   | 'sample.ctrl_img'
   | 'sample.multi_ctrl_imgs'
   | 'train.audio_loss_multiplier'
@@ -32,17 +30,7 @@ type AdditionalSections =
   | 'model.qie.match_target_res'
   | 'model.assistant_lora_path';
 
-type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
-
-export type SampleTag = {
-  title: string;
-  type: 'text' | 'multiline' | 'number'
-  full?: boolean;
-}
-
-export interface SampleTags {
-  [key: string]: SampleTag;
-}
+type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental';
 
 export interface ModelArch {
   name: string;
@@ -50,12 +38,10 @@ export interface ModelArch {
   group: ModelGroup;
   controls?: Control[];
   isVideoModel?: boolean;
-  hasMultiLinePrompts?: boolean;
   defaults?: { [key: string]: any };
   disableSections?: DisableableSections[];
   additionalSections?: AdditionalSections[];
   accuracyRecoveryAdapters?: { [key: string]: string };
-  sampleTags?: SampleTags;
 }
 
 const defaultNameOrPath = '';
@@ -679,38 +665,9 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].datasets[x].do_i2v': [false, undefined],
       'config.process[0].datasets[x].do_audio': [true, undefined],
       'config.process[0].datasets[x].fps': [24, undefined],
-      'config.process[0].datasets[x].auto_frame_count': [false, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.layer_offloading', 'model.low_vram', 'datasets.do_audio', 'datasets.audio_normalize', 'datasets.audio_preserve_pitch', 'datasets.do_i2v', 'train.audio_loss_multiplier', 'datasets.auto_frame_count'],
-  },
-  {
-    name: 'ltx2.3',
-    label: 'LTX-2.3',
-    group: 'video',
-    isVideoModel: true,
-    defaults: {
-      // default updates when [selected, unselected] in the UI
-      'config.process[0].model.name_or_path': ['Lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors', defaultNameOrPath],
-      'config.process[0].model.quantize': [true, false],
-      'config.process[0].model.quantize_te': [true, false],
-      'config.process[0].model.low_vram': [true, false],
-      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
-      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
-      'config.process[0].sample.num_frames': [121, 1],
-      'config.process[0].sample.fps': [24, 1],
-      'config.process[0].sample.width': [768, 1024],
-      'config.process[0].sample.height': [768, 1024],
-      'config.process[0].train.audio_loss_multiplier': [1.0, undefined],
-      'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
-      'config.process[0].datasets[x].cache_latents_to_disk': [true, false],
-      'config.process[0].datasets[x].do_i2v': [false, undefined],
-      'config.process[0].datasets[x].do_audio': [true, undefined],
-      'config.process[0].datasets[x].fps': [24, undefined],
-      'config.process[0].datasets[x].auto_frame_count': [false, undefined],
-    },
-    disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.layer_offloading', 'model.low_vram', 'datasets.do_audio', 'datasets.audio_normalize', 'datasets.audio_preserve_pitch', 'datasets.do_i2v', 'train.audio_loss_multiplier', 'datasets.auto_frame_count'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.layer_offloading', 'model.low_vram', 'datasets.do_audio', 'datasets.audio_normalize', 'datasets.audio_preserve_pitch', 'datasets.do_i2v', 'train.audio_loss_multiplier'],
   },
   {
     name: 'flux2_klein_4b',
@@ -741,28 +698,6 @@ export const modelArchs: ModelArch[] = [
       'model.low_vram',
       'model.layer_offloading',
       'model.qie.match_target_res',
-    ],
-  },
-  {
-    name: 'ernie_image',
-    label: 'ERNIE-Image',
-    group: 'image',
-    defaults: {
-      // default updates when [selected, unselected] in the UI
-      'config.process[0].model.name_or_path': ['baidu/ERNIE-Image', defaultNameOrPath],
-      'config.process[0].model.quantize': [true, false],
-      'config.process[0].model.quantize_te': [true, false],
-      'config.process[0].model.low_vram': [true, false],
-      'config.process[0].train.unload_text_encoder': [false, false],
-      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
-      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
-      'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
-      'config.process[0].model.qtype': ['qfloat8', 'qfloat8'],
-    },
-    disableSections: ['network.conv'],
-    additionalSections: [
-      'model.low_vram',
-      'model.layer_offloading',
     ],
   },
   {
@@ -927,18 +862,28 @@ export const modelArchs: ModelArch[] = [
   return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
 }) as any;
 
-export const groupedModelOptions: GroupedSelectOption[] = modelArchs.reduce((acc, arch) => {
-  const group = acc.find(g => g.label === arch.group);
-  if (group) {
-    group.options.push({ value: arch.name, label: arch.label });
-  } else {
-    acc.push({
-      label: arch.group,
-      options: [{ value: arch.name, label: arch.label }],
-    });
-  }
-  return acc;
-}, [] as GroupedSelectOption[]);
+// Only expose supported models in the UI selector
+const enabledModelNames = new Set([
+  'sdxl',
+  'flux2_klein_9b',
+  'zimage',
+  'zimage:turbo',
+]);
+
+export const groupedModelOptions: GroupedSelectOption[] = modelArchs
+  .filter(arch => enabledModelNames.has(arch.name))
+  .reduce((acc, arch) => {
+    const group = acc.find(g => g.label === arch.group);
+    if (group) {
+      group.options.push({ value: arch.name, label: arch.label });
+    } else {
+      acc.push({
+        label: arch.group,
+        options: [{ value: arch.name, label: arch.label }],
+      });
+    }
+    return acc;
+  }, [] as GroupedSelectOption[]);
 
 export const quantizationOptions: SelectOption[] = [
   { value: '', label: '- NONE -' },

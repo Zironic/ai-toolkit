@@ -123,16 +123,11 @@ export default function JobActionBar({
           <Cog />
         </MenuButton>
         <MenuItems anchor="bottom" className="bg-gray-900 border border-gray-700 rounded shadow-lg w-48 px-2 py-2 mt-4">
-          {job.job_type === 'train' && (
-            <MenuItem>
-              <Link
-                href={`/jobs/new?cloneId=${job.id}`}
-                className="cursor-pointer px-4 py-1 hover:bg-gray-800 rounded block"
-              >
-                Clone Job
-              </Link>
-            </MenuItem>
-          )}
+          <MenuItem>
+            <Link href={`/jobs/new?cloneId=${job.id}`} className="cursor-pointer px-4 py-1 hover:bg-gray-800 rounded block">
+              Clone Job
+            </Link>
+          </MenuItem>
           <MenuItem>
             <div
               className="cursor-pointer px-4 py-1 hover:bg-gray-800 rounded"

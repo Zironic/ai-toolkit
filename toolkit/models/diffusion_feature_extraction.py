@@ -7,10 +7,9 @@ import torch.nn.functional as F
 from diffusers import AutoencoderTiny
 from transformers import AutoImageProcessor, AutoModel, SiglipImageProcessor, SiglipVisionModel
 import lpips
-import weakref
+
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
-from toolkit.models.base_model import BaseModel
 
 
 class ResBlock(nn.Module):
@@ -776,11 +775,11 @@ class DiffusionFeatureExtractor6(nn.Module):
             # go from -1 to 1 to 0 to 1
             target_img = (target_img + 1) / 2
             target_dino_input = self.prepare_inputs(target_img)
-            target_dino_output = self.model(**target_dino_input).pooler_output.detach()
+            target_dino_output = self.model(**target_dino_input, output_hidden_states=True)['hidden_states'][-1].detach()
             # normalize
             target_dino_output = (target_dino_output - target_dino_output.mean()) / (target_dino_output.std() + 1e-6)
         pred_dino_input = self.prepare_inputs(pred_images)
-        pred_dino_output = self.model(**pred_dino_input).pooler_output
+        pred_dino_output = self.model(**pred_dino_input, output_hidden_states=True)['hidden_states'][-1]
         # normalize
         pred_dino_output = (pred_dino_output - pred_dino_output.mean()) / (pred_dino_output.std() + 1e-6)
         dino_loss = torch.nn.functional.mse_loss(
@@ -805,7 +804,7 @@ class DiffusionFeatureExtractor6(nn.Module):
             self.step += 1
         
         return dino_loss
-    
+
 class ModelOutputWrapper:
     def __init__(self, head, depth, normals, segmentation):
         self.head = head

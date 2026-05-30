@@ -153,6 +153,41 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'config.quickstart': {
+    title: 'Quickstart Template',
+    description: (
+      <>
+        Replaces the form with an empirically-validated config recipe. Picking a template overwrites every field except
+        the training name and the first dataset&apos;s folder path, which are preserved so you can apply mid-flow. The
+        Subject Likeness template applies a LoKr + weight-noise + depth-consistency + subject-masking recipe on Flux 2
+        Klein 9B; defaults to the HuggingFace checkpoint so you can run without any local file. Switch back to
+        &quot;Custom (no preset)&quot; to keep your current settings.
+      </>
+    ),
+  },
+  'train.weight_noise': {
+    title: 'Weight Noise',
+    description: (
+      <>
+        Injects Gaussian noise directly into LoRA parameter values after each optimizer step. Biases training toward
+        flatter loss minima and spreads learning across more singular directions of the LoRA factorization, which
+        empirically improves subject likeness and helps the model resist memorization of source-image artifacts. Pairs
+        well with small / single-image datasets where overfitting is the dominant failure mode.
+      </>
+    ),
+  },
+  'train.weight_noise.sigma': {
+    title: 'Sigma',
+    description: (
+      <>
+        Noise scale. In <code>relative</code> mode this is a multiplier on each tensor&apos;s weight RMS, so &quot;0.001
+        = 0.1% per-tensor perturbation per step.&quot; Typical useful range is <strong>0.001 – 0.0017</strong>. Lower
+        values barely do anything; higher values risk noise overpowering the gradient (loss flattens or training
+        diverges). Watch the <code>weight_noise_norm</code> metric to verify a sensible magnitude relative to grad
+        norm.
+      </>
+    ),
+  },
   'train.unload_text_encoder': {
     title: 'Unload Text Encoder',
     description: (
@@ -349,14 +384,474 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
-  'datasets.auto_frame_count': {
-    title: 'Auto Frame Count',
+  'perceptual_anchoring': {
+    title: 'Perceptual Anchoring',
     description: (
       <>
-        This will automatically determine the number of frames to use for each video in your dataset instead of relying
-        on a fixed num_frames. This allows you to include videos of different lengths in the dataset, and each video
-        will be processed without speeding up or slowing down. Be careful about adding long videos into your dataset, as
-        they use up more VRAM. This currently will not work with a batch size greater than 1.
+        Perceptual anchoring uses frozen perception models (ArcFace, ViTPose) to compare the training model's
+        predictions against reference images during training. This anchors the model's output to match the identity
+        and body proportions of the training subject, preventing drift and distortion.
+        <br /><br />
+        <b>Face ID Conditioning</b> injects identity tokens into the model so the LoRA embeds identity directly.
+        <b>Identity Loss</b> and <b>Body Proportion Loss</b> compare predicted outputs against reference embeddings.
+        <b>Face Suppression</b> dampens or eliminates face learning — use it standalone to train on a dataset
+        without memorizing the faces (e.g. for style or clothing LoRAs).
+        <br /><br />
+        All perception models download automatically on first use.
+      </>
+    ),
+  },
+  'face_id.enabled': {
+    title: 'Face ID Conditioning',
+    description: (
+      <>
+        Enables face identity conditioning for LoRA training. Part of the perceptual anchoring system.
+        Face embeddings are extracted from your training images using ArcFace and injected as conditioning
+        tokens during training. The trained LoRA embeds identity information, allowing identity-preserving
+        generation at inference time.
+        <br /><br />
+        Models are downloaded automatically on first use (~250MB for ArcFace).
+      </>
+    ),
+  },
+  'face_id.num_tokens': {
+    title: 'Face Tokens',
+    description: (
+      <>
+        Number of identity embedding tokens injected into the model. More tokens can capture finer identity detail
+        but increase compute and can lead to overfitting on small datasets. 4 tokens is a good default for most use cases.
+      </>
+    ),
+  },
+  'face_id.dropout_prob': {
+    title: 'Face Dropout',
+    description: (
+      <>
+        Probability of dropping all identity tokens during a training step. This acts as regularization — the model
+        learns to generate both with and without identity conditioning, preventing over-reliance on the ID signal.
+        0.1 (10%) is a good default.
+      </>
+    ),
+  },
+  'face_id.scale_lr_multiplier': {
+    title: 'Scale LR Multiplier',
+    description: (
+      <>
+        Learning rate multiplier for the output scale parameter of identity projectors. The output scale starts near
+        zero and ramps up during training. A higher multiplier (e.g. 10x) lets the scale ramp faster. Increase if
+        identity signal is too weak; decrease if it overwhelms other losses.
+      </>
+    ),
+  },
+  'face_id.init_scale': {
+    title: 'Init Scale',
+    description: (
+      <>
+        Initial value of the identity projector output scale. A small value (0.01) ensures identity tokens start
+        near-zero and gradually increase their influence. This prevents the identity signal from destabilizing
+        early training. Values between 0.001 and 0.1 work well.
+      </>
+    ),
+  },
+  'face_id.identity_metrics': {
+    title: 'Identity Metrics',
+    description: (
+      <>
+        When enabled, tracks face identity similarity (cosine similarity between predicted and reference ArcFace
+        embeddings) in the training log without applying any loss. Useful for monitoring how well identity is preserved
+        during regular training, or when you only want body proportion loss without identity loss.
+      </>
+    ),
+  },
+  'face_id.identity_loss_weight': {
+    title: 'Identity Loss Weight',
+    description: (
+      <>
+        Weight for the ArcFace identity perceptual anchor. This loss compares face embeddings between the
+        model's predicted output and the reference training image, anchoring the model to preserve facial identity.
+        <br /><br />
+        Start with 0.01–0.1. Set to 0 to disable.
+      </>
+    ),
+  },
+  'face_id.identity_loss_min_t': {
+    title: 'Identity Loss Min Timestep',
+    description: (
+      <>
+        Minimum noise timestep ratio for applying identity loss. The loss is only computed when the current
+        timestep falls within [min_t, max_t].
+        <br /><br />
+        Default: 0. Set to 0 to apply at all timesteps.
+      </>
+    ),
+  },
+  'face_id.identity_loss_max_t': {
+    title: 'Identity Loss Max Timestep',
+    description: (
+      <>
+        Maximum noise timestep ratio for applying identity loss.
+        <br /><br />
+        Default: 1. Set to 1 to apply at all timesteps.
+      </>
+    ),
+  },
+  'face_id.identity_loss_min_cos': {
+    title: 'Identity Loss Min Cosine',
+    description: (
+      <>
+        Minimum cosine similarity threshold to apply the identity loss for a given sample. If the predicted face
+        embedding similarity is below this threshold, the loss is skipped — this prevents the loss from pushing
+        on samples where no face was detected or the prediction is pure noise.
+        <br /><br />
+        Default: 0.2. Lower to be less strict; raise to only apply loss when a clear face is present.
+      </>
+    ),
+  },
+  'face_id.identity_loss_use_average': {
+    title: 'Use Average Face Embedding',
+    description: (
+      <>
+        When enabled, compares predictions against the average face embedding across the entire dataset instead of
+        the per-image embedding. This can help when individual images have varying quality or angles, providing a
+        more stable identity target. Use the Average Blend slider to interpolate between per-image and average.
+      </>
+    ),
+  },
+  'face_id.identity_loss_average_blend': {
+    title: 'Average Blend',
+    description: (
+      <>
+        Controls the blend between per-image and dataset-average face embeddings.
+        0 = use only per-image embedding, 1 = use only the dataset average, 0.5 = midpoint.
+        <br /><br />
+        Useful for balancing per-image accuracy with dataset-wide identity consistency.
+      </>
+    ),
+  },
+  'face_id.identity_loss_use_random': {
+    title: 'Use Random Face Embedding',
+    description: (
+      <>
+        When enabled, each training step picks a random face embedding from the dataset instead of using the
+        one matching the current image. This adds diversity to the identity target and can improve robustness
+        when images have varying poses or expressions.
+      </>
+    ),
+  },
+  'face_id.identity_loss_num_refs': {
+    title: 'Multi-Ref Count',
+    description: (
+      <>
+        Number of random reference embeddings to compare against each step. When greater than 0, the loss averages
+        the cosine similarity across K random references. Set to 0 to use a single reference per step.
+      </>
+    ),
+  },
+  'face_id.body_proportion_loss_weight': {
+    title: 'Body Proportion Loss Weight',
+    description: (
+      <>
+        Weight for the ViTPose body proportion perceptual anchor. This loss compares pose-invariant bone-length
+        ratios between the model's predicted output and the reference training image, anchoring the model to
+        preserve body proportions (limb lengths, torso ratio, etc.) regardless of pose.
+        <br /><br />
+        Start with 0.1–0.2. The ViTPose model (~350MB) downloads automatically from HuggingFace on first use.
+        Set to 0 to disable.
+      </>
+    ),
+  },
+  'face_id.body_proportion_loss_min_t': {
+    title: 'Body Proportion Min Timestep',
+    description: (
+      <>
+        Minimum noise timestep ratio for applying body proportion loss.
+        <br /><br />
+        Default: 0. Set to 0 to apply at all timesteps.
+      </>
+    ),
+  },
+  'face_id.body_proportion_loss_max_t': {
+    title: 'Body Proportion Max Timestep',
+    description: (
+      <>
+        Maximum noise timestep ratio for applying body proportion loss.
+        <br /><br />
+        Default: 1.
+      </>
+    ),
+  },
+  'face_id.face_suppression_weight': {
+    title: 'Face Suppression Weight',
+    description: (
+      <>
+        Dampens or eliminates the model's ability to learn faces from the training data by downweighting
+        the diffusion loss inside detected face bounding boxes. Use this as a standalone setting when you
+        want to train on a dataset without memorizing the faces — for example, training a style or clothing
+        LoRA while preventing it from reproducing the faces of people in the images.
+        <br /><br />
+        0 = no suppression (normal), 0.5 = half face learning, 1 = full suppression (no face learning).
+        Leave empty for no suppression. Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'face_id.vision_enabled': {
+    title: 'Vision Face Embeddings',
+    description: (
+      <>
+        Enables an additional CLIP or DINOv2 vision encoder for richer face detail conditioning. Face crops are
+        encoded through the vision model and injected as additional conditioning tokens. This captures fine-grained
+        visual details (hairstyle, accessories, skin texture) that ArcFace alone may miss.
+        <br /><br />
+        Increases VRAM usage. Optional — ArcFace alone works well for most identity tasks.
+      </>
+    ),
+  },
+  'subject_mask.enabled': {
+    title: 'Subject Masking',
+    description: (
+      <>
+        Caches per-image person/body/clothing masks (YOLO person detection → SAM 2 silhouette →
+        SegFormer-clothes semantic parse). Masks are stored once per image in <code>_face_id_cache/</code>
+        alongside face embeddings, then used at training time to weight the diffusion loss by region.
+        <br /><br />
+        Enabling this alone has no effect on training — you must also set one of the region loss weights
+        (Background / Clothing / Body) or enable <i>Restrict Perceptual Losses to Body</i>.
+      </>
+    ),
+  },
+  'subject_mask.sam_size': {
+    title: 'SAM 2 Size',
+    description: (
+      <>
+        Model size for the SAM 2 silhouette stage. On an RTX 4090 at fp16, timings per image are roughly:
+        tiny ~15 ms, small ~15 ms, base_plus ~27 ms, large ~55 ms. Quality is nearly identical for
+        portraits — <b>small</b> is the recommended default.
+        <br /><br />
+        This only runs at cache time (once per image), so training-time cost is zero regardless of size.
+      </>
+    ),
+  },
+  'subject_mask.yolo_conf': {
+    title: 'YOLO Confidence Threshold',
+    description: (
+      <>
+        Minimum confidence for a detected person to be kept. 0.25 is a sensible default for COCO-trained
+        YOLO; raise it if you see spurious detections, lower it if detections are missed.
+      </>
+    ),
+  },
+  'subject_mask.primary_only': {
+    title: 'Primary Person Only',
+    description: (
+      <>
+        When enabled, only the largest detected person is masked — background strangers are dropped.
+        Recommended for identity LoRA training where you don't want loss signal from other people in
+        the frame. Disable if you're training a multi-person concept.
+      </>
+    ),
+  },
+  'subject_mask.segformer_res': {
+    title: 'SegFormer Resolution',
+    description: (
+      <>
+        Input resolution for the SegFormer-clothes parser. 768 is the recommended default. Higher values
+        (1024, 1280) produce cleaner class boundaries but are slower at cache time. Output is always
+        upsampled to the original image resolution before mask smoothing.
+      </>
+    ),
+  },
+  'subject_mask.cache_resolution': {
+    title: 'Cache Resolution',
+    description: (
+      <>
+        Size (in pixels) at which masks are stored on disk. 256 is sufficient for latent-space loss
+        weighting and keeps cache files tiny (~200 KB per image). Raise to 512 if you need finer
+        boundaries for perceptual losses, at roughly 4× storage cost.
+      </>
+    ),
+  },
+  'subject_mask.background_loss_weight': {
+    title: 'Background Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss in the <i>background</i> region (pixels outside the person
+        silhouette). Leave empty for no change (default training). Set to <b>0</b> to completely ignore
+        the background, or a small value like 0.1 to de-emphasize it while still training on it.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.clothing_loss_weight': {
+    title: 'Clothing Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss on <i>clothing</i> pixels (dresses, pants, shirts, shoes,
+        bags, etc). Set below 1 to reduce the model's tendency to memorize specific garments while still
+        training faces and body.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.body_loss_weight': {
+    title: 'Body Loss Weight',
+    description: (
+      <>
+        Multiplier applied to the diffusion loss on <i>body</i> pixels (hair, face, arms, legs — the
+        identity-relevant parts). Set above 1 to boost the loss signal for identity, or combine with
+        background/clothing weights to concentrate training on the subject's body.
+        <br /><br />
+        Per-dataset overrides take priority over this global value.
+      </>
+    ),
+  },
+  'subject_mask.perceptual_restrict_to_body': {
+    title: 'Restrict Perceptual Losses to Body',
+    description: (
+      <>
+        When enabled, per-pixel perceptual losses (currently the Sapiens normal loss) are masked to the
+        body region so they focus on identity-relevant surfaces (hair, skin) instead of clothing or
+        background. Items that haven't opted in keep their original perceptual loss unchanged.
+      </>
+    ),
+  },
+  'subject_mask.save_debug_previews': {
+    title: 'Save Debug Preview Tiles',
+    description: (
+      <>
+        When enabled, writes a 5-panel PNG per image to the job's output folder at
+        <code> &lt;training_folder&gt;/&lt;name&gt;/subject_mask_previews/&lt;stem&gt;.png</code> during mask caching:
+        original image, person overlay, body overlay, clothing overlay, and full SegFormer parse colormap.
+        Useful for spot-checking mask quality on new datasets before training.
+        <br /><br />
+        Previews live in the job output folder, not alongside the dataset, so they can't be picked up as
+        training images. Only runs during the first-time cache pass (cache-hit path is unaffected). Disable
+        after initial validation to avoid disk clutter — tiles are ~500 KB each.
+      </>
+    ),
+  },
+  'depth_consistency.loss_weight': {
+    title: 'Depth Consistency Loss Weight',
+    description: (
+      <>
+        Weight for a frozen Depth-Anything-V2 perceptor that encourages the generated image's depth map
+        to match the ground-truth image's depth map. Uses MiDaS's scale-and-shift-invariant L1 plus a
+        multi-scale gradient-matching term — both differentiable through DA2 back to the predicted pixels.
+        <br /><br />
+        Helps preserve body silhouette, limb separation, and subject-vs-background depth structure when
+        identity training tends to flatten or smear the composition. Start with 0.05–0.10. Set to 0 to
+        disable. DA2-Small (~25M params, ~50 MB in bf16) is loaded once; with gradient checkpointing it
+        adds ~300 MB peak VRAM and ~100 ms per training step.
+        <br /><br />
+        Requires the first-time pass to cache GT depth maps to <code>_face_id_cache/</code> next to face
+        embeddings — similar timing to face caching.
+      </>
+    ),
+  },
+  'depth_consistency.loss_min_t': {
+    title: 'Depth Min Timestep',
+    description: (
+      <>
+        Minimum noise timestep ratio (0–1) at which to apply the depth loss. Below this, x0_pred is too
+        noisy for DA2 to produce a stable depth map. Default 0.0 (all timesteps).
+      </>
+    ),
+  },
+  'depth_consistency.loss_max_t': {
+    title: 'Depth Max Timestep',
+    description: (
+      <>
+        Maximum noise timestep ratio (0–1) at which to apply the depth loss. Default 1.0. Consider capping
+        at 0.9 so the loss contributes only where x0_pred has enough structure for DA2 to latch onto.
+      </>
+    ),
+  },
+  'depth_consistency.mask_source': {
+    title: 'Depth Mask Source',
+    description: (
+      <>
+        Where to pull the spatial weighting mask from:
+        <ul>
+          <li><b>none</b> — full-image depth loss; penalizes background depth drift too.</li>
+          <li><b>subject</b> — uses the cached person/subject mask (requires Subject Masking enabled).</li>
+          <li><b>body</b> — uses the cached identity-only body mask (hair, skin, limbs).</li>
+        </ul>
+        <b>subject</b> is the usual choice: the model still has freedom over background composition while
+        depth structure on the subject is anchored. If Subject Masking is not enabled, falls back to full-
+        image loss regardless of this setting.
+      </>
+    ),
+  },
+  'depth_consistency.ssi_weight': {
+    title: 'SSI L1 Weight',
+    description: (
+      <>
+        Weight on the scale-and-shift-invariant L1 term (MiDaS / Ranftl et al.). This solves for the
+        optimal per-sample linear fit between predicted and GT depth in closed form, then L1s the residual
+        — absorbing global scale/offset differences so only depth <i>structure</i> is penalized. Default 1.0.
+      </>
+    ),
+  },
+  'depth_consistency.grad_weight': {
+    title: 'Gradient Matching Weight',
+    description: (
+      <>
+        Weight on the multi-scale gradient-matching L1 term (MiDaS). Penalizes disagreement in local depth
+        edges / contours across multiple resolutions. The single biggest contributor to sharp subject
+        silhouettes in the original MiDaS paper. Default 0.5.
+      </>
+    ),
+  },
+  'depth_consistency.grad_scales': {
+    title: 'Gradient Scales',
+    description: (
+      <>
+        Number of resolution levels for the gradient-matching term (avg-pool halving each step). Default 4.
+        More scales = smoother coarse structure; fewer = faster, more local-detail focused.
+      </>
+    ),
+  },
+  'depth_consistency.preview_every': {
+    title: 'Preview Every (steps)',
+    description: (
+      <>
+        Save a 4-panel composite <code>[GT RGB | GT depth | Pred RGB | Pred depth]</code> every N steps to
+        <code> &lt;training_folder&gt;/&lt;name&gt;/depth_previews/</code>. Useful for visually checking whether
+        the predicted depth structure is actually tracking the ground truth, beyond the scalar loss values.
+        <br /><br />
+        0 disables. Files are ~100–200 KB each; at every-100 cadence over 3,000 steps this writes ~30 files.
+      </>
+    ),
+  },
+  'depth_consistency.model_id': {
+    title: 'DA2 Model ID',
+    description: (
+      <>
+        HuggingFace ID of the Depth-Anything-V2 checkpoint to use as a frozen perceptor. Default
+        <code> depth-anything/Depth-Anything-V2-Small-hf</code> (~25M params). Other options:
+        <code> -Base-hf</code> (~98M, ~4–6 GB activations) and <code>-Large-hf</code> (~335M, 10+ GB — likely
+        OOMs alongside the main model). Keep to Small unless you have verified you have the VRAM headroom.
+      </>
+    ),
+  },
+  'depth_consistency.input_size': {
+    title: 'DA2 Input Size',
+    description: (
+      <>
+        Long-side input resolution for the DA2 perceptor. Must be a multiple of 14 (ViT patch size).
+        Default 518 — DA2's native training resolution. 392 is a cheaper option that still produces useful
+        depth structure; sizes above 518 waste compute without quality gains.
+      </>
+    ),
+  },
+  'depth_consistency.grad_checkpoint': {
+    title: 'Gradient Checkpointing (DA2)',
+    description: (
+      <>
+        Trades a small amount of compute for a large VRAM reduction during backward through DA2. Keep this
+        on unless you have verified extra VRAM to spare — roughly 3× activation memory savings at a ~20–30%
+        fwd+bwd time cost on the perceptor.
       </>
     ),
   },

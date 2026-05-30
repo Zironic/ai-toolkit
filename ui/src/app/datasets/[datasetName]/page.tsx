@@ -5,21 +5,16 @@ import { LuImageOff, LuLoader, LuBan } from 'react-icons/lu';
 import { FaChevronLeft } from 'react-icons/fa';
 import DatasetImageCard from '@/components/DatasetImageCard';
 import { Button } from '@headlessui/react';
-import AddImagesModal, { openImagesModal, useOpenImagesModalOnDrag } from '@/components/AddImagesModal';
+import AddImagesModal, { openImagesModal } from '@/components/AddImagesModal';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
-import { CaptionDatasetModal, openCaptionDatasetModal } from '@/components/CaptionDatasetModal';
-import useSettings from '@/hooks/useSettings';
-import { pathJoin } from '@/utils/basic';
-import AutoCaptionButton from '@/components/AutoCaptionButton';
+import FullscreenDropOverlay from '@/components/FullscreenDropOverlay';
 
 export default function DatasetPage({ params }: { params: { datasetName: string } }) {
   const [imgList, setImgList] = useState<{ img_path: string }[]>([]);
-  const [isAutoCaptioning, setIsAutoCaptioning] = useState(false);
   const usableParams = use(params as any) as { datasetName: string };
   const datasetName = usableParams.datasetName;
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
-  const { settings, isSettingsLoaded } = useSettings();
 
   const refreshImageList = (dbName: string) => {
     setStatus('loading');
@@ -39,8 +34,6 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         setStatus('error');
       });
   };
-  useOpenImagesModalOnDrag(datasetName, () => refreshImageList(datasetName));
-
   useEffect(() => {
     if (datasetName) {
       refreshImageList(datasetName);
@@ -61,27 +54,27 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       text = 'Loading Images';
       subtitle = 'Please wait while we fetch your dataset images...';
       showIt = true;
-      bgColor = 'bg-gray-800/50';
-      textColor = 'text-gray-100';
-      iconColor = 'text-gray-400';
+      bgColor = 'bg-gray-50 dark:bg-gray-800/50';
+      textColor = 'text-gray-900 dark:text-gray-100';
+      iconColor = 'text-gray-500 dark:text-gray-400';
     }
     if (status == 'error') {
       icon = <LuBan className="w-8 h-8" />;
       text = 'Error Loading Images';
       subtitle = 'There was a problem fetching the images. Please try refreshing the page.';
       showIt = true;
-      bgColor = 'bg-red-600/20';
-      textColor = 'text-red-100';
-      iconColor = 'text-red-400';
+      bgColor = 'bg-red-50 dark:bg-red-950/20';
+      textColor = 'text-red-900 dark:text-red-100';
+      iconColor = 'text-red-600 dark:text-red-400';
     }
     if (status == 'success' && imgList.length === 0) {
       icon = <LuImageOff className="w-8 h-8" />;
       text = 'No Images Found';
       subtitle = 'This dataset is empty. Click "Add Images" to get started.';
       showIt = true;
-      bgColor = 'bg-gray-800/50';
-      textColor = 'text-gray-100';
-      iconColor = 'text-gray-400';
+      bgColor = 'bg-gray-50 dark:bg-gray-800/50';
+      textColor = 'text-gray-900 dark:text-gray-100';
+      iconColor = 'text-gray-500 dark:text-gray-400';
     }
 
     if (!showIt) return null;
@@ -111,12 +104,8 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         </div>
         <div className="flex-1"></div>
         <div>
-          <AutoCaptionButton
-            datasetPath={`${pathJoin(settings.DATASETS_FOLDER, datasetName)}`}
-            setIsAutoCaptioning={setIsAutoCaptioning}
-          />
           <Button
-            className="text-white bg-slate-600 px-3 py-1 rounded-md"
+            className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
             onClick={() => openImagesModal(datasetName, () => refreshImageList(datasetName))}
           >
             Add Images
@@ -131,7 +120,6 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
               <DatasetImageCard
                 key={img.img_path}
                 alt="image"
-                isAutoCaptioning={isAutoCaptioning}
                 imageUrl={img.img_path}
                 onDelete={() => refreshImageList(datasetName)}
               />
@@ -140,7 +128,10 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         )}
       </MainContent>
       <AddImagesModal />
-      <CaptionDatasetModal />
+      <FullscreenDropOverlay
+        datasetName={datasetName}
+        onComplete={() => refreshImageList(datasetName)}
+      />
     </>
   );
 }

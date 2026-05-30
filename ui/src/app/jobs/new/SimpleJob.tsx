@@ -1,5 +1,5 @@
 'use client';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
   modelArchs,
   ModelArch,
@@ -7,32 +7,26 @@ import {
   quantizationOptions,
   defaultQtype,
   jobTypeOptions,
-  SampleTags,
 } from './options';
 import { defaultDatasetConfig } from './jobConfig';
 import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
-import { objectCopy, tagsToObj, objToTags } from '@/utils/basic';
-import {
-  TextInput,
-  TextAreaInput,
-  SelectInput,
-  Checkbox,
-  FormGroup,
-  NumberInput,
-  SliderInput,
-} from '@/components/formInputs';
+import { objectCopy } from '@/utils/basic';
+import { TextInput, SelectInput, Checkbox, FormGroup, NumberInput, SliderInput } from '@/components/formInputs';
 import Card from '@/components/Card';
-import { X, Copy } from 'lucide-react';
+import CustomTimestepCurvePicker from '@/components/CustomTimestepCurvePicker';
+import { X } from 'lucide-react';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
 import SampleControlImage from '@/components/SampleControlImage';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
-import { isMac } from '@/helpers/basic';
+import { QUICKSTARTS } from './quickstarts';
 
 type Props = {
   jobConfig: JobConfig;
-  setJobConfig: (value: any, key: string) => void;
+  // Optional key matches useNestedState's signature: when omitted the
+  // entire state is replaced (used by the quickstart-template applier).
+  setJobConfig: (value: any, key?: string) => void;
   status: 'idle' | 'saving' | 'success' | 'error';
   handleSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   runId: string | null;
@@ -40,7 +34,6 @@ type Props = {
   setGpuIDs: (value: string | null) => void;
   gpuList: any;
   datasetOptions: any;
-  isLoading?: boolean;
 };
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -55,8 +48,12 @@ export default function SimpleJob({
   setGpuIDs,
   gpuList,
   datasetOptions,
-  isLoading,
 }: Props) {
+  // Quickstart selection is UI-only state — the chosen template is reflected
+  // in the dropdown label but not stored in the saved config (the config IS
+  // the template after apply; the dropdown is just a label for "which preset
+  // shaped this form last").
+  const [selectedQuickstart, setSelectedQuickstart] = useState<string>('custom');
   const modelArch = useMemo(() => {
     return modelArchs.find(a => a.name === jobConfig.config.process[0].model.arch) as ModelArch;
   }, [jobConfig.config.process[0].model.arch]);
@@ -77,44 +74,6 @@ export default function SimpleJob({
   }, [modelArch, jobType]);
 
   const isVideoModel = !!(modelArch?.group === 'video');
-  const isAudioModel = !!(modelArch?.group === 'audio');
-
-  const taggedSampleArr: Record<string, any>[] | null = useMemo(() => {
-    if (!modelArch) return null;
-    if (!modelArch.sampleTags) return null;
-    if (!jobConfig.config.process[0].sample.samples) return null;
-    let sampleArr: any[] = [];
-    for (let i = 0; i < jobConfig.config.process[0].sample.samples.length; i++) {
-      const taggedPrompt = jobConfig.config.process[0].sample.samples[i].prompt;
-      const tagsObj = tagsToObj(taggedPrompt);
-      sampleArr.push(tagsObj);
-    }
-    return sampleArr;
-  }, [modelArch, jobConfig.config.process[0].sample.samples]);
-
-  const modelArchTagSections: SampleTags[] | null = useMemo(() => {
-    if (!modelArch?.sampleTags) return null;
-    const maxPerGroup = 5;
-    let sections: SampleTags[] = [];
-    let subSection: SampleTags = {};
-    for (const [tagKey, tag] of Object.entries(modelArch.sampleTags)) {
-      if ((tag.full && Object.keys(subSection).length > 0) || Object.keys(subSection).length >= maxPerGroup) {
-        // reset the sub section build if the next tag is full or max per group is reached
-        sections.push(subSection);
-        subSection = {};
-      }
-      subSection[tagKey] = tag;
-      if (tag.full) {
-        // if the tag is full, push the section immediately and reset the sub section build
-        sections.push(subSection);
-        subSection = {};
-      }
-    }
-    if (Object.keys(subSection).length > 0) {
-      sections.push(subSection);
-    }
-    return sections.length > 0 ? sections : null;
-  }, [modelArch]);
 
   const numTopCards = useMemo(() => {
     let count = 4; // job settings, model config, target config, save config
@@ -194,44 +153,35 @@ export default function SimpleJob({
     return newQuantizationOptions;
   }, [modelArch]);
 
-  const showGPUSelect = !isMac();
-
-  let numDatasetCols = 4;
-  let numSampleTopCols = 4;
-  let datasetStyleClass = 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6';
-  let sampleTopStyleClass = 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6';
-  if (isVideoModel) {
-    numSampleTopCols += 1;
-  }
-  if (isAudioModel) {
-    numDatasetCols -= 1;
-    numSampleTopCols -= 1;
-  }
-  if (numDatasetCols == 3) {
-    datasetStyleClass = 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6';
-  }
-  if (numSampleTopCols == 5) {
-    sampleTopStyleClass = 'grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-6';
-  }
-  if (numSampleTopCols == 3) {
-    sampleTopStyleClass = 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6';
-  }
   return (
     <>
-      <form
-        onSubmit={handleSubmit}
-        className={`space-y-8 relative ${isLoading ? 'pointer-events-none opacity-50' : ''}`}
-      >
-        {isLoading && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center">
-            <div className="flex flex-col items-center gap-3">
-              <div className="h-8 w-8 animate-spin rounded-full border-4 border-gray-400 border-t-blue-500" />
-              <span className="text-sm text-gray-400">Loading...</span>
-            </div>
-          </div>
-        )}
+      <form onSubmit={handleSubmit} className="space-y-8">
         <div className={topBarClass}>
           <Card title="Job">
+            <SelectInput
+              label="Quickstart Template"
+              docKey="config.quickstart"
+              value={selectedQuickstart}
+              onChange={(value: string) => {
+                if (value === 'custom') {
+                  setSelectedQuickstart('custom');
+                  return;
+                }
+                const tmpl = QUICKSTARTS.find(q => q.id === value);
+                if (!tmpl) return;
+                const ok = window.confirm(
+                  `Apply "${tmpl.label}" template?\n\nThis will overwrite the current config. ` +
+                    `Your training name and dataset folder path will be preserved.`,
+                );
+                if (!ok) return;
+                setJobConfig(tmpl.apply(jobConfig));
+                setSelectedQuickstart(value);
+              }}
+              options={[
+                { value: 'custom', label: 'Custom (no preset)' },
+                ...QUICKSTARTS.map(q => ({ value: q.id, label: q.label })),
+              ]}
+            />
             <TextInput
               label="Training Name"
               value={jobConfig.config.name}
@@ -241,15 +191,13 @@ export default function SimpleJob({
               disabled={runId !== null}
               required
             />
-            {showGPUSelect && (
-              <SelectInput
-                label="GPU ID"
-                value={`${gpuIDs}`}
-                docKey="gpuids"
-                onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
-              />
-            )}
+            <SelectInput
+              label="GPU ID"
+              value={`${gpuIDs}`}
+              docKey="gpuids"
+              onChange={value => setGpuIDs(value)}
+              options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
+            />
             {disableSections.includes('trigger_word') ? null : (
               <TextInput
                 label="Trigger Word"
@@ -321,7 +269,7 @@ export default function SimpleJob({
                 onChange={value => setJobConfig(value, 'config.process[0].model.model_kwargs.match_target_res')}
               />
             )}
-            {modelArch?.additionalSections?.includes('model.layer_offloading') && !isMac() && (
+            {modelArch?.additionalSections?.includes('model.layer_offloading') && (
               <>
                 <Checkbox
                   label={
@@ -536,6 +484,11 @@ export default function SimpleJob({
               min={1}
               required
             />
+            <Checkbox
+              label="Save optimizer per checkpoint"
+              checked={jobConfig.config.process[0].save.save_optimizer_per_checkpoint || false}
+              onChange={value => setJobConfig(value, 'config.process[0].save.save_optimizer_per_checkpoint')}
+            />
           </Card>
         </div>
         <div>
@@ -575,13 +528,8 @@ export default function SimpleJob({
                   value={jobConfig.config.process[0].train.optimizer}
                   onChange={value => setJobConfig(value, 'config.process[0].train.optimizer')}
                   options={[
-                    { value: 'adafactor', label: 'Adafactor' },
-                    { value: 'adam', label: 'Adam' },
-                    { value: 'adamw', label: 'AdamW' },
                     { value: 'adamw8bit', label: 'AdamW8Bit' },
-                    { value: 'automagic', label: 'Automagic' },
-                    { value: 'prodigyopt', label: 'Prodigy' },
-                    { value: 'prodigy8bit', label: 'Prodigy8Bit' },
+                    { value: 'adafactor', label: 'Adafactor' },
                   ]}
                 />
                 <NumberInput
@@ -615,7 +563,19 @@ export default function SimpleJob({
                       { value: 'linear', label: 'Linear' },
                       { value: 'shift', label: 'Shift' },
                       { value: 'weighted', label: 'Weighted' },
+                      { value: 'weighted_low', label: 'Weighted Low' },
+                      { value: 'custom', label: 'Custom Weighting Curve' },
                     ]}
+                  />
+                )}
+                {jobConfig.config.process[0].train.timestep_type === 'custom' &&
+                 !disableSections.includes('train.timestep_type') && (
+                  <CustomTimestepCurvePicker
+                    value={jobConfig.config.process[0].train.custom_timestep_curve ?? null}
+                    onChange={next => setJobConfig(next, 'config.process[0].train.custom_timestep_curve')}
+                    apiBase="/api/timestep-curves"
+                    manageHref="/timestep-curves"
+                    label="Custom Weighting Curve"
                   />
                 )}
                 <SelectInput
@@ -627,8 +587,18 @@ export default function SimpleJob({
                     { value: 'balanced', label: 'Balanced' },
                     { value: 'content', label: 'High Noise' },
                     { value: 'style', label: 'Low Noise' },
+                    { value: 'custom', label: 'Custom Distribution' },
                   ]}
                 />
+                {jobConfig.config.process[0].train.content_or_style === 'custom' && (
+                  <CustomTimestepCurvePicker
+                    value={jobConfig.config.process[0].train.custom_timestep_distribution ?? null}
+                    onChange={next => setJobConfig(next, 'config.process[0].train.custom_timestep_distribution')}
+                    apiBase="/api/timestep-distributions"
+                    manageHref="/timestep-distributions"
+                    label="Custom Distribution"
+                  />
+                )}
                 <SelectInput
                   label="Loss Type"
                   className="pt-2"
@@ -641,6 +611,133 @@ export default function SimpleJob({
                     { value: 'stepped', label: 'Stepped Recovery' },
                   ]}
                 />
+                <NumberInput
+                  label="Diffusion Loss Weight"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.diffusion_loss_weight ?? 1.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].train.diffusion_loss_weight')
+                  }
+                  placeholder="1.0 = normal"
+                  min={0}
+                  max={1}
+                />
+                {(jobConfig.config.process[0].train.diffusion_loss_weight ?? 1.0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Diffusion Loss Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.diffusion_loss_min_t ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.diffusion_loss_min_t')
+                      }
+                      placeholder="0.0 = all timesteps"
+                      min={0}
+                      max={1}
+                    />
+                    <NumberInput
+                      label="Diffusion Loss Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.diffusion_loss_max_t ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.diffusion_loss_max_t')
+                      }
+                      placeholder="1.0 = all timesteps"
+                      min={0}
+                      max={1}
+                    />
+                  </>
+                )}
+                <NumberInput
+                  label="Min Denoising Step"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.min_denoising_steps ?? 0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].train.min_denoising_steps')
+                  }
+                  placeholder="0"
+                  min={0}
+                  max={999}
+                />
+                <NumberInput
+                  label="Max Denoising Step"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.max_denoising_steps ?? 999}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].train.max_denoising_steps')
+                  }
+                  placeholder="999"
+                  min={0}
+                  max={999}
+                />
+                {/* Global default for per-dataset loss_split.
+                    'auto' = key omitted: trainer turns it on for any dataset
+                            whose effective depth-consistency weight is > 0.
+                    'diffusion_depth' = force on everywhere (string).
+                    'off' = explicit null in YAML: force off everywhere. */}
+                <SelectInput
+                  label="Loss Split (global)"
+                  className="pt-2"
+                  value={
+                    jobConfig.config.process[0].train.loss_split === undefined
+                      ? 'auto'
+                      : jobConfig.config.process[0].train.loss_split === null
+                      ? 'off'
+                      : jobConfig.config.process[0].train.loss_split
+                  }
+                  onChange={value => {
+                    if (value === 'auto') {
+                      setJobConfig(undefined, 'config.process[0].train.loss_split');
+                    } else if (value === 'off') {
+                      setJobConfig(null, 'config.process[0].train.loss_split');
+                    } else {
+                      setJobConfig(value, 'config.process[0].train.loss_split');
+                    }
+                  }}
+                  options={[
+                    { value: 'auto', label: 'Auto (on when depth anchor is active)' },
+                    { value: 'diffusion_depth', label: 'Force on (Diffusion / Depth alternating)' },
+                    { value: 'off', label: 'Force off (sum every step)' },
+                  ]}
+                />
+                {/* Latent perceptual loss — experimental, hidden for now
+                <NumberInput
+                  label="Latent Perceptual Loss Weight"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.latent_perceptual_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].train.latent_perceptual_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].train.latent_perceptual_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Latent Perceptual Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.latent_perceptual_loss_min_t ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.latent_perceptual_loss_min_t')
+                      }
+                      placeholder="0.0"
+                      min={0}
+                      max={1}
+                    />
+                    <NumberInput
+                      label="Latent Perceptual Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.latent_perceptual_loss_max_t ?? 0.5}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.latent_perceptual_loss_max_t')
+                      }
+                      placeholder="0.5"
+                      min={0}
+                      max={1}
+                    />
+                  </>
+                )}
+                */}
                 {modelArch?.additionalSections?.includes('train.audio_loss_multiplier') && (
                   <NumberInput
                     label="Audio Loss Multiplier"
@@ -667,10 +764,50 @@ export default function SimpleJob({
                     label="EMA Decay"
                     className="pt-2"
                     value={jobConfig.config.process[0].train.ema_config?.ema_decay as number}
-                    onChange={value => setJobConfig(value, 'config.process[0].train.ema_config.ema_decay')}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.ema_config?.ema_decay')}
                     placeholder="eg. 0.99"
                     min={0}
                   />
+                )}
+
+                <FormGroup label="Weight Noise" className="pt-2" docKey={'train.weight_noise'}>
+                  <Checkbox
+                    label="Enable Weight Noise"
+                    className="pt-1"
+                    checked={jobConfig.config.process[0].train.weight_noise?.enabled || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.enabled')}
+                  />
+                </FormGroup>
+                {jobConfig.config.process[0].train.weight_noise?.enabled && (
+                  <>
+                    <SelectInput
+                      label="Mode"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.mode || 'relative'}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.mode')}
+                      options={[
+                        { value: 'relative', label: 'Relative (σ × per-param weight RMS)' },
+                        { value: 'absolute', label: 'Absolute (fixed σ)' },
+                      ]}
+                    />
+                    <NumberInput
+                      label="Sigma"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.sigma as number}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.sigma')}
+                      placeholder="0.001 – 0.0017"
+                      min={0}
+                      docKey={'train.weight_noise.sigma'}
+                    />
+                    <NumberInput
+                      label="Log Every"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.log_every as number}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.log_every')}
+                      placeholder="eg. 50"
+                      min={0}
+                    />
+                  </>
                 )}
 
                 <FormGroup label="Text Encoder Optimizations" className="pt-2">
@@ -838,6 +975,748 @@ export default function SimpleJob({
                     )}
                   </>
                 )}
+                <FormGroup label="Perceptual Anchoring" docKey="perceptual_anchoring">
+                  <></>
+                </FormGroup>
+                {/* Face ID Conditioning — hidden for now, available via YAML config
+                <Checkbox
+                  label="Face ID Conditioning"
+                  docKey="face_id.enabled"
+                  className="pt-1"
+                  checked={jobConfig.config.process[0].face_id?.enabled || false}
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].face_id.enabled');
+                  }}
+                />
+                {jobConfig.config.process[0].face_id?.enabled && (
+                  <>
+                    <NumberInput
+                      label="Face Tokens"
+                      docKey="face_id.num_tokens"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.num_tokens || 4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.num_tokens')
+                      }
+                      placeholder="eg. 4"
+                      min={1}
+                      max={16}
+                    />
+                    <NumberInput
+                      label="Face Dropout"
+                      docKey="face_id.dropout_prob"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.dropout_prob || 0.1}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.dropout_prob')
+                      }
+                      placeholder="eg. 0.1"
+                      min={0}
+                      max={1}
+                    />
+                    <NumberInput
+                      label="Scale LR Multiplier"
+                      docKey="face_id.scale_lr_multiplier"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.scale_lr_multiplier || 10}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.scale_lr_multiplier')
+                      }
+                      placeholder="eg. 10"
+                      min={1}
+                      max={100}
+                    />
+                    <NumberInput
+                      label="Init Scale"
+                      docKey="face_id.init_scale"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.init_scale || 0.01}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.init_scale')
+                      }
+                      placeholder="eg. 0.01"
+                      min={0.001}
+                      max={1000}
+                    />
+                    <Checkbox
+                      label="Vision Face Embeddings (CLIP/DINOv2)"
+                      docKey="face_id.vision_enabled"
+                      className="pt-3"
+                      checked={jobConfig.config.process[0].face_id?.vision_enabled || false}
+                      onChange={value => {
+                        setJobConfig(value, 'config.process[0].face_id.vision_enabled');
+                      }}
+                    />
+                    {jobConfig.config.process[0].face_id?.vision_enabled && (
+                      <>
+                        <SelectInput
+                          label="Vision Model"
+                          className="pt-2"
+                          value={jobConfig.config.process[0].face_id?.vision_model || 'openai/clip-vit-large-patch14'}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].face_id.vision_model')
+                          }
+                          options={[
+                            { label: 'CLIP ViT-L/14', value: 'openai/clip-vit-large-patch14' },
+                            { label: 'DINOv2 Large', value: 'facebook/dinov2-large' },
+                          ]}
+                        />
+                        <NumberInput
+                          label="Vision Tokens"
+                          className="pt-2"
+                          value={jobConfig.config.process[0].face_id?.vision_num_tokens || 4}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].face_id.vision_num_tokens')
+                          }
+                          placeholder="eg. 4"
+                          min={1}
+                          max={16}
+                        />
+                      </>
+                    )}
+                  </>
+                )}
+                */}
+                <Checkbox
+                  label="Identity Metrics (track without loss)"
+                  docKey="face_id.identity_metrics"
+                  className="pt-3"
+                  checked={jobConfig.config.process[0].face_id?.identity_metrics || false}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.identity_metrics')
+                  }
+                />
+                <NumberInput
+                  label="Identity Loss Weight"
+                  docKey="face_id.identity_loss_weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.identity_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.identity_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.identity_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Identity Loss Min t"
+                      docKey="face_id.identity_loss_min_t"
+                      className="pt-2"
+                      value={
+                        jobConfig.config.process[0].face_id?.identity_loss_min_t ?? 0.0
+                      }
+                      onChange={value =>
+                        setJobConfig(
+                          value,
+                          'config.process[0].face_id.identity_loss_min_t'
+                        )
+                      }
+                      placeholder="eg. 0"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Identity Loss Max t"
+                      docKey="face_id.identity_loss_max_t"
+                      className="pt-2"
+                      value={
+                        jobConfig.config.process[0].face_id?.identity_loss_max_t ?? 1.0
+                      }
+                      onChange={value =>
+                        setJobConfig(
+                          value,
+                          'config.process[0].face_id.identity_loss_max_t'
+                        )
+                      }
+                      placeholder="eg. 1"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Identity Loss Min Cosine"
+                      docKey="face_id.identity_loss_min_cos"
+                      className="pt-2"
+                      value={
+                        jobConfig.config.process[0].face_id?.identity_loss_min_cos ?? 0.2
+                      }
+                      onChange={value =>
+                        setJobConfig(
+                          value,
+                          'config.process[0].face_id.identity_loss_min_cos'
+                        )
+                      }
+                      placeholder="0.2 = only apply when face detected"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <Checkbox
+                      label="Use Average Face Embedding"
+                      docKey="face_id.identity_loss_use_average"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].face_id?.identity_loss_use_average || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.identity_loss_use_average')
+                      }
+                    />
+                    <NumberInput
+                      label="Average Blend (0=per-image, 0.5=midpoint, 1=average)"
+                      docKey="face_id.identity_loss_average_blend"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.identity_loss_average_blend ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.identity_loss_average_blend')
+                      }
+                      placeholder="0 = per-image only"
+                      min={0}
+                      max={1}
+                    />
+                    <Checkbox
+                      label="Use Random Face Embedding Per Step"
+                      docKey="face_id.identity_loss_use_random"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].face_id?.identity_loss_use_random || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.identity_loss_use_random')
+                      }
+                    />
+                    <NumberInput
+                      label="Multi-Ref Count (0 = disabled)"
+                      docKey="face_id.identity_loss_num_refs"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.identity_loss_num_refs ?? 0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.identity_loss_num_refs')
+                      }
+                      placeholder="0 = use single ref"
+                      min={0}
+                    />
+                  </>
+                )}
+                {/* Landmark loss — experimental, hidden for now
+                <NumberInput
+                  label="Landmark Loss Weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.landmark_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.landmark_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                */}
+                <NumberInput
+                  label="Body Proportion Loss Weight"
+                  docKey="face_id.body_proportion_loss_weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.body_proportion_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.body_proportion_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.body_proportion_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Body Proportion Min t"
+                      docKey="face_id.body_proportion_loss_min_t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.body_proportion_loss_min_t ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.body_proportion_loss_min_t')
+                      }
+                      placeholder="eg. 0"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Body Proportion Max t"
+                      docKey="face_id.body_proportion_loss_max_t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.body_proportion_loss_max_t ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.body_proportion_loss_max_t')
+                      }
+                      placeholder="eg. 1"
+                      min={0.0}
+                      max={1.0}
+                    />
+                  </>
+                )}
+                <NumberInput
+                  label="Face Suppression Weight"
+                  docKey="face_id.face_suppression_weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.face_suppression_weight ?? null}
+                  onChange={value =>
+                    setJobConfig(value === null || value === undefined ? undefined : value, 'config.process[0].face_id.face_suppression_weight')
+                  }
+                  placeholder="none (no suppression)"
+                  min={0}
+                  max={1}
+                />
+                {(jobConfig.config.process[0].face_id?.face_suppression_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Suppression Expand"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.face_suppression_expand ?? 2.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.face_suppression_expand')
+                      }
+                      placeholder="1.0 = face only, 1.8 = full head"
+                      min={1.0}
+                      max={3.0}
+                    />
+                    <Checkbox
+                      label="Soft Gaussian Falloff"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].face_id?.face_suppression_soft ?? false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.face_suppression_soft')
+                      }
+                    />
+                  </>
+                )}
+                {/* -------- Subject Masking (YOLO + SAM 2 + SegFormer) -------- */}
+                <Checkbox
+                  label="Subject Masking (auto body/clothing masks)"
+                  docKey="subject_mask.enabled"
+                  className="pt-4"
+                  checked={jobConfig.config.process[0].subject_mask?.enabled || false}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].subject_mask.enabled')
+                  }
+                />
+                {jobConfig.config.process[0].subject_mask?.enabled && (
+                  <>
+                    <SelectInput
+                      label="SAM 2 Size"
+                      docKey="subject_mask.sam_size"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].subject_mask?.sam_size ?? 'small'}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.sam_size')
+                      }
+                      options={[
+                        { label: 'tiny (31M params)', value: 'tiny' },
+                        { label: 'small (39M params)', value: 'small' },
+                        { label: 'base_plus (73M params)', value: 'base_plus' },
+                        { label: 'large (217M params)', value: 'large' },
+                      ]}
+                    />
+                    <NumberInput
+                      label="YOLO Confidence Threshold"
+                      docKey="subject_mask.yolo_conf"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].subject_mask?.yolo_conf ?? 0.25}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.yolo_conf')
+                      }
+                      placeholder="0.25"
+                      min={0.05}
+                      max={0.95}
+                    />
+                    <Checkbox
+                      label="Primary Person Only"
+                      docKey="subject_mask.primary_only"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].subject_mask?.primary_only ?? true}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.primary_only')
+                      }
+                    />
+                    <NumberInput
+                      label="SegFormer Resolution"
+                      docKey="subject_mask.segformer_res"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].subject_mask?.segformer_res ?? 768}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.segformer_res')
+                      }
+                      placeholder="768"
+                      min={256}
+                      max={1536}
+                    />
+                    <NumberInput
+                      label="Cache Resolution"
+                      docKey="subject_mask.cache_resolution"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].subject_mask?.cache_resolution ?? 256}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.cache_resolution')
+                      }
+                      placeholder="256"
+                      min={64}
+                      max={1024}
+                    />
+                    <NumberInput
+                      label="Body Close Radius"
+                      docKey="subject_mask.body_close_radius"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].subject_mask?.body_close_radius ?? 2}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.body_close_radius')
+                      }
+                      placeholder="2 (higher fills blotchy gaps; re-extracts cache)"
+                      min={0}
+                      max={12}
+                    />
+                    <NumberInput
+                      label="Background Loss Weight"
+                      docKey="subject_mask.background_loss_weight"
+                      className="pt-3"
+                      value={jobConfig.config.process[0].subject_mask?.background_loss_weight ?? null}
+                      onChange={value =>
+                        setJobConfig(value === null || value === undefined ? undefined : value,
+                          'config.process[0].subject_mask.background_loss_weight')
+                      }
+                      placeholder="none (no change); 0 = ignore background"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Clothing Loss Weight"
+                      docKey="subject_mask.clothing_loss_weight"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].subject_mask?.clothing_loss_weight ?? null}
+                      onChange={value =>
+                        setJobConfig(value === null || value === undefined ? undefined : value,
+                          'config.process[0].subject_mask.clothing_loss_weight')
+                      }
+                      placeholder="none (no change); <1 = de-emphasize"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Body Loss Weight"
+                      docKey="subject_mask.body_loss_weight"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].subject_mask?.body_loss_weight ?? null}
+                      onChange={value =>
+                        setJobConfig(value === null || value === undefined ? undefined : value,
+                          'config.process[0].subject_mask.body_loss_weight')
+                      }
+                      placeholder="none (no change); >1 = boost body"
+                      min={0}
+                    />
+                    <Checkbox
+                      label="Restrict Perceptual Losses to Body"
+                      docKey="subject_mask.perceptual_restrict_to_body"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].subject_mask?.perceptual_restrict_to_body ?? false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.perceptual_restrict_to_body')
+                      }
+                    />
+                    <Checkbox
+                      label="Save Debug Preview Tiles"
+                      docKey="subject_mask.save_debug_previews"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].subject_mask?.save_debug_previews ?? false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].subject_mask.save_debug_previews')
+                      }
+                    />
+                  </>
+                )}
+                {/* -------- Depth Consistency (Depth-Anything-V2 SSI + gradient) -------- */}
+                <NumberInput
+                  label="Depth Consistency Loss Weight"
+                  docKey="depth_consistency.loss_weight"
+                  className="pt-4"
+                  value={jobConfig.config.process[0].depth_consistency?.loss_weight ?? 0.1}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].depth_consistency.loss_weight')
+                  }
+                  placeholder="0.1 (Small) / 0.001 (Large); 0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].depth_consistency?.loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Depth Min t"
+                      docKey="depth_consistency.loss_min_t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.loss_min_t ?? 0.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.loss_min_t')
+                      }
+                      placeholder="eg. 0"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Depth Max t"
+                      docKey="depth_consistency.loss_max_t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.loss_max_t ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.loss_max_t')
+                      }
+                      placeholder="eg. 0.9"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <SelectInput
+                      label="Depth Mask Source"
+                      docKey="depth_consistency.mask_source"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.mask_source ?? 'subject'}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.mask_source')
+                      }
+                      options={[
+                        { label: 'none (full image)', value: 'none' },
+                        { label: 'subject (person mask)', value: 'subject' },
+                        { label: 'body (identity-relevant only)', value: 'body' },
+                      ]}
+                    />
+                    <NumberInput
+                      label="SSI L1 Weight"
+                      docKey="depth_consistency.ssi_weight"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.ssi_weight ?? 1.0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.ssi_weight')
+                      }
+                      placeholder="eg. 1.0"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Gradient Matching Weight"
+                      docKey="depth_consistency.grad_weight"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.grad_weight ?? 0.5}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.grad_weight')
+                      }
+                      placeholder="eg. 0.5"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Gradient Scales"
+                      docKey="depth_consistency.grad_scales"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.grad_scales ?? 4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.grad_scales')
+                      }
+                      placeholder="eg. 4"
+                      min={1}
+                      max={8}
+                    />
+                    <NumberInput
+                      label="Preview Every (steps)"
+                      docKey="depth_consistency.preview_every"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.preview_every ?? 100}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.preview_every')
+                      }
+                      placeholder="eg. 100; 0 disables"
+                      min={0}
+                    />
+                    <TextInput
+                      label="DA2 Model ID"
+                      docKey="depth_consistency.model_id"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.model_id ?? 'depth-anything/Depth-Anything-V2-Small-hf'}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.model_id')
+                      }
+                      placeholder="depth-anything/Depth-Anything-V2-Small-hf"
+                    />
+                    <NumberInput
+                      label="DA2 Input Size"
+                      docKey="depth_consistency.input_size"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].depth_consistency?.input_size ?? 518}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.input_size')
+                      }
+                      placeholder="518 (multiple of 14)"
+                      min={224}
+                      max={1400}
+                    />
+                    <Checkbox
+                      label="Gradient Checkpointing (DA2)"
+                      docKey="depth_consistency.grad_checkpoint"
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].depth_consistency?.grad_checkpoint ?? true}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].depth_consistency.grad_checkpoint')
+                      }
+                    />
+                  </>
+                )}
+                {/* Body shape, normal map, VAE anchor, body conditioning — experimental, hidden for now
+                <NumberInput
+                  label="Body Shape Loss Weight (HybrIK)"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.body_shape_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.body_shape_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.body_shape_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Body Shape Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.body_shape_loss_min_t ?? 0.4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.body_shape_loss_min_t')
+                      }
+                      placeholder="eg. 0.4"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Body Shape Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.body_shape_loss_max_t ?? 0.8}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.body_shape_loss_max_t')
+                      }
+                      placeholder="eg. 0.8"
+                      min={0.0}
+                      max={1.0}
+                    />
+                  </>
+                )}
+                <NumberInput
+                  label="Normal Map Loss Weight (Sapiens)"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.normal_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.normal_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.normal_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="Normal Loss Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.normal_loss_min_t ?? 0.4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.normal_loss_min_t')
+                      }
+                      placeholder="eg. 0.4"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="Normal Loss Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.normal_loss_max_t ?? 0.8}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.normal_loss_max_t')
+                      }
+                      placeholder="eg. 0.8"
+                      min={0.0}
+                      max={1.0}
+                    />
+                  </>
+                )}
+                <NumberInput
+                  label="VAE Anchor Loss Weight"
+                  className="pt-3"
+                  value={jobConfig.config.process[0].face_id?.vae_anchor_loss_weight ?? 0.0}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].face_id.vae_anchor_loss_weight')
+                  }
+                  placeholder="0 = disabled"
+                  min={0}
+                />
+                {(jobConfig.config.process[0].face_id?.vae_anchor_loss_weight ?? 0) > 0 && (
+                  <>
+                    <NumberInput
+                      label="VAE Anchor Min t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.vae_anchor_loss_min_t ?? 0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.vae_anchor_loss_min_t')
+                      }
+                      placeholder="eg. 0"
+                      min={0.0}
+                      max={1.0}
+                    />
+                    <NumberInput
+                      label="VAE Anchor Max t"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].face_id?.vae_anchor_loss_max_t ?? 0.5}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].face_id.vae_anchor_loss_max_t')
+                      }
+                      placeholder="eg. 0.5"
+                      min={0.0}
+                      max={1.0}
+                    />
+                  </>
+                )}
+                */}
+                {/* Body Shape Conditioning (SMPL) — experimental, hidden for now
+                <Checkbox
+                  label="Body Shape Conditioning (SMPL)"
+                  className="pt-3"
+                  checked={jobConfig.config.process[0].body_id?.enabled || false}
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].body_id.enabled');
+                  }}
+                />
+                {jobConfig.config.process[0].body_id?.enabled && (
+                  <>
+                    <NumberInput
+                      label="Body Tokens"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].body_id?.num_tokens || 4}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].body_id.num_tokens')
+                      }
+                      placeholder="eg. 4"
+                      min={1}
+                      max={16}
+                    />
+                    <NumberInput
+                      label="Body Dropout"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].body_id?.dropout_prob || 0.1}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].body_id.dropout_prob')
+                      }
+                      placeholder="eg. 0.1"
+                      min={0}
+                      max={1}
+                    />
+                    <NumberInput
+                      label="Scale LR Multiplier"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].body_id?.scale_lr_multiplier || 10}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].body_id.scale_lr_multiplier')
+                      }
+                      placeholder="eg. 10"
+                      min={1}
+                      max={100}
+                    />
+                    <NumberInput
+                      label="Init Scale"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].body_id?.init_scale || 0.01}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].body_id.init_scale')
+                      }
+                      placeholder="eg. 0.01"
+                      min={0.001}
+                      max={1000}
+                    />
+                  </>
+                )}
+                */}
               </div>
             </div>
           </Card>
@@ -886,36 +1765,20 @@ export default function SimpleJob({
             <>
               {jobConfig.config.process[0].datasets.map((dataset, i) => (
                 <div key={i} className="p-4 rounded-lg bg-gray-800 relative">
-                  <div className="absolute top-2 right-2 flex gap-1">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const duplicated = objectCopy(dataset);
-                        const datasets = [...jobConfig.config.process[0].datasets];
-                        datasets.splice(i + 1, 0, duplicated);
-                        setJobConfig(datasets, 'config.process[0].datasets');
-                      }}
-                      className="bg-gray-700 hover:bg-gray-600 rounded-full p-2 text-sm transition-colors"
-                      title="Duplicate Dataset"
-                    >
-                      <Copy className="w-4 h-4" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setJobConfig(
-                          jobConfig.config.process[0].datasets.filter((_, index) => index !== i),
-                          'config.process[0].datasets',
-                        )
-                      }
-                      className="bg-red-600 hover:bg-red-700 text-white rounded-full p-2 text-sm transition-colors"
-                      title="Remove Dataset"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setJobConfig(
+                        jobConfig.config.process[0].datasets.filter((_, index) => index !== i),
+                        'config.process[0].datasets',
+                      )
+                    }
+                    className="absolute top-2 right-2 bg-red-800 hover:bg-red-700 rounded-full p-1 text-sm transition-colors"
+                  >
+                    <X />
+                  </button>
                   <h2 className="text-lg font-bold mb-4">Dataset {i + 1}</h2>
-                  <div className={datasetStyleClass}>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                     <div>
                       <SelectInput
                         label="Target Dataset"
@@ -985,14 +1848,60 @@ export default function SimpleJob({
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].network_weight`)}
                         placeholder="eg. 1.0"
                       />
-                      <NumberInput
-                        label="Num Repeats"
-                        value={dataset.num_repeats || 1}
-                        className="pt-2"
-                        onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].num_repeats`)}
-                        placeholder="eg. 1"
-                        docKey={'dataset.num_repeats'}
-                      />
+                      {(() => {
+                        const selectedRes = dataset.resolution ?? [];
+                        const repeatsRaw = dataset.num_repeats;
+                        const scalarFallback = (typeof repeatsRaw === 'number' ? repeatsRaw : 1);
+                        if (selectedRes.length <= 1) {
+                          const scalarValue = Array.isArray(repeatsRaw)
+                            ? (repeatsRaw[0] ?? 1)
+                            : (repeatsRaw ?? 1);
+                          return (
+                            <NumberInput
+                              label="Num Repeats"
+                              value={scalarValue}
+                              className="pt-2"
+                              onChange={value =>
+                                setJobConfig(value, `config.process[0].datasets[${i}].num_repeats`)
+                              }
+                              placeholder="eg. 1"
+                              docKey={'dataset.num_repeats'}
+                            />
+                          );
+                        }
+                        const repeatsArr = Array.isArray(repeatsRaw)
+                          ? selectedRes.map((_, idx) => repeatsRaw[idx] ?? scalarFallback)
+                          : selectedRes.map(() => scalarFallback);
+                        const commit = (next: number[]) => {
+                          const allEqual = next.every(v => v === next[0]);
+                          const value = allEqual ? (next[0] ?? 1) : next;
+                          setJobConfig(value, `config.process[0].datasets[${i}].num_repeats`);
+                        };
+                        return (
+                          <FormGroup
+                            label="Num Repeats (per resolution)"
+                            className="pt-2"
+                            docKey={'dataset.num_repeats'}
+                          >
+                            <div className="grid grid-cols-2 gap-2">
+                              {selectedRes.map((res, idx) => (
+                                <NumberInput
+                                  key={res}
+                                  label={`@ ${res}`}
+                                  value={repeatsArr[idx] ?? 1}
+                                  onChange={value => {
+                                    const next = [...repeatsArr];
+                                    next[idx] = (value as number) ?? 1;
+                                    commit(next);
+                                  }}
+                                  placeholder="eg. 1"
+                                  min={0}
+                                />
+                              ))}
+                            </div>
+                          </FormGroup>
+                        );
+                      })()}
                     </div>
                     <div>
                       <TextInput
@@ -1010,7 +1919,7 @@ export default function SimpleJob({
                         min={0}
                         required
                       />
-                      {modelArch?.additionalSections?.includes('datasets.num_frames') && !dataset.auto_frame_count && (
+                      {modelArch?.additionalSections?.includes('datasets.num_frames') && (
                         <NumberInput
                           label="Num Frames"
                           className="pt-2"
@@ -1037,14 +1946,6 @@ export default function SimpleJob({
                           checked={dataset.is_reg || false}
                           onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].is_reg`)}
                         />
-                        {modelArch?.additionalSections?.includes('datasets.auto_frame_count') && (
-                          <Checkbox
-                            label="Auto Frame Count"
-                            checked={dataset.auto_frame_count || false}
-                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].auto_frame_count`)}
-                            docKey="datasets.auto_frame_count"
-                          />
-                        )}
                         {modelArch?.additionalSections?.includes('datasets.do_i2v') && (
                           <Checkbox
                             label="Do I2V"
@@ -1096,58 +1997,202 @@ export default function SimpleJob({
                           />
                         )}
                       </FormGroup>
-                      {!isAudioModel && (
-                        <FormGroup label="Flipping" docKey={'datasets.flip'} className="mt-2">
-                          <Checkbox
-                            label={
-                              <>
-                                Flip X <FlipHorizontal2 className="inline-block w-4 h-4 ml-1" />
-                              </>
-                            }
-                            checked={dataset.flip_x || false}
-                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].flip_x`)}
-                          />
-                          <Checkbox
-                            label={
-                              <>
-                                Flip Y <FlipVertical2 className="inline-block w-4 h-4 ml-1" />
-                              </>
-                            }
-                            checked={dataset.flip_y || false}
-                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].flip_y`)}
-                          />
-                        </FormGroup>
-                      )}
+                      <FormGroup label="Flipping" docKey={'datasets.flip'} className="mt-2">
+                        <Checkbox
+                          label={
+                            <>
+                              Flip X <FlipHorizontal2 className="inline-block w-4 h-4 ml-1" />
+                            </>
+                          }
+                          checked={dataset.flip_x || false}
+                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].flip_x`)}
+                        />
+                        <Checkbox
+                          label={
+                            <>
+                              Flip Y <FlipVertical2 className="inline-block w-4 h-4 ml-1" />
+                            </>
+                          }
+                          checked={dataset.flip_y || false}
+                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].flip_y`)}
+                        />
+                      </FormGroup>
                     </div>
-                    {!isAudioModel && (
-                      <div>
-                        <FormGroup label="Resolutions" className="pt-2">
-                          <div className="grid grid-cols-2 gap-2">
-                            {[
-                              [256, 512, 768, 1024],
-                              [1280, 1328, 1536],
-                            ].map(resGroup => (
-                              <div key={resGroup[0]} className="space-y-2">
-                                {resGroup.map(res => (
-                                  <Checkbox
-                                    key={res}
-                                    label={res.toString()}
-                                    checked={dataset.resolution.includes(res)}
-                                    onChange={value => {
-                                      const resolutions = dataset.resolution.includes(res)
-                                        ? dataset.resolution.filter(r => r !== res)
-                                        : [...dataset.resolution, res];
-                                      setJobConfig(resolutions, `config.process[0].datasets[${i}].resolution`);
-                                    }}
-                                  />
-                                ))}
-                              </div>
-                            ))}
-                          </div>
-                        </FormGroup>
-                      </div>
-                    )}
+                    <div>
+                      <FormGroup label="Resolutions" className="pt-2">
+                        <div className="grid grid-cols-2 gap-2">
+                          {[
+                            [128, 256, 384, 512, 768],
+                            [1024, 1280, 1536],
+                          ].map(resGroup => (
+                            <div key={resGroup[0]} className="space-y-2">
+                              {resGroup.map(res => (
+                                <Checkbox
+                                  key={res}
+                                  label={res.toString()}
+                                  checked={dataset.resolution.includes(res)}
+                                  onChange={value => {
+                                    const cur = dataset.resolution;
+                                    const removing = cur.includes(res);
+                                    const resolutions = removing
+                                      ? cur.filter(r => r !== res)
+                                      : [...cur, res];
+                                    setJobConfig(resolutions, `config.process[0].datasets[${i}].resolution`);
+                                    if (Array.isArray(dataset.num_repeats)) {
+                                      let nextRepeats: number[];
+                                      if (removing) {
+                                        const removeIdx = cur.indexOf(res);
+                                        nextRepeats = dataset.num_repeats.filter((_, idx) => idx !== removeIdx);
+                                      } else {
+                                        const last = dataset.num_repeats[dataset.num_repeats.length - 1] ?? 1;
+                                        nextRepeats = [...dataset.num_repeats, last];
+                                      }
+                                      const allEqual = nextRepeats.length > 0 && nextRepeats.every(v => v === nextRepeats[0]);
+                                      const valueOut: number | number[] = nextRepeats.length === 0
+                                        ? 1
+                                        : (allEqual ? nextRepeats[0] : nextRepeats);
+                                      setJobConfig(valueOut, `config.process[0].datasets[${i}].num_repeats`);
+                                    }
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      </FormGroup>
+                    </div>
                   </div>
+                  <details className="mt-3">
+                      <summary className="cursor-pointer text-sm text-gray-400 hover:text-gray-200">
+                        Per-Dataset Perceptual Anchoring Overrides
+                      </summary>
+                      <div className="mt-2 space-y-3 p-3 rounded bg-gray-700/50">
+                        {/* Diffusion */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Diffusion</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.diffusion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.diffusion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.diffusion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Face Suppression" value={dataset.face_suppression_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_weight`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Supp. Expand" value={dataset.face_suppression_expand ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_expand`)} placeholder="inherit" min={1.0} max={3.0} />
+                          </div>
+                        </div>
+                        {/* Latent Perceptual — experimental, hidden for now
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Latent Perceptual</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.latent_perceptual_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.latent_perceptual_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.latent_perceptual_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].latent_perceptual_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        */}
+                        {/* Identity */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Identity (ArcFace)</div>
+                          <div className="grid grid-cols-4 gap-2">
+                            <NumberInput label="Weight" value={dataset.identity_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.identity_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.identity_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Min Cos" value={dataset.identity_loss_min_cos ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].identity_loss_min_cos`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        {/* Landmark — experimental, hidden for now
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Landmark</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.landmark_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].landmark_loss_weight`)} placeholder="inherit" min={0} />
+                          </div>
+                        </div>
+                        */}
+                        {/* Body Proportion */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Body Proportion</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.body_proportion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.body_proportion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.body_proportion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_proportion_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        {/* Depth Consistency */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Depth Consistency</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.depth_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.depth_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.depth_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].depth_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        {/* Loss Alternation: alternate diffusion / depth per optimizer step.
+                            Three states match the global Loss Split:
+                              'auto' = key omitted (or null): inherit from global.
+                              'diffusion_depth' = force on for this dataset.
+                              'sum' = force off for this dataset (sum every step). */}
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Loss Alternation</div>
+                          <SelectInput
+                            label="Loss Split"
+                            value={
+                              dataset.loss_split === undefined || dataset.loss_split === null
+                                ? 'auto'
+                                : dataset.loss_split
+                            }
+                            onChange={value => {
+                              if (value === 'auto') {
+                                setJobConfig(undefined, `config.process[0].datasets[${i}].loss_split`);
+                              } else {
+                                setJobConfig(value, `config.process[0].datasets[${i}].loss_split`);
+                              }
+                            }}
+                            options={[
+                              { value: 'auto', label: 'Auto (use global)' },
+                              { value: 'diffusion_depth', label: 'Force on (Diffusion / Depth alternating)' },
+                              { value: 'sum', label: 'Force off (sum every step)' },
+                            ]}
+                          />
+                        </div>
+                        {/* Subject Mask Region Weights */}
+                        {jobConfig.config.process[0].subject_mask?.enabled && (
+                          <div>
+                            <div className="text-xs font-medium text-gray-400 mb-1">Subject Mask Regions</div>
+                            <div className="grid grid-cols-4 gap-2">
+                              <NumberInput label="Background" value={dataset.background_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].background_loss_weight`)} placeholder="inherit" min={0} />
+                              <NumberInput label="Clothing" value={dataset.clothing_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].clothing_loss_weight`)} placeholder="inherit" min={0} />
+                              <NumberInput label="Body" value={dataset.body_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_loss_weight`)} placeholder="inherit" min={0} />
+                              <Checkbox label="Restrict Perc." checked={dataset.perceptual_restrict_to_body ?? false} onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].perceptual_restrict_to_body`)} />
+                            </div>
+                          </div>
+                        )}
+                        {/* Body Shape, Normal Map, VAE Anchor — experimental, hidden for now
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Body Shape</div>
+                          <div className="grid grid-cols-4 gap-2">
+                            <NumberInput label="Weight" value={dataset.body_shape_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.body_shape_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.body_shape_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Min Cos" value={dataset.body_shape_loss_min_cos ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].body_shape_loss_min_cos`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">Normal Map</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.normal_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.normal_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.normal_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].normal_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs font-medium text-gray-400 mb-1">VAE Anchor</div>
+                          <div className="grid grid-cols-3 gap-2">
+                            <NumberInput label="Weight" value={dataset.vae_anchor_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.vae_anchor_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.vae_anchor_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].vae_anchor_loss_max_t`)} placeholder="inherit" min={0} max={1} />
+                          </div>
+                        </div>
+                        */}
+                      </div>
+                  </details>
                 </div>
               ))}
               <button
@@ -1168,7 +2213,13 @@ export default function SimpleJob({
         </div>
         <div>
           <Card title="Sample">
-            <div className={sampleTopStyleClass}>
+            <div
+              className={
+                isVideoModel
+                  ? 'grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-6'
+                  : 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6'
+              }
+            >
               <div>
                 <NumberInput
                   label="Sample Every"
@@ -1207,50 +2258,47 @@ export default function SimpleJob({
                   required
                 />
               </div>
-
-              {!isAudioModel && (
-                <div>
-                  <NumberInput
-                    label="Width"
-                    value={jobConfig.config.process[0].sample.width}
-                    onChange={value => setJobConfig(value, 'config.process[0].sample.width')}
-                    placeholder="eg. 1024"
-                    min={0}
-                    required
-                  />
-                  <NumberInput
-                    label="Height"
-                    value={jobConfig.config.process[0].sample.height}
-                    onChange={value => setJobConfig(value, 'config.process[0].sample.height')}
-                    placeholder="eg. 1024"
-                    className="pt-2"
-                    min={0}
-                    required
-                  />
-                  {isVideoModel && (
-                    <div>
-                      <NumberInput
-                        label="Num Frames"
-                        value={jobConfig.config.process[0].sample.num_frames}
-                        onChange={value => setJobConfig(value, 'config.process[0].sample.num_frames')}
-                        placeholder="eg. 0"
-                        className="pt-2"
-                        min={0}
-                        required
-                      />
-                      <NumberInput
-                        label="FPS"
-                        value={jobConfig.config.process[0].sample.fps}
-                        onChange={value => setJobConfig(value, 'config.process[0].sample.fps')}
-                        placeholder="eg. 0"
-                        className="pt-2"
-                        min={0}
-                        required
-                      />
-                    </div>
-                  )}
-                </div>
-              )}
+              <div>
+                <NumberInput
+                  label="Width"
+                  value={jobConfig.config.process[0].sample.width}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.width')}
+                  placeholder="eg. 1024"
+                  min={0}
+                  required
+                />
+                <NumberInput
+                  label="Height"
+                  value={jobConfig.config.process[0].sample.height}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.height')}
+                  placeholder="eg. 1024"
+                  className="pt-2"
+                  min={0}
+                  required
+                />
+                {isVideoModel && (
+                  <div>
+                    <NumberInput
+                      label="Num Frames"
+                      value={jobConfig.config.process[0].sample.num_frames}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.num_frames')}
+                      placeholder="eg. 0"
+                      className="pt-2"
+                      min={0}
+                      required
+                    />
+                    <NumberInput
+                      label="FPS"
+                      value={jobConfig.config.process[0].sample.fps}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.fps')}
+                      placeholder="eg. 0"
+                      className="pt-2"
+                      min={0}
+                      required
+                    />
+                  </div>
+                )}
+              </div>
 
               <div>
                 <NumberInput
@@ -1325,143 +2373,68 @@ export default function SimpleJob({
                   <div className="flex-1">
                     <div className="flex">
                       <div className="flex-1">
-                        {modelArch?.sampleTags && taggedSampleArr && modelArchTagSections ? (
-                          <>
-                            {modelArchTagSections.map((sampleTagSection, sti) => (
-                              <div key={sti} className="grid w-full lg:grid-flow-col lg:auto-cols-fr gap-4 mt-2">
-                                {Object.entries(sampleTagSection).map(([tagKey, tag]) => (
-                                  <div key={tagKey} className="mb-2">
-                                    {tag.type === 'text' && (
-                                      <TextInput
-                                        label={tag.title}
-                                        value={taggedSampleArr[i][tagKey] ?? ''}
-                                        onChange={value => {
-                                          let taggedSample = { ...taggedSampleArr[i] };
-                                          taggedSample[tagKey] = value;
-                                          setJobConfig(
-                                            objToTags(taggedSample),
-                                            `config.process[0].sample.samples[${i}].prompt`,
-                                          );
-                                        }}
-                                        placeholder={`Enter ${tag.title.toLowerCase()}`}
-                                      />
-                                    )}
-                                    {tag.type === 'multiline' && (
-                                      <TextAreaInput
-                                        label={tag.title}
-                                        value={taggedSampleArr[i][tagKey] ?? ''}
-                                        onChange={value => {
-                                          let taggedSample = { ...taggedSampleArr[i] };
-                                          taggedSample[tagKey] = value;
-                                          setJobConfig(
-                                            objToTags(taggedSample),
-                                            `config.process[0].sample.samples[${i}].prompt`,
-                                          );
-                                        }}
-                                        placeholder={`Enter ${tag.title.toLowerCase()}`}
-                                      />
-                                    )}
-                                    {tag.type === 'number' && (
-                                      <NumberInput
-                                        label={tag.title}
-                                        value={taggedSampleArr[i][tagKey] ?? ''}
-                                        onChange={value => {
-                                          let taggedSample = { ...taggedSampleArr[i] };
-                                          taggedSample[tagKey] = value;
-                                          setJobConfig(
-                                            objToTags(taggedSample),
-                                            `config.process[0].sample.samples[${i}].prompt`,
-                                          );
-                                        }}
-                                        placeholder={`Enter ${tag.title.toLowerCase()}`}
-                                      />
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            ))}
-                          </>
-                        ) : (
-                          <>
-                            {modelArch?.hasMultiLinePrompts ? (
-                              <TextAreaInput
-                                label={`Prompt`}
-                                value={sample.prompt}
-                                onChange={value => setJobConfig(value, `config.process[0].sample.samples[${i}].prompt`)}
-                                placeholder="Enter prompt"
-                                required
-                              />
-                            ) : (
-                              <TextInput
-                                label={`Prompt`}
-                                value={sample.prompt}
-                                onChange={value => setJobConfig(value, `config.process[0].sample.samples[${i}].prompt`)}
-                                placeholder="Enter prompt"
-                                required
-                              />
-                            )}
-                          </>
-                        )}
-
-                        <div className="grid w-full lg:grid-flow-col lg:auto-cols-fr gap-4 mt-2">
-                          {!isAudioModel && (
-                            <TextInput
-                              label={`Width`}
-                              value={sample.width ? `${sample.width}` : ''}
-                              onChange={value => {
-                                // remove any non-numeric characters
-                                value = value.replace(/\D/g, '');
-                                if (value === '') {
-                                  // remove the key from the config if empty
-                                  let newConfig = objectCopy(jobConfig);
-                                  if (newConfig.config.process[0].sample.samples[i]) {
-                                    delete newConfig.config.process[0].sample.samples[i].width;
-                                    setJobConfig(
-                                      newConfig.config.process[0].sample.samples,
-                                      'config.process[0].sample.samples',
-                                    );
-                                  }
-                                } else {
-                                  const intValue = parseInt(value);
-                                  if (!isNaN(intValue)) {
-                                    setJobConfig(intValue, `config.process[0].sample.samples[${i}].width`);
-                                  } else {
-                                    console.warn('Invalid width value:', value);
-                                  }
+                        <TextInput
+                          label={`Prompt`}
+                          value={sample.prompt}
+                          onChange={value => setJobConfig(value, `config.process[0].sample.samples[${i}].prompt`)}
+                          placeholder="Enter prompt"
+                          required
+                        />
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-2">
+                          <TextInput
+                            label={`Width`}
+                            value={sample.width ? `${sample.width}` : ''}
+                            onChange={value => {
+                              // remove any non-numeric characters
+                              value = value.replace(/\D/g, '');
+                              if (value === '') {
+                                // remove the key from the config if empty
+                                let newConfig = objectCopy(jobConfig);
+                                if (newConfig.config.process[0].sample.samples[i]) {
+                                  delete newConfig.config.process[0].sample.samples[i].width;
+                                  setJobConfig(
+                                    newConfig.config.process[0].sample.samples,
+                                    'config.process[0].sample.samples',
+                                  );
                                 }
-                              }}
-                              placeholder={`${jobConfig.config.process[0].sample.width} (default)`}
-                            />
-                          )}
-                          {!isAudioModel && (
-                            <TextInput
-                              label={`Height`}
-                              value={sample.height ? `${sample.height}` : ''}
-                              onChange={value => {
-                                // remove any non-numeric characters
-                                value = value.replace(/\D/g, '');
-                                if (value === '') {
-                                  // remove the key from the config if empty
-                                  let newConfig = objectCopy(jobConfig);
-                                  if (newConfig.config.process[0].sample.samples[i]) {
-                                    delete newConfig.config.process[0].sample.samples[i].height;
-                                    setJobConfig(
-                                      newConfig.config.process[0].sample.samples,
-                                      'config.process[0].sample.samples',
-                                    );
-                                  }
+                              } else {
+                                const intValue = parseInt(value);
+                                if (!isNaN(intValue)) {
+                                  setJobConfig(intValue, `config.process[0].sample.samples[${i}].width`);
                                 } else {
-                                  const intValue = parseInt(value);
-                                  if (!isNaN(intValue)) {
-                                    setJobConfig(intValue, `config.process[0].sample.samples[${i}].height`);
-                                  } else {
-                                    console.warn('Invalid height value:', value);
-                                  }
+                                  console.warn('Invalid width value:', value);
                                 }
-                              }}
-                              placeholder={`${jobConfig.config.process[0].sample.height} (default)`}
-                            />
-                          )}
+                              }
+                            }}
+                            placeholder={`${jobConfig.config.process[0].sample.width} (default)`}
+                          />
+                          <TextInput
+                            label={`Height`}
+                            value={sample.height ? `${sample.height}` : ''}
+                            onChange={value => {
+                              // remove any non-numeric characters
+                              value = value.replace(/\D/g, '');
+                              if (value === '') {
+                                // remove the key from the config if empty
+                                let newConfig = objectCopy(jobConfig);
+                                if (newConfig.config.process[0].sample.samples[i]) {
+                                  delete newConfig.config.process[0].sample.samples[i].height;
+                                  setJobConfig(
+                                    newConfig.config.process[0].sample.samples,
+                                    'config.process[0].sample.samples',
+                                  );
+                                }
+                              } else {
+                                const intValue = parseInt(value);
+                                if (!isNaN(intValue)) {
+                                  setJobConfig(intValue, `config.process[0].sample.samples[${i}].height`);
+                                } else {
+                                  console.warn('Invalid height value:', value);
+                                }
+                              }
+                            }}
+                            placeholder={`${jobConfig.config.process[0].sample.height} (default)`}
+                          />
                           <TextInput
                             label={`Seed`}
                             value={sample.seed ? `${sample.seed}` : ''}

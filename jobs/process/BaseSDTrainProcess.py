@@ -19,7 +19,8 @@ from safetensors.torch import save_file, load_file
 from torch.utils.data import DataLoader
 import torch
 import torch.backends.cuda
-from huggingface_hub import HfApi, interpreter_login
+from huggingface_hub import HfApi, Repository, interpreter_login
+from huggingface_hub.utils import HfFolder
 from toolkit.memory_management import MemoryManager
 
 from toolkit.basic import value_map
@@ -71,7 +72,10 @@ import hashlib
 
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
-from toolkit.basic import flush
+
+def flush():
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
@@ -94,6 +98,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.start_step = 0
         self.epoch_num = 0
         self.last_save_step = 0
+        # epoch loss accumulation
+        self._epoch_loss_sum = 0.0
+        self._epoch_loss_count = 0
+        self._pending_epoch_avg = None  # set at epoch boundary, logged then cleared
+        # identity loss epoch accumulation
+        self._id_loss_epoch_sum = 0.0
+        self._id_loss_epoch_count = 0
+        self._pending_id_loss_epoch_avg = None
+        # id sim epoch accumulation
+        self._id_sim_epoch_sum = 0.0
+        self._id_sim_epoch_count = 0
+        self._pending_id_sim_epoch_avg = None
+        # diffusion loss epoch accumulation
+        self._diff_loss_epoch_sum = 0.0
+        self._diff_loss_epoch_count = 0
+        self._pending_diff_loss_epoch_avg = None
+        # body proportion loss epoch accumulation
+        self._bp_loss_epoch_sum = 0.0
+        self._bp_loss_epoch_count = 0
+        self._pending_bp_loss_epoch_avg = None
+        # depth consistency loss epoch accumulation
+        self._dc_loss_epoch_sum = 0.0
+        self._dc_loss_epoch_count = 0
+        self._pending_dc_loss_epoch_avg = None
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
         # if true, then we do not do an optimizer step. We are accumulating gradients
@@ -168,7 +196,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.datasets = []
                     self.datasets.append(dataset)
                 self.dataset_configs.append(dataset)
-        
+
         self.is_caching_text_embeddings = any(
             dataset.cache_text_embeddings for dataset in self.dataset_configs
         )
@@ -370,6 +398,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
 
+        # Free VRAM from sampling pipeline before training resumes
+        flush()
+
     def update_training_metadata(self):
         o_dict = OrderedDict({
             "training_info": self.get_training_info()
@@ -487,6 +518,46 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def end_step_hook(self):
         pass
 
+    def _log_pending_epoch_avgs(self):
+        """Emit any pending epoch-average scalars to the logger and clear
+        them. Each metric is dual-written under both its legacy key (for
+        back-compat with existing dashboards) and its canonical
+        ``subsystem/kind/variant`` key (consumed by the new metrics tab).
+        """
+        # Lazy-import to avoid a top-of-file dependency on the SDTrainer
+        # extension when this base class is reused by other trainers.
+        try:
+            from extensions_built_in.sd_trainer.metric_naming import (
+                CANONICAL_RENAMES,
+            )
+        except Exception:  # noqa: BLE001
+            CANONICAL_RENAMES = {}
+
+        def _emit(legacy_key, value):
+            self.logger.log({legacy_key: value})
+            canonical = CANONICAL_RENAMES.get(legacy_key)
+            if canonical is not None and canonical != legacy_key:
+                self.logger.log({canonical: value})
+
+        if self._pending_epoch_avg is not None:
+            _emit('loss/epoch_avg', self._pending_epoch_avg)
+            self._pending_epoch_avg = None
+        if self._pending_id_loss_epoch_avg is not None:
+            _emit('loss/identity_loss_epoch_avg', self._pending_id_loss_epoch_avg)
+            self._pending_id_loss_epoch_avg = None
+        if self._pending_diff_loss_epoch_avg is not None:
+            _emit('loss/diffusion_loss_epoch_avg', self._pending_diff_loss_epoch_avg)
+            self._pending_diff_loss_epoch_avg = None
+        if self._pending_id_sim_epoch_avg is not None:
+            _emit('id_sim_epoch_avg', self._pending_id_sim_epoch_avg)
+            self._pending_id_sim_epoch_avg = None
+        if self._pending_bp_loss_epoch_avg is not None:
+            _emit('loss/body_proportion_loss_epoch_avg', self._pending_bp_loss_epoch_avg)
+            self._pending_bp_loss_epoch_avg = None
+        if self._pending_dc_loss_epoch_avg is not None:
+            _emit('loss/depth_consistency_loss_epoch_avg', self._pending_dc_loss_epoch_avg)
+            self._pending_dc_loss_epoch_avg = None
+
     def save(self, step=None):
         if not self.accelerator.is_main_process:
             return
@@ -532,6 +603,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # if we are doing embedding training as well, add that
                 embedding_dict = self.embedding.state_dict() if self.embedding else None
+
+                # merge identity projectors + averaged embeddings if available
+                identity_dict = self._get_identity_state_dict() if hasattr(self, '_get_identity_state_dict') else None
+                if identity_dict:
+                    import json as _json
+                    if embedding_dict is None:
+                        embedding_dict = identity_dict
+                    else:
+                        embedding_dict.update(identity_dict)
+                    save_meta['identity_enhanced'] = 'true'
+                    if hasattr(self, 'face_id_config') and self.face_id_config and self.face_id_config.enabled:
+                        save_meta['face_id_config'] = _json.dumps({
+                            'num_tokens': self.face_id_config.num_tokens,
+                            'vision_enabled': self.face_id_config.vision_enabled,
+                            'vision_num_tokens': self.face_id_config.vision_num_tokens,
+                        })
+                    if hasattr(self, 'body_id_config') and self.body_id_config and self.body_id_config.enabled:
+                        save_meta['body_id_config'] = _json.dumps({
+                            'num_tokens': self.body_id_config.num_tokens,
+                        })
+
                 self.network.save_weights(
                     file_path,
                     dtype=get_torch_dtype(self.save_config.dtype),
@@ -631,7 +723,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 
                 print_acc("Merging network weights into full model for saving...")
                 
-                self.network.merge_in(merge_weight=self.train_config.merge_network_on_save_strength)
+                self.network.merge_in(merge_weight=1.0)
                 # reset weights to zero
                 self.network.reset_weights()
                 self.network.is_merged_in = False
@@ -686,6 +778,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     state_dict = self.optimizer.state_dict()
                 torch.save(state_dict, file_path)
                 print_acc(f"Saved optimizer to {file_path}")
+                # Stepped copy paired with this checkpoint, when enabled.
+                # ``step_num`` is the zero-padded ``_NNNNNNNNN`` suffix (or
+                # '' for the initial save before any step) — only emit the
+                # copy when there's a step to pair with.
+                if self.save_config.save_optimizer_per_checkpoint and step_num:
+                    stepped_filename = f'{self.job.name}{step_num}_optimizer.pt'
+                    stepped_path = os.path.join(self.save_root, stepped_filename)
+                    torch.save(state_dict, stepped_path)
+                    print_acc(f"Saved per-checkpoint optimizer to {stepped_path}")
             except Exception as e:
                 print_acc(e)
                 print_acc("Could not save optimizer")
@@ -1171,7 +1272,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.train_config.linear_timesteps,
                         self.train_config.linear_timesteps2,
                         self.train_config.timestep_type == 'linear',
-                        self.train_config.timestep_type in ['one_step', 'two_step', 'four_step', 'eight_step'],
+                        self.train_config.timestep_type == 'one_step',
                     ])
                     
                     timestep_type = 'linear' if linear_timesteps else None
@@ -1187,7 +1288,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.sd.is_flux or 'flex' in self.sd.arch or self.sd.arch == 'zimage':
                         # flux/zimage is a patch size of 1, but latents are divided by 2, so we need to double it
                         patch_size = 2
-                    elif hasattr(self.sd.unet, 'config') and hasattr(self.sd.unet.config, 'patch_size'):
+                    elif hasattr(self.sd.unet.config, 'patch_size'):
                         patch_size = self.sd.unet.config.patch_size
                     
                     self.sd.noise_scheduler.set_train_timesteps(
@@ -1196,6 +1297,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         timestep_type=timestep_type,
                         latents=latents,
                         patch_size=patch_size,
+                        custom_curve=getattr(self.train_config, 'custom_timestep_curve', None),
                     )
                 else:
                     self.sd.noise_scheduler.set_timesteps(
@@ -1225,16 +1327,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_reg:
                     content_or_style = self.train_config.content_or_style_reg
 
-                if self.train_config.timestep_type in ['two_step', 'four_step', 'eight_step']:
-                    if self.train_config.timestep_type == 'two_step':
-                        indice_choices = [0, 499]
-                    elif self.train_config.timestep_type == 'four_step':
-                        indice_choices = [0, 250, 500, 750]
-                    elif self.train_config.timestep_type == 'eight_step':
-                        indice_choices = [0, 125, 250, 375, 500, 625, 750, 875]
-                    timestep_indices = torch.tensor(random.choices(indice_choices, k=batch_size), device=self.device_torch)
-                    timestep_indices = timestep_indices.long()
-                elif self.train_config.timestep_type == 'next_sample':
+                # if self.train_config.timestep_sampling == 'style' or self.train_config.timestep_sampling == 'content':
+                if self.train_config.timestep_type == 'next_sample':
                     timestep_indices = torch.randint(
                             0,
                             num_train_timesteps - 2, # -1 for 0 idx, -1 so we can step
@@ -1289,6 +1383,55 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             (batch_size,),
                             device=self.device_torch
                         )
+                    timestep_indices = timestep_indices.long()
+                elif content_or_style == 'custom':
+                    # Custom-distribution sampling: evaluate the user's curve
+                    # at each scheduled timestep's actual t-position, then
+                    # draw `batch_size` schedule indices via multinomial. We
+                    # have to evaluate against the schedule's actual
+                    # timesteps rather than uniformly-spaced x — otherwise
+                    # for non-uniform schedules (e.g. sigmoid) a peak the
+                    # user drew at "noisy" would land somewhere else in the
+                    # schedule. The editor labels x=0 as "noisy (t=1)" and
+                    # x=1 as "clean (t=0)", so curve x = 1 - t_normalized.
+                    #
+                    # We subtract the curve's minimum before normalizing to
+                    # a PMF so the *peak/trough ratio* the user drew (rather
+                    # than the integrated baseline area) controls
+                    # concentration. The UI's BandPreview applies the same
+                    # transform so the predicted vs. actual histograms line
+                    # up. Flat curves collapse to all-zero and fall back to
+                    # uniform via the existing degeneracy guard below.
+                    from toolkit.timestep_weighing.custom_curve import evaluate_curve_at_xs, resolve_live_curve
+                    # Re-resolve the curve from disk if the inlined snapshot
+                    # carries a sourceName — otherwise an edit-and-rerun
+                    # loop silently uses the snapshot's old shape.
+                    live_curve = resolve_live_curve(
+                        self.train_config.custom_timestep_distribution, 'distribution',
+                    )
+                    schedule_t = self.sd.noise_scheduler.timesteps.float().to(self.device_torch)
+                    num_ts = float(self.train_config.num_train_timesteps)
+                    xs_norm = (1.0 - schedule_t / num_ts).clamp(0.0, 1.0)
+                    weights = evaluate_curve_at_xs(
+                        live_curve,
+                        xs_norm,
+                    ).to(self.device_torch)
+                    weights = torch.clamp(weights - weights.min(), min=0.0)
+                    if min_noise_steps > 0 or max_noise_steps < weights.shape[0] - 1:
+                        mask = torch.zeros_like(weights)
+                        mask[min_noise_steps:max_noise_steps + 1] = 1.0
+                        weights = weights * mask
+                    total = weights.sum()
+                    if not torch.isfinite(total) or total <= 0:
+                        # Degenerate curve (or no overlap with the noise range):
+                        # fall back to uniform over the allowed range.
+                        timestep_indices = torch.randint(
+                            min_noise_steps, max(min_noise_steps + 1, max_noise_steps),
+                            (batch_size,), device=self.device_torch,
+                        )
+                    else:
+                        pmf = weights / total
+                        timestep_indices = torch.multinomial(pmf, batch_size, replacement=True)
                     timestep_indices = timestep_indices.long()
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")
@@ -1362,7 +1505,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.train_config.random_noise_multiplier > 0.0:
                     sigma = self.train_config.random_noise_multiplier
                     noise_multiplier = torch.exp(torch.randn(s, device=noise.device, dtype=noise.dtype) * sigma)
-                    noise = noise * noise_multiplier
+                
             with self.timer('make_noisy_latents'):
 
                 latent_multiplier = self.train_config.latent_multiplier
@@ -1622,6 +1765,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # run base sd process run
         self.sd.load_model()
         
+        # compile the model if needed
+        if self.model_config.compile:
+            try:
+                torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
+            except Exception as e:
+                print_acc(f"Failed to compile model: {e}")
+                print_acc("Continuing without compilation")
+
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
 
         dtype = get_torch_dtype(self.train_config.dtype)
@@ -1958,7 +2109,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.adapter_config is not None and self.adapter is None:
                 self.setup_adapter()
         flush()
-
         ### HOOK ###
         params = self.hook_add_extra_train_params(params)
         self.params = params
@@ -2052,17 +2202,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.last_save_step = self.step_num
         ### HOOK ###
         self.hook_before_train_loop()
-
-        # compile the model if needed (must be after LoRA/adapter injection AND accelerator.prepare)
-        if self.model_config.compile:
-            try:
-                # make sure it is on the gpu
-                self.sd.unet.to(self.device_torch)
-                print_acc("Compiling model with torch.compile. The first forward will hang for a while using this. This is normal.")
-                self.sd.unet = torch.compile(self.sd.unet)
-            except Exception as e:
-                print_acc(f"Failed to compile model: {e}")
-                print_acc("Continuing without compilation")
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
@@ -2186,6 +2325,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 dataloader_iterator = iter(dataloader)
                                 trigger_dataloader_setup_epoch(dataloader)
                                 self.epoch_num += 1
+                                if self._epoch_loss_count > 0:
+                                    self._pending_epoch_avg = self._epoch_loss_sum / self._epoch_loss_count
+                                    self._epoch_loss_sum = 0.0
+                                    self._epoch_loss_count = 0
+                                if self._id_loss_epoch_count > 0:
+                                    self._pending_id_loss_epoch_avg = self._id_loss_epoch_sum / self._id_loss_epoch_count
+                                    self._id_loss_epoch_sum = 0.0
+                                    self._id_loss_epoch_count = 0
+                                if self._diff_loss_epoch_count > 0:
+                                    self._pending_diff_loss_epoch_avg = self._diff_loss_epoch_sum / self._diff_loss_epoch_count
+                                    self._diff_loss_epoch_sum = 0.0
+                                    self._diff_loss_epoch_count = 0
+                                if self._id_sim_epoch_count > 0:
+                                    self._pending_id_sim_epoch_avg = self._id_sim_epoch_sum / self._id_sim_epoch_count
+                                    self._id_sim_epoch_sum = 0.0
+                                    self._id_sim_epoch_count = 0
+                                if self._bp_loss_epoch_count > 0:
+                                    self._pending_bp_loss_epoch_avg = self._bp_loss_epoch_sum / self._bp_loss_epoch_count
+                                    self._bp_loss_epoch_sum = 0.0
+                                    self._bp_loss_epoch_count = 0
+                                if self._dc_loss_epoch_count > 0:
+                                    self._pending_dc_loss_epoch_avg = self._dc_loss_epoch_sum / self._dc_loss_epoch_count
+                                    self._dc_loss_epoch_sum = 0.0
+                                    self._dc_loss_epoch_count = 0
                                 if self.train_config.gradient_accumulation_steps == -1:
                                     # if we are accumulating for an entire epoch, trigger a step
                                     self.is_grad_accumulation_step = False
@@ -2277,6 +2440,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
+                    # accumulate for epoch average
+                    if 'loss' in loss_dict:
+                        self._epoch_loss_sum += loss_dict['loss']
+                        self._epoch_loss_count += 1
+                    if 'identity_loss' in loss_dict:
+                        self._id_loss_epoch_sum += loss_dict['identity_loss']
+                        self._id_loss_epoch_count += 1
+                    if 'diffusion_loss' in loss_dict:
+                        self._diff_loss_epoch_sum += loss_dict['diffusion_loss']
+                        self._diff_loss_epoch_count += 1
+                    if 'id_sim' in loss_dict:
+                        self._id_sim_epoch_sum += loss_dict['id_sim']
+                        self._id_sim_epoch_count += 1
+                    if 'body_proportion_loss' in loss_dict:
+                        self._bp_loss_epoch_sum += loss_dict['body_proportion_loss']
+                        self._bp_loss_epoch_count += 1
+                    if 'depth_consistency_loss' in loss_dict:
+                        self._dc_loss_epoch_sum += loss_dict['depth_consistency_loss']
+                        self._dc_loss_epoch_count += 1
+
                     prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
@@ -2337,19 +2520,36 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                         for key, value in loss_dict.items():
                                             self.writer.add_scalar(f"{key}", value, self.step_num)
                                         self.writer.add_scalar(f"lr", learning_rate, self.step_num)
+                                    if self._pending_epoch_avg is not None:
+                                        self.writer.add_scalar("epoch_avg_loss", self._pending_epoch_avg, self.step_num)
+                                    if self._pending_id_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("identity_loss_epoch_avg", self._pending_id_loss_epoch_avg, self.step_num)
+                                    if self._pending_diff_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("diffusion_loss_epoch_avg", self._pending_diff_loss_epoch_avg, self.step_num)
+                                    if self._pending_id_sim_epoch_avg is not None:
+                                        self.writer.add_scalar("id_sim_epoch_avg", self._pending_id_sim_epoch_avg, self.step_num)
+                                    if self._pending_bp_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("body_proportion_loss_epoch_avg", self._pending_bp_loss_epoch_avg, self.step_num)
+                                    if self._pending_dc_loss_epoch_avg is not None:
+                                        self.writer.add_scalar("depth_consistency_loss_epoch_avg", self._pending_dc_loss_epoch_avg, self.step_num)
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
-                        
+
                         if self.accelerator.is_main_process:
                             # log to logger
                             self.logger.log({
                                 'learning_rate': learning_rate,
                             })
                             if loss_dict is not None:
+                                # Step 4: keys are now fully qualified by
+                                # SDTrainer.hook_train_loop's `apply_dual_write`
+                                # call — both legacy snake_case and canonical
+                                # `subsystem/kind/variant` siblings are present.
+                                # No more conditional `loss/` prefix; just log
+                                # whatever the trainer emits.
                                 for key, value in loss_dict.items():
-                                    self.logger.log({
-                                        f'loss/{key}': value,
-                                    })
+                                    self.logger.log({key: value})
+                            self._log_pending_epoch_avgs()
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
@@ -2357,9 +2557,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 'learning_rate': learning_rate,
                             })
                             for key, value in loss_dict.items():
-                                self.logger.log({
-                                    f'loss/{key}': value,
-                                })
+                                self.logger.log({key: value})
+                            self._log_pending_epoch_avgs()
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
@@ -2376,9 +2575,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     with self.timer('commit_logger'):
                         self.logger.commit(step=self.step_num)
 
-                # sets progress bar to match out step
+                # Sets progress bar to "completed N steps" semantics so
+                # tqdm's "X/total" display matches the sqlite step that
+                # was just logged for this iteration. Pre-fix, after iter
+                # 0 the bar still read 0/total even though sqlite already
+                # had a row at step=1 (off-by-one — confused users
+                # comparing the tqdm log line to the chart). Verified no
+                # other code reads `progress_bar.n`, so this is purely a
+                # display fix.
                 if self.progress_bar is not None:
-                    self.progress_bar.update(step - self.progress_bar.n)
+                    self.progress_bar.update(step + 1 - self.progress_bar.n)
 
                 #############################
                 # End of step

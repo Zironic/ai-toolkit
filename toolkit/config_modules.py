@@ -6,9 +6,7 @@ import random
 import torch
 import torchaudio
 
-from toolkit.audio.album_artwork import add_album_artwork
 from toolkit.prompt_utils import PromptEmbeds
-from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
 
 ImgExt = Literal['jpg', 'png', 'webp']
 
@@ -31,6 +29,14 @@ class SaveConfig:
         self.push_to_hub: bool = kwargs.get("push_to_hub", False)
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
+        # When True, write a stepped copy of the optimizer state alongside
+        # each checkpoint (e.g. ``{job_name}_000000250_optimizer.pt``) so the
+        # user can roll a stateful optimizer (Adam, Automagic, etc.) back to
+        # the same step as a saved LoRA checkpoint. The canonical
+        # ``optimizer.pt`` is still written for resume-from-latest.
+        # Stepped copies are pruned by ``clean_up_saves`` alongside the
+        # safetensors files via the existing ``max_step_saves_to_keep``.
+        self.save_optimizer_per_checkpoint: bool = kwargs.get('save_optimizer_per_checkpoint', False)
 
 class LoggingConfig:
     def __init__(self, **kwargs):
@@ -346,8 +352,84 @@ class DecoratorConfig:
         self.num_tokens: str = kwargs.get('num_tokens', 4)
 
 
-ContentOrStyleType = Literal['balanced', 'style', 'content']
+ContentOrStyleType = Literal['balanced', 'style', 'content', 'custom']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
+
+
+class WeightNoiseConfig:
+    """Inject Gaussian noise directly into LoRA parameter values after the
+    optimizer step (Pattern A — drift). Each step does ``p.data += noise``;
+    Adam's loss-minimization corrects the drift over training so the weights
+    wander around the optimizer trajectory inside a bounded ball.
+
+    Lives in ``SDTrainer`` just after ``ema.update()`` so the EMA shadow
+    tracks the (nearly) clean optimizer path while the live training weights
+    are the noisy ones used for the next forward.
+
+    Modes
+    -----
+    - ``absolute``: σ fixed at ``sigma`` everywhere. Use when you know the
+      target perturbation magnitude in absolute terms.
+    - ``relative``: σ = ``sigma`` × per-param weight RMS. Default — adapts
+      to per-tensor scale automatically and gives LoRA-up (init=0) a free
+      pass during early training (zero RMS → zero noise) so it can't
+      destabilize the start.
+
+    Metrics
+    -------
+    Every ``log_every`` steps emits ``weight_noise_norm`` (the Frobenius
+    norm of the injected noise across all tagged params). Pair with the
+    grad_noise_snr if both knobs are on.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        # 'absolute' | 'relative'
+        self.mode: str = str(kwargs.get('mode', 'relative'))
+        # σ for 'absolute', multiplier for 'relative'.
+        self.sigma: float = float(kwargs.get('sigma', 1.25e-2))
+        # 0 disables logging.
+        self.log_every: int = int(kwargs.get('log_every', 50))
+
+
+class GradientNoiseConfig:
+    """Inject Gaussian noise into LoRA gradients between clip and step.
+
+    Sits at ``SDTrainer`` ~line 5547, after ``clip_grad_norm_`` and before
+    ``optimizer.step()``. Filters to params tagged ``_is_lora`` so non-LoRA
+    trainable params are untouched. Disabled by default.
+
+    Modes
+    -----
+    - ``absolute``: σ is fixed at ``sigma`` for every step / every param.
+      Simplest; pick σ by looking at typical ``core/grad_norm`` magnitudes.
+    - ``relative``: σ = ``sigma`` × per-param grad RMS, computed before
+      injection. Adapts to per-layer scale automatically (LoRA-up grads
+      are typically orders of magnitude larger than LoRA-down grads).
+    - ``neelakantan``: σ_t = ``eta`` / (1 + step)^``gamma``  — SGLD-style
+      annealed noise from Neelakantan et al. 2015. Paper defaults eta=0.01
+      gamma=0.55.
+
+    Metrics
+    -------
+    Every ``log_every`` steps emits ``grad/noise_norm`` and
+    ``grad/noise_snr = ||grad|| / ||noise||`` (computed on the LoRA
+    subset). SNR << 1 means noise dominates (too much); SNR >> 100 means
+    injection is doing essentially nothing.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        # 'absolute' | 'relative' | 'neelakantan'
+        self.mode: str = str(kwargs.get('mode', 'neelakantan'))
+        # σ for 'absolute', multiplier for 'relative'.
+        self.sigma: float = float(kwargs.get('sigma', 1e-3))
+        # Neelakantan eta (initial scale).
+        self.eta: float = float(kwargs.get('eta', 0.01))
+        # Neelakantan gamma (anneal exponent).
+        self.gamma: float = float(kwargs.get('gamma', 0.55))
+        # 0 disables logging.
+        self.log_every: int = int(kwargs.get('log_every', 50))
 
 
 class TrainConfig:
@@ -391,7 +473,6 @@ class TrainConfig:
         self.gradient_checkpointing = kwargs.get('gradient_checkpointing', True)
         self.weight_jitter = kwargs.get('weight_jitter', 0.0)
         self.merge_network_on_save = kwargs.get('merge_network_on_save', False)
-        self.merge_network_on_save_strength = kwargs.get('merge_network_on_save_strength', 1.0)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
         self.start_step = kwargs.get('start_step', None)
         self.free_u = kwargs.get('free_u', False)
@@ -404,8 +485,6 @@ class TrainConfig:
         # batch noise correction adds other images in the batch as noise to correct away from other images
         self.do_batch_noise_correction = kwargs.get('do_batch_noise_correction', False)
         self.batch_noise_correction_scale = kwargs.get('batch_noise_correction_scale', 0.1)
-        self.do_signal_amplification = kwargs.get('do_signal_amplification', False)
-        self.signal_amplification_strength = kwargs.get('signal_amplification_strength', 0.5)
         
         self.signal_correction_noise_scale = kwargs.get('signal_correction_noise_scale', 1.0)
         self.random_noise_shift = kwargs.get('random_noise_shift', 0.0)
@@ -504,9 +583,56 @@ class TrainConfig:
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow, pseudo_huber
-        
+
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)
+
+        self.diffusion_loss_weight: float = kwargs.get('diffusion_loss_weight', 1.0)
+        self.diffusion_loss_min_t: float = kwargs.get('diffusion_loss_min_t', 0.0)
+        self.diffusion_loss_max_t: float = kwargs.get('diffusion_loss_max_t', 1.0)
+
+        # Global loss-split mode (see DatasetConfig.loss_split for the
+        # per-dataset version). Three states:
+        #   - key absent  : autodetect — turn on 'diffusion_depth' for any
+        #                   dataset where the effective depth-consistency
+        #                   loss weight is > 0. Off otherwise.
+        #   - explicit None: force off everywhere unless a per-dataset
+        #                   override sets it.
+        #   - 'diffusion_depth': force on for every dataset that doesn't set
+        #                   its own loss_split.
+        # Per-dataset loss_split (DatasetConfig.loss_split) always wins over
+        # the global setting on its samples.
+        self._loss_split_explicit: bool = ('loss_split' in kwargs)
+        self.loss_split: Union[str, None] = kwargs.get('loss_split', None)
+        if self.loss_split is not None and self.loss_split not in ('diffusion_depth',):
+            raise ValueError(
+                f"Unknown train.loss_split value: {self.loss_split!r}. "
+                "Allowed: None (off), 'diffusion_depth', or omit the key for "
+                "autodetect."
+            )
+
+        # Diagnostic: every N steps, do a dual backward (depth-only and
+        # everything-else-only) to log per-loss gradient norms and the cosine
+        # between them. 0 disables. Costs an extra backward pass + grad clone
+        # on the firing step; rest of the training loop is unaffected.
+        self.gradient_cosine_log_every: int = int(kwargs.get('gradient_cosine_log_every', 0))
+
+        # Gradient noising — inject Gaussian noise into LoRA params' .grad
+        # between clip_grad_norm_ and optimizer.step(). Biases SGD toward
+        # flatter minima and may help LoRA spread learning across more
+        # singular directions in A@B (mitigating effective-rank collapse).
+        # Disabled by default. See GradientNoiseConfig for mode docs.
+        self.gradient_noise = GradientNoiseConfig(
+            **(kwargs.get('gradient_noise', {}) or {})
+        )
+
+        # Direct weight perturbation — adds Gaussian noise to LoRA
+        # `p.data` after the optimizer step. Closest analog to the
+        # LLM "predict random strings → noise the weights" trick.
+        # Disabled by default. See WeightNoiseConfig.
+        self.weight_noise = WeightNoiseConfig(
+            **(kwargs.get('weight_noise', {}) or {})
+        )
 
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)
@@ -530,7 +656,17 @@ class TrainConfig:
         # adds an additional loss to the network to encourage it output a normalized standard deviation
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
-        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, weighted_low, custom, one_step
+        # When timestep_type == 'custom', this dict carries the curve inlined
+        # from the UI's saved curve library: { points: [{x,y}], normalize: bool }.
+        # Interpreted as per-step *loss weights* (uniform sampling, weighted loss).
+        self.custom_timestep_curve = kwargs.get('custom_timestep_curve', None)
+        # When content_or_style == 'custom', this dict carries a *distribution*
+        # curve (same { points, normalize } shape) interpreted as an
+        # unnormalized PDF. The trainer renormalizes and draws timestep
+        # indices via multinomial sampling so the model *sees* boosted
+        # regions more often, no loss reweighting.
+        self.custom_timestep_distribution = kwargs.get('custom_timestep_distribution', None)
         self.next_sample_timesteps = kwargs.get('next_sample_timesteps', 8)
         self.linear_timesteps = kwargs.get('linear_timesteps', False)
         self.linear_timesteps2 = kwargs.get('linear_timesteps2', False)
@@ -579,8 +715,13 @@ class TrainConfig:
 
         # stabilizes empty prompts to be zeroed predictions
         self.do_blank_stabilization = kwargs.get('do_blank_stabilization', False)
-        
-        self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
+
+        # E-LatentLPIPS perceptual loss in latent space
+        self.latent_perceptual_loss_weight: float = kwargs.get('latent_perceptual_loss_weight', 0.0)
+        self.latent_perceptual_loss_min_t: float = kwargs.get('latent_perceptual_loss_min_t', 0.0)
+        self.latent_perceptual_loss_max_t: float = kwargs.get('latent_perceptual_loss_max_t', 0.5)
+        self.latent_perceptual_encoder: str = kwargs.get('latent_perceptual_encoder', 'auto')
+        self.latent_perceptual_preview_every: int = kwargs.get('latent_perceptual_preview_every', 500)
 
 
 ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
@@ -675,12 +816,6 @@ class ModelConfig:
             self.qtype = "float8"
         if self.layer_offloading and self.qtype_te == "qfloat8":
             self.qtype_te = "float8"
-            
-        # Mac mps only works with torachao uint
-        if torch.backends.mps.is_available() and self.qtype == "qfloat8":
-            self.qtype = "int8"
-        if torch.backends.mps.is_available() and self.qtype_te == "qfloat8":
-            self.qtype_te = "int8"
         
         # 0 is off and 1.0 is 100% of the layers
         self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
@@ -701,10 +836,6 @@ class ModelConfig:
         # compile the model with torch compile
         self.compile = kwargs.get("compile", False)
         
-        if self.compile and self.quantize:
-            print("Warning: You cannot compile a quantized model. Disabling compile.")
-            self.compile = False
-        
         # kwargs to pass to the model
         self.model_kwargs = kwargs.get("model_kwargs", {})
         
@@ -712,6 +843,7 @@ class ModelConfig:
         self.model_paths = kwargs.get("model_paths", {})
         
         self.in_context = kwargs.get("in_context", False)
+        self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
         
         # allow frontend to pass arch with a color like arch:tag
         # but remove the tag
@@ -860,6 +992,193 @@ class SliderConfig:
 
 ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask']
 
+
+class FaceIDConfig:
+    """Configuration for LoRA+ID face-conditioned training."""
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.num_tokens: int = kwargs.get('num_tokens', 4)
+        self.dropout_prob: float = kwargs.get('dropout_prob', 0.1)
+        self.face_model: str = kwargs.get('face_model', 'buffalo_l')
+        self.scale_lr_multiplier: float = kwargs.get('scale_lr_multiplier', 10.0)
+        self.init_scale: float = kwargs.get('init_scale', 0.01)
+        # Vision encoder (CLIP/DINOv2) for fine-grained face detail
+        self.vision_enabled: bool = kwargs.get('vision_enabled', False)
+        self.vision_model: str = kwargs.get('vision_model', 'openai/clip-vit-large-patch14')
+        self.vision_num_tokens: int = kwargs.get('vision_num_tokens', 4)
+        self.vision_crop_padding: float = kwargs.get('vision_crop_padding', 0.3)
+        # Auxiliary identity loss via TAESD-decoded x0 predictions
+        self.identity_loss_weight: float = kwargs.get('identity_loss_weight', 0.0)  # 0 = disabled
+        self.identity_loss_min_t: float = kwargs.get('identity_loss_min_t', 0.0)
+        self.identity_loss_max_t: float = kwargs.get('identity_loss_max_t', 1.0)
+        # Minimum cosine similarity to apply face losses (prevents hallucinating faces)
+        self.identity_loss_min_cos: float = kwargs.get('identity_loss_min_cos', 0.2)
+        # Use per-dataset average face embedding instead of per-image embedding
+        self.identity_loss_use_average: bool = kwargs.get('identity_loss_use_average', True)
+        # Blend per-image embedding with dataset average (0.0=per-image only, 0.5=midpoint, 1.0=pure average)
+        self.identity_loss_average_blend: float = kwargs.get('identity_loss_average_blend', 0.0)
+        # Use a random face embedding from the dataset each step instead of the image's own
+        self.identity_loss_use_random: bool = kwargs.get('identity_loss_use_random', False)
+        # Compare against K random embeddings from dataset, use best match (0 = disabled)
+        self.identity_loss_num_refs: int = kwargs.get('identity_loss_num_refs', 0)
+        # Track identity metrics even when identity_loss_weight is 0
+        self.identity_metrics: bool = kwargs.get('identity_metrics', False)
+        # Auxiliary landmark shape loss via MediaPipe FaceMesh landmarks
+        self.landmark_loss_weight: float = kwargs.get('landmark_loss_weight', 0.0)  # 0 = disabled
+        # Auxiliary body proportion loss via MediaPipe BlazePose bone-length ratios
+        self.body_proportion_loss_weight: float = kwargs.get('body_proportion_loss_weight', 0.0)  # 0 = disabled
+        self.body_proportion_loss_min_t: float = kwargs.get('body_proportion_loss_min_t', 0.0)
+        self.body_proportion_loss_max_t: float = kwargs.get('body_proportion_loss_max_t', 1.0)
+        self.body_proportion_include_head: bool = kwargs.get('body_proportion_include_head', False)
+        # Auxiliary body shape loss via HybrIK SMPL beta prediction
+        self.body_shape_loss_weight: float = kwargs.get('body_shape_loss_weight', 0.0)  # 0 = disabled
+        self.body_shape_loss_min_t: float = kwargs.get('body_shape_loss_min_t', 0.4)
+        self.body_shape_loss_max_t: float = kwargs.get('body_shape_loss_max_t', 0.8)
+        self.body_shape_loss_min_cos: float = kwargs.get('body_shape_loss_min_cos', 0.2)
+        # Auxiliary normal map loss via Sapiens surface normal estimation
+        self.normal_loss_weight: float = kwargs.get('normal_loss_weight', 0.0)  # 0 = disabled
+        self.normal_loss_min_t: float = kwargs.get('normal_loss_min_t', 0.4)
+        self.normal_loss_max_t: float = kwargs.get('normal_loss_max_t', 0.8)
+        # Face suppression: downweight diffusion loss in detected face bounding boxes
+        # None = no suppression, 0.0 = zero face loss, 0.5 = half, 1.0 = normal
+        self.face_suppression_weight: Union[float, None] = kwargs.get('face_suppression_weight', None)
+        # Bbox expansion multiplier for face suppression (1.0 = tight face box, 1.8 = full head coverage)
+        self.face_suppression_expand: float = kwargs.get('face_suppression_expand', 2.0)
+        # Use Gaussian falloff instead of hard rectangle for face suppression mask
+        self.face_suppression_soft: bool = kwargs.get('face_suppression_soft', False)
+        # VAE perceptual anchor loss — compare x0_pred VAE encoder features vs reference
+        self.vae_anchor_loss_weight: float = kwargs.get('vae_anchor_loss_weight', 0.0)  # 0 = disabled
+        self.vae_anchor_loss_min_t: float = kwargs.get('vae_anchor_loss_min_t', 0.0)
+        self.vae_anchor_loss_max_t: float = kwargs.get('vae_anchor_loss_max_t', 0.5)
+        self.vae_anchor_model_path: str = kwargs.get('vae_anchor_model_path', '')  # path to VAE safetensors
+
+
+class BodyIDConfig:
+    """Configuration for body-shape-conditioned training via SMPL betas."""
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.num_tokens: int = kwargs.get('num_tokens', 4)
+        self.dropout_prob: float = kwargs.get('dropout_prob', 0.1)
+        self.detection_threshold: float = kwargs.get('detection_threshold', 0.5)
+        self.scale_lr_multiplier: float = kwargs.get('scale_lr_multiplier', 10.0)
+        self.init_scale: float = kwargs.get('init_scale', 0.01)
+
+
+class DepthConsistencyConfig:
+    """Depth-consistency auxiliary loss via a frozen Depth-Anything-V2 perceptor.
+
+    Enabled by setting ``loss_weight > 0`` (same convention as identity and
+    body-proportion losses).  The loss compares the generated image's depth
+    map (from x0_pred decoded to pixels) against the ground-truth depth map
+    (cached per image at dataset-prep time) using MiDaS's scale-and-shift-
+    invariant L1 plus a multi-scale gradient-matching term.
+
+    Note on spatial alignment: the GT depth is cached from the original
+    image; at loss time it's resized to match x0_pixels.  If the dataset
+    uses aggressive augmentation crops, cached GT depth will be slightly
+    misaligned with x0_pixels.  For typical LoRA training with modest
+    augmentation this is acceptable because SSI alignment absorbs any
+    global offset and the gradient loss operates on local structure.
+    """
+
+    def __init__(self, **kwargs):
+        # Enable by setting loss_weight > 0. Default 0.1 is calibrated for
+        # DA2-Small. If you switch to DA2-Large, drop this to ~0.001 — the
+        # larger perceptor produces much higher-magnitude gradients and
+        # 0.1 will overpower the diffusion loss. If you see washed-out or
+        # over-smoothed outputs, halve the weight and retry.
+        self.loss_weight: float = kwargs.get('loss_weight', 0.1)
+        self.loss_min_t: float = kwargs.get('loss_min_t', 0.0)
+        self.loss_max_t: float = kwargs.get('loss_max_t', 1.0)
+        # Frozen perceptor
+        self.model_id: str = kwargs.get(
+            'model_id', 'depth-anything/Depth-Anything-V2-Small-hf'
+        )
+        self.input_size: int = kwargs.get('input_size', 518)
+        # Pre-DA2 Gaussian blur (σ in pixels) on the perceptor input. 0 disables.
+        # Higher σ pushes DA2 toward coarse blob-depth and away from texture-
+        # driven fine detail — useful when training on degraded/blurry sources
+        # where the model's predictions are hazy and fine depth structure is
+        # mostly source noise. Applied symmetrically: live blur on x0_pixels
+        # at train time + same blur on VAE-roundtrip pixels at cache time, so
+        # pred and GT remain apples-to-apples. The cache key incorporates σ
+        # so different values keep independent cached GTs.
+        self.pixel_blur_sigma: float = kwargs.get('pixel_blur_sigma', 0.0)
+        # Loss composition (MiDaS formulation)
+        self.ssi_weight: float = kwargs.get('ssi_weight', 1.0)
+        self.grad_weight: float = kwargs.get('grad_weight', 0.5)
+        self.grad_scales: int = kwargs.get('grad_scales', 4)
+        # Spatial masking
+        #   'none'      - full-image loss
+        #   'subject'   - use cached person/subject mask (default)
+        #   'body'      - use cached body-only mask
+        self.mask_source: str = kwargs.get('mask_source', 'subject')
+        # Memory controls
+        self.grad_checkpoint: bool = kwargs.get('grad_checkpoint', True)
+        # Preview cadence — save a (GT RGB | GT depth | Pred RGB | Pred depth)
+        # tile every N steps to save_root/depth_previews/.  0 disables.
+        self.preview_every: int = kwargs.get('preview_every', 100)
+        # If True, render depth previews even when the depth loss isn't being
+        # applied (e.g. pure diffusion runs with loss_weight=0). The perceptor
+        # forward runs under no_grad for those samples — no backward, no loss
+        # contribution — purely for visual comparison. The encoder and GT
+        # depth cache are still built up-front, so this is opt-in.
+        self.preview_only: bool = kwargs.get('preview_only', False)
+        # Preview only for steps whose t-ratio is >= this value (video path).
+        self.preview_min_t: float = kwargs.get('preview_min_t', 0.0)
+        # Video path only: frames per DA2 chunk during x0→depth backward. Keeps
+        # peak activation memory bounded regardless of the video's total T.
+        self.frames_per_chunk: int = kwargs.get('frames_per_chunk', 8)
+
+
+class SubjectMaskConfig:
+    """Configuration for auto-masking via YOLO + SAM 2 + SegFormer-clothes.
+
+    Phase 1 is caching only — these masks are extracted and stored per-image
+    but are not yet consumed by any training loss. Loss-weighting knobs below
+    are present so YAML configs forward-compat to Phase 2, but they are
+    currently ignored by the trainer.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        self.yolo_ckpt: str = kwargs.get('yolo_ckpt', 'yolo11n.pt')
+        self.yolo_conf: float = kwargs.get('yolo_conf', 0.25)
+        self.primary_only: bool = kwargs.get('primary_only', True)
+        # stored for future use; not consumed by cache yet (SegFormer is primary source of truth)
+        self.sam_size: str = kwargs.get('sam_size', 'small')
+        self.segformer_res: int = kwargs.get('segformer_res', 768)
+        self.cache_resolution: int = kwargs.get('cache_resolution', 256)
+        self.dtype: str = kwargs.get('dtype', 'fp16')
+        # Morphological close radius applied to the body mask after SegFormer
+        # parsing — higher values fill blotchy gaps inside limbs/hair at the
+        # cost of boundary precision. Changing this invalidates cached masks.
+        self.body_close_radius: int = kwargs.get('body_close_radius', 2)
+        # True dilation radius applied to the final person mask. Closing
+        # (above) only fills holes — it doesn't grow the outer boundary,
+        # so setting body_close_radius high produces no visible change on
+        # solid SegFormer parses. ``mask_dilate_radius`` actually grows the
+        # boundary, useful for padding the masked region around the subject.
+        self.mask_dilate_radius: int = kwargs.get('mask_dilate_radius', 0)
+        # Skin-tone bias added to body-class logits (Hair/Face/arms/legs)
+        # where YCrCb-skin is detected. SegFormer-clothes frequently
+        # mislabels exposed skin (chest, midriff, thighs) as Upper-clothes
+        # or Pants; a small positive bias (1-3) flips close-call pixels
+        # back into body without affecting confidently-labelled clothing.
+        # 0 = disabled (default, preserves existing behavior).
+        self.skin_bias: float = kwargs.get('skin_bias', 0.0)
+        # Phase 2 knobs — present but unused by training yet
+        self.background_loss_weight: Optional[float] = kwargs.get('background_loss_weight', None)
+        self.clothing_loss_weight: Optional[float] = kwargs.get('clothing_loss_weight', None)
+        self.body_loss_weight: Optional[float] = kwargs.get('body_loss_weight', None)
+        self.perceptual_restrict_to_body: bool = kwargs.get('perceptual_restrict_to_body', False)
+        # Debug previews — when True, cache_subject_masks writes a 5-panel tile.png
+        # per image to {img_dir}/_face_id_cache/_previews/{stem}.png for visual QA.
+        self.save_debug_previews: bool = kwargs.get('save_debug_previews', False)
+
+
 class DatasetConfig:
     """
     Dataset config for sd-datasets
@@ -979,6 +1298,65 @@ class DatasetConfig:
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
 
+        # Per-dataset loss weight overrides (None = use global config value)
+        self.identity_loss_weight: Union[float, None] = kwargs.get('identity_loss_weight', None)
+        self.identity_loss_min_t: Union[float, None] = kwargs.get('identity_loss_min_t', None)
+        self.identity_loss_max_t: Union[float, None] = kwargs.get('identity_loss_max_t', None)
+        self.identity_loss_min_cos: Union[float, None] = kwargs.get('identity_loss_min_cos', None)
+        self.landmark_loss_weight: Union[float, None] = kwargs.get('landmark_loss_weight', None)
+        self.body_proportion_loss_weight: Union[float, None] = kwargs.get('body_proportion_loss_weight', None)
+        self.body_proportion_loss_min_t: Union[float, None] = kwargs.get('body_proportion_loss_min_t', None)
+        self.body_proportion_loss_max_t: Union[float, None] = kwargs.get('body_proportion_loss_max_t', None)
+        self.body_shape_loss_weight: Union[float, None] = kwargs.get('body_shape_loss_weight', None)
+        self.body_shape_loss_min_t: Union[float, None] = kwargs.get('body_shape_loss_min_t', None)
+        self.body_shape_loss_max_t: Union[float, None] = kwargs.get('body_shape_loss_max_t', None)
+        self.body_shape_loss_min_cos: Union[float, None] = kwargs.get('body_shape_loss_min_cos', None)
+        self.normal_loss_weight: Union[float, None] = kwargs.get('normal_loss_weight', None)
+        self.normal_loss_min_t: Union[float, None] = kwargs.get('normal_loss_min_t', None)
+        self.normal_loss_max_t: Union[float, None] = kwargs.get('normal_loss_max_t', None)
+        self.vae_anchor_loss_weight: Union[float, None] = kwargs.get('vae_anchor_loss_weight', None)
+        self.vae_anchor_loss_min_t: Union[float, None] = kwargs.get('vae_anchor_loss_min_t', None)
+        self.vae_anchor_loss_max_t: Union[float, None] = kwargs.get('vae_anchor_loss_max_t', None)
+        self.diffusion_loss_weight: Union[float, None] = kwargs.get('diffusion_loss_weight', None)
+        self.diffusion_loss_min_t: Union[float, None] = kwargs.get('diffusion_loss_min_t', None)
+        self.diffusion_loss_max_t: Union[float, None] = kwargs.get('diffusion_loss_max_t', None)
+        self.face_suppression_weight: Union[float, None] = kwargs.get('face_suppression_weight', None)
+        self.face_suppression_expand: Union[float, None] = kwargs.get('face_suppression_expand', None)
+        self.face_suppression_soft: Union[bool, None] = kwargs.get('face_suppression_soft', None)
+        self.latent_perceptual_loss_weight: Union[float, None] = kwargs.get('latent_perceptual_loss_weight', None)
+        self.latent_perceptual_loss_min_t: Union[float, None] = kwargs.get('latent_perceptual_loss_min_t', None)
+        self.latent_perceptual_loss_max_t: Union[float, None] = kwargs.get('latent_perceptual_loss_max_t', None)
+        self.depth_loss_weight: Union[float, None] = kwargs.get('depth_loss_weight', None)
+        self.depth_loss_min_t: Union[float, None] = kwargs.get('depth_loss_min_t', None)
+        self.depth_loss_max_t: Union[float, None] = kwargs.get('depth_loss_max_t', None)
+        # Per-optimizer-step alternation between diffusion and depth losses
+        # for this dataset's samples. Three states:
+        #   - None              : inherit from global TrainConfig.loss_split
+        #                         (which itself can be autodetect, force-on,
+        #                         or force-off).
+        #   - 'diffusion_depth' : force on for this dataset, regardless of
+        #                         the global setting.
+        #   - 'sum'             : force off for this dataset (losses sum
+        #                         every step), regardless of the global.
+        # The gating keys on self.step_num (advanced after each full
+        # accumulation window) so all microbatches in one optimizer step
+        # see the same active loss — Adam integrates clean single-objective
+        # gradients. Other auxiliaries (identity, body_*, normal,
+        # vae_anchor, latent perceptual) are unaffected and fire as their
+        # own gating allows.
+        self.loss_split: Union[str, None] = kwargs.get('loss_split', None)
+        if self.loss_split is not None and self.loss_split not in ('diffusion_depth', 'sum'):
+            raise ValueError(
+                f"Unknown loss_split value: {self.loss_split!r}. "
+                "Allowed: None (inherit from global), 'diffusion_depth' "
+                "(force on), 'sum' (force off, sum every step)"
+            )
+        # Subject mask (Phase 2) per-dataset overrides: None inherits global SubjectMaskConfig
+        self.background_loss_weight: Union[float, None] = kwargs.get('background_loss_weight', None)
+        self.clothing_loss_weight: Union[float, None] = kwargs.get('clothing_loss_weight', None)
+        self.body_loss_weight: Union[float, None] = kwargs.get('body_loss_weight', None)
+        self.perceptual_restrict_to_body: Union[bool, None] = kwargs.get('perceptual_restrict_to_body', None)
+
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)
         self.extra_values: List[float] = kwargs.get('extra_values', [])
@@ -999,11 +1377,6 @@ class DatasetConfig:
         # I recommend trimming your videos to the desired length and using shrink_video_to_frames(default)
         self.fps: int = kwargs.get('fps', 24)
         
-        # auto_frame_count pull as many frames as in the video at given fps
-        # Important, make sure fps for dataset is set correctly.
-        # this wont work with bucketing for now until I can handle this before bucketing.
-        self.auto_frame_count: bool = kwargs.get('auto_frame_count', False)
-        
         # debug the frame count and frame selection. You dont need this. It is for debugging.
         self.debug: bool = kwargs.get('debug', False)
         
@@ -1013,6 +1386,14 @@ class DatasetConfig:
             self.controls = [self.controls]
         # remove empty strings
         self.controls = [control for control in self.controls if control.strip() != '']
+
+        # Optional override for the depth model used when generating
+        # `_controls/{stem}.depth.jpg` images. Defaults to None — the
+        # ControlGenerator falls back to its built-in default. The
+        # auto-mirror in SDTrainer.before_dataset_load sets this on reg
+        # datasets to match `depth_consistency.model_id` so the same model
+        # used for the loss perceptor is used for the conditioning input.
+        self.depth_model_id: Optional[str] = kwargs.get('depth_model_id', None)
         
         # if true, will use a fask method to get image sizes. This can result in errors. Do not use unless you know what you are doing
         self.fast_image_size: bool = kwargs.get('fast_image_size', False)
@@ -1025,21 +1406,37 @@ class DatasetConfig:
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
     """
-    This just splits up the datasets by resolutions so you dont have to do it manually
-    :param raw_config:
-    :return:
+    Splits each dataset entry into one entry per resolution so the rest of the
+    pipeline only sees scalar-resolution datasets.
+
+    `num_repeats` may be a scalar (broadcast to every resolution) or a list
+    aligned 1:1 with the resolution list — useful for unbalanced per-bucket
+    sampling (e.g. ``resolution: [256, 512, 768, 1024]`` paired with
+    ``num_repeats: [64, 16, 4, 1]``).
     """
-    # split up datasets by resolutions
     new_config = []
     for dataset in raw_config:
         resolution = dataset.get('resolution', 512)
-        if isinstance(resolution, list):
-            resolution_list = resolution
+        resolution_list = resolution if isinstance(resolution, list) else [resolution]
+
+        num_repeats = dataset.get('num_repeats', 1)
+        if isinstance(num_repeats, list):
+            if len(num_repeats) != len(resolution_list):
+                ident = dataset.get('dataset_path') or dataset.get('folder_path') or '<unknown>'
+                raise ValueError(
+                    f"Dataset {ident!r}: num_repeats list length "
+                    f"({len(num_repeats)}) must match resolution list length "
+                    f"({len(resolution_list)}). Got num_repeats={num_repeats}, "
+                    f"resolution={resolution_list}."
+                )
+            repeats_list = num_repeats
         else:
-            resolution_list = [resolution]
-        for res in resolution_list:
+            repeats_list = [num_repeats] * len(resolution_list)
+
+        for res, reps in zip(resolution_list, repeats_list):
             dataset_copy = dataset.copy()
             dataset_copy['resolution'] = res
+            dataset_copy['num_repeats'] = reps
             new_config.append(dataset_copy)
     return new_config
 
@@ -1206,18 +1603,15 @@ class GenerateImageConfig:
                 )
             else:
                 raise ValueError(f"Unsupported video format {self.output_ext}")
-        elif self.output_ext in ['wav', 'mp3', 'flac', 'ogg']:
+        elif self.output_ext in ['wav', 'mp3']:
             # save audio file
-            audio_path = self.get_image_path(count, max_count)
             torchaudio.save(
-                audio_path, 
+                self.get_image_path(count, max_count), 
                 image[0].to('cpu'),
                 sample_rate=48000, 
                 format=None, 
                 backend=None
             )
-            if self.output_ext == 'mp3':
-                add_album_artwork(audio_path)
         else:
             # TODO save image gen header info for A1111 and us, our seeds probably wont match
             image.save(self.get_image_path(count, max_count))
@@ -1385,8 +1779,5 @@ def validate_configs(
     
     if train_config.diff_output_preservation and train_config.blank_prompt_preservation:
         raise ValueError("Cannot use both differential output preservation and blank prompt preservation at the same time. Please set one of them to False.")
-    
-    if train_config.batch_size > 1 and any(dataset_config.auto_frame_count for dataset_config in dataset_configs):
-        raise ValueError("Cannot use batch size greater than 1 with auto_frame_count. Please set batch_size to 1 or auto_frame_count to False.")
 
     
