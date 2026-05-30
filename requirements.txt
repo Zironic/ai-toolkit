@@ -1,2 +1,8 @@
 -r requirements_base.txt
-scipy==1.12.0
+scipy>=1.15
+# perceptual training dependencies (face/body/depth models)
+insightface
+onnxruntime-gpu
+onnx2torch
+dsntnn
+ultralytics
