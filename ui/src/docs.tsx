@@ -275,6 +275,16 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.diff_output_preservation_resolution': {
+    title: 'DOP Resolution (px long-side)',
+    description: (
+      <>
+        Optional: run DOP preservation at a reduced spatial resolution (long-side in pixels), e.g. select from presets
+        128 / 256 / 512 / 1024. This will downsample the latents for the preservation forward pass and compute
+        preservation loss at the reduced size to reduce compute. Choose 'Full resolution' to run at full resolution.
+      </>
+    ),
+  },
   'train.blank_prompt_preservation': {
     title: 'Blank Prompt Preservation',
     description: (
@@ -285,6 +295,16 @@ const docs: { [key: string]: ConfigDoc } = {
         training, a prior prediction is made with a blank prompt and with the LoRA disabled. This prediction is then
         used as a target on an additional training step with a blank prompt, to preserve the model's knowledge when no
         prompt is given. This helps the model to not overfit to the prompt and retain its generalization capabilities.
+      </>
+    ),
+  },
+  'train.blank_prompt_preservation_resolution': {
+    title: 'BPP Resolution (px long-side)',
+    description: (
+      <>
+        Optional: run Blank Prompt Preservation at a reduced spatial resolution (long-side in pixels), choose from
+        presets 128 / 256 / 512 / 1024. When set, the BPP preservation pass and loss will operate at the smaller
+        resolution. Choose 'Full resolution' to run at full resolution.
       </>
     ),
   },

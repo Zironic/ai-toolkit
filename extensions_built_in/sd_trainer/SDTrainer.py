@@ -1978,10 +1978,6 @@ class SDTrainer(BaseSDTrainProcess):
                         skip_full_prior = self._should_skip_full_prior(noisy_latents, preservation_resolution, do_reg_prior=do_reg_prior)
 
                         if skip_full_prior:
-                            try:
-                                print_acc(f"[DOP] Skipping full-res prior for {preservation_kind} preservation; will run reduced prediction at {preservation_resolution}px area")
-                            except Exception:
-                                pass
                             prior_pred = None
                         else:
                             prior_pred = self.get_prior_prediction(
@@ -2183,9 +2179,16 @@ class SDTrainer(BaseSDTrainProcess):
                         self.accelerator.backward(loss)
                         normal_loss = loss.detach() # dont send backward again
 
+                        # Determine preservation embeddings and resolution
+                        preservation_embeds = None
+                        preservation_resolution = None
+                        preservation_kind = None
+
                         with torch.no_grad():
                             if do_dop_this_step:
                                 preservation_embeds = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
+                                preservation_resolution = getattr(self.train_config, 'diff_output_preservation_resolution', None)
+                                preservation_kind = 'dop'
                             elif self.train_config.blank_prompt_preservation:
                                 blank_embeds = self.cached_blank_embeds.clone().detach().to(
                                     self.device_torch, dtype=dtype
@@ -2193,19 +2196,41 @@ class SDTrainer(BaseSDTrainProcess):
                                 preservation_embeds = concat_prompt_embeds(
                                     [blank_embeds] * noisy_latents.shape[0]
                                 )
-                        preservation_pred = self.predict_noise(
-                            noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
-                            timesteps=timesteps,
-                            conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
-                            unconditional_embeds=unconditional_embeds,
-                            batch=batch,
-                            **pred_kwargs
-                        )
-                        multiplier = self.train_config.diff_output_preservation_multiplier if do_dop_this_step else self.train_config.blank_prompt_preservation_multiplier
-                        preservation_loss = torch.nn.functional.mse_loss(preservation_pred, prior_pred) * multiplier
-                        self.accelerator.backward(preservation_loss)
+                                preservation_resolution = getattr(self.train_config, 'blank_prompt_preservation_resolution', None)
+                                preservation_kind = 'blank'
 
-                        loss = normal_loss + preservation_loss
+                        # Run preservation forward with optional downsampling
+                        with torch.set_grad_enabled(True):
+                            preservation_pred_res = self._run_preservation_forward(
+                                noisy_latents=noisy_latents,
+                                timesteps=timesteps,
+                                preservation_embeds=preservation_embeds,
+                                unconditional_embeds=unconditional_embeds,
+                                batch=batch,
+                                pred_kwargs=pred_kwargs,
+                                dtype=dtype,
+                                prior_pred=prior_pred,
+                                preservation_resolution=preservation_resolution,
+                                preservation_kind=preservation_kind,
+                                match_adapter_assist=match_adapter_assist,
+                                network_weight_list=network_weight_list,
+                            )
+
+                        # Handle tuple return (preservation_pred, prior_pred_for_loss) when downsampling
+                        if isinstance(preservation_pred_res, tuple):
+                            preservation_pred, prior_pred_for_loss = preservation_pred_res
+                        else:
+                            preservation_pred = preservation_pred_res
+                            prior_pred_for_loss = prior_pred
+
+                        # Compute and apply preservation loss
+                        multiplier = self.train_config.diff_output_preservation_multiplier if do_dop_this_step else self.train_config.blank_prompt_preservation_multiplier
+                        preservation_loss = self._compute_and_apply_preservation_loss(preservation_pred, prior_pred_for_loss, multiplier)
+
+                        if preservation_loss is not None:
+                            loss = normal_loss + preservation_loss.detach()
+                        else:
+                            loss = normal_loss
                         loss = loss.clone().detach()
                         # require grad again so the backward wont fail
                         loss.requires_grad_(True)
@@ -2231,6 +2256,214 @@ class SDTrainer(BaseSDTrainProcess):
 
         return loss.detach()
         # flush()
+
+    def _run_preservation_forward(self, noisy_latents, timesteps, preservation_embeds, unconditional_embeds, batch, pred_kwargs, dtype, prior_pred, preservation_resolution=None, preservation_kind: 'Optional[str]'=None, match_adapter_assist: bool = False, network_weight_list: list = None):
+        """Run preservation forward pass for DOP/blank prompt preservation and record timings.
+
+        If `preservation_resolution` (pixels, long-side) is specified, the forward pass will be
+        executed at that reduced spatial resolution and the returned preservation prediction and
+        prior prediction (both downsampled) will be suitable for loss computation.
+
+        `preservation_kind` may be 'dop' or 'blank' to help label timers appropriately.
+
+        Returns preservation_pred (or (preservation_pred, prior_pred_down) when downsampling used) or None.
+        """
+        # Determine timer base name based on preservation kind
+        timer_base = 'blank_predict' if preservation_kind == 'blank' else 'dop_predict'
+
+        # preservation_embeds may be prompt embeds or similar. Move them and latents to device inside the timer
+        # Create a shallow copy of `pred_kwargs` to avoid mutating the caller's dict and to allow
+        # removal of adapter residuals for preservation predictions when requested.
+        local_pred_kwargs = dict(pred_kwargs) if pred_kwargs is not None else {}
+        if match_adapter_assist:
+            # Remove controlnet influence for preservation loss
+            local_pred_kwargs.pop('down_intrablock_additional_residuals', None)
+            local_pred_kwargs.pop('down_block_additional_residuals', None)
+            local_pred_kwargs.pop('mid_block_additional_residual', None)
+            # For Z-Image controlnet (unified model), remove control context entirely.
+            local_pred_kwargs.pop('control_context', None)
+            local_pred_kwargs['control_context_scale'] = 0.0
+
+        effective_preservation_resolution = preservation_resolution
+
+        # If no resolution requested, do the normal full-res predict (using cleaned local kwargs)
+        if effective_preservation_resolution is None:
+            with self.timer(timer_base):
+                preservation_pred = self.predict_noise(
+                    noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                    timesteps=timesteps,
+                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeds=unconditional_embeds,
+                    batch=batch,
+                    **local_pred_kwargs
+                )
+            return preservation_pred
+
+        # Otherwise, compute a reduced latent size and run predict at that size
+        try:
+            # compute vae scale factor (pixels -> latent). Try config first, fallback to heuristic 8
+            vae = getattr(self.sd, 'vae', None)
+            if vae is not None and hasattr(vae, 'config') and 'block_out_channels' in vae.config:
+                vae_scale = 2 ** (len(vae.config['block_out_channels']) - 1)
+            else:
+                vae_scale = getattr(self.sd, 'vae_scale_factor', 8)
+        except Exception:
+            vae_scale = 8
+
+        # Current latent spatial dims
+        _, C, H, W = noisy_latents.shape
+        # Target latent area from pixel area: effective_preservation_resolution represents sqrt of target pixel area
+        target_latent_area = (effective_preservation_resolution / vae_scale) ** 2
+        # Preserve aspect ratio: target_h / target_w = H / W
+        import math
+        aspect_ratio = H / W
+        target_h = max(1, int(round(math.sqrt(target_latent_area * aspect_ratio))))
+        target_w = max(1, int(round(math.sqrt(target_latent_area / aspect_ratio))))
+
+        # Ensure target dims are compatible with transformer patch sizes (avoid invalid view shapes)
+        try:
+            tr = getattr(self.sd, 'transformer', None)
+            if tr is not None:
+                all_patch = getattr(tr, 'all_patch_size', None)
+                if all_patch:
+                    patch_min = int(min(all_patch))
+                else:
+                    patch_min = 1
+            else:
+                patch_min = 1
+        except Exception:
+            patch_min = 1
+
+        # Round target dims to nearest multiple of patch_min (at least patch_min)
+        if patch_min > 1:
+            target_h = max(patch_min, int(round(target_h / patch_min)) * patch_min)
+            target_w = max(patch_min, int(round(target_w / patch_min)) * patch_min)
+
+        # If target is same or larger than current, just run full-res
+        if target_h >= H and target_w >= W:
+            with self.timer(timer_base):
+                preservation_pred = self.predict_noise(
+                    noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                    timesteps=timesteps,
+                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeds=unconditional_embeds,
+                    batch=batch,
+                    **local_pred_kwargs
+                )
+            return preservation_pred
+
+        # CRITICAL: To downsample correctly for DOP, we must downsample the clean latents
+        # and noise separately, then re-apply the noise schedule at the small resolution.
+        with self.timer(f"{timer_base}_downsampled"):
+            latents_small, noise_small, noisy_small = self._create_downsampled_noisy_latents(
+                batch.latents, timesteps, target_h, target_w, dtype
+            )
+
+            # Generate both predictions at the same small resolution
+            prior_small = None
+            try:
+                prior_small = self.get_prior_prediction(
+                    noisy_latents=noisy_small,
+                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                    match_adapter_assist=match_adapter_assist,
+                    network_weight_list=network_weight_list if network_weight_list is not None else [],
+                    timesteps=timesteps,
+                    pred_kwargs=local_pred_kwargs,
+                    batch=batch,
+                    noise=None,
+                    unconditional_embeds=unconditional_embeds,
+                )
+            except Exception:
+                prior_small = None
+
+            preservation_pred_small = self.predict_noise(
+                noisy_latents=noisy_small,
+                timesteps=timesteps,
+                conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                unconditional_embeds=unconditional_embeds,
+                batch=batch,
+                **local_pred_kwargs
+            )
+        # Return both small preds so loss can be computed at this resolution
+        return (preservation_pred_small, prior_small)
+
+    def _create_downsampled_noisy_latents(self, original_latents: torch.Tensor, timesteps: torch.Tensor, target_h: int, target_w: int, dtype: str):
+        """Downsample `original_latents` to (target_h, target_w), sample noise at that resolution
+        and create a scheduler-consistent `noisy_small` tensor. Returns (latents_small, noise_small, noisy_small).
+        """
+        torch_dtype = get_torch_dtype(dtype)
+        # Downsample clean latents using bicubic interpolation
+        latents_small = torch.nn.functional.interpolate(
+            original_latents, size=(target_h, target_w), mode='bicubic', align_corners=False
+        ).to(self.device_torch, dtype=torch_dtype)
+
+        # Sample fresh noise at the reduced resolution
+        noise_small = torch.randn_like(latents_small, device=self.device_torch, dtype=latents_small.dtype)
+
+        try:
+            noisy_small = self.sd.add_noise(latents_small, noise_small, timesteps.to(self.device_torch))
+        except Exception as e:
+            raise RuntimeError(f"[DOP] failed to construct noisy_small via scheduler: {e}") from e
+
+        if noisy_small is None:
+            raise RuntimeError("[DOP] noisy_small was not constructed by scheduler (unexpected)")
+
+        return latents_small, noise_small, noisy_small
+
+    def _compute_and_apply_preservation_loss(self, preservation_pred, prior_pred, multiplier: float):
+        """Compute preservation loss, record diagnostics, and apply backward.
+
+        Returns the preservation_loss tensor.
+        """
+        try:
+            # Validate that both predictions are at the same resolution for fair comparison
+            if prior_pred is not None and preservation_pred.shape != prior_pred.shape:
+                try:
+                    print_acc(f"[DOP] Warning: resolution mismatch detected! preservation_pred shape {preservation_pred.shape} != prior_pred shape {prior_pred.shape}")
+                except Exception:
+                    pass
+
+            # Ensure both tensors are on the same device and dtype to avoid dtype/device mismatch errors
+            if prior_pred is not None:
+                if preservation_pred.device != prior_pred.device:
+                    preservation_pred = preservation_pred.to(prior_pred.device)
+                cpu_low_precision = prior_pred.device.type == 'cpu' and prior_pred.dtype in (torch.bfloat16, torch.float16)
+                if cpu_low_precision:
+                    preservation_pred = preservation_pred.to(torch.float32)
+                    prior_pred = prior_pred.to(torch.float32)
+                else:
+                    if preservation_pred.dtype != prior_pred.dtype:
+                        preservation_pred = preservation_pred.to(prior_pred.dtype)
+
+            preservation_loss = torch.nn.functional.mse_loss(preservation_pred, prior_pred) * multiplier
+
+        except Exception as e:
+            try:
+                print_acc(f"[DOP] preservation loss computation failed: {e}")
+            except Exception:
+                pass
+            self._last_preservation_loss = None
+            return None
+
+        # record a diagnostic scalar for the UI (best-effort)
+        try:
+            with self.timer('cpu_transfer'):
+                self._last_preservation_loss = float(preservation_loss.detach())
+        except Exception:
+            self._last_preservation_loss = None
+
+        # apply backward for preservation loss
+        try:
+            if preservation_loss.requires_grad:
+                with self.timer('preservation_backward'):
+                    self.accelerator.backward(preservation_loss)
+        except Exception as e:
+            try:
+                print_acc(f"[DOP] backward failed for preservation loss: {e}")
+            except Exception:
+                pass
+
+        return preservation_loss
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
@@ -2304,3 +2537,71 @@ class SDTrainer(BaseSDTrainProcess):
         self.end_of_training_loop()
 
         return loss_dict
+    def _should_skip_full_prior(self, noisy_latents, preservation_resolution, do_reg_prior: bool = False) -> bool:
+            """Return True if the full-resolution prior prediction can be skipped in favor of running
+            the preservation prediction at a (smaller) reduced resolution.
+
+            Conditions to skip:
+            - `preservation_resolution` is set and would downsample the `noisy_latents` spatial dims
+            when converted to latent space, AND
+            - none of the following features are active: `do_prior_divergence`, `inverted_mask_prior`,
+            `correct_pred_norm`, and there is no reg prior for this batch (`do_reg_prior`).
+            """
+            if preservation_resolution is None:
+                return False
+            try:
+                vae = getattr(self.sd, 'vae', None)
+                if vae is not None and hasattr(vae, 'config') and 'block_out_channels' in vae.config:
+                    vae_scale = 2 ** (len(vae.config['block_out_channels']) - 1)
+                else:
+                    vae_scale = getattr(self.sd, 'vae_scale_factor', 8)
+            except Exception:
+                vae_scale = 8
+            _, C, H, W = noisy_latents.shape
+            target_long = max(1, int(round(preservation_resolution / vae_scale)))
+            if H >= W:
+                target_h = target_long
+                target_w = max(1, int(round(W * (target_h / H))))
+            else:
+                target_w = target_long
+                target_h = max(1, int(round(H * (target_w / W))))
+            try:
+                tr = getattr(self.sd, 'transformer', None)
+                if tr is not None:
+                    all_patch = getattr(tr, 'all_patch_size', None)
+                    if all_patch:
+                        patch_min = int(min(all_patch))
+                    else:
+                        patch_min = 1
+                else:
+                    patch_min = 1
+            except Exception:
+                patch_min = 1
+            if patch_min > 1:
+                target_h = max(patch_min, int(round(target_h / patch_min)) * patch_min)
+                target_w = max(patch_min, int(round(target_w / patch_min)) * patch_min)
+
+            # will downsample if either target dimension strictly less than current
+            will_downsample = (target_h < H) or (target_w < W)
+            if not will_downsample:
+                return False
+            # If user configured a "full resolution every N steps" schedule, do not skip the
+            # full-resolution prior prediction on those scheduled steps. Avoid scheduling step 0
+            # as a forced full-res run (i.e., require total > 0).
+            try:
+                full_every = int(getattr(self.train_config, 'diff_output_preservation_every', 10))
+            except Exception:
+                full_every = 10
+            total = int(getattr(self, '_total_batch_count', 0))
+            if full_every >= 1 and total > 0 and (total % full_every) == 0:
+                return False
+            # check feature flags that require full-res prior
+            if getattr(self.train_config, 'do_prior_divergence', False):
+                return False
+            if getattr(self.train_config, 'inverted_mask_prior', False):
+                return False
+            if getattr(self.train_config, 'correct_pred_norm', False):
+                return False
+            if do_reg_prior:
+                return False
+            return True

@@ -5,7 +5,8 @@ import torch
 
 from PIL import Image
 from PIL.ImageOps import exif_transpose
-from toolkit.print import print_accimport av
+import av
+from toolkit.print import print_acc
             
 from toolkit import image_utils
 from toolkit.basic import get_quick_signature_string

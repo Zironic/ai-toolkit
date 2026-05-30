@@ -469,11 +469,15 @@ class TrainConfig:
         self.diff_output_preservation_multiplier = kwargs.get('diff_output_preservation_multiplier', 1.0)
         # If the trigger word is in the prompt, we will use this class name to replace it eg. "sks woman" -> "woman"
         self.diff_output_preservation_class = kwargs.get('diff_output_preservation_class', '')
-        
+        # Optional lower-resolution target for DOP (pixels, long-side). None = full resolution.
+        self.diff_output_preservation_resolution: Union[int, None] = kwargs.get('diff_output_preservation_resolution', None)
+
         # blank prompt preservation will preserve the model's knowledge of a blank prompt
         self.blank_prompt_preservation = kwargs.get('blank_prompt_preservation', False)
         self.blank_prompt_preservation_multiplier = kwargs.get('blank_prompt_preservation_multiplier', 1.0)
-        
+        # Optional lower-resolution target for BPP (pixels, long-side). None = full resolution.
+        self.blank_prompt_preservation_resolution: Union[int, None] = kwargs.get('blank_prompt_preservation_resolution', None)
+
         # legacy
         if match_adapter_assist and self.match_adapter_chance == 0.0:
             self.match_adapter_chance = 1.0
