@@ -1766,6 +1766,9 @@ class LatentCachingFileItemDTOMixin:
                 item["audio_normalize"] = True
             if self.dataset_config.audio_preserve_pitch:
                 item["audio_preserve_pitch"] = True
+        if self.is_audio_model:
+            item["is_audio_model"] = True
+            item["sample_rate"] = self.sample_rate
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -1889,8 +1892,8 @@ class LatentCachingMixin:
                         if to_disk:
                             state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
                     
-                    # audio
-                    if file_item.audio_data is not None:
+                    # audio (video+audio models only — audio-only models already encoded above via encode_images)
+                    if not self.is_audio_model and file_item.audio_data is not None:
                         audio_latent = self.sd.encode_audio([file_item.audio_data]).squeeze(0)
                         if to_disk:
                             state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
@@ -2536,7 +2539,7 @@ class ControlCachingMixin:
         if control_type == 'inpaint':
             file_item.inpaint_path = control_path
             file_item.has_inpaint_image = True
-        elif control_type == 'mask':
+        elif control_type == 'mask' or control_type == 'sapiens2_mask':
             file_item.mask_path = control_path
             file_item.has_mask_image = True
         else:

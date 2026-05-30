@@ -586,6 +586,11 @@ class TrainConfig:
 
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)
+        self.t0_velocity_equiv_weight = kwargs.get('t0_velocity_equiv_weight', False)
+        
+        # do additional fft loss
+        self.do_fft_loss = kwargs.get('do_fft_loss', False)
+        self.do_fft_velocity_equiv_weight = kwargs.get('do_fft_velocity_equiv_weight', False)
 
         self.diffusion_loss_weight: float = kwargs.get('diffusion_loss_weight', 1.0)
         self.diffusion_loss_min_t: float = kwargs.get('diffusion_loss_min_t', 0.0)
@@ -722,6 +727,13 @@ class TrainConfig:
         self.latent_perceptual_loss_max_t: float = kwargs.get('latent_perceptual_loss_max_t', 0.5)
         self.latent_perceptual_encoder: str = kwargs.get('latent_perceptual_encoder', 'auto')
         self.latent_perceptual_preview_every: int = kwargs.get('latent_perceptual_preview_every', 500)
+
+        self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
+
+        # will throw detailed error when it goes over
+        self.max_loss_debug: bool = kwargs.get("max_loss_debug", False)
+        # will clip the loss to this amount to prevent wild outliers
+        self.max_loss: Optional[float] = kwargs.get("max_loss", None)
 
 
 ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
@@ -990,7 +1002,7 @@ class SliderConfig:
                 self.targets.append(target)
         print(f"Built {len(self.targets)} slider targets (with permutations)")
 
-ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask']
+ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask', 'sapiens2_mask']
 
 
 class FaceIDConfig:
