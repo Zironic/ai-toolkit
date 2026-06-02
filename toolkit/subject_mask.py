@@ -16,7 +16,8 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file
+from toolkit.util.safe_save import atomic_save_file
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -634,7 +635,7 @@ def cache_subject_masks(
             'body_close_radius': torch.tensor([float(config.body_close_radius)]),
             CACHE_VERSION_KEY: torch.ones(1),
         }
-        save_file(save_data, cache_path)
+        atomic_save_file(save_data, cache_path)
         extracted_count += 1
         pbar.set_postfix(hit=cached_count, miss=extracted_count)
 

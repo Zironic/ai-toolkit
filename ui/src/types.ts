@@ -148,6 +148,11 @@ export interface DatasetConfig {
   clothing_loss_weight?: number;
   body_loss_weight?: number;
   perceptual_restrict_to_body?: boolean;
+  // Depth consistency per-dataset overrides
+  depth_loss_weight?: number;
+  depth_loss_min_t?: number;
+  depth_loss_max_t?: number;
+  loss_split?: string | null;
 }
 
 export interface EMAConfig {
@@ -219,6 +224,9 @@ export interface TrainConfig {
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;
   max_loss?: number | null;
+  min_denoising_steps?: number;
+  max_denoising_steps?: number;
+  loss_split?: string | null;
 }
 
 export interface QuantizeKwargsConfig {
@@ -355,6 +363,7 @@ export interface SubjectMaskConfig {
   // Debug: when true, cache_subject_masks writes a 5-panel tile.png per image
   // to _face_id_cache/_previews/ for visual inspection
   save_debug_previews?: boolean;
+  body_close_radius?: number;
 }
 
 export interface DepthConsistencyConfig {

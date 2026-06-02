@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import gc
 import os
-import tempfile
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+from toolkit.util.safe_save import atomic_save_file as _atomic_save_file
 from tqdm import tqdm
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -29,33 +29,6 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 CACHE_VERSION_KEY = "depth_gt_v3"  # v3: GT depth from VAE-encode-then-decode roundtrip pixels (zero-floor target)
 CACHE_VERSION_VIDEO_KEY = "depth_gt_video_v2"
 
-
-def _atomic_save_file(save_data: dict, cache_path: str) -> None:
-    """Windows-safe atomic safetensors write.
-
-    safetensors.save_file uses memory-mapped I/O on Windows. When the same
-    cache file has been read earlier in the same process via load_file, the
-    mmap section can stay live and block a subsequent in-place rewrite,
-    producing OSError 1224 ("user-mapped section open"). Writing to a temp
-    file in the same directory and using os.replace sidesteps that: rename
-    succeeds even when the destination is currently mmap'd.
-    """
-    cache_dir = os.path.dirname(cache_path) or "."
-    os.makedirs(cache_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=".tmp_", suffix=".safetensors", dir=cache_dir
-    )
-    os.close(fd)
-    try:
-        save_file(save_data, tmp_path)
-        os.replace(tmp_path, cache_path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        raise
 
 
 def _load_then_close(cache_path: str) -> dict:

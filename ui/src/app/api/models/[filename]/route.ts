@@ -11,8 +11,8 @@ function sanitizeFilename(raw: string): string | null {
   return base;
 }
 
-export async function DELETE(_request: NextRequest, { params }: { params: { filename: string } }) {
-  const { filename: raw } = await (params as any);
+export async function DELETE(_request: NextRequest, { params }: { params: Promise<{ filename: string }> }) {
+  const { filename: raw } = await params;
   const filename = sanitizeFilename(decodeURIComponent(raw));
   if (!filename) {
     return NextResponse.json({ error: 'Invalid filename' }, { status: 400 });

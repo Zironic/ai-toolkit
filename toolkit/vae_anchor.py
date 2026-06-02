@@ -15,7 +15,8 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+from toolkit.util.safe_save import atomic_save_file
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -223,6 +224,9 @@ class VAEAnchorEncoder(nn.Module):
             encoder.mid.block_2.register_forward_hook(hook_mid)
         )
 
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        return self.encode_with_features(x)
+
     def encode_with_features(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -395,32 +399,40 @@ def cache_vae_anchor_features(
 
     CACHE_VERSION_KEY = 'vae_anchor_v4'  # v4: cached from dataloader-transformed pixels
 
-    encoder = VAEAnchorEncoder(vae_path=face_id_config.vae_anchor_model_path)
-    encoder.load(device=torch.device('cuda'), dtype=torch.float32)
-    print("  -  Loaded VAE encoder for anchor feature caching")
-
+    # Pre-scan: load cached items immediately, collect only those that need inference
+    uncached = []
     cached_count = 0
-    computed_count = 0
-
-    for file_item in tqdm(file_items, desc="Caching VAE anchor features"):
+    for file_item in file_items:
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, '_face_id_cache')
         filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
         cache_path = os.path.join(cache_dir, f'{filename_no_ext}_vae_anchor.safetensors')
-
-        # Check cache
         if os.path.exists(cache_path):
             data = load_file(cache_path)
-            if CACHE_VERSION_KEY in data and all(
-                f'vae_anchor_{level}' in data for level in FEATURE_LEVELS
-            ):
-                # Load cached features onto file_item
+            if CACHE_VERSION_KEY in data and all(f'vae_anchor_{level}' in data for level in FEATURE_LEVELS):
                 file_item.vae_anchor_features = {
                     level: data[f'vae_anchor_{level}'].clone()
                     for level in FEATURE_LEVELS
                 }
                 cached_count += 1
                 continue
+        uncached.append(file_item)
+
+    if not uncached:
+        print(f"  -  VAE anchor features: all {len(file_items)} cached, skipping model load")
+        return
+
+    encoder = VAEAnchorEncoder(vae_path=face_id_config.vae_anchor_model_path)
+    encoder.load(device=torch.device('cuda'), dtype=torch.float32)
+    print(f"  -  Loaded VAE encoder for anchor feature caching ({len(uncached)}/{len(file_items)} images need processing)")
+
+    computed_count = 0
+
+    for file_item in tqdm(uncached, desc="Caching VAE anchor features"):
+        img_dir = os.path.dirname(file_item.path)
+        cache_dir = os.path.join(img_dir, '_face_id_cache')
+        filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
+        cache_path = os.path.join(cache_dir, f'{filename_no_ext}_vae_anchor.safetensors')
 
         # v4: encode the dataloader-transformed pixels so cached features
         # share spatial geometry with the training tensor. Apply the same
@@ -442,7 +454,7 @@ def cache_vae_anchor_features(
         save_data = {CACHE_VERSION_KEY: torch.ones(1)}
         for level_name, feat_tensor in features.items():
             save_data[f'vae_anchor_{level_name}'] = feat_tensor
-        save_file(save_data, cache_path)
+        atomic_save_file(save_data, cache_path)
 
     # Free encoder
     encoder.cleanup()

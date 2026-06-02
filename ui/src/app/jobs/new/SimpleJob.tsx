@@ -74,6 +74,7 @@ export default function SimpleJob({
   }, [modelArch, jobType]);
 
   const isVideoModel = !!(modelArch?.group === 'video');
+  const isAudioModel = !!(modelArch?.group === 'audio');
 
   const numTopCards = useMemo(() => {
     let count = 4; // job settings, model config, target config, save config

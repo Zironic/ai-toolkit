@@ -164,7 +164,7 @@ class DiffusionTrainer(SDTrainer):
                 save_now = cursor.fetchone()
                 return False if save_now is None else save_now[0] == 1
 
-        return self._retry_db_operation(_check_save)
+        return _check_save()
 
     def maybe_save(self):
         if not self.is_ui_trainer:

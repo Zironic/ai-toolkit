@@ -5,7 +5,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file
+from toolkit.util.safe_save import atomic_save_file
 from tqdm import tqdm
 import torchvision.models as models
 
@@ -302,23 +303,34 @@ def cache_body_shape_embeddings(
 
     CACHE_VERSION_KEY = 'body_shape_v1'
 
-    encoder = DifferentiableBodyShapeEncoder()
-    print("  -  Loading HybrIK encoder for body shape embeddings...")
-
-    no_body_count = 0
-
-    for file_item in tqdm(file_items, desc="Caching body shape embeddings"):
+    # Pre-scan: load cached items immediately, collect only those that need inference
+    uncached = []
+    for file_item in file_items:
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, '_face_id_cache')
         filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
         cache_path = os.path.join(cache_dir, f'{filename_no_ext}.safetensors')
-
-        # Check if cache exists with this version
         if os.path.exists(cache_path):
             data = load_file(cache_path)
             if 'body_shape_embedding' in data and CACHE_VERSION_KEY in data:
                 file_item.body_shape_embedding = data['body_shape_embedding'].clone()
                 continue
+        uncached.append(file_item)
+
+    if not uncached:
+        print(f"  -  Body shape embeddings: all {len(file_items)} cached, skipping model load")
+        return
+
+    encoder = DifferentiableBodyShapeEncoder()
+    print(f"  -  Loading HybrIK encoder for body shape embeddings ({len(uncached)}/{len(file_items)} images need processing)...")
+
+    no_body_count = 0
+
+    for file_item in tqdm(uncached, desc="Caching body shape embeddings"):
+        img_dir = os.path.dirname(file_item.path)
+        cache_dir = os.path.join(img_dir, '_face_id_cache')
+        filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
+        cache_path = os.path.join(cache_dir, f'{filename_no_ext}.safetensors')
 
         # Load image
         pil_image = exif_transpose(Image.open(file_item.path)).convert('RGB')
@@ -345,7 +357,7 @@ def cache_body_shape_embeddings(
             save_data = {k: v.clone() for k, v in existing.items()}
         save_data['body_shape_embedding'] = betas
         save_data[CACHE_VERSION_KEY] = torch.ones(1)
-        save_file(save_data, cache_path)
+        atomic_save_file(save_data, cache_path)
 
     # Free encoder VRAM
     del encoder

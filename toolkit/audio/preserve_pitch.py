@@ -1,7 +1,10 @@
 import math
 import torch
 import torch.nn.functional as F
-import torchaudio
+try:
+    import torchaudio
+except ImportError:
+    torchaudio = None
     
 def time_stretch_preserve_pitch(waveform: torch.Tensor, sample_rate: int, target_samples: int) -> torch.Tensor:
     """

@@ -58,6 +58,21 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             self.linear_timesteps_weights2 = hbsmntw_weighing
             pass
 
+    def time_shift(self, mu: float, sigma: float, t: torch.Tensor) -> torch.Tensor:
+        """
+        Custom time shift function that prevents division by zero errors.
+        """
+        # Add a small epsilon to prevent division by zero when t is 0
+        epsilon = 1e-10
+        was_numpy = isinstance(t, np.ndarray)
+        if was_numpy:
+            t = torch.tensor(t, dtype=torch.float32)
+        t_clamped = torch.clamp(t, min=epsilon, max=1.0 - epsilon)
+        result = math.exp(mu) / (math.exp(mu) + (1 / t_clamped - 1) ** sigma)
+        if was_numpy:
+            return result.numpy()
+        return result
+
     def get_weights_for_timesteps(self, timesteps: torch.Tensor, v2=False, timestep_type="linear") -> torch.Tensor:
         # Get the indices of the timesteps
         step_indices = [(self.timesteps == t).nonzero().item()
@@ -112,9 +127,21 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         device,
         timestep_type='linear',
         latents=None,
-        patch_size=1
+        patch_size=1,
+        custom_curve=None,
     ):
         self.timestep_type = timestep_type
+        if custom_curve is not None:
+            from toolkit.timestep_weighing.custom_curve import resolve_live_curve, sample_timesteps_from_curve
+            custom_curve = resolve_live_curve(custom_curve, 'distribution')
+            timesteps = sample_timesteps_from_curve(
+                custom_curve,
+                num_samples=num_timesteps,
+                num_steps=self.config.num_train_timesteps,
+                device=device,
+            )
+            self.timesteps = timesteps
+            return timesteps
         if timestep_type == 'linear' or timestep_type == 'weighted':
             timesteps = torch.linspace(1000, 1, num_timesteps, device=device)
             self.timesteps = timesteps

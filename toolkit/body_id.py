@@ -4,7 +4,8 @@ from typing import Optional, List, TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn as nn
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file
+from toolkit.util.safe_save import atomic_save_file
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -515,42 +516,16 @@ def cache_body_proportion_embeddings(
     existing face embeddings.  Sets file_item.body_proportion_embedding and
     file_item.person_bbox.
     """
-    import sys
-    import cv2
-    from PIL import Image
-    from PIL.ImageOps import exif_transpose
-    from huggingface_hub import hf_hub_download
-
-    # Download MediaPipe person detector from HuggingFace (for person bbox)
-    det_code_path = hf_hub_download('opencv/person_detection_mediapipe', 'mp_persondet.py')
-    det_model_path = hf_hub_download('opencv/person_detection_mediapipe', 'person_detection_mediapipe_2023mar.onnx')
-
-    det_dir = os.path.dirname(det_code_path)
-    if det_dir not in sys.path:
-        sys.path.insert(0, det_dir)
-
-    from mp_persondet import MPPersonDet
-
-    print("Loading MediaPipe person detector + ViTPose...")
-    detector = MPPersonDet(det_model_path, scoreThreshold=0.5)
-
-    # Load ViTPose encoder for pose estimation
-    encoder = DifferentiableBodyProportionEncoder()
-    encoder.eval()
-
-    no_body_count = 0
-
     include_head = getattr(face_id_config, 'body_proportion_include_head', False)
-    # Cache version key: v3 = with head ratios, v2 = body only
     CACHE_VERSION_KEY = 'body_proportion_v3_head' if include_head else 'body_proportion_v2'
 
-    for file_item in tqdm(file_items, desc="Caching body proportion embeddings"):
+    # Pre-scan: load cached items immediately, collect only those that need inference
+    uncached = []
+    for file_item in file_items:
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, '_face_id_cache')
         filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
         cache_path = os.path.join(cache_dir, f'{filename_no_ext}.safetensors')
-
-        # Check if cache exists with ViTPose version
         if os.path.exists(cache_path):
             data = load_file(cache_path)
             if 'body_proportion_embedding' in data and 'person_bbox' in data and CACHE_VERSION_KEY in data:
@@ -558,12 +533,40 @@ def cache_body_proportion_embeddings(
                 pb = data['person_bbox'].clone()
                 file_item.person_bbox = pb if pb.abs().sum() > 0 else None
                 continue
+        uncached.append(file_item)
 
-        # Need to extract
+    if not uncached:
+        print(f"  -  Body proportion embeddings: all {len(file_items)} cached, skipping model load")
+        return
+
+    import sys
+    import cv2
+    from PIL import Image
+    from PIL.ImageOps import exif_transpose
+    from huggingface_hub import hf_hub_download
+
+    det_code_path = hf_hub_download('opencv/person_detection_mediapipe', 'mp_persondet.py')
+    det_model_path = hf_hub_download('opencv/person_detection_mediapipe', 'person_detection_mediapipe_2023mar.onnx')
+    det_dir = os.path.dirname(det_code_path)
+    if det_dir not in sys.path:
+        sys.path.insert(0, det_dir)
+    from mp_persondet import MPPersonDet
+
+    print(f"Loading MediaPipe person detector + ViTPose ({len(uncached)}/{len(file_items)} images need processing)...")
+    detector = MPPersonDet(det_model_path, scoreThreshold=0.5)
+    encoder = DifferentiableBodyProportionEncoder()
+    encoder.eval()
+
+    no_body_count = 0
+
+    for file_item in tqdm(uncached, desc="Caching body proportion embeddings"):
+        img_dir = os.path.dirname(file_item.path)
+        cache_dir = os.path.join(img_dir, '_face_id_cache')
+        filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
+        cache_path = os.path.join(cache_dir, f'{filename_no_ext}.safetensors')
+
         pil_image = exif_transpose(Image.open(file_item.path)).convert('RGB')
         cv_img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-
-        # Detect persons using MediaPipe
         persons = detector.infer(cv_img)
 
         n_ratios = DifferentiableBodyProportionEncoder.NUM_BODY_RATIOS + (
@@ -573,7 +576,6 @@ def cache_body_proportion_embeddings(
             prop_tensor = torch.zeros(n_ratios * 2)
             file_item.body_proportion_embedding = prop_tensor
             file_item.person_bbox = None
-
             os.makedirs(cache_dir, exist_ok=True)
             save_data = {}
             if os.path.exists(cache_path):
@@ -581,19 +583,13 @@ def cache_body_proportion_embeddings(
             save_data['body_proportion_embedding'] = prop_tensor
             save_data['person_bbox'] = torch.zeros(4)
             save_data[CACHE_VERSION_KEY] = torch.ones(1)
-            save_file(save_data, cache_path)
+            atomic_save_file(save_data, cache_path)
             continue
 
-        # Use highest-confidence person
         best_person = max(persons, key=lambda p: p[-1])
-
-        # Use full image as bbox — ViTPose handles full frames well
-        # and tight/ROI crops can miss legs/feet
         img_w, img_h = pil_image.size
         full_img_bbox = [0, 0, img_w, img_h]
         person_bbox_tensor = torch.tensor(full_img_bbox, dtype=torch.float32)
-
-        # Run ViTPose via encode()
         prop_tensor = encoder.encode(pil_image, person_bbox=full_img_bbox, include_head=include_head)
 
         if prop_tensor.abs().sum() < 1e-6:
@@ -602,7 +598,6 @@ def cache_body_proportion_embeddings(
         file_item.body_proportion_embedding = prop_tensor
         file_item.person_bbox = person_bbox_tensor if prop_tensor.abs().sum() > 0 else None
 
-        # Save alongside existing cache data
         os.makedirs(cache_dir, exist_ok=True)
         save_data = {}
         if os.path.exists(cache_path):
@@ -610,14 +605,13 @@ def cache_body_proportion_embeddings(
         save_data['body_proportion_embedding'] = prop_tensor
         save_data['person_bbox'] = person_bbox_tensor if file_item.person_bbox is not None else torch.zeros(4)
         save_data[CACHE_VERSION_KEY] = torch.ones(1)
-        save_file(save_data, cache_path)
+        atomic_save_file(save_data, cache_path)
 
-    # Free models
     del detector, encoder
     torch.cuda.empty_cache()
 
     if no_body_count > 0:
-        print(f"  -  Warning: no body detected in {no_body_count}/{len(file_items)} images (using zero vector)")
+        print(f"  -  Warning: no body detected in {no_body_count}/{len(uncached)} images (using zero vector)")
 
 
 def cache_body_embeddings(

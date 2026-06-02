@@ -7,15 +7,17 @@ from optimum.quanto.tensor import Optimizer, qtype, qtypes
 from torchao.quantization.quant_api import (
     quantize_ as torchao_quantize_,
     Float8WeightOnlyConfig,
-    UIntXWeightOnlyConfig,
+    IntxWeightOnlyConfig,
     Int8WeightOnlyConfig
 )
+from torchao.quantization.quant_primitives import MappingType
 from optimum.quanto import freeze
 from tqdm import tqdm
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
 
 from toolkit.print import print_acc
+from toolkit.memory_management import is_oom, soft_empty_cache, get_free_vram, model_size_bytes
 import os
 
 if TYPE_CHECKING:
@@ -35,13 +37,13 @@ Q_MODULES = [
 
 torchao_qtypes = {
     # "int4": Int4WeightOnlyConfig(),
-    "uint2": UIntXWeightOnlyConfig(torch.uint2),
-    "uint3": UIntXWeightOnlyConfig(torch.uint3),
-    "uint4": UIntXWeightOnlyConfig(torch.uint4),
-    "uint5": UIntXWeightOnlyConfig(torch.uint5),
-    "uint6": UIntXWeightOnlyConfig(torch.uint6),
-    "uint7": UIntXWeightOnlyConfig(torch.uint7),
-    "uint8": UIntXWeightOnlyConfig(torch.uint8),
+    "uint2": IntxWeightOnlyConfig(torch.int2, mapping_type=MappingType.ASYMMETRIC),
+    "uint3": IntxWeightOnlyConfig(torch.int3, mapping_type=MappingType.ASYMMETRIC),
+    "uint4": IntxWeightOnlyConfig(torch.int4, mapping_type=MappingType.ASYMMETRIC),
+    "uint5": IntxWeightOnlyConfig(torch.int5, mapping_type=MappingType.ASYMMETRIC),
+    "uint6": IntxWeightOnlyConfig(torch.int6, mapping_type=MappingType.ASYMMETRIC),
+    "uint7": IntxWeightOnlyConfig(torch.int7, mapping_type=MappingType.ASYMMETRIC),
+    "uint8": IntxWeightOnlyConfig(torch.int8, mapping_type=MappingType.ASYMMETRIC),
     "int8": Int8WeightOnlyConfig(),
     "float8": Float8WeightOnlyConfig(),
 }
@@ -113,6 +115,16 @@ def quantize(
                 continue
             else:
                 if isinstance(weights, aotype):
+                    # torchao_quantize_ called on a parent module recursively
+                    # quantizes all nn.Linear children. If the loop then reaches
+                    # those same children they are already Float8Tensor/etc. and
+                    # a second quantize_ call crashes (aten.abs unimplemented).
+                    # Fix: only quantize leaf nn.Linear modules that are still
+                    # plain (unquantized) tensors.
+                    if not isinstance(m, torch.nn.Linear):
+                        continue
+                    if type(m.weight) is not torch.Tensor:
+                        continue  # already quantized — skip
                     torchao_quantize_(m, weights.config)
                 else:
                     _quantize_submodule(
@@ -278,8 +290,8 @@ def quantize_model(
             module_name = lora_module.lora_name.replace('$$', '.').replace('transformer.', '')
             lora_exclude_modules.append(module_name)
             if base_model.model_config.low_vram:
-                # move it back to cpu
                 orig_module.to("cpu")
+                soft_empty_cache()
         pass
         # quantize additional layers
         print_acc(" - quantizing additional layers")
@@ -293,25 +305,60 @@ def quantize_model(
         # quantize model the original way without an accuracy recovery adapter
         # move and quantize only certain pieces at a time.
         quantization_type = get_qtype(base_model.model_config.qtype)
-        # all_blocks = list(model_to_quantize.transformer_blocks)
         all_blocks: List[torch.nn.Module] = []
         transformer_block_names = base_model.get_transformer_block_names()
         for name in transformer_block_names:
             block_list = getattr(model_to_quantize, name, None)
             if block_list is not None:
                 all_blocks += list(block_list)
+
+        # Auto-detect block-by-block mode: use it whenever the model's
+        # float-weight footprint exceeds 60% of free VRAM (quantization
+        # temporarily needs ~2x a block's memory as scratch space).
+        _model_bytes = model_size_bytes(model_to_quantize)
+        _free_vram = get_free_vram(base_model.device_torch) if torch.cuda.is_available() else 0
+        use_block_by_block = base_model.model_config.low_vram or (
+            torch.cuda.is_available() and _model_bytes > _free_vram * 0.6
+        )
+        if use_block_by_block and not base_model.model_config.low_vram:
+            base_model.print_and_status_update(
+                f" - model is {_model_bytes / 1e9:.1f} GB, free VRAM is "
+                f"{_free_vram / 1e9:.1f} GB — using block-by-block quantization"
+            )
+
         base_model.print_and_status_update(
             f" - quantizing {len(all_blocks)} transformer blocks"
         )
         for block in tqdm(all_blocks):
-            block.to(base_model.device_torch, dtype=base_model.torch_dtype, non_blocking=True)
-            quantize(block, weights=quantization_type)
+            if use_block_by_block:
+                soft_empty_cache()
+            block.to(base_model.device_torch, dtype=base_model.torch_dtype)
+            try:
+                quantize(block, weights=quantization_type)
+            except Exception as e:
+                if not is_oom(e):
+                    raise
+                # OOM during quantization: flush and retry once
+                soft_empty_cache()
+                quantize(block, weights=quantization_type)
             freeze(block)
-            block.to("cpu", non_blocking=True)
+            if use_block_by_block:
+                # Frozen block is ~3x smaller than bf16 (quantized weights are
+                # no longer nn.Parameters after freeze). Keep it on GPU so the
+                # full quantized model accumulates there (~5 GB for 9B int8),
+                # avoiding a CPU->GPU migration at inference that triggers
+                # quanto's dequantization path and triples VRAM usage.
+                soft_empty_cache()
 
-        # todo, on extras find a universal way to quantize them on device and move them back to their original
-        # device without having to move the transformer blocks to the device first
+        # Quantize non-transformer-block layers (projections, embeddings, norms).
+        # By this point all transformer blocks are quantized (~50% of original
+        # size), so there is headroom to move the remaining unquantized Linear
+        # layers to the target device for torchao.
         base_model.print_and_status_update(" - quantizing extras")
-        # model_to_quantize.to(base_model.device_torch, dtype=base_model.torch_dtype)
+        soft_empty_cache()
+        for m in model_to_quantize.modules():
+            if isinstance(m, torch.nn.Linear) and type(m.weight) is torch.Tensor:
+                m.to(base_model.device_torch, dtype=base_model.torch_dtype)
         quantize(model_to_quantize, weights=quantization_type)
         freeze(model_to_quantize)
+        soft_empty_cache()

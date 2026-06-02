@@ -24,34 +24,38 @@ class Extension(object):
         pass
 
 
-def get_all_extensions() -> List[Extension]:
+def get_all_extensions_process_dict(needed_types: set = None) -> dict:
+    """Build a uid -> process-class dict, importing only what is needed.
+
+    Parameters
+    ----------
+    needed_types:
+        Set of process-type strings required by the current job.  When
+        provided the loader stops as soon as every type has been found,
+        skipping unrelated (and potentially heavy) extension modules
+        entirely.  Pass ``None`` to load everything (legacy behaviour).
+    """
     extension_folders = ['extensions', 'extensions_built_in']
+    process_dict = {}
+    remaining = set(needed_types) if needed_types is not None else None
 
-    # This will hold the classes from all extension modules
-    all_extension_classes: List[Extension] = []
-
-    # Iterate over all directories (i.e., packages) in the "extensions" directory
     for sub_dir in extension_folders:
+        if remaining is not None and not remaining:
+            break  # all needed types already found
         extensions_dir = os.path.join(TOOLKIT_ROOT, sub_dir)
         for (_, name, _) in pkgutil.iter_modules([extensions_dir]):
-            # try:
-                # Import the module
+            if remaining is not None and not remaining:
+                break  # all needed types already found
+            try:
                 module = importlib.import_module(f"{sub_dir}.{name}")
-                # Get the value of the AI_TOOLKIT_EXTENSIONS variable
                 extensions = getattr(module, "AI_TOOLKIT_EXTENSIONS", None)
-                # Check if the value is a list
                 if isinstance(extensions, list):
-                    # Iterate over the list and add the classes to the main list
-                    all_extension_classes.extend(extensions)
-            # except ImportError as e:
-            #     print(f"Failed to import the {name} module. Error: {str(e)}")
+                    for ext in extensions:
+                        if remaining is None or ext.uid in remaining:
+                            process_dict[ext.uid] = ext.get_process()
+                            if remaining is not None:
+                                remaining.discard(ext.uid)
+            except ImportError as e:
+                print(f"Warning: skipped extension '{name}' (missing dependency: {e})")
 
-    return all_extension_classes
-
-
-def get_all_extensions_process_dict():
-    all_extensions = get_all_extensions()
-    process_dict = {}
-    for extension in all_extensions:
-        process_dict[extension.uid] = extension.get_process()
     return process_dict

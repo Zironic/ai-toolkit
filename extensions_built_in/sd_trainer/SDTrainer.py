@@ -1,7 +1,9 @@
+import hashlib
 import os
 import random
 import contextlib
 from collections import OrderedDict
+from pathlib import Path
 from typing import Union, Literal, List, Optional
 
 import numpy as np
@@ -14,6 +16,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
+from toolkit.memory_management import soft_empty_cache, safe_ram_flush, log_vram
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.config_modules import GenerateImageConfig
 from toolkit.data_loader import get_dataloader_datasets
@@ -666,7 +669,133 @@ class SDTrainer(BaseSDTrainProcess):
 
     def before_model_load(self):
         pass
-    
+
+    # -------------------------------------------------------------------------
+    # Prompt embedding disk cache helpers
+    # -------------------------------------------------------------------------
+
+    @property
+    def _prompt_cache_dir(self) -> Path:
+        return Path(self.save_root) / '_prompt_cache'
+
+    def _embed_cache_path(self, *key_parts) -> Path:
+        """Return the safetensors path for an embedding identified by key_parts."""
+        combined = '\x00'.join(str(p) for p in key_parts)
+        digest = hashlib.sha256(combined.encode('utf-8')).hexdigest()[:32]
+        arch = getattr(self.model_config, 'arch', 'unknown')
+        return self._prompt_cache_dir / f"{arch}_{digest}.safetensors"
+
+    def _check_dataset_files_all_cached(self) -> bool:
+        """Lightweight pre-load scan: True iff every dataset file already has a
+        text-embedding cache on disk.
+
+        Replicates the get_text_embedding_path() hash formula so the check is
+        exact, without constructing FileItemDTO objects (which requires the full
+        dataset load that happens after load_model()).
+        """
+        from toolkit.cache_utils import compute_param_digest, find_cached_file
+
+        IMAGE_EXTS = frozenset(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.gif'])
+        arch = getattr(self.model_config, 'arch', None)
+
+        for ds_config in self.dataset_configs:
+            if not ds_config.cache_text_embeddings:
+                return False
+
+            # Control images baked into TE require image-path hashing — skip opt
+            if getattr(ds_config, 'encode_control_in_text_embeddings', False):
+                return False
+
+            folder = getattr(ds_config, 'folder_path', None) or getattr(ds_config, 'dataset_path', None)
+            if not folder:
+                return False
+            folder_path = Path(folder)
+            if not folder_path.exists() or not folder_path.is_dir():
+                return False
+
+            for img_path in folder_path.rglob('*'):
+                if img_path.suffix.lower() not in IMAGE_EXTS:
+                    continue
+
+                caption = getattr(ds_config, 'default_caption', None) or ''
+                for ext in ('.txt', '.caption'):
+                    cap_path = img_path.with_suffix(ext)
+                    if cap_path.exists():
+                        try:
+                            caption = cap_path.read_text(encoding='utf-8', errors='replace').strip()
+                        except Exception:
+                            caption = ''
+                        break
+
+                hash_dict = OrderedDict([
+                    ("caption", caption),
+                    ("text_embedding_space_version", arch),
+                    ("text_embedding_version", 1),
+                ])
+                param_digest = compute_param_digest(hash_dict)
+                content_digest = hashlib.sha256(caption.encode('utf-8')).hexdigest()
+                te_dir = img_path.parent / '_t_e_cache'
+                cache_path = te_dir / f'{img_path.stem}_{param_digest}_{content_digest}.safetensors'
+
+                if not find_cached_file(cache_path, legacy_fallback=False):
+                    return False
+
+        return True
+
+    def _check_all_te_inputs_cached(self) -> bool:
+        """Return True if every embedding the TE would produce is already on
+        disk, meaning the TE does not need to be loaded at all this run."""
+        if not (self.train_config.unload_text_encoder or self.is_caching_text_embeddings):
+            return False
+        if getattr(self.train_config, 'train_text_encoder', False):
+            return False
+        if getattr(self.train_config, 'diff_output_preservation', False):
+            return False
+        # Control-in-TE embeddings encode images — skip optimisation for those models
+        if getattr(self.sd, 'encode_control_in_text_embeddings', False):
+            return False
+
+        if not self._check_dataset_files_all_cached():
+            return False
+
+        arch = getattr(self.model_config, 'arch', 'unknown')
+        uncond = getattr(self.train_config, 'unconditional_prompt', '') or ''
+
+        # Special embeds: unconditional, blank, and optional trigger
+        if not self._embed_cache_path('uncond', arch, uncond).exists():
+            return False
+        if not self._embed_cache_path('blank', arch, '').exists():
+            return False
+        trigger = getattr(self, 'trigger_word', None)
+        if trigger is not None and not self._embed_cache_path('trigger', arch, trigger).exists():
+            return False
+
+        # Sample prompt embeds
+        if (self.sample_config is not None
+                and self.sample_config.samples
+                and not getattr(self.train_config, 'disable_sampling', False)):
+            for sample_item, prompt in zip(self.sample_config.samples, self.sample_config.prompts):
+                neg = sample_item.neg or ''
+                if not self._embed_cache_path('sample_pos', arch, prompt).exists():
+                    return False
+                if not self._embed_cache_path('sample_neg', arch, neg).exists():
+                    return False
+
+        return True
+
+    def hook_after_sd_init_before_load(self):
+        super().hook_after_sd_init_before_load()
+        try:
+            if self._check_all_te_inputs_cached():
+                print_acc(
+                    "[TE Skip] All text embeddings found on disk — "
+                    "skipping text encoder load to save VRAM and time."
+                )
+                self.sd._skip_text_encoder = True
+        except Exception as e:
+            # Never let the optimisation crash the job; fall back to normal load
+            print_acc(f"[TE Skip] Pre-check failed ({e}), loading TE normally.")
+
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
             return
@@ -690,70 +819,89 @@ class SDTrainer(BaseSDTrainProcess):
                     ctrl_img_3=sample_item.ctrl_img_3,
                 )
                 
+                te_skipped = getattr(self.sd, '_skip_text_encoder', False)
+                arch = getattr(self.model_config, 'arch', 'unknown')
+                # Use raw prompt/neg strings as cache keys so they match the pre-check.
+                raw_neg = sample_item.neg or ''
+
                 has_control_images = False
                 if gen_img_config.ctrl_img is not None or gen_img_config.ctrl_img_1 is not None or gen_img_config.ctrl_img_2 is not None or gen_img_config.ctrl_img_3 is not None:
                     has_control_images = True
-                # see if we need to encode the control images
-                if self.sd.encode_control_in_text_embeddings and has_control_images:
-                    
-                    ctrl_img_list = []
-                    
-                    if gen_img_config.ctrl_img is not None:
-                        ctrl_img = Image.open(gen_img_config.ctrl_img).convert("RGB")
-                        # convert to 0 to 1 tensor
-                        ctrl_img = (
-                            TF.to_tensor(ctrl_img)
-                            .unsqueeze(0)
-                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        )
-                        ctrl_img_list.append(ctrl_img)
-                    
-                    if gen_img_config.ctrl_img_1 is not None:
-                        ctrl_img_1 = Image.open(gen_img_config.ctrl_img_1).convert("RGB")
-                        # convert to 0 to 1 tensor
-                        ctrl_img_1 = (
-                            TF.to_tensor(ctrl_img_1)
-                            .unsqueeze(0)
-                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        )
-                        ctrl_img_list.append(ctrl_img_1)
-                    if gen_img_config.ctrl_img_2 is not None:
-                        ctrl_img_2 = Image.open(gen_img_config.ctrl_img_2).convert("RGB")
-                        # convert to 0 to 1 tensor
-                        ctrl_img_2 = (
-                            TF.to_tensor(ctrl_img_2)
-                            .unsqueeze(0)
-                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        )
-                        ctrl_img_list.append(ctrl_img_2)
-                    if gen_img_config.ctrl_img_3 is not None:
-                        ctrl_img_3 = Image.open(gen_img_config.ctrl_img_3).convert("RGB")
-                        # convert to 0 to 1 tensor
-                        ctrl_img_3 = (
-                            TF.to_tensor(ctrl_img_3)
-                            .unsqueeze(0)
-                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                        )
-                        ctrl_img_list.append(ctrl_img_3)
-                    
-                    if self.sd.has_multiple_control_images:
-                        ctrl_img = ctrl_img_list
-                    else:
-                        ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
-                    
-                    
-                    positive = self.sd.encode_prompt(
-                        gen_img_config.prompt,
-                        control_images=ctrl_img
-                    ).to('cpu')
-                    negative = self.sd.encode_prompt(
-                        gen_img_config.negative_prompt,
-                        control_images=ctrl_img
-                    ).to('cpu')
+
+                # Disk-cache hit: skip encoding when both pos and neg are cached.
+                # Control-image embeddings depend on image content, skip cache for those.
+                use_disk_cache = not (self.sd.encode_control_in_text_embeddings and has_control_images)
+                pos_cache_path = self._embed_cache_path('sample_pos', arch, prompt)
+                neg_cache_path = self._embed_cache_path('sample_neg', arch, raw_neg)
+
+                if use_disk_cache and (te_skipped or (pos_cache_path.exists() and neg_cache_path.exists())):
+                    positive = PromptEmbeds.load(str(pos_cache_path))
+                    negative = PromptEmbeds.load(str(neg_cache_path))
                 else:
-                    positive = self.sd.encode_prompt(gen_img_config.prompt).to('cpu')
-                    negative = self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu')
-                
+                    # see if we need to encode the control images
+                    if self.sd.encode_control_in_text_embeddings and has_control_images:
+
+                        ctrl_img_list = []
+
+                        if gen_img_config.ctrl_img is not None:
+                            ctrl_img = Image.open(gen_img_config.ctrl_img).convert("RGB")
+                            # convert to 0 to 1 tensor
+                            ctrl_img = (
+                                TF.to_tensor(ctrl_img)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(ctrl_img)
+
+                        if gen_img_config.ctrl_img_1 is not None:
+                            ctrl_img_1 = Image.open(gen_img_config.ctrl_img_1).convert("RGB")
+                            # convert to 0 to 1 tensor
+                            ctrl_img_1 = (
+                                TF.to_tensor(ctrl_img_1)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(ctrl_img_1)
+                        if gen_img_config.ctrl_img_2 is not None:
+                            ctrl_img_2 = Image.open(gen_img_config.ctrl_img_2).convert("RGB")
+                            # convert to 0 to 1 tensor
+                            ctrl_img_2 = (
+                                TF.to_tensor(ctrl_img_2)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(ctrl_img_2)
+                        if gen_img_config.ctrl_img_3 is not None:
+                            ctrl_img_3 = Image.open(gen_img_config.ctrl_img_3).convert("RGB")
+                            # convert to 0 to 1 tensor
+                            ctrl_img_3 = (
+                                TF.to_tensor(ctrl_img_3)
+                                .unsqueeze(0)
+                                .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                            )
+                            ctrl_img_list.append(ctrl_img_3)
+
+                        if self.sd.has_multiple_control_images:
+                            ctrl_img = ctrl_img_list
+                        else:
+                            ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
+
+                        positive = self.sd.encode_prompt(
+                            gen_img_config.prompt,
+                            control_images=ctrl_img
+                        ).to('cpu')
+                        negative = self.sd.encode_prompt(
+                            gen_img_config.negative_prompt,
+                            control_images=ctrl_img
+                        ).to('cpu')
+                    else:
+                        positive = self.sd.encode_prompt(gen_img_config.prompt).to('cpu')
+                        negative = self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu')
+
+                    if use_disk_cache:
+                        positive.save(str(pos_cache_path))
+                        negative.save(str(neg_cache_path))
+
                 self.sd.sample_prompts_cache.append({
                     'conditional': positive,
                     'unconditional': negative
@@ -905,6 +1053,38 @@ class SDTrainer(BaseSDTrainProcess):
 
         return params
 
+    def get_sample_offload_modules(self) -> list:
+        mods = []
+        for m in [
+            self.face_id_projector,
+            self.vision_face_projector,
+            self.body_id_projector,
+            self.taesd,
+        ]:
+            if m is not None:
+                mods.append(m)
+        return mods
+
+    def get_vram_diagnostic_modules(self) -> dict:
+        mods = {}
+        _perceptual = {
+            'id_loss_model': self.id_loss_model,
+            'landmark_loss_model': self.landmark_loss_model,
+            'body_proportion_model': self.body_proportion_model,
+            'body_shape_model': self.body_shape_model,
+            'normal_model': self.normal_model,
+            'depth_encoder': self.depth_encoder,
+            'latent_perceptual_model': self.latent_perceptual_model,
+            'vae_anchor_encoder': self.vae_anchor_encoder,
+            'face_id_projector': self.face_id_projector,
+            'vision_face_projector': self.vision_face_projector,
+            'body_id_projector': self.body_id_projector,
+        }
+        for name, m in _perceptual.items():
+            if m is not None:
+                mods[name] = m
+        return mods
+
     def _get_identity_state_dict(self) -> Optional[OrderedDict]:
         """Collect projector weights and averaged identity embeddings for saving in LoRA."""
         extra = OrderedDict()
@@ -929,6 +1109,131 @@ class SDTrainer(BaseSDTrainProcess):
             extra['identity.body_embedding'] = self._avg_body_embedding
 
         return extra if extra else None
+
+    def _do_cache_and_unload_te(self):
+        """Cache unconditional and per-image text embeddings, then unload the TE.
+
+        Factored out of hook_before_train_loop so it can be called early —
+        before perceptual dataset caching — freeing the TE's VRAM pages before
+        the perceptual models load.  Guards against double execution.
+
+        When the TE was skipped at load time (_skip_text_encoder=True) every
+        embedding is loaded from the prompt disk cache instead of encoded live.
+        """
+        if getattr(self, '_te_unloaded', False):
+            return
+
+        te_skipped = getattr(self.sd, '_skip_text_encoder', False)
+        arch = getattr(self.model_config, 'arch', 'unknown')
+        uncond_text = getattr(self.train_config, 'unconditional_prompt', '') or ''
+
+        if self.is_caching_text_embeddings:
+            self.sd.unet.to('cpu')
+
+        # --- unconditional embeds ---
+        uncond_cache_path = self._embed_cache_path('uncond', arch, uncond_text)
+        if te_skipped or uncond_cache_path.exists():
+            self.unconditional_embeds = PromptEmbeds.load(str(uncond_cache_path)).to(
+                self.device_torch, dtype=self.sd.torch_dtype
+            ).detach()
+        else:
+            with torch.no_grad():
+                kwargs = {}
+                if self.sd.encode_control_in_text_embeddings:
+                    control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    if self.sd.has_multiple_control_images:
+                        control_image = [control_image]
+                    kwargs['control_images'] = control_image
+                self.unconditional_embeds = self.sd.encode_prompt(
+                    [uncond_text],
+                    long_prompts=self.do_long_prompts,
+                    **kwargs
+                ).to(self.device_torch, dtype=self.sd.torch_dtype).detach()
+            # PromptEmbeds.save() is already atomic; no extra wrapper needed
+            self.unconditional_embeds.save(str(uncond_cache_path))
+
+        if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
+            print_acc("Caching embeddings and unloading text encoder")
+            with torch.no_grad():
+                if self.train_config.train_text_encoder:
+                    raise ValueError("Cannot unload text encoder if training text encoder")
+
+                encode_kwargs = {}
+                if self.sd.encode_control_in_text_embeddings:
+                    control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    if self.sd.has_multiple_control_images:
+                        control_image = [control_image]
+                    encode_kwargs['control_images'] = control_image
+
+                # Lazily move TE to device only when we actually need to encode something
+                _te_on_device = te_skipped  # if skipped, no need to move
+
+                def _ensure_te_on_device():
+                    nonlocal _te_on_device
+                    if not _te_on_device:
+                        self.sd.text_encoder_to(self.device_torch)
+                        _te_on_device = True
+
+                # --- blank embeds ---
+                blank_cache_path = self._embed_cache_path('blank', arch, '')
+                if te_skipped or blank_cache_path.exists():
+                    self.cached_blank_embeds = PromptEmbeds.load(str(blank_cache_path))
+                else:
+                    _ensure_te_on_device()
+                    self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
+                    self.cached_blank_embeds.save(str(blank_cache_path))
+
+                # --- trigger embeds ---
+                if self.trigger_word is not None:
+                    trigger_cache_path = self._embed_cache_path('trigger', arch, self.trigger_word)
+                    if te_skipped or trigger_cache_path.exists():
+                        self.cached_trigger_embeds = PromptEmbeds.load(str(trigger_cache_path))
+                    else:
+                        _ensure_te_on_device()
+                        self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
+                        self.cached_trigger_embeds.save(str(trigger_cache_path))
+
+                if self.train_config.diff_output_preservation:
+                    from toolkit.prompt_utils import build_dop_replacement_pairs
+                    triggers_csv = self.trigger_word
+                    classes_csv = self.train_config.diff_output_preservation_class
+                    self._dop_replacement_pairs = build_dop_replacement_pairs(
+                        triggers_csv=triggers_csv,
+                        classes_csv=classes_csv,
+                        case_insensitive=False
+                    )
+                    datasets = get_dataloader_datasets(self.data_loader)
+                    for dataset in datasets:
+                        dataset.precompute_dop_embeddings(
+                            triggers_csv=triggers_csv,
+                            classes_csv=classes_csv,
+                            encode_fn=lambda caption: self.sd.encode_prompt(caption, **encode_kwargs),
+                            case_insensitive=False,
+                            debug=getattr(self.train_config, 'diff_output_preservation_debug', False)
+                        )
+
+                self.cache_sample_prompts()
+
+                if te_skipped:
+                    print_acc("\n***** TEXT ENCODER WAS NOT LOADED (all prompts disk-cached) *****\n")
+                else:
+                    print_acc("\n***** UNLOADING TEXT ENCODER *****")
+                    if self.is_caching_text_embeddings:
+                        print_acc("Embeddings cached to disk. We dont need the text encoder anymore")
+                    else:
+                        print_acc("This will train only with a blank prompt or trigger word, if set")
+                        print_acc("If this is not what you want, remove the unload_text_encoder flag")
+                    print_acc("***********************************")
+                    print_acc("")
+
+                    if self.is_caching_text_embeddings:
+                        unload_text_encoder(self.sd)
+                    else:
+                        self.sd.text_encoder_to("cpu")
+                    flush()
+
+        self._te_unloaded = True
+        log_vram("TE unloaded (before perceptual caching)")
 
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
@@ -973,6 +1278,18 @@ class SDTrainer(BaseSDTrainProcess):
         # Run if face conditioning is enabled OR identity loss is enabled OR landmark loss is enabled OR face suppression is active
         _any_face = self.face_id_config is not None and (self.face_id_config.enabled or self.face_id_config.identity_loss_weight > 0 or self.face_id_config.landmark_loss_weight > 0 or self.face_id_config.body_proportion_loss_weight > 0 or self.face_id_config.body_shape_loss_weight > 0 or self.face_id_config.normal_loss_weight > 0 or _vae_anchor_enabled or self.face_id_config.identity_metrics or _ds_identity or _ds_landmark or _ds_body_prop or _ds_body_shape or _ds_normal)
         _any_face = _any_face or _any_face_suppression
+
+        # Cache text embeddings and unload the TE before any perceptual model
+        # loads, so the TE's VRAM pages are freed first.
+        self._do_cache_and_unload_te()
+
+        # Flush stale mmap pages from model/TE loading before any perceptual
+        # model is loaded. Safetensors mmap file handles stay open until all
+        # Python refs (including GC cycles) are broken; multiple GC passes here
+        # release those handles so Windows can reclaim those physical pages
+        # before each perceptual model loads its own file into the working set.
+        safe_ram_flush()
+
         if _any_face:
             # If face_suppression_weight needs bboxes but no face_id config exists, create a minimal one
             _face_cache_config = self.face_id_config
@@ -987,6 +1304,7 @@ class SDTrainer(BaseSDTrainProcess):
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
                     cache_face_embeddings(dataset.file_list, _face_cache_config)
+            safe_ram_flush()
 
         # Compute per-dataset average identity embeddings
         self._identity_mean_embed = None  # (512,) ArcFace bias direction, set after model load
@@ -1059,6 +1377,7 @@ class SDTrainer(BaseSDTrainProcess):
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
                     cache_body_proportion_embeddings(dataset.file_list, self.face_id_config)
+            safe_ram_flush()
 
         # Body shape (HybrIK): cache SMPL betas for body shape loss
         if self.face_id_config is not None and (self.face_id_config.body_shape_loss_weight > 0 or _ds_body_shape):
@@ -1071,6 +1390,7 @@ class SDTrainer(BaseSDTrainProcess):
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
                     cache_body_shape_embeddings(dataset.file_list, self.face_id_config)
+            safe_ram_flush()
 
         # Normal maps (Sapiens): cache surface normals for normal loss
         if self.face_id_config is not None and (self.face_id_config.normal_loss_weight > 0 or _ds_normal):
@@ -1083,6 +1403,7 @@ class SDTrainer(BaseSDTrainProcess):
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
                     cache_normal_embeddings(dataset.file_list, self.face_id_config)
+            safe_ram_flush()
 
         # NOTE: depth consistency GT caching is deferred until after the TAEF2
         # decoder is loaded (further below) so the cache can run pixels through
@@ -1110,6 +1431,7 @@ class SDTrainer(BaseSDTrainProcess):
                         dataset.file_list, self.subject_mask_config,
                         preview_dir=_sm_preview_dir,
                     )
+            safe_ram_flush()
 
         # VAE anchor features: cache multi-scale VAE encoder features for perceptual anchor loss
         if _vae_anchor_enabled:
@@ -1122,6 +1444,7 @@ class SDTrainer(BaseSDTrainProcess):
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
                     cache_vae_anchor_features(dataset.file_list, self.face_id_config)
+            safe_ram_flush()
 
         # Body shape (conditioning): cache SMPL betas for all datasets
         if self.body_id_config is not None and self.body_id_config.enabled:
@@ -1134,6 +1457,7 @@ class SDTrainer(BaseSDTrainProcess):
                 datasets = get_dataloader_datasets(self.data_loader_reg)
                 for dataset in datasets:
                     cache_body_embeddings(dataset.file_list, self.body_id_config)
+            safe_ram_flush()
 
         # Compute averaged identity embeddings for saving in LoRA
         self._avg_face_embedding = None
@@ -1185,6 +1509,7 @@ class SDTrainer(BaseSDTrainProcess):
 
         # Load identity loss model (ArcFace + TAESD) if enabled
         # Works with or without face token conditioning (face_id.enabled)
+        log_vram("perceptual model loading — start")
         if (self.face_id_config is not None
                 and (self.face_id_config.identity_loss_weight > 0 or self.face_id_config.identity_metrics or _ds_identity)):
             print_acc("LoRA+ID: Loading identity loss model (ArcFace)...")
@@ -1347,6 +1672,33 @@ class SDTrainer(BaseSDTrainProcess):
                 _decoder.forward = _fine_ckpt_forward
                 print_acc("  VAE decoder: fine-grained gradient checkpointing enabled")
 
+        log_vram("perceptual models loaded (pre-offload)")
+        # CPU-offload frozen perceptual models when low_vram is set.
+        # Accelerate registers pre/post forward hooks that move each model to
+        # GPU just before its forward() call and back to CPU immediately after,
+        # so they only occupy VRAM for the duration of their forward pass.
+        if self.model_config.low_vram:
+            from accelerate import cpu_offload as _cpu_offload
+            _perceptual_models = [
+                self.id_loss_model,
+                self.landmark_loss_model,
+                self.body_proportion_model,
+                self.body_shape_model,
+                self.normal_model,
+                self.depth_encoder,
+                self.latent_perceptual_model,
+                self.vae_anchor_encoder,
+            ]
+            for _m in _perceptual_models:
+                if _m is not None:
+                    _cpu_offload(_m, execution_device=self.device_torch)
+            # empty_cache flushes CUDA allocator pages freed by cpu_offload().
+            # Without this the allocator holds those pages as "reserved" even
+            # though no tensor needs them, keeping VRAM commit inflated.
+            torch.cuda.empty_cache()
+            print_acc("LoRA+ID: Perceptual models CPU-offloaded via Accelerate (low_vram mode)")
+        log_vram("perceptual models post-offload")
+
         # Load lightweight decoder for face losses (identity)
         if _need_face_decoder and self.taesd is None:
             if hasattr(self.sd.vae, 'config') and self.sd.vae.config is not None:
@@ -1486,28 +1838,25 @@ class SDTrainer(BaseSDTrainProcess):
                 for dataset in get_dataloader_datasets(self.data_loader_reg):
                     _cache_dataset_depth(dataset)
 
-        if self.is_caching_text_embeddings:
-            # make sure model is on cpu for this part so we don't oom.
-            self.sd.unet.to('cpu')
+        # unconditional embeds and TE unload handled early in
+        # _do_cache_and_unload_te() — these are no-ops when that ran.
+        if not getattr(self, '_te_unloaded', False):
+            if self.is_caching_text_embeddings:
+                self.sd.unet.to('cpu')
 
-        # cache unconditional embeds (blank prompt)
-        with torch.no_grad():
-            kwargs = {}
-            if self.sd.encode_control_in_text_embeddings:
-                # just do a blank image for unconditionals
-                control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                if self.sd.has_multiple_control_images:
-                    control_image = [control_image]
-                
-                kwargs['control_images'] = control_image
-            self.unconditional_embeds = self.sd.encode_prompt(
-                [self.train_config.unconditional_prompt],
-                long_prompts=self.do_long_prompts,
-                **kwargs
-            ).to(
-                self.device_torch,
-                dtype=self.sd.torch_dtype
-            ).detach()
+        if self.unconditional_embeds is None:
+            with torch.no_grad():
+                kwargs = {}
+                if self.sd.encode_control_in_text_embeddings:
+                    control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    if self.sd.has_multiple_control_images:
+                        control_image = [control_image]
+                    kwargs['control_images'] = control_image
+                self.unconditional_embeds = self.sd.encode_prompt(
+                    [self.train_config.unconditional_prompt],
+                    long_prompts=self.do_long_prompts,
+                    **kwargs
+                ).to(self.device_torch, dtype=self.sd.torch_dtype).detach()
         
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
@@ -1549,14 +1898,14 @@ class SDTrainer(BaseSDTrainProcess):
                 # single prompt
                 self.negative_prompt_pool = [self.train_config.negative_prompt]
 
-        # handle unload text encoder
-        if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
+        # handle unload text encoder — _do_cache_and_unload_te() runs this
+        # early (before perceptual caching); this block is a fallback no-op.
+        if (self.train_config.unload_text_encoder or self.is_caching_text_embeddings) and not getattr(self, '_te_unloaded', False):
+            _te_skipped_fallback = getattr(self.sd, '_skip_text_encoder', False)
             print_acc("Caching embeddings and unloading text encoder")
             with torch.no_grad():
                 if self.train_config.train_text_encoder:
                     raise ValueError("Cannot unload text encoder if training text encoder")
-                # cache embeddings
-                self.sd.text_encoder_to(self.device_torch)
                 encode_kwargs = {}
                 if self.sd.encode_control_in_text_embeddings:
                     # just do a blank image for unconditionals
@@ -1564,9 +1913,19 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.sd.has_multiple_control_images:
                         control_image = [control_image]
                     encode_kwargs['control_images'] = control_image
-                self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
-                if self.trigger_word is not None:
-                    self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
+                if not _te_skipped_fallback:
+                    # cache embeddings
+                    self.sd.text_encoder_to(self.device_torch)
+                    self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
+                    if self.trigger_word is not None:
+                        self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
+                else:
+                    arch_fb = getattr(self.model_config, 'arch', 'unknown')
+                    self.cached_blank_embeds = PromptEmbeds.load(str(self._embed_cache_path('blank', arch_fb, '')))
+                    if self.trigger_word is not None:
+                        self.cached_trigger_embeds = PromptEmbeds.load(
+                            str(self._embed_cache_path('trigger', arch_fb, self.trigger_word))
+                        )
 
                 # DOP: Precompute embeddings via dataloader (new pattern)
                 if self.train_config.diff_output_preservation:
@@ -1612,13 +1971,34 @@ class SDTrainer(BaseSDTrainProcess):
                     # keep legacy usage for now. 
                     self.sd.text_encoder_to("cpu")
                 flush()
-        
+
+        # For low_vram runs that don't use unload_text_encoder: cache sample
+        # prompts now so generate_images never needs text encoders in VRAM.
+        # Sample prompts are fixed for the entire job, so one encode is enough.
+        _te_skipped = getattr(self.sd, '_skip_text_encoder', False)
+        if self.model_config.low_vram and self.sd.sample_prompts_cache is None:
+            print_acc("Caching sample prompts (low_vram: text encoders will stay off GPU during sampling)")
+            with torch.no_grad():
+                if not _te_skipped:
+                    self.sd.text_encoder_to(self.device_torch)
+                    soft_empty_cache()
+                self.cache_sample_prompts()
+                if not _te_skipped:
+                    self.sd.text_encoder_to('cpu')
+                    soft_empty_cache()
+
         if self.train_config.blank_prompt_preservation and self.cached_blank_embeds is None:
             # make sure we have this if not unloading
-            self.cached_blank_embeds = self.sd.encode_prompt("").to(
-                self.device_torch,
-                dtype=self.sd.torch_dtype
-            ).detach()
+            if _te_skipped:
+                arch = getattr(self.model_config, 'arch', 'unknown')
+                self.cached_blank_embeds = PromptEmbeds.load(
+                    str(self._embed_cache_path('blank', arch, ''))
+                ).to(self.device_torch, dtype=self.sd.torch_dtype).detach()
+            else:
+                self.cached_blank_embeds = self.sd.encode_prompt("").to(
+                    self.device_torch,
+                    dtype=self.sd.torch_dtype
+                ).detach()
         
         if self.train_config.diffusion_feature_extractor_path is not None:
             vae = self.sd.vae
@@ -3526,7 +3906,7 @@ class SDTrainer(BaseSDTrainProcess):
                             x0_unscaled = x0_unscaled + self.sd.vae.config['shift_factor']
                         x0_vae_pixels = self.sd.vae.decode(x0_unscaled.to(vae_dtype)).sample.clamp(-1, 1)
                         with torch.amp.autocast('cuda', enabled=False):
-                            _, pred_features = self.vae_anchor_encoder.encode_with_features(x0_vae_pixels.float())
+                            _, pred_features = self.vae_anchor_encoder(x0_vae_pixels.float())
 
                         # Compute cosine loss per feature level — returns (B,) per-sample losses
                         va_loss_per_sample, va_per_level = VAEAnchorEncoder.compute_loss(

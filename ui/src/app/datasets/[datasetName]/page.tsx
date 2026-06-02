@@ -15,13 +15,14 @@ import useSettings from '@/hooks/useSettings';
 import { pathJoin } from '@/utils/basic';
 import AutoCaptionButton from '@/components/AutoCaptionButton';
 
-export default function DatasetPage({ params }: { params: { datasetName: string } }) {
+export default function DatasetPage({ params }: { params: Promise<{ datasetName: string }> }) {
   const [imgList, setImgList] = useState<{ img_path: string }[]>([]);
-  const usableParams = use(params as any) as { datasetName: string };
+  const usableParams = use(params) as { datasetName: string };
   const datasetName = usableParams.datasetName;
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const { settings, isSettingsLoaded } = useSettings();
   const [selectedImgPath, setSelectedImgPath] = useState<string | null>(null);
+  const [isAutoCaptioning, setIsAutoCaptioning] = useState(false);
   const [captionRefreshKeys, setCaptionRefreshKeys] = useState<Record<string, number>>({});
   const [scrollParent, setScrollParent] = useState<HTMLDivElement | null>(null);
   const scrollParentCallback = useCallback((el: HTMLDivElement | null) => setScrollParent(el), []);
@@ -41,7 +42,6 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         setStatus('error');
       });
   };
-  useOpenImagesModalOnDrag(datasetName, () => refreshImageList(datasetName));
 
   const imgPaths = useMemo(() => imgList.map(img => img.img_path), [imgList]);
 
@@ -160,12 +160,13 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         )}
       </MainContent>
       <AddImagesModal />
+      <FullscreenDropOverlay datasetName={datasetName} onComplete={() => refreshImageList(datasetName)} />
       <DatasetImageViewer
         imgPath={selectedImgPath}
         imageList={imgPaths}
         onChange={setSelectedImgPath}
         refreshImages={() => refreshImageList(datasetName)}
-        onCaptionSaved={path => setCaptionRefreshKeys(prev => ({ ...prev, [path]: (prev[path] || 0) + 1 })}
+        onCaptionSaved={path => setCaptionRefreshKeys(prev => ({ ...prev, [path]: (prev[path] || 0) + 1 }))}
       />
     </>
   );

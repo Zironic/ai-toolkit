@@ -15,7 +15,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file
+from toolkit.util.safe_save import atomic_save_file
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -318,23 +319,35 @@ def cache_normal_embeddings(
 
     CACHE_VERSION_KEY = 'normal_v1'
 
-    encoder = DifferentiableNormalEncoder()
-    encoder.to('cuda')
-
-    no_normal_count = 0
-
-    for file_item in tqdm(file_items, desc="Caching normal maps"):
+    # Pre-scan: load cached items immediately, collect only those that need inference
+    uncached = []
+    for file_item in file_items:
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, '_face_id_cache')
         filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
         cache_path = os.path.join(cache_dir, f'{filename_no_ext}_normals.safetensors')
-
-        # Check cache
         if os.path.exists(cache_path):
             data = load_file(cache_path)
             if 'normal_embedding' in data and CACHE_VERSION_KEY in data:
                 file_item.normal_embedding = data['normal_embedding'].clone()
                 continue
+        uncached.append(file_item)
+
+    if not uncached:
+        print(f"  -  Normal embeddings: all {len(file_items)} cached, skipping model load")
+        return
+
+    print(f"  Loading Sapiens 0.3B normal model ({len(uncached)}/{len(file_items)} images need processing)...")
+    encoder = DifferentiableNormalEncoder()
+    encoder.to('cuda')
+
+    no_normal_count = 0
+
+    for file_item in tqdm(uncached, desc="Caching normal maps"):
+        img_dir = os.path.dirname(file_item.path)
+        cache_dir = os.path.join(img_dir, '_face_id_cache')
+        filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
+        cache_path = os.path.join(cache_dir, f'{filename_no_ext}_normals.safetensors')
 
         pil_image = exif_transpose(Image.open(file_item.path)).convert('RGB')
         normals = encoder.encode(pil_image)  # (3, 256, 192)
@@ -349,7 +362,7 @@ def cache_normal_embeddings(
             'normal_embedding': normals.half(),  # fp16 to save disk (~300KB)
             CACHE_VERSION_KEY: torch.ones(1),
         }
-        save_file(save_data, cache_path)
+        atomic_save_file(save_data, cache_path)
 
     del encoder
     torch.cuda.empty_cache()

@@ -1,5 +1,6 @@
 import { GroupedSelectOption, SelectOption, JobConfig } from '@/types';
 import { defaultSliderConfig } from './jobConfig';
+import { defaultAudioSampleConfig, defaultSampleConfig } from '@/helpers/defaultSamples';
 
 type Control = 'depth' | 'line' | 'pose' | 'inpaint';
 
@@ -31,7 +32,7 @@ type AdditionalSections =
   | 'model.qie.match_target_res'
   | 'model.assistant_lora_path';
 
-type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental';
+type ModelGroup = 'image' | 'instruction' | 'video' | 'audio' | 'experimental';
 
 export interface ModelArch {
   name: string;

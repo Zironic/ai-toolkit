@@ -6,7 +6,8 @@ from typing import Optional, List, Tuple, TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn as nn
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file
+from toolkit.util.safe_save import atomic_save_file
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -519,6 +520,41 @@ def cache_face_embeddings(
     landmark_loss_enabled = face_id_config.landmark_loss_weight > 0
     need_bbox = vision_enabled or identity_loss_enabled or landmark_loss_enabled
 
+    # Pre-scan: load cached items immediately, collect only those that need inference
+    uncached = []
+    for file_item in file_items:
+        img_dir = os.path.dirname(file_item.path)
+        cache_dir = os.path.join(img_dir, '_face_id_cache')
+        filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
+        cache_path = os.path.join(cache_dir, f'{filename_no_ext}.safetensors')
+        if os.path.exists(cache_path):
+            data = load_file(cache_path)
+            has_arcface = 'face_embedding' in data
+            has_vision = 'vision_face_embedding' in data
+            has_identity = 'identity_embedding' in data
+            has_landmark = 'landmark_embedding' in data
+            has_bbox = 'face_bbox' in data
+            if (has_arcface
+                    and (not vision_enabled or has_vision)
+                    and (not identity_loss_enabled or has_identity)
+                    and (not landmark_loss_enabled or has_landmark)
+                    and (not need_bbox or has_bbox)):
+                file_item.face_embedding = data['face_embedding'].clone()
+                if has_bbox:
+                    file_item.face_bbox = data['face_bbox'].clone()
+                if vision_enabled and has_vision:
+                    file_item.vision_face_embedding = data['vision_face_embedding'].clone()
+                if identity_loss_enabled and has_identity:
+                    file_item.identity_embedding = data['identity_embedding'].clone()
+                if landmark_loss_enabled and has_landmark:
+                    file_item.landmark_embedding = data['landmark_embedding'].clone()
+                continue
+        uncached.append(file_item)
+
+    if not uncached:
+        print(f"  -  Face embeddings: all {len(file_items)} cached, skipping model load")
+        return
+
     extractor = FaceIDExtractor(model_name=face_id_config.face_model)
     vision_encoder = None
     if vision_enabled:
@@ -537,39 +573,11 @@ def cache_face_embeddings(
 
     no_face_count = 0
 
-    for file_item in tqdm(file_items, desc="Caching face embeddings"):
+    for file_item in tqdm(uncached, desc="Caching face embeddings"):
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, '_face_id_cache')
         filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
         cache_path = os.path.join(cache_dir, f'{filename_no_ext}.safetensors')
-
-        # Check if cache exists and has all needed keys
-        if os.path.exists(cache_path):
-            data = load_file(cache_path)
-            has_arcface = 'face_embedding' in data
-            has_vision = 'vision_face_embedding' in data
-            has_identity = 'identity_embedding' in data
-            has_landmark = 'landmark_embedding' in data
-            has_bbox = 'face_bbox' in data
-
-            if (has_arcface
-                    and (not vision_enabled or has_vision)
-                    and (not identity_loss_enabled or has_identity)
-                    and (not landmark_loss_enabled or has_landmark)
-                    and (not need_bbox or has_bbox)):
-                # Cache is complete — clone() all tensors because safetensors
-                # memory-maps files; if another caching pass (e.g. body
-                # proportion) overwrites this file, mmap'd tensors go stale.
-                file_item.face_embedding = data['face_embedding'].clone()
-                if has_bbox:
-                    file_item.face_bbox = data['face_bbox'].clone()
-                if vision_enabled and has_vision:
-                    file_item.vision_face_embedding = data['vision_face_embedding'].clone()
-                if identity_loss_enabled and has_identity:
-                    file_item.identity_embedding = data['identity_embedding'].clone()
-                if landmark_loss_enabled and has_landmark:
-                    file_item.landmark_embedding = data['landmark_embedding'].clone()
-                continue
 
         # Need to extract (either no cache or missing embeddings)
         pil_image = exif_transpose(Image.open(file_item.path)).convert('RGB')
@@ -636,7 +644,7 @@ def cache_face_embeddings(
             save_data['landmark_embedding'] = landmark_tensor
 
         os.makedirs(cache_dir, exist_ok=True)
-        save_file(save_data, cache_path)
+        atomic_save_file(save_data, cache_path)
 
     # Free encoder VRAM
     if vision_encoder is not None:
@@ -648,4 +656,4 @@ def cache_face_embeddings(
     torch.cuda.empty_cache()
 
     if no_face_count > 0:
-        print(f"  -  Warning: no face detected in {no_face_count}/{len(file_items)} images (using zero vector)")
+        print(f"  -  Warning: no face detected in {no_face_count}/{len(uncached)} images (using zero vector)")

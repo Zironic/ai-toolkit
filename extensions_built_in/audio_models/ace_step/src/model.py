@@ -20,7 +20,10 @@ import time
 
 import torch
 import torch.nn.functional as F
-import torchaudio
+try:
+    import torchaudio
+except ImportError:
+    torchaudio = None
 from safetensors.torch import load_file
 from torch import nn
 from transformers import AutoTokenizer

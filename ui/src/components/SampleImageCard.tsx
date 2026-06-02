@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, ReactNode } from 'react';
-import { isVideo } from '@/utils/basic';
+import { isVideo, isAudio } from '@/utils/basic';
 
 interface SampleImageCardProps {
   imageUrl: string;

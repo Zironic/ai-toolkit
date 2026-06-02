@@ -19,9 +19,9 @@ from safetensors.torch import save_file, load_file
 from torch.utils.data import DataLoader
 import torch
 import torch.backends.cuda
-from huggingface_hub import HfApi, Repository, interpreter_login
-from huggingface_hub.utils import HfFolder
-from toolkit.memory_management import MemoryManager
+from huggingface_hub import HfApi, interpreter_login
+from toolkit.memory_management import MemoryManager, log_vram, safe_ram_flush
+from toolkit.gpu_diagnostics import dump_vram_map
 
 from toolkit.basic import value_map
 from toolkit.clip_vision_adapter import ClipVisionAdapter
@@ -293,6 +293,46 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         return generate_image_config_list
 
+    def warmup_vram(self):
+        """Run a single 1-step inference pass before training to warm up CUDA memory layout.
+
+        Going through the generate→train device-state round-trip compacts the CUDA allocator
+        and moves quantised weights through their first GPU→GPU transition, giving the same
+        VRAM layout as if real samples had been generated — without producing keeper images.
+        """
+        if not self.accelerator.is_main_process:
+            return
+        if self.sample_config is None or not self.sample_config.samples:
+            return
+        import tempfile
+        print_acc("VRAM warmup: running 1-step inference to initialise memory layout...")
+        sample_config = self.sample_config
+        sample_item = sample_config.samples[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GenerateImageConfig(
+                prompt=sample_item.prompt or '',
+                width=sample_item.width,
+                height=sample_item.height,
+                negative_prompt=sample_item.neg or '',
+                seed=sample_config.seed,
+                guidance_scale=sample_item.guidance_scale,
+                num_inference_steps=1,
+                network_multiplier=sample_item.network_multiplier,
+                extra_values=sample_config.extra_values,
+                output_folder=tmpdir,
+                output_ext=sample_config.ext,
+            )
+            _offload = self.get_sample_offload_modules()
+            for _m in _offload:
+                _m.to('cpu')
+            if _offload:
+                torch.cuda.empty_cache()
+            self.sd.generate_images([config], sampler=sample_config.sampler)
+            for _m in _offload:
+                _m.to(self.sd.device_torch)
+        flush()
+        print_acc("VRAM warmup complete.")
+
     def sample(self, step=None, is_first=False):
         if not self.accelerator.is_main_process:
             return
@@ -388,10 +428,36 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
         
-        # send to be generated
+        # Move training-only modules (projectors, TAESD) to CPU during sampling
+        _sample_offload = self.get_sample_offload_modules()
+        for _m in _sample_offload:
+            _m.to('cpu')
+        if _sample_offload:
+            torch.cuda.empty_cache()
+
+        log_vram("inference start (after offload, before generate_images)")
+        _infer_diag = {}
+        if self.sd.unet is not None:
+            _infer_diag['transformer'] = self.sd.unet
+        if self.sd.vae is not None:
+            _infer_diag['vae'] = self.sd.vae
+        if self.sd.text_encoder is not None:
+            te = self.sd.text_encoder
+            if isinstance(te, list):
+                for _i, _t in enumerate(te):
+                    _infer_diag[f'text_encoder_{_i}'] = _t
+            else:
+                _infer_diag['text_encoder'] = te
+        if self.sd.network is not None:
+            _infer_diag['network_lokr'] = self.sd.network
+        _infer_diag.update(self.get_vram_diagnostic_modules())
+        print(dump_vram_map(_infer_diag))
         self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        
+        # Restore training-only modules back to GPU
+        for _m in _sample_offload:
+            _m.to(self.sd.device_torch)
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
@@ -810,6 +876,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def hook_add_extra_train_params(self, params):
         # override in subclass
         return params
+
+    def get_vram_diagnostic_modules(self) -> dict:
+        """Return a name->module dict for dump_vram_map(). Override in subclasses to add extra models."""
+        return {}
+
+    def get_sample_offload_modules(self) -> list:
+        """Return modules to move to CPU during sampling and restore to GPU after.
+        Override in subclasses to include training-only models (projectors, TAESD, etc.)."""
+        return []
 
     def hook_before_train_loop(self):
         if self.accelerator.is_main_process:
@@ -1789,10 +1864,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             unet.enable_xformers_memory_efficient_attention()
             if isinstance(text_encoder, list):
                 for te in text_encoder:
+                    if te is None:
+                        continue
                     # if it has it
                     if hasattr(te, 'enable_xformers_memory_efficient_attention'):
                         te.enable_xformers_memory_efficient_attention()
-        
+
         if self.train_config.attention_backend != 'native':
             if hasattr(vae, 'set_attention_backend'):
                 vae.set_attention_backend(self.train_config.attention_backend)
@@ -1800,10 +1877,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 unet.set_attention_backend(self.train_config.attention_backend)
             if isinstance(text_encoder, list):
                 for te in text_encoder:
+                    if te is None:
+                        continue
                     if hasattr(te, 'set_attention_backend'):
                         te.set_attention_backend(self.train_config.attention_backend)
             else:
-                if hasattr(text_encoder, 'set_attention_backend'):
+                if text_encoder is not None and hasattr(text_encoder, 'set_attention_backend'):
                     text_encoder.set_attention_backend(self.train_config.attention_backend)
         if self.train_config.sdp:
             torch.backends.cuda.enable_math_sdp(True)
@@ -1838,15 +1917,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print("Gradient checkpointing not supported on this model")
             if isinstance(text_encoder, list):
                 for te in text_encoder:
+                    if te is None:
+                        continue
                     if hasattr(te, 'enable_gradient_checkpointing'):
                         te.enable_gradient_checkpointing()
                     if hasattr(te, "gradient_checkpointing_enable"):
                         te.gradient_checkpointing_enable()
             else:
-                if hasattr(text_encoder, 'enable_gradient_checkpointing'):
-                    text_encoder.enable_gradient_checkpointing()
-                if hasattr(text_encoder, "gradient_checkpointing_enable"):
-                    text_encoder.gradient_checkpointing_enable()
+                if text_encoder is not None:
+                    if hasattr(text_encoder, 'enable_gradient_checkpointing'):
+                        text_encoder.enable_gradient_checkpointing()
+                    if hasattr(text_encoder, "gradient_checkpointing_enable"):
+                        text_encoder.gradient_checkpointing_enable()
 
         if self.sd.refiner_unet is not None:
             self.sd.refiner_unet.to(self.device_torch, dtype=dtype)
@@ -1859,11 +1941,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if isinstance(text_encoder, list):
             for te in text_encoder:
+                if te is None:
+                    continue
                 te.requires_grad_(False)
                 te.eval()
         else:
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
+            if text_encoder is not None:
+                text_encoder.requires_grad_(False)
+                text_encoder.eval()
         unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
@@ -2208,11 +2293,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sample(0, is_first=True)
 
         # sample first
-        if self.train_config.skip_first_sample or self.train_config.disable_sampling:
+        if self.train_config.disable_sampling:
             print_acc("Skipping first sample due to config setting")
+        elif self.train_config.skip_first_sample:
+            # No keeper images, but still do the generate→train round-trip so the
+            # CUDA allocator warms up and training runs at full speed from step 1.
+            print_acc("Skipping first sample — running VRAM warmup with 1 inference step")
+            self.warmup_vram()
         elif self.step_num <= 1 or self.train_config.force_first_sample:
             print_acc("Generating baseline samples before training")
             self.sample(self.step_num)
+        else:
+            # Resuming mid-run: no samples generated, but still warm up VRAM
+            # so the CUDA allocator is in the same state as after a normal sample run.
+            print_acc("Resuming from checkpoint — running VRAM warmup with 1 inference step")
+            self.warmup_vram()
         
         if self.accelerator.is_local_main_process:
             self.progress_bar = ToolkitProgressBar(
@@ -2260,10 +2355,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # TRAIN LOOP
         ###################################################################
 
-
+        safe_ram_flush()
+        log_vram("training loop start")
+        _diag_modules = {}
+        if self.sd.unet is not None:
+            _diag_modules['transformer'] = self.sd.unet
+        if self.sd.vae is not None:
+            _diag_modules['vae'] = self.sd.vae
+        if self.sd.text_encoder is not None:
+            te = self.sd.text_encoder
+            if isinstance(te, list):
+                for i, t in enumerate(te):
+                    _diag_modules[f'text_encoder_{i}'] = t
+            else:
+                _diag_modules['text_encoder'] = te
+        if self.sd.network is not None:
+            _diag_modules['network_lokr'] = self.sd.network
+        if self.optimizer is not None:
+            _diag_modules['optimizer'] = self.optimizer
+        _diag_modules.update(self.get_vram_diagnostic_modules())
+        print(dump_vram_map(_diag_modules))
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
+        _logged_first_step = False
         for step in range(start_step_num, self.train_config.steps):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
@@ -2385,6 +2500,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
+                if not _logged_first_step:
+                    log_vram("after first training step (peak activation memory)")
+                    _logged_first_step = True
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:

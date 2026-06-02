@@ -41,6 +41,7 @@ from torchvision.transforms import functional as TF
 from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
+from toolkit.memory_management import log_vram
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
@@ -403,8 +404,11 @@ class BaseModel:
         else:
             network = BlankNetwork()
 
+        log_vram("generate_images: before save_device_state")
         self.save_device_state()
+        log_vram("generate_images: after save_device_state / before set_device_state_preset")
         self.set_device_state_preset('generate')
+        log_vram("generate_images: after set_device_state_preset('generate')")
 
         # save current seed state for training
         rng_state = torch.get_rng_state()
@@ -416,6 +420,7 @@ class BaseModel:
                 pipeline.set_progress_bar_config(disable=True)
             except:
                 pass
+        log_vram("generate_images: after get_generation_pipeline()")
 
         # Enable CacheDiT acceleration for supported DiT pipelines
         cache_dit_enabled = False
@@ -431,6 +436,7 @@ class BaseModel:
                 cache_dit_enabled = True
         except ImportError:
             pass
+        log_vram("generate_images: after CacheDiT setup")
 
         start_multiplier = 1.0
         if network is not None:
@@ -1467,21 +1473,48 @@ class BaseModel:
         self.set_device_state(self.device_state)
         self.device_state = None
 
+    @staticmethod
+    def _move_module_if_needed(module, device):
+        """Move module to device only if it is not already there.
+
+        Calling .to() on a quanto-frozen model that is already on the target
+        device triggers QTensor.__torch_dispatch__ and materialises a full-
+        precision dequantised copy alongside the frozen quantised weights,
+        doubling transformer VRAM. Skipping the call when the device matches
+        avoids this entirely.
+        """
+        target = torch.device(device)
+        try:
+            first_param = next(module.parameters())
+            current = first_param.device
+            if current.type == target.type and (
+                target.index is None or current.index == target.index
+            ):
+                return
+        except StopIteration:
+            return
+        module.to(device)
+
     def set_device_state(self, state):
+        log_vram("set_device_state: start")
         if state['vae']['training']:
             self.vae.train()
         else:
             self.vae.eval()
-        self.vae.to(state['vae']['device'])
+        self._move_module_if_needed(self.vae, state['vae']['device'])
+        log_vram("set_device_state: after vae")
         if state['unet']['training']:
             self.unet.train()
         else:
             self.unet.eval()
-        self.unet.to(state['unet']['device'])
+        log_vram("set_device_state: after unet.eval()")
+        self._move_module_if_needed(self.unet, state['unet']['device'])
+        log_vram("set_device_state: after unet._move_if_needed()")
         if state['unet']['requires_grad']:
             self.unet.requires_grad_(True)
         else:
             self.unet.requires_grad_(False)
+        log_vram("set_device_state: after unet.requires_grad_()")
         if isinstance(self.text_encoder, list):
             for i, encoder in enumerate(self.text_encoder):
                 if isinstance(state['text_encoder'], list):
@@ -1489,7 +1522,7 @@ class BaseModel:
                         encoder.train()
                     else:
                         encoder.eval()
-                    encoder.to(state['text_encoder'][i]['device'])
+                    self._move_module_if_needed(encoder, state['text_encoder'][i]['device'])
                     encoder.requires_grad_(
                         state['text_encoder'][i]['requires_grad'])
                 else:
@@ -1497,7 +1530,7 @@ class BaseModel:
                         encoder.train()
                     else:
                         encoder.eval()
-                    encoder.to(state['text_encoder']['device'])
+                    self._move_module_if_needed(encoder, state['text_encoder']['device'])
                     encoder.requires_grad_(
                         state['text_encoder']['requires_grad'])
         else:
@@ -1505,12 +1538,12 @@ class BaseModel:
                 self.text_encoder.train()
             else:
                 self.text_encoder.eval()
-            self.text_encoder.to(state['text_encoder']['device'])
+            self._move_module_if_needed(self.text_encoder, state['text_encoder']['device'])
             self.text_encoder.requires_grad_(
                 state['text_encoder']['requires_grad'])
 
         if self.adapter is not None:
-            self.adapter.to(state['adapter']['device'])
+            self._move_module_if_needed(self.adapter, state['adapter']['device'])
             self.adapter.requires_grad_(state['adapter']['requires_grad'])
             if state['adapter']['training']:
                 self.adapter.train()
@@ -1518,7 +1551,7 @@ class BaseModel:
                 self.adapter.eval()
 
         if self.refiner_unet is not None:
-            self.refiner_unet.to(state['refiner_unet']['device'])
+            self._move_module_if_needed(self.refiner_unet, state['refiner_unet']['device'])
             self.refiner_unet.requires_grad_(
                 state['refiner_unet']['requires_grad'])
             if state['refiner_unet']['training']:

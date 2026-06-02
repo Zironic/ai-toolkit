@@ -17,6 +17,7 @@ interface DatasetImageCardProps {
   captionRefreshKey?: number;
   observerRoot?: Element | null;
   rootMargin?: string;
+  isAutoCaptioning?: boolean;
 }
 
 const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
@@ -29,6 +30,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   captionRefreshKey = 0,
   observerRoot = null,
   rootMargin = '200px 0px',
+  isAutoCaptioning = false,
 }) => {
   const [loaded, setLoaded] = useState<boolean>(false);
   const [showAudioPlayer, setShowAudioPlayer] = useState(true);
@@ -256,7 +258,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             </button>
           </div>
         </div>
-        {inViewport && isVisible && !isItAudio && (
+        {isVisible && !isItAudio && (
           <div className="text-xs text-gray-100 bg-gray-950 mt-1 absolute bottom-0 left-0 p-1 opacity-25 hover:opacity-90 transition-opacity duration-300 w-full">
             {imageUrl}
           </div>

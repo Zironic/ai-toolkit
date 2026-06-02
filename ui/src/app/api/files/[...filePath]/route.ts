@@ -4,8 +4,9 @@ import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 
-export async function GET(request: NextRequest, { params }: { params: { filePath: string } }) {
-  const { filePath } = await params;
+export async function GET(request: NextRequest, { params }: { params: Promise<{ filePath: string[] }> }) {
+  const { filePath: filePathParts } = await params;
+  const filePath = filePathParts.join('/');
   try {
     // Decode the path
     const decodedFilePath = decodeURIComponent(filePath);

@@ -44,17 +44,17 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
       key: 'steps',
       render: row => {
         const jobConfig: JobConfig = JSON.parse(row.job_config);
-        const totalSteps = jobConfig.config.process[0].train.steps;
+        const totalSteps = jobConfig.config.process[0].train?.steps;
 
         return (
           <div>
             <div className="text-xs text-gray-400">
-              {row.step} / {totalSteps}
+              {row.step}{totalSteps != null ? ` / ${totalSteps}` : ''}
             </div>
             <div className="bg-gray-700 rounded-full h-1.5">
               <div
                 className="bg-blue-500 h-1.5 rounded-full"
-                style={{ width: `${(row.step / totalSteps) * 100}%` }}
+                style={{ width: totalSteps ? `${(row.step / totalSteps) * 100}%` : '0%' }}
               ></div>
             </div>
           </div>

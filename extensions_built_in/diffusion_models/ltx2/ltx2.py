@@ -3,7 +3,10 @@ import os
 from typing import List, Optional
 
 import torch
-import torchaudio
+try:
+    import torchaudio
+except ImportError:
+    torchaudio = None
 from transformers import Gemma3Config
 import yaml
 from toolkit.config_modules import GenerateImageConfig, ModelConfig

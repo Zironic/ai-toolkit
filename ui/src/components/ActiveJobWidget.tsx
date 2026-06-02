@@ -6,7 +6,7 @@ import useJobsList from '@/hooks/useJobsList';
 import { JobConfig } from '@/types';
 
 export default function ActiveJobWidget() {
-  const { jobs } = useJobsList({ onlyActive: true, reloadInterval: 5000 });
+  const { jobs } = useJobsList(true, 5000);
 
   if (!jobs || jobs.length === 0) return null;
 

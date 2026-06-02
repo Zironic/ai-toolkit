@@ -15,7 +15,7 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 from toolkit.accelerator import unwrap_model
 from optimum.quanto import freeze
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
-from toolkit.memory_management import MemoryManager
+from toolkit.memory_management import MemoryManager, safe_ram_flush, log_vram
 from safetensors.torch import load_file
 
 from transformers import AutoTokenizer, Qwen3ForCausalLM
@@ -181,10 +181,12 @@ class ZImageModel(BaseModel):
             if self.model_config.qtype == "qfloat8":
                 self.model_config.qtype = "float8"
 
+        log_vram("transformer loaded (pre-quant)")
         if self.model_config.quantize:
             self.print_and_status_update("Quantizing Transformer")
             quantize_model(self, transformer)
-            flush()
+            safe_ram_flush()
+        log_vram("transformer post-quant")
 
         if (
             self.model_config.layer_offloading
@@ -204,7 +206,8 @@ class ZImageModel(BaseModel):
             self.print_and_status_update("Moving transformer to CPU")
             transformer.to("cpu")
 
-        flush()
+        safe_ram_flush()
+        log_vram("transformer settled (pre-TE load)")
 
         self.print_and_status_update("Text Encoder")
         tokenizer = AutoTokenizer.from_pretrained(
@@ -213,6 +216,7 @@ class ZImageModel(BaseModel):
         text_encoder = Qwen3ForCausalLM.from_pretrained(
             base_model_path, subfolder="text_encoder", torch_dtype=dtype
         )
+        log_vram("TE loaded (pre-quant)")
 
         if (
             self.model_config.layer_offloading
@@ -224,14 +228,19 @@ class ZImageModel(BaseModel):
                 offload_percent=self.model_config.layer_offloading_text_encoder_percent,
             )
 
-        text_encoder.to(self.device_torch, dtype=dtype)
-        flush()
-
         if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Text Encoder")
+            # Quantise on CPU first so we only need VRAM for the compressed
+            # weights, not the full-precision copy.  Both torchao and quanto
+            # are device-agnostic and work on CPU.
+            self.print_and_status_update("Quantizing Text Encoder (CPU)")
             quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
             freeze(text_encoder)
-            flush()
+            safe_ram_flush()
+        log_vram("TE post-quant (still on CPU)")
+
+        text_encoder.to(self.device_torch, dtype=dtype)
+        safe_ram_flush()
+        log_vram("TE moved to VRAM")
 
         self.print_and_status_update("Loading VAE")
         vae = AutoencoderKL.from_pretrained(
@@ -264,13 +273,15 @@ class ZImageModel(BaseModel):
         # leave it on cpu for now
         if not self.low_vram:
             pipe.transformer = pipe.transformer.to(self.device_torch)
+            log_vram("transformer moved to VRAM")
 
-        flush()
+        safe_ram_flush()
         # just to make sure everything is on the right device and dtype
         text_encoder[0].to(self.device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
-        flush()
+        safe_ram_flush()
+        log_vram("model load complete")
 
         # save it to the model class
         self.vae = vae

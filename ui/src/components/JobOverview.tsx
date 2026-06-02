@@ -22,8 +22,9 @@ export default function JobOverview({ job }: JobOverviewProps) {
 
   const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
+  const jobType = job.job_type ?? 'train';
   const totalSteps = getTotalSteps(job);
-  const progress = (job.step / totalSteps) * 100;
+  const progress = totalSteps ? (job.step / totalSteps) * 100 : 0;
   const isStopping = job.stop && job.status === 'running';
 
   const logLines: string[] = useMemo(() => {

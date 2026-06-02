@@ -9,7 +9,12 @@ class ExtensionJob(BaseJob):
     def __init__(self, config: OrderedDict):
         super().__init__(config)
         self.device = self.get_conf('device', 'cpu')
-        self.process_dict = get_all_extensions_process_dict()
+        needed_types = {
+            p['type']
+            for p in self.config.get('process', [])
+            if isinstance(p, dict) and 'type' in p
+        }
+        self.process_dict = get_all_extensions_process_dict(needed_types or None)
         self.load_processes(self.process_dict)
 
     def run(self):

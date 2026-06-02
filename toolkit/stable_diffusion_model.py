@@ -22,6 +22,8 @@ from tqdm import tqdm
 from torchvision.transforms import Resize, transforms
 
 from toolkit.assistant_lora import load_assistant_lora_from_path
+from toolkit.memory_management import soft_empty_cache, safe_ram_flush, log_vram
+from toolkit.gpu_diagnostics import dump_vram_map
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.dequantize import patch_dequantization_on_save
@@ -174,6 +176,9 @@ class StableDiffusion:
         self.logit_scale = None
         self.ckppt_info = None
         self.is_loaded = False
+        # Set True (from outside before load_model) to skip loading TE weights when all
+        # prompt embeddings are already on disk; the TE is then never allocated.
+        self._skip_text_encoder: bool = False
 
         # to hold network if there is one
         self.network = None
@@ -289,6 +294,7 @@ class StableDiffusion:
         if self.is_loaded:
             return
         dtype = get_torch_dtype(self.dtype)
+        skip_te = getattr(self, '_skip_text_encoder', False)
 
         # move the betas alphas and  alphas_cumprod to device. Sometimed they get stuck on cpu, not sure why
         # self.noise_scheduler.betas = self.noise_scheduler.betas.to(self.device_torch)
@@ -317,12 +323,14 @@ class StableDiffusion:
             # see if path exists
             if not os.path.exists(model_path) or os.path.isdir(model_path):
                 # try to load with default diffusers
+                _xl_te_kwargs = {'text_encoder': None, 'text_encoder_2': None} if skip_te else {}
                 pipe = pipln.from_pretrained(
                     model_path,
                     dtype=dtype,
                     device=self.device_torch,
                     # variant="fp16",
                     use_safetensors=True,
+                    **_xl_te_kwargs,
                     **load_args
                 )
             else:
@@ -338,10 +346,12 @@ class StableDiffusion:
 
             text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
             tokenizer = [pipe.tokenizer, pipe.tokenizer_2]
-            for text_encoder in text_encoders:
-                text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
-                text_encoder.requires_grad_(False)
-                text_encoder.eval()
+            for te in text_encoders:
+                if te is None:
+                    continue
+                te.to(self.te_device_torch, dtype=self.te_torch_dtype)
+                te.requires_grad_(False)
+                te.eval()
             text_encoder = text_encoders
 
             pipe.vae = pipe.vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
@@ -405,33 +415,41 @@ class StableDiffusion:
                 transformer.to(self.device_torch)
             else:
                 transformer.to(self.device_torch, dtype=dtype)
-                
+
+            safe_ram_flush()
+
             scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model_path, subfolder="scheduler")
             print_acc("Loading vae")
             vae = AutoencoderKL.from_pretrained(base_model_path, subfolder="vae", torch_dtype=dtype)
             flush()
             
-            print_acc("Loading t5")
-            tokenizer_3 = T5TokenizerFast.from_pretrained(base_model_path, subfolder="tokenizer_3", torch_dtype=dtype)
-            text_encoder_3 = T5EncoderModel.from_pretrained(
-                base_model_path, 
-                subfolder="text_encoder_3", 
-                torch_dtype=dtype
-            )
-            
-            text_encoder_3.to(self.device_torch, dtype=dtype)
-            flush()
-
-            if self.model_config.quantize:
-                print_acc("Quantizing T5")
-                quantize(text_encoder_3, weights=get_qtype(self.model_config.qtype))
-                freeze(text_encoder_3)
+            if not skip_te:
+                print_acc("Loading t5")
+                tokenizer_3 = T5TokenizerFast.from_pretrained(base_model_path, subfolder="tokenizer_3", torch_dtype=dtype)
+                text_encoder_3 = T5EncoderModel.from_pretrained(
+                    base_model_path,
+                    subfolder="text_encoder_3",
+                    torch_dtype=dtype
+                )
+                text_encoder_3.to(self.device_torch, dtype=dtype)
                 flush()
-                
+                if self.model_config.quantize:
+                    print_acc("Quantizing T5")
+                    quantize(text_encoder_3, weights=get_qtype(self.model_config.qtype))
+                    freeze(text_encoder_3)
+                    safe_ram_flush()
+            else:
+                tokenizer_3 = None
+                text_encoder_3 = None
 
             # see if path exists
             if not os.path.exists(model_path) or os.path.isdir(model_path):
                 try:
+                    _v3_te_kwargs = (
+                        {'text_encoder': None, 'text_encoder_2': None,
+                         'tokenizer': None, 'tokenizer_2': None}
+                        if skip_te else {}
+                    )
                     # try to load with default diffusers
                     pipe = pipln.from_pretrained(
                         base_model_path,
@@ -444,6 +462,7 @@ class StableDiffusion:
                         use_safetensors=True,
                         repo_type="model",
                         ignore_patterns=["*.md", "*..gitattributes"],
+                        **_v3_te_kwargs,
                         **load_args
                     )
                 except Exception as e:
@@ -465,12 +484,12 @@ class StableDiffusion:
 
             text_encoders = [pipe.text_encoder, pipe.text_encoder_2, pipe.text_encoder_3]
             tokenizer = [pipe.tokenizer, pipe.tokenizer_2, pipe.tokenizer_3]
-            # replace the to function with a no-op since it throws an error instead of a warning
-            # text_encoders[2].to = lambda *args, **kwargs: None
-            for text_encoder in text_encoders:
-                text_encoder.to(self.device_torch, dtype=dtype)
-                text_encoder.requires_grad_(False)
-                text_encoder.eval()
+            for te in text_encoders:
+                if te is None:
+                    continue
+                te.to(self.device_torch, dtype=dtype)
+                te.requires_grad_(False)
+                te.eval()
             text_encoder = text_encoders
 
 
@@ -493,25 +512,26 @@ class StableDiffusion:
 
             main_model_path = model_path
 
-            # load the TE in 8bit mode
-            text_encoder = T5EncoderModel.from_pretrained(
-                main_model_path,
-                subfolder="text_encoder",
-                torch_dtype=self.torch_dtype,
-                **te_kwargs
-            )
+            if not skip_te:
+                # load the TE in 8bit mode
+                text_encoder = T5EncoderModel.from_pretrained(
+                    main_model_path,
+                    subfolder="text_encoder",
+                    torch_dtype=self.torch_dtype,
+                    **te_kwargs
+                )
+                if te_is_quantized:
+                    # replace the to function with a no-op since it throws an error instead of a warning
+                    text_encoder.to = lambda *args, **kwargs: None
+                text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
+            else:
+                text_encoder = None
 
             # load the transformer
             subfolder = "transformer"
             # check if it is just the unet
             if os.path.exists(model_path) and not os.path.exists(os.path.join(model_path, subfolder)):
                 subfolder = None
-
-            if te_is_quantized:
-                # replace the to function with a no-op since it throws an error instead of a warning
-                text_encoder.to = lambda *args, **kwargs: None
-
-            text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
 
             if self.model_config.is_pixart_sigma:
                 # load the transformer only from the save
@@ -548,10 +568,9 @@ class StableDiffusion:
             pipe.transformer = pipe.transformer.to(self.device_torch, dtype=dtype)
 
             flush()
-            # text_encoder = pipe.text_encoder
-            # text_encoder.to(self.device_torch, dtype=dtype)
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
+            if text_encoder is not None:
+                text_encoder.requires_grad_(False)
+                text_encoder.eval()
             pipe.transformer = pipe.transformer.to(self.device_torch, dtype=dtype)
             tokenizer = pipe.tokenizer
 
@@ -575,23 +594,25 @@ class StableDiffusion:
 
             main_model_path = model_path
 
-            # load the TE in 8bit mode
-            text_encoder = UMT5EncoderModel.from_pretrained(
-                main_model_path,
-                subfolder="text_encoder",
-                torch_dtype=self.torch_dtype,
-                **te_kwargs
-            )
+            if not skip_te:
+                # load the TE in 8bit mode
+                text_encoder = UMT5EncoderModel.from_pretrained(
+                    main_model_path,
+                    subfolder="text_encoder",
+                    torch_dtype=self.torch_dtype,
+                    **te_kwargs
+                )
+                if te_is_quantized:
+                    # replace the to function with a no-op since it throws an error instead of a warning
+                    text_encoder.to = lambda *args, **kwargs: None
+            else:
+                text_encoder = None
 
             # load the transformer
             subfolder = "transformer"
             # check if it is just the unet
             if os.path.exists(model_path) and not os.path.exists(os.path.join(model_path, subfolder)):
                 subfolder = None
-
-            if te_is_quantized:
-                # replace the to function with a no-op since it throws an error instead of a warning
-                text_encoder.to = lambda *args, **kwargs: None
 
             # load the transformer only from the save
             transformer = AuraFlowTransformer2DModel.from_pretrained(
@@ -614,10 +635,9 @@ class StableDiffusion:
             # patch_auraflow_pos_embed(pipe.transformer.pos_embed)
 
             flush()
-            # text_encoder = pipe.text_encoder
-            # text_encoder.to(self.device_torch, dtype=dtype)
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
+            if text_encoder is not None:
+                text_encoder.requires_grad_(False)
+                text_encoder.eval()
             pipe.transformer = pipe.transformer.to(self.device_torch, dtype=dtype)
             tokenizer = pipe.tokenizer
 
@@ -777,7 +797,10 @@ class StableDiffusion:
             else:
                 transformer.to(self.device_torch, dtype=dtype)
 
-            flush()
+            # After quantization/materialization the original mmap'd float tensors
+            # have no live references. Multiple GC passes close the file handles so
+            # Windows can reclaim those physical pages before the TE file is mapped in.
+            safe_ram_flush()
 
             scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model_path, subfolder="scheduler")
             self.print_and_status_update("Loading VAE")
@@ -787,56 +810,65 @@ class StableDiffusion:
                 vae = AutoencoderKL.from_pretrained(base_model_path, subfolder="vae", torch_dtype=dtype)
             flush()
             
-            self.print_and_status_update("Loading T5")
-            tokenizer_2 = T5TokenizerFast.from_pretrained(base_model_path, subfolder="tokenizer_2", torch_dtype=dtype)
-            text_encoder_2 = T5EncoderModel.from_pretrained(base_model_path, subfolder="text_encoder_2",
-                                                            torch_dtype=dtype)
-
-            text_encoder_2.to(self.device_torch, dtype=dtype)
-            flush()
-
-            if self.model_config.quantize_te:
-                self.print_and_status_update("Quantizing T5")
-                quantize(text_encoder_2, weights=get_qtype(self.model_config.qtype))
-                freeze(text_encoder_2)
-                flush()
-                
-            self.print_and_status_update("Loading CLIP")
-            text_encoder = CLIPTextModel.from_pretrained(base_model_path, subfolder="text_encoder", torch_dtype=dtype)
-            tokenizer = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer", torch_dtype=dtype)
-            text_encoder.to(self.device_torch, dtype=dtype)
-
             self.print_and_status_update("Making pipe")
             Pipe = FluxPipeline
-            
-            pipe: Pipe = Pipe(
-                scheduler=scheduler,
-                text_encoder=text_encoder,
-                tokenizer=tokenizer,
-                text_encoder_2=None,
-                tokenizer_2=tokenizer_2,
-                vae=vae,
-                transformer=None,
-            )
-            pipe.text_encoder_2 = text_encoder_2
-            pipe.transformer = transformer
 
-            self.print_and_status_update("Preparing Model")
-
-            text_encoder = [pipe.text_encoder, pipe.text_encoder_2]
-            tokenizer = [pipe.tokenizer, pipe.tokenizer_2]
-
-            pipe.transformer = pipe.transformer.to(self.device_torch)
-
-            flush()
-            text_encoder[0].to(self.device_torch)
-            text_encoder[0].requires_grad_(False)
-            text_encoder[0].eval()
-            text_encoder[1].to(self.device_torch)
-            text_encoder[1].requires_grad_(False)
-            text_encoder[1].eval()
-            pipe.transformer = pipe.transformer.to(self.device_torch)
-            flush()
+            if not skip_te:
+                self.print_and_status_update("Loading T5")
+                tokenizer_2 = T5TokenizerFast.from_pretrained(base_model_path, subfolder="tokenizer_2", torch_dtype=dtype)
+                text_encoder_2 = T5EncoderModel.from_pretrained(base_model_path, subfolder="text_encoder_2",
+                                                                torch_dtype=dtype)
+                text_encoder_2.to(self.device_torch, dtype=dtype)
+                flush()
+                if self.model_config.quantize_te:
+                    self.print_and_status_update("Quantizing T5")
+                    quantize(text_encoder_2, weights=get_qtype(self.model_config.qtype))
+                    freeze(text_encoder_2)
+                    safe_ram_flush()
+                self.print_and_status_update("Loading CLIP")
+                text_encoder = CLIPTextModel.from_pretrained(base_model_path, subfolder="text_encoder", torch_dtype=dtype)
+                tokenizer = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer", torch_dtype=dtype)
+                text_encoder.to(self.device_torch, dtype=dtype)
+                pipe: Pipe = Pipe(
+                    scheduler=scheduler,
+                    text_encoder=text_encoder,
+                    tokenizer=tokenizer,
+                    text_encoder_2=None,
+                    tokenizer_2=tokenizer_2,
+                    vae=vae,
+                    transformer=None,
+                )
+                pipe.text_encoder_2 = text_encoder_2
+                pipe.transformer = transformer
+                self.print_and_status_update("Preparing Model")
+                text_encoder = [pipe.text_encoder, pipe.text_encoder_2]
+                tokenizer = [pipe.tokenizer, pipe.tokenizer_2]
+                pipe.transformer = pipe.transformer.to(self.device_torch)
+                flush()
+                text_encoder[0].to(self.device_torch)
+                text_encoder[0].requires_grad_(False)
+                text_encoder[0].eval()
+                text_encoder[1].to(self.device_torch)
+                text_encoder[1].requires_grad_(False)
+                text_encoder[1].eval()
+                pipe.transformer = pipe.transformer.to(self.device_torch)
+                flush()
+            else:
+                self.print_and_status_update("TE skip — all prompts are disk-cached")
+                pipe: Pipe = Pipe(
+                    scheduler=scheduler,
+                    text_encoder=None,
+                    tokenizer=None,
+                    text_encoder_2=None,
+                    tokenizer_2=None,
+                    vae=vae,
+                    transformer=None,
+                )
+                pipe.transformer = transformer
+                pipe.transformer = pipe.transformer.to(self.device_torch)
+                flush()
+                text_encoder = [None, None]
+                tokenizer = [None, None]
         elif self.model_config.is_lumina2:
             self.print_and_status_update("Loading Lumina2 model")
             # base_model_path = "black-forest-labs/FLUX.1-schnell"
@@ -891,23 +923,26 @@ class StableDiffusion:
             vae = AutoencoderKL.from_pretrained(base_model_path, subfolder="vae", torch_dtype=dtype)
             flush()
             
-            if self.model_config.te_name_or_path is not None:
-                self.print_and_status_update("Loading TE")
-                tokenizer = AutoTokenizer.from_pretrained(self.model_config.te_name_or_path, torch_dtype=dtype)
-                text_encoder = AutoModel.from_pretrained(self.model_config.te_name_or_path, torch_dtype=dtype)
-            else:
-                self.print_and_status_update("Loading Gemma2")
-                tokenizer = AutoTokenizer.from_pretrained(base_model_path, subfolder="tokenizer", torch_dtype=dtype)
-                text_encoder = AutoModel.from_pretrained(base_model_path, subfolder="text_encoder", torch_dtype=dtype)
-
-            text_encoder.to(self.device_torch, dtype=dtype)
-            flush()
-
-            if self.model_config.quantize_te:
-                self.print_and_status_update("Quantizing Gemma2")
-                quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
-                freeze(text_encoder)
+            if not skip_te:
+                if self.model_config.te_name_or_path is not None:
+                    self.print_and_status_update("Loading TE")
+                    tokenizer = AutoTokenizer.from_pretrained(self.model_config.te_name_or_path, torch_dtype=dtype)
+                    text_encoder = AutoModel.from_pretrained(self.model_config.te_name_or_path, torch_dtype=dtype)
+                else:
+                    self.print_and_status_update("Loading Gemma2")
+                    tokenizer = AutoTokenizer.from_pretrained(base_model_path, subfolder="tokenizer", torch_dtype=dtype)
+                    text_encoder = AutoModel.from_pretrained(base_model_path, subfolder="text_encoder", torch_dtype=dtype)
+                text_encoder.to(self.device_torch, dtype=dtype)
                 flush()
+                if self.model_config.quantize_te:
+                    self.print_and_status_update("Quantizing Gemma2")
+                    quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
+                    freeze(text_encoder)
+                    safe_ram_flush()
+            else:
+                self.print_and_status_update("TE skip — all prompts are disk-cached")
+                tokenizer = None
+                text_encoder = None
 
             self.print_and_status_update("Making pipe")
             pipe: Lumina2Pipeline = Lumina2Pipeline(
@@ -928,9 +963,10 @@ class StableDiffusion:
             pipe.transformer = pipe.transformer.to(self.device_torch)
 
             flush()
-            text_encoder.to(self.device_torch)
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
+            if text_encoder is not None:
+                text_encoder.to(self.device_torch)
+                text_encoder.requires_grad_(False)
+                text_encoder.eval()
             pipe.transformer = pipe.transformer.to(self.device_torch)
             flush()
         else:
@@ -966,6 +1002,7 @@ class StableDiffusion:
 
             # see if path exists
             if not os.path.exists(model_path) or os.path.isdir(model_path):
+                _sd1_te_kwargs = {'text_encoder': None, 'tokenizer': None} if skip_te else {}
                 # try to load with default diffusers
                 pipe = pipln.from_pretrained(
                     model_path,
@@ -976,6 +1013,7 @@ class StableDiffusion:
                     safety_checker=None,
                     # variant="fp16",
                     trust_remote_code=True,
+                    **_sd1_te_kwargs,
                     **load_args
                 )
             else:
@@ -994,9 +1032,10 @@ class StableDiffusion:
 
             pipe.register_to_config(requires_safety_checker=False)
             text_encoder = pipe.text_encoder
-            text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
+            if text_encoder is not None:
+                text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
+                text_encoder.requires_grad_(False)
+                text_encoder.eval()
             tokenizer = pipe.tokenizer
 
         # scheduler doesn't get set sometimes, so we set it here
@@ -1167,7 +1206,20 @@ class StableDiffusion:
             network = BlankNetwork()
 
         self.save_device_state()
-        self.set_device_state_preset('generate')
+        if self.low_vram:
+            # Phase-based VRAM management: T5-XXL (~10 GB) + transformer (~6 GB)
+            # exceeds a 12 GB card if both are resident simultaneously.
+            # Instead, text encoders live on CPU for the entire sample batch
+            # (prompts are pre-cached) and only transformer + VAE occupy VRAM.
+            self.set_device_state_preset('unload')
+            # VAE stays on GPU throughout — small (~500 MB), needed for every decode.
+            self.vae.to(self.vae_device_torch)
+            if self.sample_prompts_cache is not None:
+                # Prompts pre-cached: load transformer once for the whole batch.
+                self.unet.to(self.device_torch)
+            soft_empty_cache()
+        else:
+            self.set_device_state_preset('generate')
 
         # save current seed state for training
         rng_state = torch.get_rng_state()
@@ -1367,6 +1419,8 @@ class StableDiffusion:
 
         # pipeline.to(self.device_torch)
 
+        log_vram("generate_images: pipeline built, entering inference loop")
+
         with network:
             with torch.no_grad():
                 if network is not None:
@@ -1455,7 +1509,13 @@ class StableDiffusion:
                     if self.sample_prompts_cache is not None:
                         conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
                         unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
-                    else: 
+                    else:
+                        if self.low_vram:
+                            # Text-encode phase: text encoders to GPU, transformer
+                            # stays on CPU to avoid co-residency OOM.
+                            self.text_encoder_to(self.te_device_torch)
+                            self.unet.to('cpu')
+                            soft_empty_cache()
                         # encode the prompt ourselves so we can do fun stuff with embeddings
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
@@ -1468,6 +1528,11 @@ class StableDiffusion:
                         )
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
+                        if self.low_vram:
+                            # Denoise phase: text encoders back to CPU, transformer to GPU.
+                            self.text_encoder_to('cpu')
+                            self.unet.to(self.device_torch)
+                            soft_empty_cache()
 
                     # allow any manipulations to take place to embeddings
                     gen_config.post_process_embeddings(
@@ -1524,6 +1589,24 @@ class StableDiffusion:
 
                     conditional_embeds = conditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
                     unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
+
+                    if i == 0:
+                        log_vram("generate_images: before sampler")
+                        _infer_mods = {}
+                        if self.unet is not None:
+                            _infer_mods['transformer'] = self.unet
+                        if self.vae is not None:
+                            _infer_mods['vae'] = self.vae
+                        if self.text_encoder is not None:
+                            te = self.text_encoder
+                            if isinstance(te, list):
+                                for _i, _t in enumerate(te):
+                                    _infer_mods[f'text_encoder_{_i}'] = _t
+                            else:
+                                _infer_mods['text_encoder'] = te
+                        if self.network is not None:
+                            _infer_mods['network_lokr'] = self.network
+                        print(dump_vram_map(_infer_mods))
 
                     if self.is_xl:
                         # fix guidance rescale for sdxl
@@ -1713,6 +1796,11 @@ class StableDiffusion:
                     gen_config.log_image(img, i)
                     self._after_sample_image(i, len(image_configs))
                     flush()
+                    if self.low_vram and self.sample_prompts_cache is None:
+                        # No pre-cached prompts: swap transformer off GPU so the
+                        # next image's text-encode phase doesn't OOM.
+                        self.unet.to('cpu')
+                        soft_empty_cache()
 
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
@@ -1721,7 +1809,14 @@ class StableDiffusion:
         del pipeline
         if refiner_pipeline is not None:
             del refiner_pipeline
-        torch.cuda.empty_cache()
+        if self.low_vram:
+            # Return transformer and VAE to CPU before restore_device_state()
+            # so restore doesn't fight with the training-state placement.
+            self.unet.to('cpu')
+            self.vae.to('cpu')
+            soft_empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
         # restore training state
         torch.set_rng_state(rng_state)
@@ -3112,8 +3207,9 @@ class StableDiffusion:
     def text_encoder_to(self, *args, **kwargs):
         if isinstance(self.text_encoder, list):
             for encoder in self.text_encoder:
-                encoder.to(*args, **kwargs)
-        else:
+                if encoder is not None:
+                    encoder.to(*args, **kwargs)
+        elif self.text_encoder is not None:
             self.text_encoder.to(*args, **kwargs)
             
     def convert_lora_weights_before_save(self, state_dict):

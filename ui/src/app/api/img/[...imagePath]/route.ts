@@ -5,8 +5,31 @@ import path from 'path';
 import { Readable } from 'stream';
 import { getDatasetsRoot, getTrainingFolder, getDataRoot } from '@/server/settings';
 
-export async function GET(request: NextRequest, { params }: { params: { imagePath: string } }) {
-  const { imagePath } = await params;
+const contentTypeMap: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.svg': 'image/svg+xml',
+  '.bmp': 'image/bmp',
+  '.tiff': 'image/tiff',
+  '.tif': 'image/tiff',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.m4a': 'audio/mp4',
+};
+
+export async function GET(request: NextRequest, { params }: { params: Promise<{ imagePath: string[] }> }) {
+  const { imagePath: imagePathParts } = await params;
+  const imagePath = imagePathParts.join('/');
   try {
     // Decode the path
     const filepath = decodeURIComponent(imagePath);

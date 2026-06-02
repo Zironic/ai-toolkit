@@ -494,3 +494,107 @@ export const SliderInput: React.FC<SliderInputProps> = props => {
     </div>
   );
 };
+
+export interface TextAreaInputProps {
+  label?: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  required?: boolean;
+  disabled?: boolean;
+  className?: string;
+  docKey?: string | null;
+  doc?: ConfigDoc | null;
+  rows?: number;
+}
+
+export const TextAreaInput: React.FC<TextAreaInputProps> = props => {
+  const { label, value, onChange, placeholder, required, disabled, className, docKey = null, rows = 3 } = props;
+  let { doc } = props;
+  if (!doc && docKey) {
+    doc = getDoc(docKey);
+  }
+  return (
+    <div className={classNames(className)}>
+      {label && (
+        <label className={labelClasses}>
+          {label}{' '}
+          {doc && (
+            <div className="inline-block ml-1 text-xs text-gray-500 cursor-pointer" onClick={() => openDoc(doc)}>
+              <CircleHelp className="inline-block w-4 h-4 cursor-pointer" />
+            </div>
+          )}
+        </label>
+      )}
+      <textarea
+        value={value}
+        onChange={e => {
+          if (!disabled) onChange(e.target.value);
+        }}
+        className={`${inputClasses} resize-y ${disabled ? 'opacity-30 cursor-not-allowed' : ''}`}
+        placeholder={placeholder}
+        required={required}
+        disabled={disabled}
+        rows={rows}
+      />
+    </div>
+  );
+};
+
+export interface CreatableSelectInputProps {
+  label?: string;
+  value: string | null;
+  onChange: (value: string | null) => void;
+  options: SelectOption[];
+  placeholder?: string;
+  required?: boolean;
+  disabled?: boolean;
+  className?: string;
+  docKey?: string | null;
+  doc?: ConfigDoc | null;
+}
+
+export const CreatableSelectInput: React.FC<CreatableSelectInputProps> = props => {
+  const { label, value, onChange, options, placeholder, required, disabled, className, docKey = null } = props;
+  let { doc } = props;
+  if (!doc && docKey) {
+    doc = getDoc(docKey);
+  }
+  const listId = React.useId();
+  return (
+    <div className={classNames(className)}>
+      {label && (
+        <label className={labelClasses}>
+          {label}{' '}
+          {doc && (
+            <div className="inline-block ml-1 text-xs text-gray-500 cursor-pointer" onClick={() => openDoc(doc)}>
+              <CircleHelp className="inline-block w-4 h-4 cursor-pointer" />
+            </div>
+          )}
+        </label>
+      )}
+      <datalist id={listId}>
+        {options.map(opt => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </datalist>
+      <input
+        type="text"
+        list={listId}
+        value={value ?? ''}
+        onChange={e => {
+          if (!disabled) {
+            const v = e.target.value;
+            onChange(v === '' ? null : v);
+          }
+        }}
+        className={`${inputClasses} ${disabled ? 'opacity-30 cursor-not-allowed' : ''}`}
+        placeholder={placeholder}
+        required={required}
+        disabled={disabled}
+      />
+    </div>
+  );
+};

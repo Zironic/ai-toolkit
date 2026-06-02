@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobConfig';
 import { jobTypeOptions } from './options';
@@ -150,8 +150,38 @@ export default function TrainingForm() {
     saveJob();
   };
 
+  const importFileRef = useRef<HTMLInputElement>(null);
+
+  const handleImportConfig = () => {
+    importFileRef.current?.click();
+  };
+
+  const handleImportFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const parsed = JSON.parse(ev.target?.result as string);
+        setJobConfig(migrateJobConfig(parsed));
+      } catch {
+        alert('Failed to parse config file. Make sure it is valid JSON.');
+      }
+    };
+    reader.readAsText(file);
+    // reset so the same file can be re-imported
+    e.target.value = '';
+  };
+
   return (
     <>
+      <input
+        ref={importFileRef}
+        type="file"
+        accept=".json"
+        className="hidden"
+        onChange={handleImportFileChange}
+      />
       <TopBar>
         <div className="flex-shrink-0">
           <Button className="text-gray-500 dark:text-gray-300 px-2 sm:px-3 mt-1" onClick={() => history.back()}>
