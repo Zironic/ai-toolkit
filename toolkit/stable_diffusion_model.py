@@ -296,6 +296,10 @@ class StableDiffusion:
         return None
 
     @property
+    def text_embedding_space_version(self):
+        return self.arch
+    
+    @property
     def unet_unwrapped(self):
         return unwrap_model(self.unet)
     

@@ -148,7 +148,7 @@ class ControlGenerator:
             img = img.convert('RGB')
             img.save(save_path)
             return save_path
-        elif control_type == 'inpaint' or control_type == 'mask':
+        elif control_type in ['inpaint', 'mask']:
             self.debug_print("Generating inpaint/mask control")
             img = image.copy()
             if self.control_bg_remover is None:
@@ -156,7 +156,7 @@ class ControlGenerator:
                 self.control_bg_remover = AutoModelForImageSegmentation.from_pretrained(
                     'ZhengPeng7/BiRefNet_HR',
                     trust_remote_code=True,
-                    revision="595e212b3eaa6a1beaad56cee49749b1e00b1596",
+                    revision="a7a562f6fd16021180f2f4348f4de003a2d3d1e1",
                     torch_dtype=torch.float16
                 ).to(device)
                 self.control_bg_remover.eval()
@@ -186,6 +186,18 @@ class ControlGenerator:
             else:
                 img = mask
                 img = img.convert('RGB')
+            img.save(save_path)
+            return save_path
+        elif control_type in ['sapiens2_mask']:
+            self.debug_print("Generating sapiens2_mask control")
+            if self.control_bg_remover is None:
+                from toolkit.models.sapiens2 import Sapiens2Matting
+                self.control_bg_remover = Sapiens2Matting.from_pretrained(
+                    device=device, 
+                    dtype=torch.float16
+                )
+            img = image.copy()
+            img = self.control_bg_remover(img)
             img.save(save_path)
             return save_path
         else:

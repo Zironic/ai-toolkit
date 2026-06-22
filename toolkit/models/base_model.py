@@ -266,6 +266,10 @@ class BaseModel:
     @property
     def is_lumina2(self):
         return self.arch == 'lumina2'
+    
+    @property
+    def text_embedding_space_version(self):
+        return self.arch
 
     @property
     def text_embed_dim(self):

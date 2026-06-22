@@ -1,11 +1,12 @@
 import { GroupedSelectOption, SelectOption, JobConfig } from '@/types';
 import { defaultSliderConfig } from './jobConfig';
-import { defaultAudioSampleConfig, defaultSampleConfig } from '@/helpers/defaultSamples';
+import { defaultAudioSampleConfig, defaultSampleConfig, defaultIdeogramSamplesConfig } from '@/helpers/defaultSamples';
 
 type Control = 'depth' | 'line' | 'pose' | 'inpaint';
 
 type DisableableSections =
   | 'model.quantize'
+  | 'model.quantize_te'
   | 'train.timestep_type'
   | 'network.conv'
   | 'trigger_word'
@@ -30,7 +31,9 @@ type AdditionalSections =
   | 'model.layer_offloading'
   | 'model.low_vram'
   | 'model.qie.match_target_res'
-  | 'model.assistant_lora_path';
+  | 'model.assistant_lora_path'
+  | 'model.unconditional_lora_path'
+  | 'ideogram_4_prompt';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio';
 
@@ -178,9 +181,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
       'config.process[0].sample.num_frames': [41, 1],
       'config.process[0].sample.fps': [16, 1],
+      'config.process[0].datasets[x].fps': [16, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['datasets.num_frames', 'model.low_vram'],
+    additionalSections: ['datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count'],
   },
   {
     name: 'wan21_i2v:14b480p',
@@ -197,9 +201,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.num_frames': [41, 1],
       'config.process[0].sample.fps': [16, 1],
       'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
+      'config.process[0].datasets[x].fps': [16, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count'],
   },
   {
     name: 'wan21_i2v:14b',
@@ -216,9 +221,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.num_frames': [41, 1],
       'config.process[0].sample.fps': [16, 1],
       'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
+      'config.process[0].datasets[x].fps': [16, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count'],
   },
   {
     name: 'wan21:14b',
@@ -234,9 +240,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
       'config.process[0].sample.num_frames': [41, 1],
       'config.process[0].sample.fps': [16, 1],
+      'config.process[0].datasets[x].fps': [16, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['datasets.num_frames', 'model.low_vram'],
+    additionalSections: ['datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count'],
   },
   {
     name: 'wan22_14b:t2v',
@@ -254,6 +261,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.fps': [16, 1],
       'config.process[0].model.low_vram': [true, false],
       'config.process[0].train.timestep_type': ['linear', 'sigmoid'],
+      'config.process[0].datasets[x].fps': [16, undefined],
       'config.process[0].model.model_kwargs': [
         {
           train_high_noise: true,
@@ -263,7 +271,7 @@ export const modelArchs: ModelArch[] = [
       ],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['datasets.num_frames', 'model.low_vram', 'model.multistage', 'model.layer_offloading'],
+    additionalSections: ['datasets.num_frames', 'model.low_vram', 'model.multistage', 'model.layer_offloading', 'datasets.auto_frame_count'],
     accuracyRecoveryAdapters: {
       // '3 bit with ARA': 'uint3|ostris/accuracy_recovery_adapters/wan22_14b_t2i_torchao_uint3.safetensors',
       '4 bit with ARA': 'uint4|ostris/accuracy_recovery_adapters/wan22_14b_t2i_torchao_uint4.safetensors',
@@ -285,6 +293,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.fps': [16, 1],
       'config.process[0].model.low_vram': [true, false],
       'config.process[0].train.timestep_type': ['linear', 'sigmoid'],
+      'config.process[0].datasets[x].fps': [16, undefined],
       'config.process[0].model.model_kwargs': [
         {
           train_high_noise: true,
@@ -300,6 +309,7 @@ export const modelArchs: ModelArch[] = [
       'model.low_vram',
       'model.multistage',
       'model.layer_offloading',
+      'datasets.auto_frame_count',
     ],
     accuracyRecoveryAdapters: {
       '4 bit with ARA': 'uint4|ostris/accuracy_recovery_adapters/wan22_14b_i2v_torchao_uint4.safetensors',
@@ -324,9 +334,10 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.height': [768, 1024],
       'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
       'config.process[0].datasets[x].do_i2v': [true, undefined],
+      'config.process[0].datasets[x].fps': [24, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.do_i2v'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.do_i2v', 'datasets.auto_frame_count'],
   },
   {
     name: 'lumina2',
@@ -938,6 +949,164 @@ export const modelArchs: ModelArch[] = [
     },
     disableSections: ['network.conv'],
     additionalSections: ['model.low_vram'],
+  },
+  {
+    name: 'hidream_o1',
+    label: 'HiDream-O1',
+    group: 'image',
+    defaults: {
+      'config.process[0].model.name_or_path': ['HiDream-ai/HiDream-O1-Image', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [false, false],
+      'config.process[0].train.timestep_type': ['linear', 'sigmoid'],
+      'config.process[0].network.conv': [undefined, 16],
+      'config.process[0].network.conv_alpha': [undefined, 16],
+      'config.process[0].train.max_loss': [1.0, undefined],
+      'config.process[0].network.network_kwargs.ignore_if_contains': [['lm_head', 'patch_embed', 'visual'], []],
+      'config.process[0].network.transformer_only': [false, undefined],
+      'config.process[0].sample.width': [2048, 1024],
+      'config.process[0].sample.height': [2048, 1024],
+      'config.process[0].model.model_kwargs': [
+        {
+          noise_scale_inference: 8.0,
+          noise_scale: 8.0,
+        },
+        {},
+      ],
+    },
+    disableSections: [
+      'network.conv',
+      'model.quantize_te',
+      'train.unload_text_encoder',
+    ],
+    additionalSections: [
+      'model.low_vram',
+      'model.layer_offloading',
+    ],
+  },
+  {
+    name: 'zimage_l2p',
+    label: 'Z-Image L2P (pixel space)',
+    group: 'image',
+    defaults: {
+      'config.process[0].model.name_or_path': ['zhen-nan/L2P/model-1k-merge.safetensors', defaultNameOrPath],
+      'config.process[0].model.extras_name_or_path': ['Tongyi-MAI/Z-Image-Turbo', undefined],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].train.timestep_type': ['linear', 'sigmoid'],
+      'config.process[0].network.conv': [undefined, 16],
+      'config.process[0].network.conv_alpha': [undefined, 16],
+      'config.process[0].model.low_vram': [true, false],
+    },
+    disableSections: [
+      'network.conv',
+    ],
+    additionalSections: [
+      'model.low_vram',
+      'model.layer_offloading',
+    ],
+  },
+  {
+    name: 'ideogram4',
+    label: 'Ideogram4',
+    group: 'experimental',
+    defaults: {
+      'config.process[0].model.name_or_path': ['ideogram-ai/ideogram-4-fp8', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].train.timestep_type': ['linear', 'sigmoid'],
+      'config.process[0].network.conv': [undefined, 16],
+      'config.process[0].network.conv_alpha': [undefined, 16],
+      'config.process[0].model.low_vram': [true, false],
+      'config.process[0].sample': [defaultIdeogramSamplesConfig, defaultSampleConfig],
+      'config.process[0].model.unconditional_lora_path': [
+        'ostris/ideogram_4_unconditional_lora/ideogram_4_unconditional_lora_r16.safetensors',
+        undefined,
+      ],
+    },
+    disableSections: [
+      'network.conv',
+    ],
+    additionalSections: [
+      'model.low_vram',
+      'model.layer_offloading',
+      'ideogram_4_prompt',
+      'model.unconditional_lora_path',
+    ],
+    hasMultiLinePrompts: true,
+  },
+  {
+    name: 'prx_pixel',
+    label: 'PRXPixel (pixel space)',
+    group: 'image',
+    defaults: {
+      'config.process[0].model.name_or_path': ['Photoroom/prxpixel-t2i', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].train.timestep_type': ['linear', 'sigmoid'],
+      'config.process[0].network.conv': [undefined, 16],
+      'config.process[0].network.conv_alpha': [undefined, 16],
+      'config.process[0].model.low_vram': [true, false],
+    },
+    disableSections: [
+      'network.conv',
+    ],
+    additionalSections: [
+      'model.low_vram',
+      'model.layer_offloading',
+    ],
+  },
+  {
+    name: 'boogu_image',
+    label: 'Boogu Image',
+    group: 'image',
+    defaults: {
+      'config.process[0].model.name_or_path': ['Boogu/Boogu-Image-0.1-Base', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].train.timestep_type': ['linear', 'sigmoid'],
+      'config.process[0].network.conv': [undefined, 16],
+      'config.process[0].network.conv_alpha': [undefined, 16],
+      'config.process[0].model.low_vram': [true, false],
+    },
+    disableSections: [
+      'network.conv',
+    ],
+    additionalSections: [
+      'model.low_vram',
+      'model.layer_offloading',
+    ],
+  },
+  {
+    name: 'boogu_image_edit',
+    label: 'Boogu Image Edit',
+    group: 'instruction',
+    defaults: {
+      'config.process[0].model.name_or_path': ['Boogu/Boogu-Image-0.1-Edit', defaultNameOrPath],
+      'config.process[0].model.quantize': [true, false],
+      'config.process[0].model.quantize_te': [true, false],
+      'config.process[0].train.timestep_type': ['linear', 'sigmoid'],
+      'config.process[0].network.conv': [undefined, 16],
+      'config.process[0].network.conv_alpha': [undefined, 16],
+      'config.process[0].model.low_vram': [true, false],
+      'config.process[0].train.unload_text_encoder': [false, false],
+      'config.process[0].model.model_kwargs': [
+        {
+          match_target_res: false,
+        },
+        {},
+      ],
+    },
+    disableSections: [
+      'network.conv', 'train.unload_text_encoder',
+    ],
+    additionalSections: [
+      'datasets.multi_control_paths',
+      'sample.multi_ctrl_imgs',
+      'model.low_vram',
+      'model.layer_offloading',
+      'model.qie.match_target_res',
+    ],
   },
 ].sort((a, b) => {
   // Sort by label, case-insensitive
