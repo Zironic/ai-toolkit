@@ -166,6 +166,17 @@ class BaseModel:
         self._status_update_hooks = []
         self.is_transformer = False
 
+        # Partial-load flags for the text-encoder worker split. These are set as
+        # attributes after construction but before load_model():
+        #   te_only  -> load ONLY the text encoder(s)+tokenizer(s) (no transformer/VAE).
+        #               Used by the throwaway TE cache worker process.
+        #   skip_te  -> load the transformer (+VAE) but NOT the text encoder(s); the
+        #               text encoder is replaced with a FakeTextEncoder. Used by the
+        #               trainer once a worker has cached all embeddings to disk.
+        # Only honored by models that implement them (currently zimage + anima).
+        self.te_only = False
+        self.skip_te = False
+
         self.sample_prompts_cache = None
         
         self.accuracy_recovery_adapter: Union[None, 'LoRASpecialNetwork'] = None
@@ -255,6 +266,12 @@ class BaseModel:
     @property
     def is_lumina2(self):
         return self.arch == 'lumina2'
+
+    @property
+    def text_embed_dim(self):
+        # Most architectures do not need cache-dimension validation. Models
+        # with a fixed text embedding width can override this property.
+        return None
 
     def get_bucket_divisibility(self):
         if self.vae is None:

@@ -580,6 +580,7 @@ export default function SimpleJob({
                     { value: 'adamw', label: 'AdamW' },
                     { value: 'adamw8bit', label: 'AdamW8Bit' },
                     { value: 'automagic', label: 'Automagic' },
+                    { value: 'automagic2', label: 'Automagic v2' },
                     { value: 'prodigyopt', label: 'Prodigy' },
                     { value: 'prodigy8bit', label: 'Prodigy8Bit' },
                   ]}
@@ -671,6 +672,46 @@ export default function SimpleJob({
                     placeholder="eg. 0.99"
                     min={0}
                   />
+                )}
+
+                <FormGroup label="Weight Noise" className="pt-2" docKey={'train.weight_noise'}>
+                  <Checkbox
+                    label="Enable Weight Noise"
+                    className="pt-1"
+                    checked={jobConfig.config.process[0].train.weight_noise?.enabled || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.enabled')}
+                  />
+                </FormGroup>
+                {jobConfig.config.process[0].train.weight_noise?.enabled && (
+                  <>
+                    <SelectInput
+                      label="Mode"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.mode || 'relative'}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.mode')}
+                      options={[
+                        { value: 'relative', label: 'Relative (σ × per-param weight RMS)' },
+                        { value: 'absolute', label: 'Absolute (fixed σ)' },
+                      ]}
+                    />
+                    <NumberInput
+                      label="Sigma"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.sigma as number}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.sigma')}
+                      placeholder="0.001 – 0.0017"
+                      min={0}
+                      docKey={'train.weight_noise.sigma'}
+                    />
+                    <NumberInput
+                      label="Log Every"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.log_every as number}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.log_every')}
+                      placeholder="eg. 50"
+                      min={0}
+                    />
+                  </>
                 )}
 
                 <FormGroup label="Text Encoder Optimizations" className="pt-2">

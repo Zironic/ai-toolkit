@@ -573,6 +573,72 @@ def encode_prompts_flux(
     return prompt_embeds, pooled_prompt_embeds
 
 
+@torch.no_grad()
+def encode_prompts_anima(
+        tokenizer,
+        t5_tokenizer,
+        text_encoder,
+        text_conditioner,
+        prompts: list,
+        device=None,
+        output_dtype=None,
+        dropout_prob: float = 0.0,
+        max_sequence_length: int = 512,
+):
+    """Two-stage Anima encoding: Qwen3 → AnimaTextConditioner → Cosmos conditioning."""
+    if dropout_prob > 0.0:
+        prompts = [p if torch.rand(1).item() > dropout_prob else "" for p in prompts]
+
+    if device is None:
+        device = text_encoder.device
+    if output_dtype is None:
+        output_dtype = text_encoder.dtype
+
+    prompts = [prompts] if isinstance(prompts, str) else list(prompts)
+
+    # Stage 1a: Qwen3 hidden states
+    qwen_inputs = tokenizer(
+        prompts,
+        padding="longest",
+        max_length=max_sequence_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    qwen_ids = qwen_inputs.input_ids.to(device)
+    qwen_mask = qwen_inputs.attention_mask.to(device)
+    if qwen_ids.shape[-1] == 0:
+        qwen_ids = qwen_ids.new_zeros((qwen_ids.shape[0], 1))
+        qwen_mask = qwen_mask.new_zeros((qwen_mask.shape[0], 1))
+
+    qwen_embeds = text_encoder(
+        input_ids=qwen_ids,
+        attention_mask=qwen_mask,
+        output_hidden_states=False,
+    ).last_hidden_state.to(dtype=text_conditioner.dtype, device=device)
+    qwen_embeds = qwen_embeds * qwen_mask.to(qwen_embeds).unsqueeze(-1)
+
+    # Stage 1b: T5 token IDs (no encoder pass needed — conditioner handles embedding)
+    t5_inputs = t5_tokenizer(
+        prompts,
+        padding="longest",
+        max_length=max_sequence_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    t5_ids = t5_inputs.input_ids.to(device)
+    t5_mask = t5_inputs.attention_mask.to(device)
+
+    # Stage 2: AnimaTextConditioner bridge
+    conditioning = text_conditioner(
+        source_hidden_states=qwen_embeds,
+        target_input_ids=t5_ids,
+        target_attention_mask=t5_mask,
+        source_attention_mask=qwen_mask,
+    ).to(dtype=output_dtype, device=device)
+
+    return conditioning
+
+
 # for XL
 def get_add_time_ids(
         height: int,

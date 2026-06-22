@@ -94,6 +94,8 @@ def main():
     
     if args.log is not None:
         setup_log_to_file(args.log)
+        # expose the log path so child processes (e.g. the TE cache worker) log to the same file
+        os.environ['AITK_LOG_FILE'] = args.log
 
     config_file_list = args.config_file_list
     if len(config_file_list) == 0:

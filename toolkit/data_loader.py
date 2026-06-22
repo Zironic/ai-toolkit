@@ -534,6 +534,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     dataset_root=dataset_folder,
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
                     text_embedding_space_version=self.sd.model_config.arch if self.sd else "sd1",
+                    expected_te_dim=getattr(self.sd, 'text_embed_dim', None) if self.sd else None,
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
                     latent_space_version=latent_space_version,
                     temporal_compression=temporal_compression,

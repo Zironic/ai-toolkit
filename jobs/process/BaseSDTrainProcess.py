@@ -172,6 +172,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.is_caching_text_embeddings = any(
             dataset.cache_text_embeddings for dataset in self.dataset_configs
         )
+        # set True in run() once a TE worker has cached all embeddings to disk; tells the
+        # trainer to load skip_te (no text encoder) and read embeds from disk instead of
+        # encoding them in-process.
+        self._use_cached_te = False
 
         self.embed_config = None
         embedding_raw = self.get_conf('embedding', None)
@@ -1561,6 +1565,99 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set trainable params
         self.sd.adapter = self.adapter
 
+    def maybe_run_te_cache_worker(self) -> bool:
+        """If this run caches text embeddings on a supported arch, ensure every embedding
+        is on disk — running a throwaway TE worker subprocess if needed — so the trainer
+        can load skip_te and never hold the text encoder alongside the transformer.
+
+        Returns True if the trainer should load with skip_te and read embeds from disk.
+        Raises if the worker fails or the cache is still incomplete afterward.
+        """
+        import sys
+        import json
+        import subprocess
+
+        if not self.is_caching_text_embeddings:
+            return False
+        # don't recurse: the worker process sets this so it caches in-process instead
+        if os.environ.get('AITK_IS_TE_WORKER', '0') == '1':
+            return False
+        # only archs with a te_only / skip_te load path
+        if self.model_config.arch not in ('zimage', 'anima'):
+            return False
+        if not (hasattr(self, 'cache_text_encoder_outputs_to_disk') and hasattr(self, 'aux_cache_is_ready')):
+            return False
+
+        # already fully cached for this exact config — use it, no worker needed
+        if self.aux_cache_is_ready():
+            print_acc("[te-worker] aux embedding cache already complete; using cached embeds (skip_te)")
+            return True
+
+        pipeline_dir = os.path.join(self.save_root, '.pipeline')
+        os.makedirs(pipeline_dir, exist_ok=True)
+        worker_config_path = os.path.join(pipeline_dir, 'te_worker_config.json')
+        with open(worker_config_path, 'w') as f:
+            json.dump(self.job.raw_config, f)
+
+        env = dict(os.environ)
+        env['AITK_IS_TE_WORKER'] = '1'
+
+        cmd = [sys.executable, '-m', 'toolkit.te_cache_worker', worker_config_path]
+        log_file = os.environ.get('AITK_LOG_FILE')
+        if log_file:
+            cmd += ['-l', log_file]
+
+        print_acc("[te-worker] launching text-encoder cache worker (text encoder will not be loaded in the trainer)")
+        result = subprocess.run(cmd, env=env, cwd=os.getcwd())
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Text-encoder cache worker failed (exit code {result.returncode}). "
+                f"Config: {worker_config_path}"
+            )
+        if not self.aux_cache_is_ready():
+            raise RuntimeError(
+                "Text-encoder cache worker finished but the aux embedding cache is still "
+                "incomplete. Refusing to train with skip_te (embeddings would be missing)."
+            )
+        print_acc("[te-worker] cache complete; trainer will load without the text encoder (skip_te)")
+        return True
+
+    def run_te_cache_worker(self):
+        """Entry for the throwaway text-encoder cache worker process.
+
+        Loads the model with te_only=True (text encoder + tokenizers only, no transformer
+        or VAE), encodes and persists every text embedding the trainer will need to disk
+        (dataset captions, DOP, and aux blank/trigger/uncond/sample embeds), then returns
+        so the process can exit and let the OS reclaim all text-encoder memory.
+
+        Only supported on archs that implement the te_only load path (zimage, anima) and
+        on process classes that implement cache_text_encoder_outputs_to_disk (SDTrainer).
+        """
+        BaseTrainProcess.run(self)
+        self.hook_before_model_load()
+        model_config_to_load = copy.deepcopy(self.model_config)
+
+        ModelClass = get_model_class(self.model_config)
+        sampler = ModelClass.get_train_scheduler() if hasattr(ModelClass, 'get_train_scheduler') else None
+
+        self.sd = ModelClass(
+            device=self.accelerator.device,
+            model_config=model_config_to_load,
+            dtype=self.train_config.dtype,
+            custom_pipeline=self.custom_pipeline,
+            noise_scheduler=sampler,
+        )
+        self.sd.te_only = True
+
+        self.hook_after_sd_init_before_load()
+        self.sd.load_model()
+
+        if not hasattr(self, 'cache_text_encoder_outputs_to_disk'):
+            raise NotImplementedError(
+                "This process type does not support the text-encoder cache worker."
+            )
+        self.cache_text_encoder_outputs_to_disk()
+
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
@@ -1594,6 +1691,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 arch = 'flux'
             if self.model_config.is_lumina2:
                 arch = 'lumina2'
+            if self.model_config.is_anima:
+                arch = 'flux'  # anima uses FlowMatchEulerDiscreteScheduler
             sampler = get_sampler(
                 self.train_config.noise_scheduler,
                 {
@@ -1608,6 +1707,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
                 self.load_training_state_from_metadata(previous_refiner_save)
 
+        # Ensure all text embeddings are cached to disk (running a throwaway TE worker if
+        # needed) so the trainer can load without the text encoder.
+        self._use_cached_te = self.maybe_run_te_cache_worker()
+
         self.sd = ModelClass(
             # todo handle single gpu and multi gpu here
             # device=self.device,
@@ -1617,10 +1720,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
             custom_pipeline=self.custom_pipeline,
             noise_scheduler=sampler,
         )
-        
+        if self._use_cached_te:
+            # never load the text encoder in the trainer; embeds come from disk
+            self.sd.skip_te = True
+
         self.hook_after_sd_init_before_load()
         # run base sd process run
         self.sd.load_model()
+
+        if self._use_cached_te:
+            if not self.load_cached_text_encoder_outputs_from_disk():
+                raise RuntimeError(
+                    "TE worker ran but cached text-encoder outputs could not be loaded "
+                    "from disk. Refusing to train with a skipped text encoder."
+                )
         
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
 
@@ -1780,6 +1893,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     is_auraflow=self.model_config.is_auraflow,
                     is_flux=self.model_config.is_flux,
                     is_lumina2=self.model_config.is_lumina2,
+                    is_anima=self.model_config.is_anima,
                     is_ssd=self.model_config.is_ssd,
                     is_vega=self.model_config.is_vega,
                     dropout=self.network_config.dropout,
@@ -2254,6 +2368,33 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if not did_first_flush:
                 flush()
                 did_first_flush = True
+                # one-time CUDA memory report after the first real training step, to see
+                # what is actually resident (allocated) vs what the caching allocator has
+                # reserved/committed (the gap is cached/fragmented, not leaked tensors).
+                # Gated to keep normal logs clean: set AITK_CUDA_MEM_REPORT=1 (or
+                # DEBUG_TOOLKIT=1) to enable.
+                _mem_report = (
+                    os.environ.get("AITK_CUDA_MEM_REPORT", "0") == "1"
+                    or os.environ.get("DEBUG_TOOLKIT", "0") == "1"
+                )
+                if _mem_report and torch.cuda.is_available():
+                    dev = self.device_torch
+                    gb = 1024 ** 3
+                    alloc = torch.cuda.memory_allocated(dev) / gb
+                    reserved = torch.cuda.memory_reserved(dev) / gb
+                    max_alloc = torch.cuda.max_memory_allocated(dev) / gb
+                    max_reserved = torch.cuda.max_memory_reserved(dev) / gb
+                    free_b, total_b = torch.cuda.mem_get_info(dev)
+                    used_total = (total_b - free_b) / gb  # process + everything else on the device
+                    print_acc("")
+                    print_acc("================ CUDA memory @ first train step ================")
+                    print_acc(f"  allocated (live tensors)     : {alloc:6.2f} GB")
+                    print_acc(f"  reserved  (allocator pool)   : {reserved:6.2f} GB   (cached/frag: {reserved - alloc:5.2f} GB)")
+                    print_acc(f"  peak allocated               : {max_alloc:6.2f} GB")
+                    print_acc(f"  peak reserved                : {max_reserved:6.2f} GB")
+                    print_acc(f"  device in use (nvidia-smi-ish): {used_total:6.2f} GB")
+                    print_acc("================================================================")
+                    print_acc("")
             # flush()
             # setup the networks to gradient checkpointing and everything works
             if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):

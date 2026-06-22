@@ -350,6 +350,26 @@ ContentOrStyleType = Literal['balanced', 'style', 'content']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 
 
+class WeightNoiseConfig:
+    """Inject Gaussian noise directly into LoRA parameter values after the
+    optimizer step (drift / weight perturbation). Modes:
+
+    - ``absolute``: σ fixed at ``sigma`` everywhere.
+    - ``relative``: σ = ``sigma`` × per-param weight RMS. Default — adapts
+      to per-tensor scale automatically; zero-init LoRA-up params get zero
+      noise until they learn something, which avoids destabilizing the start.
+
+    Every ``log_every`` steps emits ``weight_noise_norm`` (Frobenius norm of
+    the injected noise across all tagged params).
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        self.mode: str = str(kwargs.get('mode', 'relative'))  # 'absolute' | 'relative'
+        self.sigma: float = float(kwargs.get('sigma', 1.25e-2))
+        self.log_every: int = int(kwargs.get('log_every', 50))
+
+
 class TrainConfig:
     def __init__(self, **kwargs):
         self.noise_scheduler = kwargs.get('noise_scheduler', 'ddpm')
@@ -582,8 +602,12 @@ class TrainConfig:
         
         self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
 
+        self.weight_noise: WeightNoiseConfig = WeightNoiseConfig(
+            **(kwargs.get('weight_noise', {}) or {})
+        )
 
-ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
+
+ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21', 'anima']
 
 
 class ModelConfig:
@@ -599,6 +623,7 @@ class ModelConfig:
         self.is_v3: bool = kwargs.get('is_v3', False)
         self.is_flux: bool = kwargs.get('is_flux', False)
         self.is_lumina2: bool = kwargs.get('is_lumina2', False)
+        self.is_anima: bool = kwargs.get('is_anima', False)
         if self.is_pixart_sigma:
             self.is_pixart = True
         self.use_flux_cfg = kwargs.get('use_flux_cfg', False)
@@ -664,6 +689,16 @@ class ModelConfig:
         self.te_name_or_path = kwargs.get("te_name_or_path", None)
         
         self.arch: ModelArch = kwargs.get("arch", None)
+
+        # Older jobs and malformed UI transitions may omit the architecture.
+        # Z-Image cannot be loaded through the legacy StableDiffusion pipeline,
+        # so recover its architecture from the well-known model path rather than
+        # silently treating it as SD1 below.
+        if self.arch is None and self.name_or_path is not None:
+            normalized_model_path = str(self.name_or_path).replace('\\', '/').lower()
+            model_name = normalized_model_path.rstrip('/').rsplit('/', 1)[-1]
+            if model_name.startswith('z-image'):
+                self.arch = 'zimage'
         
         # auto memory management, only for some models
         self.auto_memory = kwargs.get("auto_memory", False)
@@ -742,6 +777,8 @@ class ModelConfig:
                 self.is_flux = True
             elif self.arch == 'lumina2':
                 self.is_lumina2 = True
+            elif self.arch == 'anima':
+                self.is_anima = True
             elif self.arch == 'vega':
                 self.is_vega = True
             elif self.arch == 'ssd':
@@ -765,6 +802,8 @@ class ModelConfig:
                 self.arch = 'flux'
             elif kwargs.get('is_lumina2', False):
                 self.arch = 'lumina2'
+            elif kwargs.get('is_anima', False):
+                self.arch = 'anima'
             elif kwargs.get('is_vega', False):
                 self.arch = 'vega'
             elif kwargs.get('is_ssd', False):

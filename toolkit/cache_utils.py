@@ -104,49 +104,15 @@ def atomic_write(target: Path, write_fn: Callable[[Path], None], fsync: bool = T
         raise
 
 
-def find_cached_file(expected_path: Path, legacy_fallback: bool = True) -> Optional[Path]:
-    """Return a Path to the cached file.
-
-    If `expected_path` exists return it. Otherwise, if `legacy_fallback` is True,
-    attempt to find a legacy-named cache file by searching for files that start with
-    the same base (prefix before first underscore) and return the best candidate
-    (most recent modification time) or None.
-    """
+def find_cached_file(expected_path: Path) -> Optional[Path]:
+    """Return the expected_path if it exists, otherwise None."""
     expected_path = Path(expected_path)
     if expected_path.exists():
         return expected_path
-    if not legacy_fallback:
-        return None
-    parent = expected_path.parent
-    if not parent.exists():
-        return None
-    # prefix before first underscore in the expected filename
-    base_name = expected_path.name.split('_')[0]
-    # get the expected file extension
-    expected_ext = expected_path.suffix.lower()
-    candidates = []
-    try:
-        for p in parent.iterdir():
-            if not p.is_file():
-                continue
-            # skip temporary files (atomic_write creates .tmp.* files)
-            if p.name.startswith('.') and '.tmp.' in p.name:
-                continue
-            # only consider files with matching extension to avoid picking up temp files
-            if expected_ext and p.suffix.lower() != expected_ext:
-                continue
-            if p.name.startswith(base_name + '_'):
-                candidates.append(p)
-    except Exception:
-        return None
-    if not candidates:
-        return None
-    # pick most recently modified candidate as heuristic
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0]
+    return None
 
 
-def wait_for_cached_file(expected_path: Path, timeout: float = 5.0, poll_interval: float = 0.1, legacy_fallback: bool = True) -> Optional[Path]:
+def wait_for_cached_file(expected_path: Path, timeout: float = 5.0, poll_interval: float = 0.1, **kwargs) -> Optional[Path]:
     """Wait up to `timeout` seconds for a cached file to appear and be stable.
 
     Returns the Path if found and stable, otherwise None.
@@ -157,7 +123,7 @@ def wait_for_cached_file(expected_path: Path, timeout: float = 5.0, poll_interva
     deadline = time.time() + float(timeout)
     last_size = None
     while time.time() < deadline:
-        candidate = find_cached_file(Path(expected_path), legacy_fallback=legacy_fallback)
+        candidate = find_cached_file(Path(expected_path))
         if candidate is None:
             time.sleep(poll_interval)
             continue

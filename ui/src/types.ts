@@ -116,6 +116,13 @@ export interface EMAConfig {
   ema_decay: number;
 }
 
+export interface WeightNoiseConfig {
+  enabled: boolean;
+  mode: 'relative' | 'absolute';
+  sigma: number;
+  log_every: number;
+}
+
 export interface TrainConfig {
   batch_size: number;
   bypass_guidance_embedding?: boolean;
@@ -131,6 +138,7 @@ export interface TrainConfig {
   lr: number;
   ema_config?: EMAConfig;
   dtype: string;
+  weight_noise?: WeightNoiseConfig;
   unload_text_encoder: boolean;
   cache_text_embeddings: boolean;
   optimizer_params: {

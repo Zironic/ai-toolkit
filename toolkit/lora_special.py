@@ -129,6 +129,12 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.module_dropout = module_dropout
         self.is_checkpointing = False
 
+        self.lora_down.weight._is_lora = True
+        if hasattr(self.lora_up, 'weight'):
+            self.lora_up.weight._is_lora = True
+        if use_bias and getattr(self.lora_up, 'bias', None) is not None:
+            self.lora_up.bias._is_lora = True
+
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
         self.org_module[0].forward = self.forward
@@ -183,6 +189,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             is_auraflow: bool = False,
             is_flux: bool = False,
             is_lumina2: bool = False,
+            is_anima: bool = False,
             use_bias: bool = False,
             is_lorm: bool = False,
             ignore_if_contains = None,
@@ -250,6 +257,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         self.is_auraflow = is_auraflow
         self.is_flux = is_flux
         self.is_lumina2 = is_lumina2
+        self.is_anima = is_anima
         self.network_type = network_type
         self.is_assistant_adapter = is_assistant_adapter
         self.full_rank = network_type.lower() == "fullrank"
@@ -274,7 +282,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             self.use_old_lokr_format = False
 
         # always do peft for flux only for now
-        if self.is_flux or self.is_v3 or self.is_lumina2 or is_transformer:
+        if self.is_flux or self.is_v3 or self.is_lumina2 or self.is_anima or is_transformer:
             # don't do peft format for lokr if using old format
             if self.network_type.lower() != "lokr" or not self.use_old_lokr_format:
                 self.peft_format = True
@@ -317,7 +325,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             unet_prefix = self.LORA_PREFIX_UNET
             if self.peft_format:
                 unet_prefix = self.PEFT_PREFIX_UNET
-            if is_pixart or is_v3 or is_auraflow or is_flux or is_lumina2 or self.is_transformer:
+            if is_pixart or is_v3 or is_auraflow or is_flux or is_lumina2 or self.is_anima or self.is_transformer:
                 unet_prefix = f"lora_transformer"
                 if self.peft_format:
                     unet_prefix = "transformer"
@@ -513,6 +521,9 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         if is_lumina2:
             target_modules = ["Lumina2Transformer2DModel"]
 
+        if self.is_anima:
+            target_modules = ["CosmosTransformer3DModel"]
+
         if train_unet:
             self.unet_loras, skipped_un = create_modules(True, None, unet, target_modules)
         else:
@@ -538,6 +549,12 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         for lora in self.text_encoder_loras + self.unet_loras:
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
+
+        # Tag every adapter parameter so weight_noise can filter to LoRA-only
+        # without knowing module types (covers LoKr, LoHa, full-rank, etc.)
+        for adapter in self.text_encoder_loras + self.unet_loras:
+            for p in adapter.parameters():
+                p._is_lora = True
 
         if self.full_train_in_out:
             print("full train in out")

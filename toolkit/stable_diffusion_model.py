@@ -50,7 +50,9 @@ from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAda
     StableDiffusionXLControlNetPipeline, StableDiffusionControlNetPipeline, StableDiffusion3Pipeline, \
     StableDiffusion3Img2ImgPipeline, PixArtSigmaPipeline, AuraFlowPipeline, AuraFlowTransformer2DModel, FluxPipeline, \
     FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel, Lumina2Pipeline, \
-    FluxControlPipeline, Lumina2Transformer2DModel
+    FluxControlPipeline, Lumina2Transformer2DModel, AnimaModularPipeline, AnimaTextConditioner
+from diffusers.models import CosmosTransformer3DModel, AutoencoderKLQwenImage
+from transformers import Qwen2Tokenizer, Qwen3Model
 import diffusers
 from diffusers import \
     AutoencoderKL, \
@@ -163,6 +165,10 @@ class StableDiffusion:
         self.tokenizer: Union[None, 'CLIPTokenizer', List['CLIPTokenizer']]
         self.noise_scheduler: Union[None, 'DDPMScheduler'] = noise_scheduler
 
+        # Anima-specific components (populated during load_model for anima arch)
+        self.anima_t5_tokenizer = None
+        self.anima_text_conditioner = None
+
         self.refiner_unet: Union[None, 'UNet2DConditionModel'] = None
         self.assistant_lora: Union[None, 'LoRASpecialNetwork'] = None
 
@@ -192,7 +198,7 @@ class StableDiffusion:
         self.config_file = None
 
         self.is_flow_matching = False
-        if self.is_flux or self.is_v3 or self.is_auraflow or self.is_lumina2 or isinstance(self.noise_scheduler, CustomFlowMatchEulerDiscreteScheduler):
+        if self.is_flux or self.is_v3 or self.is_auraflow or self.is_lumina2 or self.is_anima or isinstance(self.noise_scheduler, CustomFlowMatchEulerDiscreteScheduler):
             self.is_flow_matching = True
 
         self.quantize_device = self.device_torch
@@ -204,7 +210,13 @@ class StableDiffusion:
         self._status_update_hooks = []
         # todo update this based on the model
         self.is_transformer = False
-        
+
+        # Partial-load flags for the text-encoder worker split (see BaseModel for docs).
+        # Set as attributes after construction but before load_model(). Only honored by
+        # archs that implement them (currently anima).
+        self.te_only = False
+        self.skip_te = False
+
         self.sample_prompts_cache = None
         
         self.is_multistage = False
@@ -268,7 +280,21 @@ class StableDiffusion:
     @property
     def is_lumina2(self):
         return self.arch == 'lumina2'
-    
+
+    @property
+    def is_anima(self):
+        return self.arch == 'anima'
+
+    @property
+    def text_embed_dim(self):
+        """Expected last dim of text embeddings, or None if no validation needed."""
+        if self.is_anima:
+            try:
+                return self.unet.config.text_embed_dim  # 1024
+            except Exception:
+                return 1024
+        return None
+
     @property
     def unet_unwrapped(self):
         return unwrap_model(self.unet)
@@ -276,6 +302,8 @@ class StableDiffusion:
     def get_bucket_divisibility(self):
         if self.vae is None:
             return 16
+        if self.is_anima:
+            return 16  # 8 (vae) * 2 (transformer patch)
         divisibility = 2 ** (len(self.vae.config['block_out_channels']) - 1)
         
         # flux packs this again,
@@ -932,6 +960,105 @@ class StableDiffusion:
             text_encoder.eval()
             pipe.transformer = pipe.transformer.to(self.device_torch)
             flush()
+        elif self.model_config.is_anima:
+            self.print_and_status_update("Loading Anima model")
+            base_model_path = self.model_config.name_or_path_original
+            model_path = self.model_config.name_or_path
+
+            # Resolve base_model_path (a local full checkpoint keeps the transformer in a
+            # subfolder) even when te_only skips loading the transformer itself.
+            if os.path.isdir(model_path) and os.path.isdir(os.path.join(model_path, 'transformer')):
+                base_model_path = model_path
+
+            transformer = None
+            if self.te_only:
+                self.print_and_status_update("Skipping Anima transformer (te_only load)")
+            else:
+                self.print_and_status_update("Loading Anima transformer")
+                # for local checkpoints the transformer sits in a subfolder
+                if os.path.isdir(model_path) and os.path.isdir(os.path.join(model_path, 'transformer')):
+                    transformer = CosmosTransformer3DModel.from_pretrained(
+                        os.path.join(model_path, 'transformer'), torch_dtype=dtype
+                    )
+                else:
+                    transformer = CosmosTransformer3DModel.from_pretrained(
+                        model_path, subfolder='transformer', torch_dtype=dtype
+                    )
+
+                transformer.to(self.quantize_device, dtype=dtype)
+                flush()
+
+                if self.model_config.quantize:
+                    patch_dequantization_on_save(transformer)
+                    quantization_type = get_qtype(self.model_config.qtype)
+                    self.print_and_status_update("Quantizing Anima transformer")
+                    quantize(transformer, weights=quantization_type, **self.model_config.quantize_kwargs)
+                    transformer.to(self.device_torch)
+                else:
+                    transformer.to(self.device_torch, dtype=dtype)
+                flush()
+
+            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model_path, subfolder="scheduler")
+
+            vae = None
+            if self.te_only:
+                self.print_and_status_update("Skipping Anima VAE (te_only load)")
+            else:
+                self.print_and_status_update("Loading Anima VAE")
+                vae = AutoencoderKLQwenImage.from_pretrained(base_model_path, subfolder="vae", torch_dtype=dtype)
+                flush()
+
+            # tokenizers are tiny; always load them so the pipeline is well-formed
+            tokenizer = Qwen2Tokenizer.from_pretrained(base_model_path, subfolder="tokenizer")
+            t5_tokenizer = T5TokenizerFast.from_pretrained(base_model_path, subfolder="t5_tokenizer")
+
+            if self.skip_te:
+                # Trainer running off a pre-built embedding cache: never load the heavy
+                # Qwen3 text encoder or the Anima text conditioner.
+                from toolkit.unloader import FakeTextEncoder
+                self.print_and_status_update("Skipping Anima text encoder + conditioner (skip_te load)")
+                text_encoder = FakeTextEncoder(device=self.device_torch, dtype=dtype)
+                text_conditioner = FakeTextEncoder(device=self.device_torch, dtype=dtype)
+            else:
+                self.print_and_status_update("Loading Anima text encoder (Qwen3)")
+                text_encoder = Qwen3Model.from_pretrained(base_model_path, subfolder="text_encoder", torch_dtype=dtype)
+                text_encoder.to(self.device_torch, dtype=dtype)
+                text_encoder.requires_grad_(False)
+                text_encoder.eval()
+                flush()
+
+                self.print_and_status_update("Loading Anima text conditioner")
+                text_conditioner = AnimaTextConditioner.from_pretrained(
+                    base_model_path, subfolder="text_conditioner", torch_dtype=dtype
+                )
+                text_conditioner.to(self.device_torch, dtype=dtype)
+                text_conditioner.requires_grad_(False)
+                text_conditioner.eval()
+                flush()
+
+            self.print_and_status_update("Building Anima pipeline")
+            from diffusers.modular_pipelines.anima.modular_blocks_anima import AnimaAutoBlocks
+            pipe = AnimaModularPipeline(blocks=AnimaAutoBlocks())
+            pipe.transformer = transformer
+            pipe.vae = vae
+            pipe.text_encoder = text_encoder
+            pipe.tokenizer = tokenizer
+            pipe.t5_tokenizer = t5_tokenizer
+            pipe.text_conditioner = text_conditioner
+            pipe.scheduler = scheduler
+
+            # spatial patch_size is 2 — tell _run_preservation_forward to round to multiples of 2
+            if transformer is not None:
+                transformer.all_patch_size = [2]
+
+            self.anima_t5_tokenizer = t5_tokenizer
+            self.anima_text_conditioner = text_conditioner
+            # Keep the CustomFlowMatchEulerDiscreteScheduler passed via constructor
+            # (it has set_train_timesteps); only fall back to the checkpoint scheduler
+            # if no custom scheduler was injected.
+            if self.noise_scheduler is None:
+                self.noise_scheduler = scheduler
+            flush()
         else:
             if self.custom_pipeline is not None:
                 pipln = self.custom_pipeline
@@ -1004,22 +1131,30 @@ class StableDiffusion:
         # add hacks to unet to help training
         # pipe.unet = prepare_unet_for_training(pipe.unet)
 
-        if self.is_pixart or self.is_v3 or self.is_auraflow or self.is_flux or self.is_lumina2:
+        if self.is_pixart or self.is_v3 or self.is_auraflow or self.is_flux or self.is_lumina2 or self.is_anima:
             # pixart and sd3 dont use a unet
             self.unet = pipe.transformer
         else:
             self.unet: 'UNet2DConditionModel' = pipe.unet
-        self.vae: 'AutoencoderKL' = pipe.vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
-        self.vae.eval()
-        self.vae.requires_grad_(False)
-        VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
-        self.vae_scale_factor = VAE_SCALE_FACTOR
-        self.unet.to(self.device_torch, dtype=dtype)
-        self.unet.requires_grad_(False)
-        self.unet.eval()
+        if self.te_only:
+            # TE cache worker: no transformer/VAE were loaded; nothing to place on device.
+            self.vae = pipe.vae
+            self.vae_scale_factor = 8 if self.is_anima else None
+        else:
+            self.vae: 'AutoencoderKL' = pipe.vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+            self.vae.eval()
+            self.vae.requires_grad_(False)
+            if self.is_anima:
+                VAE_SCALE_FACTOR = 8
+            else:
+                VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
+            self.vae_scale_factor = VAE_SCALE_FACTOR
+            self.unet.to(self.device_torch, dtype=dtype)
+            self.unet.requires_grad_(False)
+            self.unet.eval()
 
         # load any loras we have
-        if self.model_config.lora_path is not None and not self.is_flux and not self.is_lumina2:
+        if self.model_config.lora_path is not None and not self.is_flux and not self.is_lumina2 and not self.is_anima:
             pipe.load_lora_weights(self.model_config.lora_path, adapter_name="lora1")
             pipe.fuse_lora()
             # unfortunately, not an easier way with peft
@@ -1321,6 +1456,12 @@ class StableDiffusion:
                     scheduler=noise_scheduler,
                     **extra_args
                 )
+
+            elif self.is_anima:
+                pipeline = self.pipeline
+                pipeline.scheduler = noise_scheduler
+                pipeline.transformer = self.unet
+                pipeline.vae = self.vae
 
             else:
                 pipeline = Pipe(
@@ -1667,6 +1808,71 @@ class StableDiffusion:
                             generator=generator,
                             **extra
                         ).images[0]
+                    elif self.is_anima:
+                        import numpy as np
+                        from diffusers.utils.torch_utils import randn_tensor
+                        from diffusers.image_processor import VaeImageProcessor
+
+                        h = gen_config.height
+                        w = gen_config.width
+                        vae_scale = pipeline.vae_scale_factor  # 8
+                        h_lat = h // vae_scale
+                        w_lat = w // vae_scale
+
+                        # latents shape: (1, C, 1, H_lat, W_lat) for Cosmos
+                        num_channels = self.unet.config.in_channels
+                        latents = randn_tensor(
+                            (1, num_channels, 1, h_lat, w_lat),
+                            generator=generator,
+                            device=self.device_torch,
+                            dtype=self.torch_dtype,
+                        )
+                        padding_mask = latents.new_zeros(1, 1, h, w, dtype=self.torch_dtype)
+
+                        # set up timesteps via sigmas
+                        n_steps = gen_config.num_inference_steps
+                        sigmas = np.linspace(1.0, 1.0 / n_steps, n_steps)
+                        noise_scheduler.set_timesteps(sigmas=sigmas, device=self.device_torch)
+                        noise_scheduler.set_begin_index(0)
+                        timesteps = noise_scheduler.timesteps
+
+                        cond_embeds = conditional_embeds.text_embeds.to(self.device_torch, self.torch_dtype)
+                        uncond_embeds = unconditional_embeds.text_embeds.to(self.device_torch, self.torch_dtype)
+                        guidance = gen_config.guidance_scale
+
+                        for t in timesteps:
+                            timestep = t.expand(1).to(self.torch_dtype) / noise_scheduler.config.num_train_timesteps
+
+                            # CFG: run cond and uncond together
+                            latents_input = torch.cat([latents, latents])
+                            enc_hs = torch.cat([uncond_embeds, cond_embeds])
+                            t_batch = timestep.repeat(2)
+
+                            with torch.no_grad():
+                                noise_pred = self.unet(
+                                    hidden_states=latents_input.to(self.torch_dtype),
+                                    timestep=t_batch,
+                                    encoder_hidden_states=enc_hs,
+                                    padding_mask=padding_mask,
+                                    return_dict=False,
+                                )[0]
+
+                            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + guidance * (noise_pred_cond - noise_pred_uncond)
+
+                            latents = noise_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                        # decode
+                        vae = self.vae
+                        z_dim = vae.config.z_dim
+                        lm = torch.tensor(vae.config.latents_mean).view(1, z_dim, 1, 1, 1).to(latents)
+                        ls = torch.tensor(vae.config.latents_std).view(1, z_dim, 1, 1, 1).to(latents)
+                        latents_denorm = latents * ls + lm
+                        with torch.no_grad():
+                            decoded = vae.decode(latents_denorm, return_dict=False)[0][:, :, 0]
+
+                        image_processor = VaeImageProcessor(vae_scale_factor=vae_scale)
+                        img = image_processor.postprocess(decoded, output_type='pil')[0]
                     else:
                         img = pipeline(
                             # prompt=gen_config.prompt,
@@ -1878,7 +2084,12 @@ class StableDiffusion:
         # get the embeddings
         if text_embeddings is None and conditional_embeddings is None:
             raise ValueError("Either text_embeddings or conditional_embeddings must be specified")
-        if text_embeddings is None and unconditional_embeddings is not None:
+
+        # Anima: avoid generic CFG concat — the forward pass handles CFG directly
+        if self.is_anima:
+            if text_embeddings is None:
+                text_embeddings = conditional_embeddings
+        elif text_embeddings is None and unconditional_embeddings is not None:
             text_embeddings = concat_prompt_embeds([
                 unconditional_embeddings,  # negative embedding
                 conditional_embeddings,  # positive embedding
@@ -1892,7 +2103,14 @@ class StableDiffusion:
         do_classifier_free_guidance = True
 
         # check if batch size of embeddings matches batch size of latents
-        if latents.shape[0] == text_embeddings.text_embeds.shape[0]:
+        if self.is_anima:
+            # Anima handles CFG inside its own forward block; always treat as no-CFG here
+            do_classifier_free_guidance = False
+        elif isinstance(text_embeddings.text_embeds, (list, tuple)):
+            te_batch = text_embeddings.text_embeds[0].shape[0]
+            if latents.shape[0] == te_batch:
+                do_classifier_free_guidance = False
+        elif latents.shape[0] == text_embeddings.text_embeds.shape[0]:
             do_classifier_free_guidance = False
         elif latents.shape[0] * 2 != text_embeddings.text_embeds.shape[0]:
             raise ValueError("Batch size of latents must be the same or half the batch size of text embeddings")
@@ -2236,6 +2454,30 @@ class StableDiffusion:
                         timestep=t,
                         return_dict=False,
                     )[0]
+                elif self.is_anima:
+                    # Cosmos uses timestep in [0, 1]
+                    t = timestep.float() / self.noise_scheduler.config.num_train_timesteps
+                    t = t.expand(latent_model_input.shape[0]).to(self.device_torch, self.torch_dtype)
+                    # latents are 4D (B, C, H, W); expand to 5D for the Cosmos transformer
+                    lmi_5d = latent_model_input.unsqueeze(2)
+                    h_latent, w_latent = lmi_5d.shape[-2], lmi_5d.shape[-1]
+                    padding_mask = lmi_5d.new_zeros(1, 1, h_latent * 8, w_latent * 8, dtype=self.torch_dtype)
+                    # text_embeds may be a list (from multi-encoder concat path) or a tensor
+                    raw_te = text_embeddings.text_embeds
+                    if isinstance(raw_te, (list, tuple)):
+                        raw_te = raw_te[0]
+                    with self.accelerator.autocast():
+                        noise_pred = self.unet(
+                            hidden_states=lmi_5d.to(self.device_torch, self.torch_dtype),
+                            timestep=t,
+                            encoder_hidden_states=raw_te.to(self.device_torch, self.torch_dtype),
+                            padding_mask=padding_mask,
+                            return_dict=False,
+                        )[0]
+                    if isinstance(noise_pred, QTensor):
+                        noise_pred = noise_pred.dequantize()
+                    # squeeze back to 4D for loss computation
+                    noise_pred = noise_pred.squeeze(2)
                 else:
                     noise_pred = self.unet(
                         latent_model_input.to(self.device_torch, self.torch_dtype),
@@ -2479,6 +2721,19 @@ class StableDiffusion:
                 attention_mask=prompt_attention_mask,
             )
 
+        elif self.is_anima:
+            conditioning_embeds = train_tools.encode_prompts_anima(
+                tokenizer=self.tokenizer,
+                t5_tokenizer=self.anima_t5_tokenizer,
+                text_encoder=self.text_encoder,
+                text_conditioner=self.anima_text_conditioner,
+                prompts=prompt,
+                device=self.device_torch,
+                output_dtype=self.torch_dtype,
+                dropout_prob=dropout_prob,
+            )
+            return PromptEmbeds(conditioning_embeds)
+
         elif isinstance(self.text_encoder, T5EncoderModel):
             embeds, attention_mask = train_tools.encode_prompts_pixart(
                 self.tokenizer,
@@ -2530,6 +2785,10 @@ class StableDiffusion:
         self.vae.requires_grad_(False)
         # move to device and dtype
         image_list = [image.to(device, dtype=dtype) for image in image_list]
+
+        if self.is_anima:
+            from toolkit.models.anima import encode_images_anima
+            return encode_images_anima(self.vae, image_list, device, dtype)
 
         VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
 
@@ -2674,7 +2933,7 @@ class StableDiffusion:
                 for name, param in self.text_encoder.named_parameters(recurse=True, prefix=f"{SD_PREFIX_TEXT_ENCODER}"):
                     named_params[name] = param
         if unet:
-            if self.is_flux or self.is_lumina2:
+            if self.is_flux or self.is_lumina2 or self.is_anima:
                 for name, param in self.unet.named_parameters(recurse=True, prefix="transformer"):
                     named_params[name] = param
             else:
@@ -2793,7 +3052,14 @@ class StableDiffusion:
                     save_directory=os.path.join(output_file, 'transformer'),
                     safe_serialization=True,
                 )
-                
+
+            elif self.is_anima:
+                transformer: CosmosTransformer3DModel = unwrap_model(self.unet)
+                transformer.save_pretrained(
+                    save_directory=os.path.join(output_file, 'transformer'),
+                    safe_serialization=True,
+                )
+
             else:
 
                 self.pipeline.save_pretrained(
@@ -2935,8 +3201,12 @@ class StableDiffusion:
                 te_has_grad = self.text_encoder.layers[0].mlp.gate_proj.weight.requires_grad
             elif isinstance(self.text_encoder, LlamaModel):
                 te_has_grad = self.text_encoder.layers[0].mlp.gate_proj.weight.requires_grad
-            else:
+            elif isinstance(self.text_encoder, Qwen3Model):
+                te_has_grad = self.text_encoder.layers[0].mlp.gate_proj.weight.requires_grad
+            elif hasattr(self.text_encoder, 'text_model'):
                 te_has_grad = self.text_encoder.text_model.final_layer_norm.weight.requires_grad
+            else:
+                te_has_grad = False
 
             self.device_state['text_encoder'] = {
                 'training': self.text_encoder.training,
@@ -3112,12 +3382,56 @@ class StableDiffusion:
         if isinstance(self.text_encoder, list):
             for encoder in self.text_encoder:
                 encoder.to(*args, **kwargs)
-        else:
+        elif self.text_encoder is not None:
             self.text_encoder.to(*args, **kwargs)
+        if self.anima_text_conditioner is not None:
+            self.anima_text_conditioner.to(*args, **kwargs)
             
     def convert_lora_weights_before_save(self, state_dict):
-        # can be overridden in child classes to convert weights before saving
-        return state_dict
+        if not self.is_anima:
+            return state_dict
+
+        # Convert diffusers PEFT keys → native Circlestone/ComfyUI format.
+        # Inverse of diffusers' _convert_non_diffusers_anima_lora_to_diffusers.
+        rename = {
+            "transformer_blocks.": "blocks.",
+            "attn1.to_q": "self_attn.q_proj",
+            "attn1.to_k": "self_attn.k_proj",
+            "attn1.to_v": "self_attn.v_proj",
+            "attn1.to_out.0": "self_attn.output_proj",
+            "attn2.to_q": "cross_attn.q_proj",
+            "attn2.to_k": "cross_attn.k_proj",
+            "attn2.to_v": "cross_attn.v_proj",
+            "attn2.to_out.0": "cross_attn.output_proj",
+            "ff.net.0.proj": "mlp.layer1",
+            "ff.net.2": "mlp.layer2",
+            "norm1.linear_1": "adaln_modulation_self_attn.1",
+            "norm1.linear_2": "adaln_modulation_self_attn.2",
+            "norm2.linear_1": "adaln_modulation_cross_attn.1",
+            "norm2.linear_2": "adaln_modulation_cross_attn.2",
+            "norm3.linear_1": "adaln_modulation_mlp.1",
+            "norm3.linear_2": "adaln_modulation_mlp.2",
+            "norm_out.linear_1": "final_layer.adaln_modulation.1",
+            "norm_out.linear_2": "final_layer.adaln_modulation.2",
+            "proj_out": "final_layer.linear",
+            "time_embed.t_embedder": "t_embedder.1",
+            "time_embed.norm": "t_embedding_norm",
+            "patch_embed.proj": "x_embedder.proj.1",
+        }
+
+        new_dict = {}
+        for key, value in state_dict.items():
+            new_key = key
+            # transformer.X  →  diffusion_model.X
+            if new_key.startswith("transformer."):
+                new_key = "diffusion_model." + new_key[len("transformer."):]
+            for old, new in rename.items():
+                new_key = new_key.replace(old, new)
+            # PEFT naming → kohya naming
+            new_key = new_key.replace(".lora_A.", ".lora_down.")
+            new_key = new_key.replace(".lora_B.", ".lora_up.")
+            new_dict[new_key] = value
+        return new_dict
     
     def convert_lora_weights_before_load(self, state_dict):
         # can be overridden in child classes to convert weights before loading
@@ -3142,6 +3456,8 @@ class StableDiffusion:
             return 'flux.1'
         if self.is_lumina2:
             return 'lumina2'
+        if self.is_anima:
+            return 'anima'
         if self.is_ssd:
             return 'ssd'
         if self.is_vega:

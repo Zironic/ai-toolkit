@@ -2103,7 +2103,21 @@ class TextEmbeddingFileItemDTOMixin:
             if not cached:
                 return
             try:
-                self.prompt_embeds = PromptEmbeds.load(str(cached))
+                loaded = PromptEmbeds.load(str(cached))
+                # Validate embedding dim if expected dim is known
+                expected_dim = getattr(self, 'expected_te_dim', None)
+                if expected_dim is not None:
+                    te = loaded.text_embeds
+                    actual_dim = te[-1].shape[-1] if isinstance(te, (list, tuple)) else te.shape[-1]
+                    if actual_dim != expected_dim:
+                        print_acc(f"Warning: stale text embedding cache (dim {actual_dim} != expected {expected_dim}), re-encoding: {cached}")
+                        try:
+                            import os as _os
+                            _os.remove(str(cached))
+                        except Exception:
+                            pass
+                        return
+                self.prompt_embeds = loaded
             except FileNotFoundError:
                 # file was removed racing with load; treat as missing
                 return

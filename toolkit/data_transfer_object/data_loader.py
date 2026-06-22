@@ -71,6 +71,7 @@ class FileItemDTO(
         self.te_padding_side = kwargs.get("te_padding_side", "right")
         self.latent_space_version = kwargs.get("latent_space_version", "sd1")
         self.text_embedding_space_version = kwargs.get("text_embedding_space_version", "sd1")
+        self.expected_te_dim: int | None = kwargs.get("expected_te_dim", None)
         if dataset_root is not None:
             # remove dataset root from path
             file_key = self.path.replace(dataset_root, "")

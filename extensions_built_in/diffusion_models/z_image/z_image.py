@@ -157,8 +157,7 @@ class ZImageModel(BaseModel):
         model_path = self.model_config.name_or_path
         base_model_path = self.model_config.extras_name_or_path
 
-        self.print_and_status_update("Loading transformer")
-
+        # resolve base_model_path early (needed for TE/VAE even when we skip the transformer)
         transformer_path = model_path
         transformer_subfolder = "transformer"
         if os.path.exists(transformer_path):
@@ -170,73 +169,90 @@ class ZImageModel(BaseModel):
             if os.path.exists(te_folder_path):
                 base_model_path = model_path
 
-        transformer = ZImageTransformer2DModel.from_pretrained(
-            transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
-        )
-
-        # load assistant lora if specified
-        if self.model_config.assistant_lora_path is not None:
-            self.load_training_adapter(transformer)
-            # set qtype to be float8 if it is qfloat8
-            if self.model_config.qtype == "qfloat8":
-                self.model_config.qtype = "float8"
-
-        if self.model_config.quantize:
-            self.print_and_status_update("Quantizing Transformer")
-            quantize_model(self, transformer)
-            flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-                ignore_modules=[
-                    transformer.x_pad_token,
-                    transformer.cap_pad_token,
-                ]
+        transformer = None
+        if self.te_only:
+            # TE cache worker: we only need the text encoder, skip the transformer entirely.
+            self.print_and_status_update("Skipping transformer (te_only load)")
+        else:
+            self.print_and_status_update("Loading transformer")
+            transformer = ZImageTransformer2DModel.from_pretrained(
+                transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
             )
 
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer to CPU")
-            transformer.to("cpu")
+            # load assistant lora if specified
+            if self.model_config.assistant_lora_path is not None:
+                self.load_training_adapter(transformer)
+                # set qtype to be float8 if it is qfloat8
+                if self.model_config.qtype == "qfloat8":
+                    self.model_config.qtype = "float8"
 
-        flush()
+            if self.model_config.quantize:
+                self.print_and_status_update("Quantizing Transformer")
+                quantize_model(self, transformer)
+                flush()
 
-        self.print_and_status_update("Text Encoder")
+            if (
+                self.model_config.layer_offloading
+                and self.model_config.layer_offloading_transformer_percent > 0
+            ):
+                MemoryManager.attach(
+                    transformer,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_transformer_percent,
+                    ignore_modules=[
+                        transformer.x_pad_token,
+                        transformer.cap_pad_token,
+                    ]
+                )
+
+            if self.model_config.low_vram:
+                self.print_and_status_update("Moving transformer to CPU")
+                transformer.to("cpu")
+
+            flush()
+
         tokenizer = AutoTokenizer.from_pretrained(
             base_model_path, subfolder="tokenizer", torch_dtype=dtype
         )
-        text_encoder = Qwen3ForCausalLM.from_pretrained(
-            base_model_path, subfolder="text_encoder", torch_dtype=dtype
-        )
 
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+        if self.skip_te:
+            # Trainer running off a pre-built embedding cache: never load the heavy TE.
+            from toolkit.unloader import FakeTextEncoder
+            self.print_and_status_update("Skipping text encoder (skip_te load)")
+            text_encoder = FakeTextEncoder(device=self.device_torch, dtype=dtype)
+        else:
+            self.print_and_status_update("Text Encoder")
+            text_encoder = Qwen3ForCausalLM.from_pretrained(
+                base_model_path, subfolder="text_encoder", torch_dtype=dtype
             )
 
-        text_encoder.to(self.device_torch, dtype=dtype)
-        flush()
+            if (
+                self.model_config.layer_offloading
+                and self.model_config.layer_offloading_text_encoder_percent > 0
+            ):
+                MemoryManager.attach(
+                    text_encoder,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+                )
 
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Text Encoder")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
+            text_encoder.to(self.device_torch, dtype=dtype)
             flush()
 
-        self.print_and_status_update("Loading VAE")
-        vae = AutoencoderKL.from_pretrained(
-            base_model_path, subfolder="vae", torch_dtype=dtype
-        )
+            if self.model_config.quantize_te:
+                self.print_and_status_update("Quantizing Text Encoder")
+                quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+                freeze(text_encoder)
+                flush()
+
+        vae = None
+        if self.te_only:
+            self.print_and_status_update("Skipping VAE (te_only load)")
+        else:
+            self.print_and_status_update("Loading VAE")
+            vae = AutoencoderKL.from_pretrained(
+                base_model_path, subfolder="vae", torch_dtype=dtype
+            )
 
         self.noise_scheduler = ZImageModel.get_train_scheduler()
 
@@ -262,11 +278,12 @@ class ZImageModel(BaseModel):
         tokenizer = [pipe.tokenizer]
 
         # leave it on cpu for now
-        if not self.low_vram:
+        if pipe.transformer is not None and not self.low_vram:
             pipe.transformer = pipe.transformer.to(self.device_torch)
 
         flush()
         # just to make sure everything is on the right device and dtype
+        # (FakeTextEncoder under skip_te is a no-op for these calls)
         text_encoder[0].to(self.device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()

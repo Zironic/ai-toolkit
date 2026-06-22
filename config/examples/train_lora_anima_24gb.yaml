@@ -1,0 +1,68 @@
+---
+# Anima LoRA training — requires ~24 GB VRAM
+# Anima is a 2B anime-focused text-to-image model built on Cosmos-Predict2 DiT.
+# Official checkpoint: circlestone-labs/Anima-Base-v1.0-Diffusers
+job: extension
+config:
+  name: "my_first_anima_lora_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      # performance_log_every: 1000
+      device: cuda:0
+      # trigger_word: "p3r5on"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: bf16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        save_format: 'diffusers'
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [ 512, 768, 1024 ]
+      train:
+        batch_size: 1
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        timestep_type: 'linear'
+        # skip_first_sample: true
+        # disable_sampling: true
+        ema_config:
+          use_ema: true
+          ema_decay: 0.99
+        dtype: bf16
+      model:
+        name_or_path: "circlestone-labs/Anima-Base-v1.0-Diffusers"
+        arch: anima
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 512
+        height: 768
+        prompts:
+          - "An anime girl with long red hair sitting peacefully in a sunlit garden surrounded by flowers"
+          - "An anime boy with blue eyes standing on a rooftop at sunset, wind blowing through his hair"
+          - "A beautiful anime landscape with cherry blossom trees and a small wooden bridge over a stream"
+          - "An anime style illustration of a young woman in a cozy beanie holding a coffee cup at a cafe"
+          - "An anime style painting of a bear building a log cabin in snowy mountain wilderness"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4.0
+        sample_steps: 25
+meta:
+  name: "[name]"
+  version: '1.0'

@@ -153,6 +153,29 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.weight_noise': {
+    title: 'Weight Noise',
+    description: (
+      <>
+        Injects Gaussian noise directly into LoRA parameter values after each optimizer step. Biases training toward
+        flatter loss minima and spreads learning across more singular directions of the LoRA factorization, which
+        empirically improves subject likeness and helps the model resist memorization of source-image artifacts. Pairs
+        well with small / single-image datasets where overfitting is the dominant failure mode.
+      </>
+    ),
+  },
+  'train.weight_noise.sigma': {
+    title: 'Sigma',
+    description: (
+      <>
+        Noise scale. In <code>relative</code> mode this is a multiplier on each tensor&apos;s weight RMS, so &quot;0.001
+        = 0.1% per-tensor perturbation per step.&quot; Typical useful range is <strong>0.001 – 0.0017</strong>. Lower
+        values barely do anything; higher values risk noise overpowering the gradient (loss flattens or training
+        diverges). Watch the <code>weight_noise_norm</code> metric to verify a sensible magnitude relative to grad
+        norm.
+      </>
+    ),
+  },
   'train.unload_text_encoder': {
     title: 'Unload Text Encoder',
     description: (

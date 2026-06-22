@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig
-from toolkit.data_loader import get_dataloader_datasets
+from toolkit.config_modules import GenerateImageConfig, WeightNoiseConfig
+from toolkit.data_loader import get_dataloader_datasets, get_dataloader_from_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
 from toolkit.image_utils import show_tensors, show_latents
@@ -37,6 +37,7 @@ from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtracto
 from toolkit.util.losses import wavelet_loss, stepped_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
+from toolkit import aux_embed_cache
 from PIL import Image
 from torchvision.transforms import functional as TF
 from toolkit.basic import flush
@@ -109,6 +110,7 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
 
+        self._last_weight_noise_norm: Optional[float] = None
 
     def before_model_load(self):
         pass
@@ -204,7 +206,150 @@ class SDTrainer(BaseSDTrainProcess):
                     'conditional': positive,
                     'unconditional': negative
                 })
-        
+
+    # ------------------------------------------------------------------
+    # Text-encoder worker support
+    # ------------------------------------------------------------------
+    def _aux_config_params(self) -> dict:
+        """Inputs that determine the aux (blank/trigger/uncond/sample) embeds. Changing
+        any of these invalidates the on-disk aux cache. Used identically by the worker
+        (writer) and the trainer (reader) so they agree on the cache key."""
+        sample_prompts: List[str] = []
+        sample_negs: List[Optional[str]] = []
+        if (
+            self.sample_config is not None
+            and getattr(self.sample_config, 'prompts', None) is not None
+            and not self.train_config.disable_sampling
+        ):
+            sample_prompts = list(self.sample_config.prompts)
+            if getattr(self.sample_config, 'samples', None) is not None:
+                sample_negs = [getattr(s, 'neg', None) for s in self.sample_config.samples]
+        return {
+            'model': str(self.model_config.name_or_path),
+            'arch': str(self.model_config.arch),
+            'trigger_word': self.trigger_word,
+            'unconditional_prompt': self.train_config.unconditional_prompt,
+            'diff_output_preservation': bool(self.train_config.diff_output_preservation),
+            'sample_prompts': sample_prompts,
+            'sample_negatives': sample_negs,
+        }
+
+    def _expected_aux_sample_count(self) -> int:
+        if self.train_config.disable_sampling:
+            return 0
+        if self.sample_config is None or getattr(self.sample_config, 'prompts', None) is None:
+            return 0
+        return len(self.sample_config.prompts)
+
+    def aux_cache_is_ready(self) -> bool:
+        """True if every text embedding the trainer needs is already on disk for the
+        current config (so the trainer can load with skip_te and never touch the TE)."""
+        return aux_embed_cache.aux_cache_is_complete(
+            self.save_root,
+            aux_embed_cache.compute_aux_config_hash(self._aux_config_params()),
+            self._expected_aux_sample_count(),
+        )
+
+    def cache_text_encoder_outputs_to_disk(self):
+        """Run in the throwaway TE worker process (model loaded te_only). Encodes and
+        persists every text embedding the trainer needs — dataset captions (via the
+        dataloader cache), DOP embeds, and the aux blank/trigger/uncond/sample embeds —
+        then returns so the process can exit and free the text encoder."""
+        self.sd.text_encoder_to(self.device_torch)
+
+        # these are not defaulted on the process; ensure they exist for the DOP path below
+        self.data_loader = None
+        self.data_loader_reg = None
+
+        # 1) dataset caption embeddings (+reg) -> disk, triggered by building the loaders
+        if self.datasets is not None:
+            self.data_loader = get_dataloader_from_datasets(
+                self.datasets, self.train_config.batch_size, self.sd
+            )
+        if self.datasets_reg is not None:
+            self.data_loader_reg = get_dataloader_from_datasets(
+                self.datasets_reg, self.train_config.batch_size, self.sd
+            )
+
+        # 2) aux embeds (blank / unconditional / trigger / DOP / samples)
+        with torch.no_grad():
+            encode_kwargs = {}
+            if self.sd.encode_control_in_text_embeddings:
+                control_image = torch.zeros(
+                    (1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype
+                )
+                if self.sd.has_multiple_control_images:
+                    control_image = [control_image]
+                encode_kwargs['control_images'] = control_image
+
+            blank = self.sd.encode_prompt("", **encode_kwargs).to('cpu')
+            unconditional = blank
+            uncond_prompt = self.train_config.unconditional_prompt
+            if uncond_prompt is not None and uncond_prompt != "":
+                unconditional = self.sd.encode_prompt(uncond_prompt, **encode_kwargs).to('cpu')
+
+            trigger = None
+            if self.trigger_word is not None:
+                trigger = self.sd.encode_prompt(self.trigger_word, **encode_kwargs).to('cpu')
+
+            # DOP embeds write their own per-file disk cache
+            if self.train_config.diff_output_preservation and self.data_loader is not None:
+                from toolkit.prompt_utils import build_dop_replacement_pairs
+                triggers_csv = self.trigger_word
+                classes_csv = self.train_config.diff_output_preservation_class
+                self._dop_replacement_pairs = build_dop_replacement_pairs(
+                    triggers_csv=triggers_csv, classes_csv=classes_csv, case_insensitive=False
+                )
+                for dataset in get_dataloader_datasets(self.data_loader):
+                    dataset.precompute_dop_embeddings(
+                        triggers_csv=triggers_csv,
+                        classes_csv=classes_csv,
+                        encode_fn=lambda caption: self.sd.encode_prompt(caption, **encode_kwargs),
+                        case_insensitive=False,
+                        debug=getattr(self.train_config, 'diff_output_preservation_debug', False),
+                    )
+
+            # sample-prompt embeds -> self.sd.sample_prompts_cache (in memory), persisted below
+            self.cache_sample_prompts()
+            samples = self.sd.sample_prompts_cache or []
+
+        config_hash = aux_embed_cache.compute_aux_config_hash(self._aux_config_params())
+        aux_embed_cache.save_aux_embeds(
+            self.save_root,
+            config_hash,
+            blank=blank,
+            trigger=trigger,
+            unconditional=unconditional,
+            samples=samples,
+        )
+        print_acc(
+            f"[te-worker] cached aux embeds (samples={len(samples)}, trigger={'yes' if trigger is not None else 'no'}) to {aux_embed_cache.aux_cache_dir(self.save_root)}"
+        )
+
+    def load_cached_text_encoder_outputs_from_disk(self) -> bool:
+        """Trainer side: populate the in-memory aux embeds from the worker's on-disk cache.
+        Returns True on success, False if the cache is not present/valid for this config."""
+        loaded = aux_embed_cache.load_aux_embeds(
+            self.save_root,
+            aux_embed_cache.compute_aux_config_hash(self._aux_config_params()),
+            self._expected_aux_sample_count(),
+        )
+        if loaded is None:
+            return False
+
+        def _to_device(pe):
+            if pe is None:
+                return None
+            return pe.to(self.device_torch, dtype=self.sd.torch_dtype)
+
+        self.cached_blank_embeds = _to_device(loaded.get('blank'))
+        self.cached_trigger_embeds = _to_device(loaded.get('trigger'))
+        uncond = _to_device(loaded.get('unconditional'))
+        if uncond is None:
+            uncond = self.cached_blank_embeds
+        self.unconditional_embeds = uncond.detach() if uncond is not None else None
+        self.sd.sample_prompts_cache = loaded.get('samples') or []
+        return True
 
     def before_dataset_load(self):
         self.assistant_adapter = None
@@ -240,29 +385,32 @@ class SDTrainer(BaseSDTrainProcess):
 
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
-        if self.is_caching_text_embeddings:
+        if self.is_caching_text_embeddings and not self._use_cached_te:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
-        
-        # cache unconditional embeds (blank prompt)
-        with torch.no_grad():
-            kwargs = {}
-            if self.sd.encode_control_in_text_embeddings:
-                # just do a blank image for unconditionals
-                control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                if self.sd.has_multiple_control_images:
-                    control_image = [control_image]
-                
-                kwargs['control_images'] = control_image
-            self.unconditional_embeds = self.sd.encode_prompt(
-                [self.train_config.unconditional_prompt],
-                long_prompts=self.do_long_prompts,
-                **kwargs
-            ).to(
-                self.device_torch,
-                dtype=self.sd.torch_dtype
-            ).detach()
-        
+
+        # cache unconditional embeds (blank prompt). When a TE worker has already cached
+        # everything, self.unconditional_embeds was populated from disk and the text
+        # encoder is not loaded — skip the in-process encode.
+        if not self._use_cached_te:
+            with torch.no_grad():
+                kwargs = {}
+                if self.sd.encode_control_in_text_embeddings:
+                    # just do a blank image for unconditionals
+                    control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    if self.sd.has_multiple_control_images:
+                        control_image = [control_image]
+
+                    kwargs['control_images'] = control_image
+                self.unconditional_embeds = self.sd.encode_prompt(
+                    [self.train_config.unconditional_prompt],
+                    long_prompts=self.do_long_prompts,
+                    **kwargs
+                ).to(
+                    self.device_torch,
+                    dtype=self.sd.torch_dtype
+                ).detach()
+
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
         # move vae to device if we did not cache latents
@@ -303,8 +451,9 @@ class SDTrainer(BaseSDTrainProcess):
                 # single prompt
                 self.negative_prompt_pool = [self.train_config.negative_prompt]
 
-        # handle unload text encoder
-        if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
+        # handle unload text encoder. When a TE worker already cached everything to disk,
+        # the embeds are loaded and the text encoder is not present — skip this entirely.
+        if (self.train_config.unload_text_encoder or self.is_caching_text_embeddings) and not self._use_cached_te:
             print_acc("Caching embeddings and unloading text encoder")
             with torch.no_grad():
                 if self.train_config.train_text_encoder:
@@ -1958,7 +2107,7 @@ class SDTrainer(BaseSDTrainProcess):
                             target_w = max(1, int(round(math.sqrt(target_latent_area / aspect_ratio))))
                             # transformer patch rounding
                             try:
-                                tr = getattr(self.sd, 'transformer', None)
+                                tr = getattr(self.sd, 'transformer', None) or getattr(self.sd, 'unet', None)
                                 if tr is not None:
                                     all_patch = getattr(tr, 'all_patch_size', None)
                                     if all_patch:
@@ -2322,7 +2471,7 @@ class SDTrainer(BaseSDTrainProcess):
 
         # Ensure target dims are compatible with transformer patch sizes (avoid invalid view shapes)
         try:
-            tr = getattr(self.sd, 'transformer', None)
+            tr = getattr(self.sd, 'transformer', None) or getattr(self.sd, 'unet', None)
             if tr is not None:
                 all_patch = getattr(tr, 'all_patch_size', None)
                 if all_patch:
@@ -2465,6 +2614,57 @@ class SDTrainer(BaseSDTrainProcess):
 
         return preservation_loss
 
+    def _inject_weight_noise(self) -> None:
+        """Add Gaussian noise directly to LoRA parameter values after the optimizer step.
+
+        No-op when weight_noise.enabled is False. Runs after ema.update() so the EMA
+        shadow tracks the clean optimizer trajectory while live weights are the noisy
+        ones used for the next forward.
+
+        Modes:
+          'absolute': σ fixed at cfg.sigma.
+          'relative': σ = cfg.sigma × per-param weight RMS. Zero-init LoRA-up params
+                      get zero noise until they learn — avoids destabilizing early training.
+        """
+        cfg = self.train_config.weight_noise
+        if not getattr(cfg, 'enabled', False):
+            return
+
+        mode = cfg.mode
+        step = max(0, int(getattr(self, 'step_num', 0)))
+        do_log = cfg.log_every > 0 and step % cfg.log_every == 0
+        noise_sq = 0.0
+
+        groups = self.params
+        if not groups:
+            return
+        if isinstance(groups[0], dict):
+            iterable = (p for g in groups for p in g.get('params', []))
+        else:
+            iterable = iter(groups)
+
+        for p in iterable:
+            if not getattr(p, '_is_lora', False):
+                continue
+            w = p.data
+            if mode == 'absolute':
+                sigma = float(cfg.sigma)
+            elif mode == 'relative':
+                rms = float(w.detach().pow(2).mean().clamp_min(1e-30).sqrt())
+                sigma = float(cfg.sigma) * rms
+            else:
+                return
+
+            if sigma <= 0:
+                continue
+            noise = torch.randn_like(w) * sigma
+            if do_log:
+                noise_sq += float(noise.pow(2).sum())
+            w.add_(noise)
+
+        if do_log:
+            self._last_weight_noise_norm = noise_sq ** 0.5
+
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
             batch_list = batch
@@ -2513,6 +2713,7 @@ class SDTrainer(BaseSDTrainProcess):
             if self.ema is not None:
                 with self.timer('ema_update'):
                     self.ema.update()
+            self._inject_weight_noise()
         else:
             # gradient accumulation. Just a place for breakpoint
             pass
@@ -2533,6 +2734,10 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
+
+        if self._last_weight_noise_norm is not None:
+            loss_dict['weight_noise_norm'] = self._last_weight_noise_norm
+            self._last_weight_noise_norm = None
 
         self.end_of_training_loop()
 

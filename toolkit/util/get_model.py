@@ -17,6 +17,22 @@ BUILT_IN_MODELS = [
 ]
 
 
+LEGACY_MODEL_ARCHES = {
+    'sd1',
+    'sd2',
+    'sd3',
+    'sdxl',
+    'pixart',
+    'pixart_sigma',
+    'auraflow',
+    'flux',
+    'lumina2',
+    'vega',
+    'ssd',
+    'anima',
+}
+
+
 def get_all_models() -> List[BaseModel]:
     extension_folders = ['extensions', 'extensions_built_in']
 
@@ -46,5 +62,9 @@ def get_model_class(config: ModelConfig):
     for ModelClass in all_models:
         if ModelClass.arch == config.arch:
             return ModelClass
-    # default to the legacy model
-    return StableDiffusion
+    if config.arch in LEGACY_MODEL_ARCHES:
+        return StableDiffusion
+    raise ValueError(
+        f"No model implementation is registered for architecture {config.arch!r}. "
+        "Check model.arch and any extension import errors printed above."
+    )

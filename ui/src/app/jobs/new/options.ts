@@ -343,6 +343,23 @@ export const modelArchs: ModelArch[] = [
     disableSections: ['network.conv'],
   },
   {
+    name: 'anima',
+    label: 'Anima',
+    group: 'image',
+    defaults: {
+      'config.process[0].model.name_or_path': ['circlestone-labs/Anima-Base-v1.0-Diffusers', defaultNameOrPath],
+      'config.process[0].model.quantize': [false, false],
+      'config.process[0].model.quantize_te': [false, false],
+      'config.process[0].sample.sampler': ['flowmatch', 'flowmatch'],
+      'config.process[0].train.noise_scheduler': ['flowmatch', 'flowmatch'],
+      'config.process[0].sample.width': [512, 1024],
+      'config.process[0].sample.height': [768, 1024],
+      'config.process[0].sample.guidance_scale': [4.0, 4.0],
+      'config.process[0].sample.sample_steps': [25, 20],
+    },
+    disableSections: ['network.conv'],
+  },
+  {
     name: 'qwen_image',
     label: 'Qwen-Image',
     group: 'image',

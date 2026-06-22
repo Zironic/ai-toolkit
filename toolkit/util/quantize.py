@@ -1,13 +1,15 @@
 from fnmatch import fnmatch
 from typing import List, Optional, Union, TYPE_CHECKING
 import torch
+from torchao.quantization import Float8Tensor
 
 from optimum.quanto.quantize import _quantize_submodule
 from optimum.quanto.tensor import Optimizer, qtype, qtypes
 from torchao.quantization.quant_api import (
     quantize_ as torchao_quantize_,
+    _is_linear as torchao_is_linear,
     Float8WeightOnlyConfig,
-    UIntXWeightOnlyConfig,
+    IntxWeightOnlyConfig,
     Int8WeightOnlyConfig
 )
 from optimum.quanto import freeze
@@ -34,14 +36,13 @@ Q_MODULES = [
 ]
 
 torchao_qtypes = {
-    # "int4": Int4WeightOnlyConfig(),
-    "uint2": UIntXWeightOnlyConfig(torch.uint2),
-    "uint3": UIntXWeightOnlyConfig(torch.uint3),
-    "uint4": UIntXWeightOnlyConfig(torch.uint4),
-    "uint5": UIntXWeightOnlyConfig(torch.uint5),
-    "uint6": UIntXWeightOnlyConfig(torch.uint6),
-    "uint7": UIntXWeightOnlyConfig(torch.uint7),
-    "uint8": UIntXWeightOnlyConfig(torch.uint8),
+    "uint2": IntxWeightOnlyConfig(torch.int2),
+    "uint3": IntxWeightOnlyConfig(torch.int3),
+    "uint4": IntxWeightOnlyConfig(torch.int4),
+    "uint5": IntxWeightOnlyConfig(torch.int5),
+    "uint6": IntxWeightOnlyConfig(torch.int6),
+    "uint7": IntxWeightOnlyConfig(torch.int7),
+    "uint8": Int8WeightOnlyConfig(),
     "int8": Int8WeightOnlyConfig(),
     "float8": Float8WeightOnlyConfig(),
 }
@@ -100,6 +101,25 @@ def quantize(
         include = [include] if isinstance(include, str) else include
     if exclude is not None:
         exclude = [exclude] if isinstance(exclude, str) else exclude
+
+    if isinstance(weights, aotype):
+        # TorchAO quantize_ already walks the entire module tree. Calling it for
+        # every item yielded by named_modules() quantizes children once through
+        # their parent and then attempts to quantize them again directly.
+        def filter_fn(module: torch.nn.Module, fqn: str) -> bool:
+            if not torchao_is_linear(module, fqn):
+                return False
+            if isinstance(module.weight, Float8Tensor):
+                return False
+            if include is not None and not any(fnmatch(fqn, pattern) for pattern in include):
+                return False
+            if exclude is not None and any(fnmatch(fqn, pattern) for pattern in exclude):
+                return False
+            return True
+
+        torchao_quantize_(model, weights.config, filter_fn=filter_fn)
+        return
+
     for name, m in model.named_modules():
         if include is not None and not any(
             fnmatch(name, pattern) for pattern in include
@@ -112,17 +132,14 @@ def quantize(
             if m.__class__.__name__ in Q_MODULES:
                 continue
             else:
-                if isinstance(weights, aotype):
-                    torchao_quantize_(m, weights.config)
-                else:
-                    _quantize_submodule(
-                        model,
-                        name,
-                        m,
-                        weights=weights,
-                        activations=activations,
-                        optimizer=optimizer,
-                    )
+                _quantize_submodule(
+                    model,
+                    name,
+                    m,
+                    weights=weights,
+                    activations=activations,
+                    optimizer=optimizer,
+                )
         except Exception as e:
             print(f"Failed to quantize {name}: {e}")
             # raise e
