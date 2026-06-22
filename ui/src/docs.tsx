@@ -308,6 +308,18 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.dop_single_backward': {
+    title: 'Single Backward Pass',
+    description: (
+      <>
+        By default DOP runs two backward passes per step (one for the main loss, one for the preservation loss),
+        which keeps peak VRAM low because each forward graph is freed before the next is built. Enable this to instead
+        sum the preservation loss into the main loss and run a single combined backward — slightly faster, but both
+        forward graphs stay resident until the backward, so peak VRAM is higher by roughly the size of the (optionally
+        downsampled) preservation graph. Pairs well with a reduced DOP Resolution, which keeps that extra graph small.
+      </>
+    ),
+  },
   'train.blank_prompt_preservation': {
     title: 'Blank Prompt Preservation',
     description: (

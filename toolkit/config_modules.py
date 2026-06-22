@@ -491,6 +491,11 @@ class TrainConfig:
         self.diff_output_preservation_class = kwargs.get('diff_output_preservation_class', '')
         # Optional lower-resolution target for DOP (pixels, long-side). None = full resolution.
         self.diff_output_preservation_resolution: Union[int, None] = kwargs.get('diff_output_preservation_resolution', None)
+        # When True, sum the preservation loss into the main loss and run a single combined
+        # backward (faster, fewer accelerate calls) instead of backpropagating each loss term
+        # separately. Single backward keeps both forward graphs alive at once, so peak VRAM is
+        # higher by roughly the size of the (optionally downsampled) preservation graph.
+        self.dop_single_backward = kwargs.get('dop_single_backward', False)
 
         # blank prompt preservation will preserve the model's knowledge of a blank prompt
         self.blank_prompt_preservation = kwargs.get('blank_prompt_preservation', False)

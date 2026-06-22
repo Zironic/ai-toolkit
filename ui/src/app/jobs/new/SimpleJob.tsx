@@ -853,6 +853,15 @@ export default function SimpleJob({
                             128 px is very coarse — preserves generalization but loses fine detail.
                           </div>
                         )}
+                        <Checkbox
+                          label="Single Backward Pass"
+                          docKey={'train.dop_single_backward'}
+                          className="pt-2"
+                          checked={jobConfig.config.process[0].train.dop_single_backward || false}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].train.dop_single_backward')
+                          }
+                        />
                       </>
                     )}
                   </>

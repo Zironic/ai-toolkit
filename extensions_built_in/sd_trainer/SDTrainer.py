@@ -2368,9 +2368,16 @@ class SDTrainer(BaseSDTrainProcess):
                         print_acc("[DOP WARNING] diff_output_preservation enabled but embeddings missing - skipping preservation loss this step")
 
                     if do_dop_this_step or self.train_config.blank_prompt_preservation:
-                        # send the loss backwards otherwise checkpointing will fail
-                        self.accelerator.backward(loss)
-                        normal_loss = loss.detach() # dont send backward again
+                        single_backward = self.train_config.dop_single_backward
+                        if single_backward:
+                            # Keep the main loss graph alive so it can be combined with the
+                            # preservation loss into one backward at the end of the step.
+                            normal_loss = loss
+                        else:
+                            # Two-pass: send the loss backwards now (frees its graph before the
+                            # preservation forward, keeping peak VRAM low) otherwise checkpointing will fail
+                            self.accelerator.backward(loss)
+                            normal_loss = loss.detach() # dont send backward again
 
                         # Determine preservation embeddings and resolution
                         preservation_embeds = None
@@ -2416,17 +2423,30 @@ class SDTrainer(BaseSDTrainProcess):
                             preservation_pred = preservation_pred_res
                             prior_pred_for_loss = prior_pred
 
-                        # Compute and apply preservation loss
+                        # Compute preservation loss; in two-pass mode this also backprops it.
                         multiplier = self.train_config.diff_output_preservation_multiplier if do_dop_this_step else self.train_config.blank_prompt_preservation_multiplier
-                        preservation_loss = self._compute_and_apply_preservation_loss(preservation_pred, prior_pred_for_loss, multiplier)
+                        preservation_loss = self._compute_and_apply_preservation_loss(
+                            preservation_pred, prior_pred_for_loss, multiplier,
+                            apply_backward=not single_backward,
+                        )
 
-                        if preservation_loss is not None:
-                            loss = normal_loss + preservation_loss.detach()
+                        if single_backward:
+                            # Both losses are still graph-connected; sum them and let the
+                            # trailing self.accelerator.backward(loss) run a single combined pass.
+                            if preservation_loss is not None:
+                                loss = normal_loss + preservation_loss
+                            else:
+                                loss = normal_loss
                         else:
-                            loss = normal_loss
-                        loss = loss.clone().detach()
-                        # require grad again so the backward wont fail
-                        loss.requires_grad_(True)
+                            # Two-pass: gradients are already applied; rebuild a detached loss
+                            # purely for logging / the nan-check below (trailing backward is a no-op).
+                            if preservation_loss is not None:
+                                loss = normal_loss + preservation_loss.detach()
+                            else:
+                                loss = normal_loss
+                            loss = loss.clone().detach()
+                            # require grad again so the backward wont fail
+                            loss.requires_grad_(True)
 
                 # check if nan
                 if torch.isnan(loss):
@@ -2603,8 +2623,13 @@ class SDTrainer(BaseSDTrainProcess):
 
         return latents_small, noise_small, noisy_small
 
-    def _compute_and_apply_preservation_loss(self, preservation_pred, prior_pred, multiplier: float):
-        """Compute preservation loss, record diagnostics, and apply backward.
+    def _compute_and_apply_preservation_loss(self, preservation_pred, prior_pred, multiplier: float, apply_backward: bool = True):
+        """Compute preservation loss, record diagnostics, and optionally apply backward.
+
+        When ``apply_backward`` is True (default, two-pass mode) the preservation loss is
+        backpropagated here so its forward graph can be freed immediately. When False
+        (single-backward mode) the still-connected loss tensor is returned for the caller to
+        sum into the main loss and backprop once.
 
         Returns the preservation_loss tensor.
         """
@@ -2645,16 +2670,18 @@ class SDTrainer(BaseSDTrainProcess):
         except Exception:
             self._last_preservation_loss = None
 
-        # apply backward for preservation loss
-        try:
-            if preservation_loss.requires_grad:
-                with self.timer('preservation_backward'):
-                    self.accelerator.backward(preservation_loss)
-        except Exception as e:
+        # apply backward for preservation loss (two-pass mode only; single-backward mode
+        # defers this so the caller can combine it with the main loss for one backward)
+        if apply_backward:
             try:
-                print_acc(f"[DOP] backward failed for preservation loss: {e}")
-            except Exception:
-                pass
+                if preservation_loss.requires_grad:
+                    with self.timer('preservation_backward'):
+                        self.accelerator.backward(preservation_loss)
+            except Exception as e:
+                try:
+                    print_acc(f"[DOP] backward failed for preservation loss: {e}")
+                except Exception:
+                    pass
 
         return preservation_loss
 
