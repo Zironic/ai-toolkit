@@ -42,6 +42,12 @@ class Timer:
     def add_after_print_hook(self, hook):
         self._after_print_hooks.append(hook)
 
+    def record(self, timer_name, elapsed_time):
+        """Record a completed timing measured by an external clock."""
+        if timer_name not in self.timers:
+            self.timers[timer_name] = deque(maxlen=self.max_buffer)
+        self.timers[timer_name].append(float(elapsed_time))
+
     def print(self):
         if not is_ui:
             print(f"\nTimer '{self.name}':")

@@ -104,6 +104,8 @@ export const defaultJobConfig: JobConfig = {
           diff_output_preservation_class: 'person',
           diff_output_preservation_resolution: null,
           dop_single_backward: false,
+          dop_prior_cache: false,
+          dop_prior_cache_samples: 12,
           blank_prompt_preservation_resolution: null,
           switch_boundary_every: 1,
           loss_type: 'mse',

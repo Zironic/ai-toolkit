@@ -124,6 +124,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.first_sample_config = self.sample_config
         self.logging_config = LoggingConfig(**self.get_conf('logging', {}))
         self.logger = create_logger(self.logging_config, config, self.save_root)
+        self.performance_log_path = os.path.join(self.save_root, 'performance_log.jsonl')
+        self.timer.add_after_print_hook(self._write_performance_timing_log)
         self.optimizer: torch.optim.Optimizer = None
         self.lr_scheduler = None
         self.data_loader: Union[DataLoader, None] = None
@@ -719,6 +721,115 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.logger.start()
         self.prepare_accelerator()
+
+    def resolve_performance_timers(self):
+        """Resolve model-specific asynchronous timers before logging the rolling window."""
+        pass
+
+    def _write_performance_timing_log(self, timing_dict):
+        """Append one reconciled timing window to performance_log.jsonl."""
+        if not self.accelerator.is_main_process or 'train_loop' not in timing_dict:
+            return
+        step_count = len(self.timer.timers.get('train_loop', ()))
+        if step_count == 0:
+            return
+
+        def per_step(*names):
+            return sum(sum(self.timer.timers.get(name, ())) for name in names) / step_count
+
+        total = timing_dict['train_loop']
+        data = per_step('get_batch', 'get_batch:reg', 'reset_batch', 'reset_batch:reg')
+        prepare = per_step('preprocess_batch')
+        sizes = (256, 512, 768, 1024)
+        bucket_counts = {
+            size: int(sum(self.timer.timers.get(f'resolution/count/{size}', ())))
+            for size in sizes
+        }
+        total_bucket_samples = sum(bucket_counts.values())
+        normal_forward = 0.0
+        normal_backward = 0.0
+        resolution_buckets = {}
+        for size in sizes:
+            count = bucket_counts[size]
+            memory_count = int(sum(
+                self.timer.timers.get(f'resolution/memory/count/{size}', ())
+            ))
+            gb = 1024 ** 3
+            forward_part = timing_dict.get(f'gpu/normal_training_forward/{size}', 0.0)
+            backward_part = timing_dict.get(f'gpu/normal_backward/{size}', 0.0)
+            normal_forward += forward_part
+            normal_backward += backward_part
+            allocated_sum = sum(self.timer.timers.get(
+                f'resolution/memory/allocated_sum/{size}', ()
+            ))
+            reserved_sum = sum(self.timer.timers.get(
+                f'resolution/memory/reserved_sum/{size}', ()
+            ))
+            incremental_sum = sum(self.timer.timers.get(
+                f'resolution/memory/incremental_sum/{size}', ()
+            ))
+            resolution_buckets[str(size)] = {
+                'count': count,
+                'share': count / total_bucket_samples if total_bucket_samples else 0.0,
+                'normal_forward_s': forward_part * step_count / count if count else 0.0,
+                'normal_backward_s': backward_part * step_count / count if count else 0.0,
+                'normal_path_s': (forward_part + backward_part) * step_count / count if count else 0.0,
+                'peak_allocated_gb_avg': allocated_sum / memory_count / gb if memory_count else 0.0,
+                'peak_allocated_gb_max': max(self.timer.timers.get(
+                    f'resolution/memory/allocated_max/{size}', (0,)
+                )) / gb,
+                'peak_reserved_gb_avg': reserved_sum / memory_count / gb if memory_count else 0.0,
+                'peak_reserved_gb_max': max(self.timer.timers.get(
+                    f'resolution/memory/reserved_max/{size}', (0,)
+                )) / gb,
+                'incremental_peak_allocated_gb_avg': (
+                    incremental_sum / memory_count / gb if memory_count else 0.0
+                ),
+                'incremental_peak_allocated_gb_max': max(self.timer.timers.get(
+                    f'resolution/memory/incremental_max/{size}', (0,)
+                )) / gb,
+            }
+        dop = timing_dict.get('gpu/dop_section', 0.0)
+        cache_hits = int(sum(self.timer.timers.get('dop/cache_hit', ())))
+        cache_misses = int(sum(self.timer.timers.get('dop/cache_miss', ())))
+        cache_lookups = cache_hits + cache_misses
+        cache_lookup = per_step('dop_prior_cache_lookup')
+        cache_write = per_step('dop_prior_cache_write')
+        prior_generation = timing_dict.get('gpu/dop_prior_generation', 0.0)
+        prior_generation_per_miss = (
+            prior_generation * step_count / cache_misses if cache_misses else 0.0
+        )
+        dop_backward = timing_dict.get('gpu/dop_backward', 0.0)
+        combined_backward = timing_dict.get('gpu/combined_backward', 0.0)
+        backward = normal_backward + dop_backward + combined_backward
+        optimizer = timing_dict.get('gpu/optimizer_step', 0.0)
+        accounted = data + prepare + normal_forward + dop + backward + optimizer
+        record = {
+            'step': self.step_num,
+            'window_steps': step_count,
+            'entire_training_step_s': total,
+            'data_loading_s': data,
+            'batch_preparation_s': prepare,
+            'normal_training_forward_s': normal_forward,
+            'normal_path_by_resolution': resolution_buckets,
+            'dop_section_s': dop,
+            'dop_cache_hits': cache_hits,
+            'dop_cache_misses': cache_misses,
+            'dop_cache_hit_rate': cache_hits / cache_lookups if cache_lookups else None,
+            'dop_cache_lookup_s': cache_lookup,
+            'dop_cache_write_s': cache_write,
+            'dop_prior_generation_s': prior_generation,
+            'dop_prior_generation_per_miss_s': prior_generation_per_miss,
+            'backward_s': backward,
+            'normal_backward_s': normal_backward,
+            'dop_backward_s': dop_backward,
+            'combined_backward_s': combined_backward,
+            'optimizer_step_s': optimizer,
+            'other_overhead_s': max(0.0, total - accounted),
+        }
+        os.makedirs(os.path.dirname(self.performance_log_path), exist_ok=True)
+        with open(self.performance_log_path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, separators=(',', ':')) + '\n')
         
     def sample_step_hook(self, img_num, total_imgs):
         pass
@@ -1584,7 +1695,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if os.environ.get('AITK_IS_TE_WORKER', '0') == '1':
             return False
         # only archs with a te_only / skip_te load path
-        if self.model_config.arch not in ('zimage', 'anima'):
+        if self.model_config.arch not in ('zimage', 'anima', 'ideogram4'):
             return False
         if not (hasattr(self, 'cache_text_encoder_outputs_to_disk') and hasattr(self, 'aux_cache_is_ready')):
             return False
@@ -2701,6 +2812,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
+                        self.resolve_performance_timers()
                         # print the timers and clear them
                         self.timer.print()
                         self.timer.reset()

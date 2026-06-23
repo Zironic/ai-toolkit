@@ -496,6 +496,13 @@ class TrainConfig:
         # separately. Single backward keeps both forward graphs alive at once, so peak VRAM is
         # higher by roughly the size of the (optionally downsampled) preservation graph.
         self.dop_single_backward = kwargs.get('dop_single_backward', False)
+        # When True, cache the frozen-base prior prediction for the reduced-resolution DOP path.
+        # The prior is a frozen-model output (LoRA disabled), so it is deterministic and can be
+        # computed once and reused. Per-image safetensors caches warm lazily from live batches and
+        # use the latent cache's hash-addressed strategy. Prompt/model/resolution changes select a
+        # new cache automatically. dop_prior_cache_samples controls entries per image.
+        self.dop_prior_cache = kwargs.get('dop_prior_cache', False)
+        self.dop_prior_cache_samples = int(kwargs.get('dop_prior_cache_samples', 12))
 
         # blank prompt preservation will preserve the model's knowledge of a blank prompt
         self.blank_prompt_preservation = kwargs.get('blank_prompt_preservation', False)

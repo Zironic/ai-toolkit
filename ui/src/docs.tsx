@@ -320,6 +320,19 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.dop_prior_cache': {
+    title: 'Cache Prior Predictions',
+    description: (
+      <>
+        The DOP prior is a prediction from the frozen base model with the LoRA disabled, so for a given
+        noised latent and timestep it never changes during training. Enable this to persist a small per-image
+        pool — warmed from live training batches — and reuse it, so later runs do not repeat that warmup and DOP
+        step skips the extra frozen-model forward. Only active with a reduced DOP Resolution (it runs in the
+        downsampled path) and standard LoRA training (disabled automatically when controlnet/adapter
+        conditioning is present). Prompt, model, resolution, or scheduler changes select a new cache automatically.
+      </>
+    ),
+  },
   'train.blank_prompt_preservation': {
     title: 'Blank Prompt Preservation',
     description: (

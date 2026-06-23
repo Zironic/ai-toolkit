@@ -3169,17 +3169,20 @@ class StableDiffusion:
         unet_has_grad = False
 
         self.device_state = {
-            **empty_preset,
-            'vae': {
+            **copy.deepcopy(empty_preset),
+        }
+        # vae/unet may be None on a partial (te_only) load; keep empty_preset defaults then.
+        if self.vae is not None:
+            self.device_state['vae'] = {
                 'training': self.vae.training,
                 'device': self.vae.device,
-            },
-            'unet': {
+            }
+        if self.unet is not None:
+            self.device_state['unet'] = {
                 'training': self.unet.training,
                 'device': self.unet.device,
                 'requires_grad': unet_has_grad,
-            },
-        }
+            }
         if isinstance(self.text_encoder, list):
             self.device_state['text_encoder']: List[dict] = []
             for encoder in self.text_encoder:
@@ -3261,20 +3264,23 @@ class StableDiffusion:
         self.device_state = None
 
     def set_device_state(self, state):
-        if state['vae']['training']:
-            self.vae.train()
-        else:
-            self.vae.eval()
-        self.vae.to(state['vae']['device'])
-        if state['unet']['training']:
-            self.unet.train()
-        else:
-            self.unet.eval()
-        self.unet.to(state['unet']['device'])
-        if state['unet']['requires_grad']:
-            self.unet.requires_grad_(True)
-        else:
-            self.unet.requires_grad_(False)
+        # vae/unet may be None on a partial (te_only) load; skip them then.
+        if self.vae is not None:
+            if state['vae']['training']:
+                self.vae.train()
+            else:
+                self.vae.eval()
+            self.vae.to(state['vae']['device'])
+        if self.unet is not None:
+            if state['unet']['training']:
+                self.unet.train()
+            else:
+                self.unet.eval()
+            self.unet.to(state['unet']['device'])
+            if state['unet']['requires_grad']:
+                self.unet.requires_grad_(True)
+            else:
+                self.unet.requires_grad_(False)
         if isinstance(self.text_encoder, list):
             for i, encoder in enumerate(self.text_encoder):
                 if isinstance(state['text_encoder'], list):

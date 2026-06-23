@@ -360,63 +360,81 @@ class Ideogram4Model(BaseModel):
         self.print_and_status_update("Loading Ideogram4 model")
         base = self.model_config.name_or_path
 
-        transformer = self._load_transformer(base)
+        transformer = None
+        if self.te_only:
+            # TE cache worker: only the text encoder is needed, skip the transformer.
+            self.print_and_status_update("Skipping transformer (te_only load)")
+        else:
+            transformer = self._load_transformer(base)
 
-        if self.model_config.quantize:
-            self.print_and_status_update("Quantizing Transformer")
-            quantize_model(self, transformer)
+            if self.model_config.quantize:
+                self.print_and_status_update("Quantizing Transformer")
+                quantize_model(self, transformer)
+                flush()
+            else:
+                transformer.to(self.device_torch, dtype=dtype)
             flush()
-        else:
-            transformer.to(self.device_torch, dtype=dtype)
-        flush()
 
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-                ignore_modules=[
-                    transformer.rotary_emb.inv_freq,
-                    transformer.input_proj,
-                    transformer.llm_cond_proj,
-                ],
-            )
-        elif self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer to CPU")
-            transformer.to("cpu")
-        else:
-            # quantize_model leaves the model on CPU; make sure it lands on device.
-            transformer.to(self.device_torch)
-        flush()
-
-        tokenizer, text_encoder = self._load_text_encoder(base)
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Text Encoder")
-            text_encoder.to(self.device_torch)
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
+            if (
+                self.model_config.layer_offloading
+                and self.model_config.layer_offloading_transformer_percent > 0
+            ):
+                MemoryManager.attach(
+                    transformer,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_transformer_percent,
+                    ignore_modules=[
+                        transformer.rotary_emb.inv_freq,
+                        transformer.input_proj,
+                        transformer.llm_cond_proj,
+                    ],
+                )
+            elif self.model_config.low_vram:
+                self.print_and_status_update("Moving transformer to CPU")
+                transformer.to("cpu")
+            else:
+                # quantize_model leaves the model on CPU; make sure it lands on device.
+                transformer.to(self.device_torch)
             flush()
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
-            )
-        elif self.model_config.low_vram:
-            self.print_and_status_update("Moving text encoder to CPU")
-            text_encoder.to("cpu")
-        else:
-            self.print_and_status_update("Moving text encoder to device")
-            text_encoder.to(self.device_torch)
-        flush()
 
-        vae = self._load_vae(base)
+        if self.skip_te:
+            # Trainer running off a pre-built embedding cache: never load the heavy
+            # Qwen3-VL text encoder. Keep the (cheap) tokenizer for a well-formed model.
+            from toolkit.unloader import FakeTextEncoder
+            self.print_and_status_update("Skipping text encoder (skip_te load)")
+            te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
+            tokenizer = AutoTokenizer.from_pretrained(te_path, token=HF_TOKEN)
+            text_encoder = FakeTextEncoder(device=self.device_torch, dtype=dtype)
+        else:
+            tokenizer, text_encoder = self._load_text_encoder(base)
+            if self.model_config.quantize_te:
+                self.print_and_status_update("Quantizing Text Encoder")
+                text_encoder.to(self.device_torch)
+                quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+                freeze(text_encoder)
+                flush()
+            if (
+                self.model_config.layer_offloading
+                and self.model_config.layer_offloading_text_encoder_percent > 0
+            ):
+                MemoryManager.attach(
+                    text_encoder,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+                )
+            elif self.model_config.low_vram:
+                self.print_and_status_update("Moving text encoder to CPU")
+                text_encoder.to("cpu")
+            else:
+                self.print_and_status_update("Moving text encoder to device")
+                text_encoder.to(self.device_torch)
+            flush()
+
+        vae = None
+        if self.te_only:
+            self.print_and_status_update("Skipping VAE (te_only load)")
+        else:
+            vae = self._load_vae(base)
 
         self.noise_scheduler = Ideogram4Model.get_train_scheduler()
 
@@ -430,7 +448,7 @@ class Ideogram4Model(BaseModel):
         self.model = transformer
         self.pipeline = Ideogram4Pipeline(self)
 
-        if self.model_config.unconditional_lora_path is not None:
+        if not self.te_only and self.model_config.unconditional_lora_path is not None:
             self.load_unconditional_lora(transformer)
 
         self.print_and_status_update("Model Loaded")

@@ -50,6 +50,12 @@ class Automagic2(torch.optim.Optimizer):
         )
         super().__init__(params, defaults)
 
+        # Per-param scratch buffers, kept OUT of self.state so they are never
+        # serialized into the checkpoint (they are pure working memory, lazily
+        # rebuilt on demand). Storing them in self.state previously bloated the
+        # saved optimizer state ~10x.
+        self._scratch_buffers = {}
+
         self._hook_handles = []
         for group in self.param_groups:
             for p in group["params"]:
@@ -68,24 +74,25 @@ class Automagic2(torch.optim.Optimizer):
     def _rms(t: torch.Tensor) -> torch.Tensor:
         return t.norm(2) / (t.numel() ** 0.5)
 
-    @staticmethod
-    def _scratch(state: dict, key: str, ref: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        # Persistent per-param scratch buffer, reused every step. Keeping the
-        # full-size fp32/int temporaries resident — instead of allocating and
-        # freeing them inside the backward hook — gives the caching allocator a
-        # stable, unchanging set of block sizes. That is what avoids the
-        # reserved-pool fragmentation that was surfacing as a spurious OOM
-        # mid-backward (a scalar .norm() failing at 21/28 GB). Cost is a bounded
-        # steady-state bump (~a few x trainable-param bytes), traded for no churn.
-        buf = state.get(key)
+    def _scratch(self, p: torch.Tensor, key: str, dtype: torch.dtype) -> torch.Tensor:
+        # Persistent per-param scratch buffer, reused every step and stored on the
+        # optimizer itself (NOT in self.state, so it is never checkpointed). Reusing
+        # one buffer per (param, key) keeps the caching allocator's block sizes
+        # stable, which is what avoids the reserved-pool fragmentation that surfaced
+        # as a spurious OOM mid-backward (a scalar .norm() failing at 21/28 GB).
+        bufs = self._scratch_buffers.get(p)
+        if bufs is None:
+            bufs = {}
+            self._scratch_buffers[p] = bufs
+        buf = bufs.get(key)
         if (
             buf is None
-            or buf.shape != ref.shape
+            or buf.shape != p.shape
             or buf.dtype != dtype
-            or buf.device != ref.device
+            or buf.device != p.device
         ):
-            buf = torch.empty(ref.shape, dtype=dtype, device=ref.device)
-            state[key] = buf
+            buf = torch.empty(p.shape, dtype=dtype, device=p.device)
+            bufs[key] = buf
         return buf
 
     def _init_state(self, p: torch.Tensor, group: dict) -> None:
@@ -128,15 +135,13 @@ class Automagic2(torch.optim.Optimizer):
         beta2 = group["beta2"]
         eps = group["eps"]
 
-        # fp32 working copy of the grad (gbuf) plus a fp32 scratch buffer (ubuf)
-        # that is reused in turn for the squared grad, the update, and finally the
-        # stochastic-rounding noise. Both live in state, so nothing full-size is
-        # allocated or freed inside the backward hook.
-        gbuf = self._scratch(state, "_grad_fp32", p, torch.float32)
-        gbuf.copy_(grad)
-        ubuf = self._scratch(state, "_scratch_fp32", p, torch.float32)
-
-        torch.mul(gbuf, gbuf, out=ubuf).add_(eps)  # ubuf = grad^2 + eps
+        # Single fp32 scratch buffer, reused in turn for the squared grad, the
+        # update, and finally the SR noise. bf16 -> fp32 is lossless, and the final
+        # "* grad" below casts the bf16 grad up exactly, so we never need a separate
+        # fp32 copy of the grad.
+        ubuf = self._scratch(p, "update", torch.float32)
+        ubuf.copy_(grad)            # fp32 copy of grad
+        ubuf.mul_(ubuf).add_(eps)   # ubuf = grad^2 + eps
 
         if p.dim() >= 2:
             row_state = state["exp_avg_sq_row"]
@@ -151,14 +156,14 @@ class Automagic2(torch.optim.Optimizer):
             # Approx second-moment update written straight into ubuf, then * grad.
             r = (row / row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
             c = col.unsqueeze(-2).rsqrt()
-            torch.mul(r, c, out=ubuf).mul_(gbuf)
+            torch.mul(r, c, out=ubuf).mul_(grad)
         else:
             v_state = state["exp_avg_sq"]
             v = v_state if v_state.dtype == torch.float32 else v_state.to(torch.float32)
             v.mul_(beta2).add_(ubuf, alpha=1.0 - beta2)
             if v_state.dtype != torch.float32:
                 v_state.copy_(v.to(v_state.dtype))
-            torch.rsqrt(v, out=ubuf).mul_(gbuf)
+            torch.rsqrt(v, out=ubuf).mul_(grad)
 
         ubuf.div_((self._rms(ubuf) / group["clip_threshold"]).clamp_(min=1.0))
 
@@ -185,7 +190,7 @@ class Automagic2(torch.optim.Optimizer):
         if p.dtype == torch.bfloat16:
             # fp32 working copy of the param, reused across steps, shared by weight
             # decay and SR.
-            pbuf = self._scratch(state, "_param_fp32", p, torch.float32)
+            pbuf = self._scratch(p, "param", torch.float32)
             pbuf.copy_(p)
             if wd != 0.0:
                 ubuf.addcmul_(pbuf, lr_t, value=wd)
@@ -203,7 +208,7 @@ class Automagic2(torch.optim.Optimizer):
                 if p.dtype == torch.float32:
                     ubuf.addcmul_(p, lr_t, value=wd)
                 else:
-                    pbuf = self._scratch(state, "_param_fp32", p, torch.float32)
+                    pbuf = self._scratch(p, "param", torch.float32)
                     pbuf.copy_(p)
                     ubuf.addcmul_(pbuf, lr_t, value=wd)
             p.add_(ubuf if p.dtype == torch.float32 else ubuf.to(p.dtype), alpha=-1.0)
@@ -245,5 +250,11 @@ class Automagic2(torch.optim.Optimizer):
                 group[k] = v
             for p in group["params"]:
                 st = self.state.get(p)
-                if st is not None and isinstance(st.get("lr"), torch.Tensor):
-                    st["lr"] = st["lr"].to(torch.float32)
+                if st is not None:
+                    if isinstance(st.get("lr"), torch.Tensor):
+                        st["lr"] = st["lr"].to(torch.float32)
+                    # Drop scratch buffers that older checkpoints saved into state
+                    # (they belong on self._scratch_buffers now and are rebuilt
+                    # lazily); otherwise they'd re-bloat every subsequent save.
+                    for legacy in ("_grad_fp32", "_scratch_fp32", "_param_fp32"):
+                        st.pop(legacy, None)

@@ -1,13 +1,16 @@
 import os
 import random
+import hashlib
+import json
 from collections import OrderedDict
+from contextlib import contextmanager
 from typing import Union, Literal, List, Optional
 
 import numpy as np
 from diffusers import T2IAdapter, AutoencoderTiny, ControlNetModel
 
 import torch.functional as F
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader, ConcatDataset
 
 from toolkit import train_tools
@@ -21,7 +24,7 @@ from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.print import print_acc
-from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
+from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds, normalize_caption_separators
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
@@ -81,7 +84,11 @@ class SDTrainer(BaseSDTrainProcess):
         self.cached_blank_embeds: Optional[PromptEmbeds] = None
         self.cached_trigger_embeds: Optional[PromptEmbeds] = None
         self.diff_output_preservation_embeds: Optional[PromptEmbeds] = None
-        
+        self._gpu_phase_events = {}
+        self._resolution_bucket_counts = {}
+        self._resolution_memory_stats = {}
+        self._resolution_memory_baseline = None
+        self._current_resolution_bucket = 256
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
         
@@ -230,6 +237,7 @@ class SDTrainer(BaseSDTrainProcess):
             'trigger_word': self.trigger_word,
             'unconditional_prompt': self.train_config.unconditional_prompt,
             'diff_output_preservation': bool(self.train_config.diff_output_preservation),
+            'diff_output_preservation_class': self.train_config.diff_output_preservation_class,
             'sample_prompts': sample_prompts,
             'sample_negatives': sample_negs,
         }
@@ -260,6 +268,15 @@ class SDTrainer(BaseSDTrainProcess):
         # these are not defaulted on the process; ensure they exist for the DOP path below
         self.data_loader = None
         self.data_loader_reg = None
+
+        # The worker loads te_only (no VAE / clip / control models), so building the
+        # dataloader must ONLY trigger text-embedding caching. Disable every other
+        # per-dataset caching path here; the trainer process does those with the VAE.
+        for ds_cfg in (self.dataset_configs or []):
+            ds_cfg.cache_latents = False
+            ds_cfg.cache_latents_to_disk = False
+            ds_cfg.cache_clip_vision_to_disk = False
+            ds_cfg.controls = []
 
         # 1) dataset caption embeddings (+reg) -> disk, triggered by building the loaders
         if self.datasets is not None:
@@ -512,10 +529,40 @@ class SDTrainer(BaseSDTrainProcess):
                     unload_text_encoder(self.sd)
                 else:
                     # todo once every model is tested to work, unload properly. Though, this will all be merged into one thing.
-                    # keep legacy usage for now. 
+                    # keep legacy usage for now.
                     self.sd.text_encoder_to("cpu")
                 flush()
-        
+
+        # When a TE worker pre-cached everything, the in-process caching block above was
+        # skipped. DOP still needs its per-dataset state (_dop_enabled + replacement pairs)
+        # so the dataloader loads the worker-cached DOP embeds for each item. Calling
+        # precompute_dop_embeddings here sets that state and returns early on a full cache
+        # hit, so no encoding happens and the (absent) text encoder is never touched.
+        if self._use_cached_te and self.train_config.diff_output_preservation and self.data_loader is not None:
+            from toolkit.prompt_utils import build_dop_replacement_pairs
+            triggers_csv = self.trigger_word
+            classes_csv = self.train_config.diff_output_preservation_class
+            self._dop_replacement_pairs = build_dop_replacement_pairs(
+                triggers_csv=triggers_csv,
+                classes_csv=classes_csv,
+                case_insensitive=False,
+            )
+
+            def _dop_no_encode(caption):
+                raise RuntimeError(
+                    "DOP embedding cache miss in a skip_te trainer: the TE worker should "
+                    f"have cached all DOP embeddings. Missing for caption: {caption!r}"
+                )
+
+            for dataset in get_dataloader_datasets(self.data_loader):
+                dataset.precompute_dop_embeddings(
+                    triggers_csv=triggers_csv,
+                    classes_csv=classes_csv,
+                    encode_fn=_dop_no_encode,
+                    case_insensitive=False,
+                    debug=getattr(self.train_config, 'diff_output_preservation_debug', False),
+                )
+
         if self.train_config.blank_prompt_preservation and self.cached_blank_embeds is None:
             # make sure we have this if not unloading
             self.cached_blank_embeds = self.sd.encode_prompt("").to(
@@ -1275,7 +1322,8 @@ class SDTrainer(BaseSDTrainProcess):
         loss = loss.mean()
         if loss.item() > 1e3:
             pass
-        self.accelerator.backward(loss)
+        with self._gpu_phase(f'normal_backward/{self._current_resolution_bucket}'):
+            self.accelerator.backward(loss)
         return pure_loss
 
 
@@ -1299,7 +1347,6 @@ class SDTrainer(BaseSDTrainProcess):
         was_network_active = False
         if self.network is not None:
             was_network_active = self.network.is_active
-            self.network.is_active = False
         can_disable_adapter = False
         was_adapter_active = False
         if self.adapter is not None and (isinstance(self.adapter, IPAdapter) or
@@ -1308,7 +1355,6 @@ class SDTrainer(BaseSDTrainProcess):
         ):
             can_disable_adapter = True
             was_adapter_active = self.adapter.is_active
-            self.adapter.is_active = False
 
         if self.train_config.unload_text_encoder and self.adapter is not None and not isinstance(self.adapter, CustomAdapter):
             raise ValueError("Prior predictions currently do not support unloading text encoder with adapter")
@@ -1362,8 +1408,6 @@ class SDTrainer(BaseSDTrainProcess):
 
             # dont use network on this
             # self.network.multiplier = 0.0
-            self.sd.unet.eval()
-
             if self.adapter is not None and isinstance(self.adapter, IPAdapter) and not self.sd.is_flux and not self.sd.is_lumina2:
                 # we need to remove the image embeds from the prompt except for flux
                 embeds_to_use: PromptEmbeds = embeds_to_use.clone().detach()
@@ -1380,17 +1424,32 @@ class SDTrainer(BaseSDTrainProcess):
             if self.train_config.do_guidance_loss:
                 guidance_embedding_scale = self._guidance_loss_target_batch
 
-            prior_pred = self.sd.predict_noise(
-                latents=noisy_latents.to(self.device_torch, dtype=dtype).detach(),
-                conditional_embeddings=embeds_to_use.to(self.device_torch, dtype=dtype).detach(),
-                unconditional_embeddings=unconditional_embeds,
-                timestep=timesteps,
-                guidance_scale=self.train_config.cfg_scale,
-                guidance_embedding_scale=guidance_embedding_scale,
-                rescale_cfg=self.train_config.cfg_rescale,
-                batch=batch,
-                **pred_kwargs  # adapter residuals in here
-            )
+            if self.network is not None:
+                self.network.is_active = False
+            if can_disable_adapter:
+                self.adapter.is_active = False
+            self.sd.unet.eval()
+            try:
+                prior_pred = self.sd.predict_noise(
+                    latents=noisy_latents.to(self.device_torch, dtype=dtype).detach(),
+                    conditional_embeddings=embeds_to_use.to(self.device_torch, dtype=dtype).detach(),
+                    unconditional_embeddings=unconditional_embeds,
+                    timestep=timesteps,
+                    guidance_scale=self.train_config.cfg_scale,
+                    guidance_embedding_scale=guidance_embedding_scale,
+                    rescale_cfg=self.train_config.cfg_rescale,
+                    batch=batch,
+                    **pred_kwargs  # adapter residuals in here
+                )
+                if prior_pred is None:
+                    raise RuntimeError('base model returned no prior prediction')
+            finally:
+                if was_unet_training:
+                    self.sd.unet.train()
+                if can_disable_adapter:
+                    self.adapter.is_active = was_adapter_active
+                if self.network is not None:
+                    self.network.is_active = was_network_active
             if was_unet_training:
                 self.sd.unet.train()
             prior_pred = prior_pred.detach()
@@ -1448,7 +1507,88 @@ class SDTrainer(BaseSDTrainProcess):
         )
     
 
+    @contextmanager
+    def _gpu_phase(self, name):
+        enabled = (
+            self.performance_log_every > 0
+            and torch.cuda.is_available()
+            and self.device_torch.type == 'cuda'
+        )
+        if not enabled:
+            yield
+            return
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        stream = torch.cuda.current_stream(self.device_torch)
+        start.record(stream)
+        try:
+            yield
+        finally:
+            end.record(stream)
+            self._gpu_phase_events.setdefault(name, []).append((start, end))
+
+    def _performance_resolution_bucket(self, batch):
+        items = getattr(batch, 'file_items', None)
+        if items:
+            height = getattr(items[0], 'crop_height', None)
+            width = getattr(items[0], 'crop_width', None)
+            if height and width:
+                pixel_count = int(height) * int(width)
+                return min(
+                    (256, 512, 768, 1024),
+                    key=lambda size: abs(pixel_count - size * size),
+                )
+        latents = getattr(batch, 'latents', None)
+        tensor = latents if latents is not None else getattr(batch, 'tensor', None)
+        if tensor is None or tensor.ndim < 4:
+            return 256
+        height, width = tensor.shape[-2:]
+        if latents is not None:
+            scale = getattr(self.sd, 'vae_scale_factor', 8) or 8
+            height, width = height * scale, width * scale
+        pixel_count = int(height) * int(width)
+        return min((256, 512, 768, 1024), key=lambda size: abs(pixel_count - size * size))
+
+    def _start_resolution_memory_sample(self):
+        if not (
+            self.performance_log_every > 0
+            and torch.cuda.is_available()
+            and self.device_torch.type == 'cuda'
+        ):
+            self._resolution_memory_baseline = None
+            return
+        torch.cuda.reset_peak_memory_stats(self.device_torch)
+        self._resolution_memory_baseline = torch.cuda.memory_allocated(self.device_torch)
+
+    def _finish_resolution_memory_sample(self, bucket):
+        baseline = self._resolution_memory_baseline
+        if baseline is None:
+            return
+        allocated = torch.cuda.max_memory_allocated(self.device_torch)
+        reserved = torch.cuda.max_memory_reserved(self.device_torch)
+        incremental = max(0, allocated - baseline)
+        stats = self._resolution_memory_stats.setdefault(bucket, {
+            'count': 0, 'allocated_sum': 0, 'allocated_max': 0,
+            'reserved_sum': 0, 'reserved_max': 0,
+            'incremental_sum': 0, 'incremental_max': 0,
+        })
+        stats['count'] += 1
+        stats['allocated_sum'] += allocated
+        stats['allocated_max'] = max(stats['allocated_max'], allocated)
+        stats['reserved_sum'] += reserved
+        stats['reserved_max'] = max(stats['reserved_max'], reserved)
+        stats['incremental_sum'] += incremental
+        stats['incremental_max'] = max(stats['incremental_max'], incremental)
+        self._resolution_memory_baseline = None
+
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
+        resolution_bucket = self._performance_resolution_bucket(batch)
+        self._current_resolution_bucket = resolution_bucket
+        if self.performance_log_every > 0:
+            self._resolution_bucket_counts[resolution_bucket] = (
+                self._resolution_bucket_counts.get(resolution_bucket, 0) + 1
+            )
+        self._start_resolution_memory_sample()
         with torch.no_grad():
             self.timer.start('preprocess_batch')
             if isinstance(self.adapter, CustomAdapter):
@@ -2332,15 +2472,18 @@ class SDTrainer(BaseSDTrainProcess):
                     )
                 else:
                     with self.timer('predict_unet'):
-                        noise_pred = self.predict_noise(
-                            noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
-                            timesteps=timesteps,
-                            conditional_embeds=conditional_embeds.to(self.device_torch, dtype=dtype),
-                            unconditional_embeds=unconditional_embeds,
-                            batch=batch,
-                            is_primary_pred=True,
-                            **pred_kwargs
-                        )
+                        with self._gpu_phase(
+                            f'normal_training_forward/{self._current_resolution_bucket}'
+                        ):
+                            noise_pred = self.predict_noise(
+                                noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                                timesteps=timesteps,
+                                conditional_embeds=conditional_embeds.to(self.device_torch, dtype=dtype),
+                                unconditional_embeds=unconditional_embeds,
+                                batch=batch,
+                                is_primary_pred=True,
+                                **pred_kwargs
+                            )
                     self.after_unet_predict()
 
                     with self.timer('calculate_loss'):
@@ -2376,7 +2519,10 @@ class SDTrainer(BaseSDTrainProcess):
                         else:
                             # Two-pass: send the loss backwards now (frees its graph before the
                             # preservation forward, keeping peak VRAM low) otherwise checkpointing will fail
-                            self.accelerator.backward(loss)
+                            with self._gpu_phase(
+                                f'normal_backward/{self._current_resolution_bucket}'
+                            ):
+                                self.accelerator.backward(loss)
                             normal_loss = loss.detach() # dont send backward again
 
                         # Determine preservation embeddings and resolution
@@ -2401,20 +2547,21 @@ class SDTrainer(BaseSDTrainProcess):
 
                         # Run preservation forward with optional downsampling
                         with torch.set_grad_enabled(True):
-                            preservation_pred_res = self._run_preservation_forward(
-                                noisy_latents=noisy_latents,
-                                timesteps=timesteps,
-                                preservation_embeds=preservation_embeds,
-                                unconditional_embeds=unconditional_embeds,
-                                batch=batch,
-                                pred_kwargs=pred_kwargs,
-                                dtype=dtype,
-                                prior_pred=prior_pred,
-                                preservation_resolution=preservation_resolution,
-                                preservation_kind=preservation_kind,
-                                match_adapter_assist=match_adapter_assist,
-                                network_weight_list=network_weight_list,
-                            )
+                            with self._gpu_phase('dop_section'):
+                                preservation_pred_res = self._run_preservation_forward(
+                                    noisy_latents=noisy_latents,
+                                    timesteps=timesteps,
+                                    preservation_embeds=preservation_embeds,
+                                    unconditional_embeds=unconditional_embeds,
+                                    batch=batch,
+                                    pred_kwargs=pred_kwargs,
+                                    dtype=dtype,
+                                    prior_pred=prior_pred,
+                                    preservation_resolution=preservation_resolution,
+                                    preservation_kind=preservation_kind,
+                                    match_adapter_assist=match_adapter_assist,
+                                    network_weight_list=network_weight_list,
+                                )
 
                         # Handle tuple return (preservation_pred, prior_pred_for_loss) when downsampling
                         if isinstance(preservation_pred_res, tuple):
@@ -2465,10 +2612,191 @@ class SDTrainer(BaseSDTrainProcess):
                     # if self.is_bfloat:
                     # loss.backward()
                     # else:
-                    self.accelerator.backward(loss)
+                    backward_phase = (
+                        'combined_backward'
+                        if self.train_config.dop_single_backward
+                        else f'normal_backward/{self._current_resolution_bucket}'
+                    )
+                    with self._gpu_phase(backward_phase):
+                        self.accelerator.backward(loss)
 
+        self._finish_resolution_memory_sample(resolution_bucket)
         return loss.detach()
         # flush()
+
+    def _dop_patch_size(self) -> int:
+        """Patchify factor used when computing image_seq_len for the flow-match shift.
+
+        Mirrors the logic in BaseSDTrainProcess.process_general_training_batch: flux/flex/zimage
+        latents are divided by 2 (patch_size 2), others read unet.config.patch_size, default 1.
+        """
+        sd = self.sd
+        try:
+            if getattr(sd, 'is_flux', False) or 'flex' in getattr(sd, 'arch', '') or getattr(sd, 'arch', '') == 'zimage':
+                return 2
+            unet = getattr(sd, 'unet', None)
+            if unet is not None and hasattr(unet, 'config') and hasattr(unet.config, 'patch_size'):
+                return int(unet.config.patch_size)
+        except Exception:
+            pass
+        return 1
+
+    def _dop_reproject_timesteps(self, timesteps, main_h, main_w, dop_h, dop_w):
+        """Re-project the main-resolution timestep(s) onto the reduced DOP resolution's dynamic-shift
+        curve so the preservation forward runs at the noise level appropriate to that resolution.
+
+        The flow-match shift is resolution-aware: image_seq_len scales with latent area, so a smaller
+        DOP resolution yields a smaller shift (mu) and a lower average noise level. The live path
+        otherwise reuses the main-resolution timestep, which applies main-resolution noise to the
+        downsampled latents. This is a quantile-preserving remap: invert the main-res shift to recover
+        the base quantile, then re-apply the shift at the DOP resolution. It preserves the configured
+        content/style timestep weighting and adds no new RNG.
+
+        No-op (returns timesteps unchanged) unless the scheduler uses plain dynamic shifting; exotic
+        sigma transforms (karras/exponential/beta/terminal/invert) break the closed-form remap.
+        """
+        sched = self.sd.noise_scheduler
+        try:
+            cfg = sched.config
+            if not bool(cfg.get('use_dynamic_shifting', False)):
+                return timesteps
+            if self.train_config.timestep_type not in ('shift', 'flux_shift', 'lumina2_shift'):
+                return timesteps
+            if (cfg.get('use_karras_sigmas') or cfg.get('use_exponential_sigmas')
+                    or cfg.get('use_beta_sigmas') or cfg.get('shift_terminal') or cfg.get('invert_sigmas')):
+                return timesteps
+            if not hasattr(sched, 'time_shift'):
+                return timesteps
+        except Exception:
+            return timesteps
+
+        from toolkit.samplers.custom_flowmatch_sampler import calculate_shift
+
+        patch_size = self._dop_patch_size()
+
+        def _mu(h, w):
+            seq_len = (h * w) // (patch_size ** 2)
+            mu = calculate_shift(
+                seq_len,
+                cfg.get('base_image_seq_len', 256),
+                cfg.get('max_image_seq_len', 4096),
+                cfg.get('base_shift', 0.5),
+                cfg.get('max_shift', 1.16),
+            )
+            min_shift = getattr(sched, '_min_shift', None)
+            if min_shift is not None:
+                mu = max(mu, min_shift)
+            return float(mu)
+
+        try:
+            mu_main = _mu(main_h, main_w)
+            mu_dop = _mu(dop_h, dop_w)
+            if abs(mu_main - mu_dop) < 1e-6:
+                return timesteps
+            s_main = math.exp(mu_main)
+            sigma = (timesteps.float() / 1000.0).clamp(1e-6, 1.0 - 1e-6)
+            # invert the main-resolution shift to the base quantile
+            base = (sigma / (s_main + sigma * (1.0 - s_main))).clamp(1e-6, 1.0 - 1e-6)
+            # re-apply the shift at the DOP resolution using the scheduler's own transform
+            shifted = sched.time_shift(mu_dop, 1.0, base)
+            return (shifted * 1000.0).to(dtype=timesteps.dtype)
+        except Exception:
+            return timesteps
+
+    def _dop_prior_cache_hash(self, file_item, target_h, target_w, samples):
+        """Return the stable namespace digest for one image and DOP configuration."""
+        caption = getattr(file_item, '_dop_transformed_caption', None)
+        if caption is None:
+            caption = normalize_caption_separators(
+                self._map_triggers_to_classes_in_text(file_item.caption or '')
+            )
+        params = {'version': 2, 'prompt': caption, 'size': [target_h, target_w], 'samples': samples}
+        params['model'] = str(self.model_config.name_or_path_original)
+        params['arch'] = self.model_config.arch
+        params['qtype'] = getattr(self.model_config, 'qtype', None)
+        params['dtype'] = getattr(self.model_config, 'dtype', None)
+        params['patch_size'] = self._dop_patch_size()
+        params['timestep_type'] = getattr(self.train_config, 'timestep_type', None)
+        params['content_or_style'] = getattr(self.train_config, 'content_or_style', None)
+        params['scheduler'] = dict(getattr(self.sd.noise_scheduler, 'config', {}))
+        return hashlib.md5(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()
+
+    @staticmethod
+    def _dop_prior_cache_valid(state, target_h, target_w):
+        try:
+            noisy, ts, prior = state['noisy_latents'], state['timesteps'], state['prior_predictions']
+            return (noisy.ndim == 4 and prior.shape == noisy.shape and ts.ndim == 1
+                    and noisy.shape[0] == ts.shape[0]
+                    and tuple(noisy.shape[-2:]) == (target_h, target_w))
+        except (KeyError, AttributeError):
+            return False
+
+    def _dop_prior_cache_load_batch(self, batch, target_h, target_w, samples, dtype):
+        """Load one cached sample for every image, or return None on any miss."""
+        file_items = getattr(batch, 'file_items', None)
+        if not file_items:
+            return
+        chosen = []
+        for item in file_items:
+            path = item.get_dop_prior_path(self._dop_prior_cache_hash(item, target_h, target_w, samples))
+            if not os.path.exists(path):
+                return None
+            try:
+                state = load_file(path, device='cpu')
+            except Exception:
+                return None
+            if not self._dop_prior_cache_valid(state, target_h, target_w):
+                return None
+            if state['timesteps'].shape[0] < samples:
+                return None
+            idx = random.randrange(state['timesteps'].shape[0])
+            chosen.append((state['noisy_latents'][idx], state['timesteps'][idx], state['prior_predictions'][idx]))
+        torch_dtype = get_torch_dtype(dtype)
+        noisy = torch.stack([x[0] for x in chosen]).to(self.device_torch, dtype=torch_dtype)
+        ts = torch.stack([x[1] for x in chosen]).to(self.device_torch)
+        prior = torch.stack([x[2] for x in chosen]).to(self.device_torch, dtype=torch_dtype)
+        return noisy, ts, prior
+
+    def _dop_prior_cache_add_batch(self, batch, target_h, target_w, samples,
+                                   noisy_small, timesteps, prior_small):
+        """Append each live image result to its persistent cache until full."""
+        items = getattr(batch, 'file_items', None)
+        if not items or len(items) != prior_small.shape[0]:
+            return
+        ts = timesteps.detach().float().reshape(-1).cpu()
+        if ts.shape[0] == 1 and len(items) > 1:
+            ts = ts.expand(len(items)).contiguous()
+        if ts.shape[0] != len(items):
+            return
+        noisy_cpu, prior_cpu = noisy_small.detach().cpu(), prior_small.detach().cpu()
+        for idx, item in enumerate(items):
+            path = item.get_dop_prior_path(self._dop_prior_cache_hash(item, target_h, target_w, samples))
+            state = None
+            if os.path.exists(path):
+                try:
+                    state = load_file(path, device='cpu')
+                except Exception:
+                    pass
+            if state is not None and not self._dop_prior_cache_valid(state, target_h, target_w):
+                state = None
+            if state is None:
+                state = {'noisy_latents': noisy_cpu[idx:idx + 1],
+                         'timesteps': ts[idx:idx + 1],
+                         'prior_predictions': prior_cpu[idx:idx + 1]}
+            elif state['timesteps'].shape[0] >= samples:
+                continue
+            else:
+                state = {key: torch.cat((state[key], value[idx:idx + 1]), dim=0).contiguous()
+                         for key, value in (('noisy_latents', noisy_cpu), ('timesteps', ts),
+                                            ('prior_predictions', prior_cpu))}
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            temp_path = f'{path}.{os.getpid()}.{random.randrange(1 << 30)}.tmp.safetensors'
+            try:
+                save_file(state, temp_path, metadata={'format': 'aitk_dop_prior_v2'})
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
     def _run_preservation_forward(self, noisy_latents, timesteps, preservation_embeds, unconditional_embeds, batch, pred_kwargs, dtype, prior_pred, preservation_resolution=None, preservation_kind: 'Optional[str]'=None, match_adapter_assist: bool = False, network_weight_list: list = None):
         """Run preservation forward pass for DOP/blank prompt preservation and record timings.
@@ -2481,6 +2809,13 @@ class SDTrainer(BaseSDTrainProcess):
 
         Returns preservation_pred (or (preservation_pred, prior_pred_down) when downsampling used) or None.
         """
+        # Preservation/DOP loss compares the LoRA-on prediction against the frozen-base
+        # prediction. Classifier-free guidance serves no purpose for this comparison: it would
+        # double every forward in this path (cond+uncond batch) and amplify the prior target
+        # with guidance the base model wouldn't apply. Always run the preservation forwards and
+        # the matching prior without CFG, regardless of the training CFG setting.
+        unconditional_embeds = None
+
         # Determine timer base name based on preservation kind
         timer_base = 'blank_predict' if preservation_kind == 'blank' else 'dop_predict'
 
@@ -2567,36 +2902,98 @@ class SDTrainer(BaseSDTrainProcess):
 
         # CRITICAL: To downsample correctly for DOP, we must downsample the clean latents
         # and noise separately, then re-apply the noise schedule at the small resolution.
+        # Re-project the main-resolution timestep onto this reduced resolution's dynamic-shift curve
+        # so the preservation forward runs at the noise level appropriate to the DOP resolution
+        # (lower res -> lower shift -> lower average noise) rather than reusing the main-resolution
+        # noise level. No-op unless the scheduler is using plain dynamic shifting. The same remapped
+        # timestep feeds the noisy-latent construction, the prior, and the preservation forward so
+        # all three stay consistent.
+        dop_timesteps = self._dop_reproject_timesteps(
+            timesteps, noisy_latents.shape[2], noisy_latents.shape[3], target_h, target_w
+        )
+
+        # Frozen-base prior cache (DOP only). The prior is a LoRA-disabled forward, so it is
+        # deterministic and reusable. Disabled when extra per-batch conditioning is present
+        # (local_pred_kwargs non-empty, e.g. controlnet) since the cached noisy latent wouldn't
+        # match the current batch's conditioning. Cache files are keyed by latent identity plus
+        # prompt/model/resolution/scheduler configuration.
+        cache_on = (
+            getattr(self.train_config, 'dop_prior_cache', False)
+            and preservation_kind == 'dop'
+            and not local_pred_kwargs
+        )
+        samples = max(1, int(getattr(self.train_config, 'dop_prior_cache_samples', 12)))
+
+        # Steady state: load one matching sample per image and skip the frozen-base forward.
+        cached_batch = None
+        if cache_on:
+            with self.timer('dop_prior_cache_lookup'):
+                cached_batch = self._dop_prior_cache_load_batch(
+                    batch, target_h, target_w, samples, dtype
+                )
+            self.timer.record(
+                'dop/cache_hit' if cached_batch is not None else 'dop/cache_miss',
+                1.0,
+            )
+        if cached_batch is not None:
+            noisy_small, cached_timesteps, prior_small = cached_batch
+            with self.timer(f"{timer_base}_downsampled"):
+                preservation_pred_small = self.predict_noise(
+                    noisy_latents=noisy_small,
+                    timesteps=cached_timesteps,
+                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeds=unconditional_embeds,
+                    batch=batch,
+                    **local_pred_kwargs
+                )
+            return (preservation_pred_small, prior_small)
+
         with self.timer(f"{timer_base}_downsampled"):
             latents_small, noise_small, noisy_small = self._create_downsampled_noisy_latents(
-                batch.latents, timesteps, target_h, target_w, dtype
+                batch.latents, dop_timesteps, target_h, target_w, dtype
             )
 
             # Generate both predictions at the same small resolution
             prior_small = None
             try:
-                prior_small = self.get_prior_prediction(
-                    noisy_latents=noisy_small,
-                    conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
-                    match_adapter_assist=match_adapter_assist,
-                    network_weight_list=network_weight_list if network_weight_list is not None else [],
-                    timesteps=timesteps,
-                    pred_kwargs=local_pred_kwargs,
-                    batch=batch,
-                    noise=None,
-                    unconditional_embeds=unconditional_embeds,
+                with self._gpu_phase('dop_prior_generation'):
+                    prior_small = self.get_prior_prediction(
+                        noisy_latents=noisy_small,
+                        conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                        match_adapter_assist=match_adapter_assist,
+                        network_weight_list=network_weight_list if network_weight_list is not None else [],
+                        timesteps=dop_timesteps,
+                        pred_kwargs=local_pred_kwargs,
+                        batch=batch,
+                        noise=None,
+                        unconditional_embeds=unconditional_embeds,
+                    )
+            except Exception as e:
+                print_acc(
+                    f'[DOP] frozen prior prediction failed; skipping DOP for this step: '
+                    f'{type(e).__name__}: {e}'
                 )
-            except Exception:
                 prior_small = None
+
+            if prior_small is None:
+                return (None, None)
 
             preservation_pred_small = self.predict_noise(
                 noisy_latents=noisy_small,
-                timesteps=timesteps,
+                timesteps=dop_timesteps,
                 conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
                 unconditional_embeds=unconditional_embeds,
                 batch=batch,
                 **local_pred_kwargs
             )
+
+        # Warmup: append this live result to each image's persistent cache.
+        if cache_on and prior_small is not None:
+            with self.timer('dop_prior_cache_write'):
+                self._dop_prior_cache_add_batch(
+                    batch, target_h, target_w, samples, noisy_small, dop_timesteps, prior_small
+                )
+
         # Return both small preds so loss can be computed at this resolution
         return (preservation_pred_small, prior_small)
 
@@ -2633,6 +3030,9 @@ class SDTrainer(BaseSDTrainProcess):
 
         Returns the preservation_loss tensor.
         """
+        if preservation_pred is None or prior_pred is None:
+            self._last_preservation_loss = None
+            return None
         try:
             # Validate that both predictions are at the same resolution for fair comparison
             if prior_pred is not None and preservation_pred.shape != prior_pred.shape:
@@ -2676,7 +3076,8 @@ class SDTrainer(BaseSDTrainProcess):
             try:
                 if preservation_loss.requires_grad:
                     with self.timer('preservation_backward'):
-                        self.accelerator.backward(preservation_loss)
+                        with self._gpu_phase('dop_backward'):
+                            self.accelerator.backward(preservation_loss)
             except Exception as e:
                 try:
                     print_acc(f"[DOP] backward failed for preservation loss: {e}")
@@ -2736,6 +3137,23 @@ class SDTrainer(BaseSDTrainProcess):
         if do_log:
             self._last_weight_noise_norm = noise_sq ** 0.5
 
+    def resolve_performance_timers(self):
+        for bucket, count in self._resolution_bucket_counts.items():
+            self.timer.record(f'resolution/count/{bucket}', count)
+        self._resolution_bucket_counts.clear()
+        for bucket, stats in self._resolution_memory_stats.items():
+            for key, value in stats.items():
+                self.timer.record(f'resolution/memory/{key}/{bucket}', value)
+        self._resolution_memory_stats.clear()
+        if not self._gpu_phase_events:
+            return
+        torch.cuda.synchronize(self.device_torch)
+        step_count = max(1, len(self.timer.timers.get('train_loop', ())))
+        for name, events in self._gpu_phase_events.items():
+            seconds = sum(start.elapsed_time(end) for start, end in events) / 1000.0
+            self.timer.record(f'gpu/{name}', seconds / step_count)
+        self._gpu_phase_events.clear()
+
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
             batch_list = batch
@@ -2776,7 +3194,8 @@ class SDTrainer(BaseSDTrainProcess):
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
-                self.optimizer.step()
+                with self._gpu_phase('optimizer_step'):
+                    self.optimizer.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):

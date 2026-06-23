@@ -862,6 +862,20 @@ export default function SimpleJob({
                             setJobConfig(value, 'config.process[0].train.dop_single_backward')
                           }
                         />
+                        <Checkbox
+                          label="Cache Prior Predictions"
+                          docKey={'train.dop_prior_cache'}
+                          className="pt-2"
+                          checked={jobConfig.config.process[0].train.dop_prior_cache || false}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.dop_prior_cache')}
+                        />
+                        {jobConfig.config.process[0].train.dop_prior_cache &&
+                          (jobConfig.config.process[0].train.diff_output_preservation_resolution === null ||
+                            jobConfig.config.process[0].train.diff_output_preservation_resolution === undefined) && (
+                            <div className="text-xs text-yellow-300 pt-1">
+                              Prior caching only takes effect with a reduced DOP Resolution set above.
+                            </div>
+                          )}
                       </>
                     )}
                   </>

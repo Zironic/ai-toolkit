@@ -1676,6 +1676,22 @@ class LatentCachingFileItemDTOMixin:
 
         return self._latent_path
 
+    def get_dop_prior_path(self: 'FileItemDTO', dop_hash: str):
+        """Disk path for this image's cached DOP prior samples.
+
+        Mirrors get_latent_path's hashing: the filename embeds the latent-identity hash (so crop/
+        scale/flip changes invalidate it just like the latent cache) plus a `dop_hash` covering the
+        prior-determining config (class prompt, model, DOP resolution, sample count, shift params).
+        Stored in a sibling `_dop_prior_cache` dir so it never interferes with latent-cache scans.
+        """
+        img_dir = os.path.dirname(self.path)
+        cache_dir = os.path.join(img_dir, '_dop_prior_cache')
+        hash_dict = self.get_latent_info_dict()
+        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+        latent_hash = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii').replace('=', '')
+        return os.path.join(cache_dir, f'{filename_no_ext}_{latent_hash}_{dop_hash}.safetensors')
+
     def cleanup_latent(self):
         if self._encoded_latent is not None:
             if not self.is_caching_to_memory:

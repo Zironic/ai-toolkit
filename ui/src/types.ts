@@ -153,6 +153,8 @@ export interface TrainConfig {
   diff_output_preservation_class: string;
   diff_output_preservation_resolution?: number | null;
   dop_single_backward?: boolean;
+  dop_prior_cache?: boolean;
+  dop_prior_cache_samples?: number;
   blank_prompt_preservation?: boolean;
   blank_prompt_preservation_multiplier?: number;
   blank_prompt_preservation_resolution?: number | null;
