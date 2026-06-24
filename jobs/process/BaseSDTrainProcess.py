@@ -112,6 +112,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # update modelconfig dtype to match train
         model_config['dtype'] = self.train_config.dtype
         self.model_config = ModelConfig(**model_config)
+        from toolkit.memory_management import MemoryManager
+        MemoryManager.set_offload_profile_enabled(
+            self.model_config.layer_offloading_profile
+        )
+        prefetch_enabled = self.model_config.layer_offloading_prefetch
+        MemoryManager.set_offload_trace_enabled(
+            self.model_config.layer_offloading_trace or prefetch_enabled
+        )
+        MemoryManager.set_offload_prefetch_enabled(prefetch_enabled)
+        MemoryManager.set_fp8_grad_input_enabled(
+            self.model_config.layer_offloading_fp8_grad_input
+        )
 
         self.save_config = SaveConfig(**self.get_conf('save', {}))
         self.sample_config = SampleConfig(**self.get_conf('sample', {}))

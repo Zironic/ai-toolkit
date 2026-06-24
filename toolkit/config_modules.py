@@ -694,6 +694,25 @@ class ModelConfig:
         # 0 is off and 1.0 is 100% of the layers
         self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
         self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
+        # Budget-driven training offload. Frozen weights remain compact on CPU
+        # and a bounded GPU ring streams only the layers that do not fit.
+        self.layer_offloading_smart = kwargs.get("layer_offloading_smart", False)
+        self.layer_offloading_smart_headroom_gb = kwargs.get(
+            "layer_offloading_smart_headroom_gb", 4.0
+        )
+        self.layer_offloading_profile = kwargs.get("layer_offloading_profile", False)
+        self.layer_offloading_trace = kwargs.get("layer_offloading_trace", False)
+        self.layer_offloading_prefetch = kwargs.get("layer_offloading_prefetch", False)
+        self.layer_offloading_fp8_forward = kwargs.get(
+            "layer_offloading_fp8_forward", False
+        )
+        self.layer_offloading_fp8_grad_input = kwargs.get(
+            "layer_offloading_fp8_grad_input", False
+        )
+        # 0 checkpoints every supported block; -1 enables time-based tuning.
+        self.layer_offloading_checkpoint_keep_last = kwargs.get(
+            "layer_offloading_checkpoint_keep_last", 0
+        )
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for
