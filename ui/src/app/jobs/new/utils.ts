@@ -47,6 +47,13 @@ export const handleModelArchChange = (
       delete newModel.layer_offloading;
       delete newModel.layer_offloading_text_encoder_percent;
       delete newModel.layer_offloading_transformer_percent;
+      delete newModel.layer_offloading_smart;
+      delete newModel.layer_offloading_smart_headroom_gb;
+      delete newModel.layer_offloading_profile;
+      delete newModel.layer_offloading_prefetch;
+      delete newModel.layer_offloading_fp8_forward;
+      delete newModel.layer_offloading_fp8_grad_input;
+      delete newModel.layer_offloading_checkpoint_keep_last;
       setJobConfig(newModel, 'config.process[0].model');
     }
   } else {
@@ -55,6 +62,13 @@ export const handleModelArchChange = (
       setJobConfig(false, 'config.process[0].model.layer_offloading');
       setJobConfig(1.0, 'config.process[0].model.layer_offloading_text_encoder_percent');
       setJobConfig(1.0, 'config.process[0].model.layer_offloading_transformer_percent');
+      setJobConfig(false, 'config.process[0].model.layer_offloading_smart');
+      setJobConfig(4, 'config.process[0].model.layer_offloading_smart_headroom_gb');
+      setJobConfig(false, 'config.process[0].model.layer_offloading_profile');
+      setJobConfig(false, 'config.process[0].model.layer_offloading_prefetch');
+      setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_forward');
+      setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_grad_input');
+      setJobConfig(0, 'config.process[0].model.layer_offloading_checkpoint_keep_last');
     }
   }
 

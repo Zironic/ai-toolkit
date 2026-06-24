@@ -268,6 +268,89 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.layer_offloading_smart': {
+    title: 'Smart Transformer Offloading',
+    description: (
+      <>
+        Krea 2 experimental mode. Measures free VRAM and deterministically keeps as many transformer layers resident as
+        fit after reserving memory for training and the shared transfer ring. This replaces the Transformer Offload %
+        selection while enabled.
+      </>
+    ),
+  },
+  'model.layer_offloading_smart_headroom_gb': {
+    title: 'Training VRAM Reserve',
+    description: (
+      <>
+        VRAM kept free for activations, LoRA weights, gradients, optimizer state, and temporary kernels. Increase this
+        if training runs out of memory; decrease it to keep more transformer layers resident.
+      </>
+    ),
+  },
+  'model.layer_offloading_profile': {
+    title: 'Profile Layer Offloading',
+    description: (
+      <>
+        Records pageable and pinned CPU submission stalls, GPU staging time, and compute-stream wait time for streamed
+        layers. A report is printed after the first completed step and at each performance logging window. Profiling
+        adds CUDA timing events, so leave it disabled for normal training.
+      </>
+    ),
+  },
+  'model.layer_offloading_prefetch': {
+    title: 'Prefetch Offloaded Layers',
+    description: (
+      <>
+        Experimental. Background CPU workers copy upcoming offloaded layers into pinned memory ahead of time, using the
+        recorded per-step access order, so the training thread no longer blocks while staging pageable weights. This can
+        sharply reduce step time when offloading is bottlenecked by pageable/pagefile stalls. Enables access tracing
+        automatically and keeps a bounded pinned pool sized to available RAM.
+      </>
+    ),
+  },
+  'model.layer_offloading_fp8_forward': {
+    title: 'Native FP8 Training',
+    description: (
+      <>
+        Uses the frozen base model&apos;s FP8 weights directly for streamed linear
+        forwards. Checkpoint recompute leaves those weights resident for the
+        following grad-input calculation, which also stays quantized through
+        TorchAO. Experimental and only effective for compatible FP8 models and GPUs.
+      </>
+    ),
+  },
+  'model.layer_offloading_fp8_grad_input': {
+    title: 'Native FP8 Grad Input',
+    description: (
+      <>
+        Computes the backward grad-input with a native FP8 matmul (folding the
+        per-row weight scales into the gradient and using <code>_scaled_mm</code>{' '}
+        against the raw FP8 weight) instead of dequantizing the weight to bf16.
+        Reduces backward compute and memory traffic. Experimental: a one-time
+        self-check validates it against the bf16 result on first use and falls
+        back automatically if it disagrees, so training stays correct.
+      </>
+    ),
+  },
+  'model.layer_offloading_checkpoint_keep_last': {
+    title: 'Uncheckpointed Trailing Blocks',
+    description: (
+      <>
+        Number of final transformer blocks to leave uncheckpointed. Those blocks
+        keep their activations instead of recomputing them in the backward pass,
+        which removes recompute kernel launches once the step is launch-bound
+        rather than transfer-bound. Each kept block costs some VRAM, so raise
+        this only while peak memory stays under the card; 0 checkpoints every
+        block (lowest VRAM, most recompute).
+        <br />
+        <br />
+        Set to <code>-1</code> for auto: the trainer measures the real reserved
+        memory and forward/backward time per resolution. It climbs while steps
+        get faster, then returns to the fastest measured value on regression.
+        The card&apos;s spill line remains a hard safety ceiling.
+      </>
+    ),
+  },
   'model.qie.match_target_res': {
     title: 'Match Target Res',
     description: (

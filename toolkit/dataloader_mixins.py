@@ -1855,6 +1855,29 @@ class TextEmbeddingFileItemDTOMixin:
         # honor dataset-level preference to keep text embeddings in memory
         self.is_caching_text_embeddings_to_memory = getattr(self.dataset_config, 'cache_text_embeddings_to_memory', True)
 
+    def refresh_caption_for_text_embedding_cache(self):
+        """Reload the caption source before deriving a text-cache key.
+
+        FileItemDTO instances memoize raw/processed captions and embedding paths.
+        The image-adjacent .txt sidecar is authoritative; captions.json is only
+        temporary editing storage and must not participate in cache validity.
+        Clear both memoization layers and deliberately call load_caption without
+        a caption dictionary so the content-addressed filename and encoded text
+        both come from the current sidecar.
+        """
+        previous = getattr(self, 'caption', None)
+        self.raw_caption = None
+        self.raw_caption_short = None
+        self.caption = None
+        self.caption_short = None
+        self._text_embedding_path = None
+        self._dop_text_embedding_path = None
+        self.prompt_embeds = None
+        self.dop_prompt_embeds = None
+        self.is_text_embedding_cached = False
+        self.load_caption(None)
+        return previous != self.caption
+
     def get_text_embedding_info_dict(self: 'FileItemDTO', dop_caption: str = None):
         # make sure the caption is loaded here
         if self.caption is None:
@@ -2042,6 +2065,7 @@ class TextEmbeddingCachingMixin:
             
             for file_item in self.file_list:
                 file_item.latent_load_device = self.sd.device
+                file_item.refresh_caption_for_text_embedding_cache()
                 
                 text_embedding_path = Path(file_item.get_text_embedding_path(recalculate=True))
                 cached = find_cached_file(text_embedding_path)

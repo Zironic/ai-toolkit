@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 # Mirror run.py's pre-torch environment setup so behavior/allocator tuning matches.
 load_dotenv()
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
+# Generous HF download read timeout (default 10s) so a flaky/slow Qwen3-VL pull in the
+# worker doesn't die on a transient ReadTimeout. Overridable via .env.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 sys.path.insert(0, os.getcwd())
 os.environ["DISABLE_TELEMETRY"] = "YES"

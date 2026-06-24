@@ -183,6 +183,13 @@ export interface ModelConfig {
   layer_offloading?: boolean;
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
+  layer_offloading_smart?: boolean;
+  layer_offloading_smart_headroom_gb?: number;
+  layer_offloading_profile?: boolean;
+  layer_offloading_prefetch?: boolean;
+  layer_offloading_fp8_forward?: boolean;
+  layer_offloading_fp8_grad_input?: boolean;
+  layer_offloading_checkpoint_keep_last?: number;
   assistant_lora_path?: string;
   unconditional_lora_path?: string;
   compile?: boolean;

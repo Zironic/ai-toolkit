@@ -63,7 +63,9 @@ export default function TrainingForm() {
           parsed.config.process[0].sqlite_db_path = './aitk_db.db';
           parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
           parsed.config.process[0].device = 'cuda';
-          parsed.config.process[0].performance_log_every = 10;
+          if (parsed.config.process[0].performance_log_every == null) {
+            parsed.config.process[0].performance_log_every = 10;
+          }
         } catch (err) {
           console.warn('Could not set required fields on imported config:', err);
         }
@@ -297,7 +299,9 @@ export default function TrainingForm() {
                 parsed.config.process[0].sqlite_db_path = './aitk_db.db';
                 parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
                 parsed.config.process[0].device = 'cuda';
-                parsed.config.process[0].performance_log_every = 10;
+                if (parsed.config.process[0].performance_log_every == null) {
+                  parsed.config.process[0].performance_log_every = 10;
+                }
               } catch (e) {
                 console.warn(e);
               }

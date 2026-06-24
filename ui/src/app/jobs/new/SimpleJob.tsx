@@ -352,18 +352,69 @@ export default function SimpleJob({
                 />
                 {jobConfig.config.process[0].model.layer_offloading && (
                   <div className="pt-2">
-                    <SliderInput
-                      label="Transformer Offload %"
-                      value={Math.round(
-                        (jobConfig.config.process[0].model.layer_offloading_transformer_percent ?? 1) * 100,
-                      )}
-                      onChange={value =>
-                        setJobConfig(value * 0.01, 'config.process[0].model.layer_offloading_transformer_percent')
-                      }
-                      min={0}
-                      max={100}
-                      step={1}
-                    />
+                    {modelArch?.name === 'krea2' && (
+                      <>
+                        <Checkbox
+                          label="Smart Transformer Offloading (Comfy-style)"
+                          checked={jobConfig.config.process[0].model.layer_offloading_smart || false}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].model.layer_offloading_smart')
+                          }
+                          docKey="model.layer_offloading_smart"
+                        />
+                        {jobConfig.config.process[0].model.layer_offloading_smart && (
+                          <NumberInput
+                            label="Training VRAM Reserve (GB)"
+                            value={
+                              jobConfig.config.process[0].model.layer_offloading_smart_headroom_gb ?? 4
+                            }
+                            onChange={value =>
+                              setJobConfig(
+                                value ?? 4,
+                                'config.process[0].model.layer_offloading_smart_headroom_gb',
+                              )
+                            }
+                            min={1}
+                            max={24}
+                            docKey="model.layer_offloading_smart_headroom_gb"
+                          />
+                        )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart && (
+                          <NumberInput
+                            label="Uncheckpointed Trailing Blocks"
+                            value={
+                              jobConfig.config.process[0].model.layer_offloading_checkpoint_keep_last ?? 0
+                            }
+                            onChange={value =>
+                              setJobConfig(
+                                value ?? 0,
+                                'config.process[0].model.layer_offloading_checkpoint_keep_last',
+                              )
+                            }
+                            min={-1}
+                            max={48}
+                            docKey="model.layer_offloading_checkpoint_keep_last"
+                          />
+                        )}
+                      </>
+                    )}
+                    {!(
+                      modelArch?.name === 'krea2' &&
+                      jobConfig.config.process[0].model.layer_offloading_smart
+                    ) && (
+                      <SliderInput
+                        label="Transformer Offload %"
+                        value={Math.round(
+                          (jobConfig.config.process[0].model.layer_offloading_transformer_percent ?? 1) * 100,
+                        )}
+                        onChange={value =>
+                          setJobConfig(value * 0.01, 'config.process[0].model.layer_offloading_transformer_percent')
+                        }
+                        min={0}
+                        max={100}
+                        step={1}
+                      />
+                    )}
                     <SliderInput
                       label="Text Encoder Offload %"
                       value={Math.round(
@@ -375,6 +426,38 @@ export default function SimpleJob({
                       min={0}
                       max={100}
                       step={1}
+                    />
+                    <Checkbox
+                      label="Profile Layer Offloading"
+                      checked={jobConfig.config.process[0].model.layer_offloading_profile || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].model.layer_offloading_profile')
+                      }
+                      docKey="model.layer_offloading_profile"
+                    />
+                    <Checkbox
+                      label="Prefetch Offloaded Layers"
+                      checked={jobConfig.config.process[0].model.layer_offloading_prefetch || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch')
+                      }
+                      docKey="model.layer_offloading_prefetch"
+                    />
+                    <Checkbox
+                      label="Native FP8 Training"
+                      checked={jobConfig.config.process[0].model.layer_offloading_fp8_forward || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_forward')
+                      }
+                      docKey="model.layer_offloading_fp8_forward"
+                    />
+                    <Checkbox
+                      label="Native FP8 Grad Input"
+                      checked={jobConfig.config.process[0].model.layer_offloading_fp8_grad_input || false}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_grad_input')
+                      }
+                      docKey="model.layer_offloading_fp8_grad_input"
                     />
                   </div>
                 )}

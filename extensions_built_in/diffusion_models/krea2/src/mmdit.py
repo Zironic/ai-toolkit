@@ -24,7 +24,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 
@@ -56,10 +55,13 @@ def attention(
     scale: float | None = None,
     gqa: bool = False,
 ) -> Tensor:
-    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-        x = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
-        )
+    # Do not force cuDNN here. For some training sequence shapes its selected
+    # plan reserves a multi-GiB workspace (observed as a 9.9 -> 24.4 GiB live
+    # allocation spike on a 12 GiB Ada card). Automatic SDPA dispatch can use
+    # Flash or another memory-efficient backend and retains the math fallback.
+    x = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
+    )
     return rearrange(x, "B H L D -> B L (H D)")
 
 
@@ -342,6 +344,10 @@ class SingleStreamDiT(nn.Module):
         super().__init__()
         self.config = config
         self.gradient_checkpointing = False
+        # Number of trailing blocks to leave uncheckpointed (activations kept
+        # resident, no backward recompute). Trading a little VRAM for fewer
+        # recompute-forward kernel launches once the step is launch-bound.
+        self._checkpoint_keep_last = 0
 
         headdim = config.features // config.heads
         axes = [
@@ -404,11 +410,13 @@ class SingleStreamDiT(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, keep_last: int = 0):
         self.gradient_checkpointing = True
+        self._checkpoint_keep_last = max(0, int(keep_last))
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+        self._checkpoint_keep_last = 0
 
     def forward(
         self,
@@ -442,8 +450,16 @@ class SingleStreamDiT(nn.Module):
 
         freqs = self.posemb(pos)
 
-        for block in self.blocks:
-            if self.gradient_checkpointing and torch.is_grad_enabled():
+        # Selective checkpointing: checkpoint all but the last `keep_last`
+        # blocks. The trailing blocks keep their activations (no recompute),
+        # which has the shortest residency since their backward runs first.
+        checkpoint_cutoff = len(self.blocks) - self._checkpoint_keep_last
+        for i, block in enumerate(self.blocks):
+            if (
+                self.gradient_checkpointing
+                and torch.is_grad_enabled()
+                and i < checkpoint_cutoff
+            ):
                 combined = checkpoint(
                     block,
                     combined,

@@ -54,6 +54,10 @@ class Timer:
         timing_dict = {}
         # sort by longest at top
         for timer_name, timings in sorted(self.timers.items(), key=lambda x: sum(x[1]), reverse=True):
+            # An aborted/OOM step can create a timer and then cancel it before
+            # recording a sample. Empty timers are not measurements.
+            if not timings:
+                continue
             avg_time = sum(timings) / len(timings)
             
             if not is_ui:

@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 # Load the .env file if it exists
 load_dotenv()
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
+# Be generous with the HF download read timeout (default 10s) so large/flaky model pulls
+# (e.g. Qwen3-VL) don't die on a transient ReadTimeout. Overridable via .env.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 seed = None
 if "SEED" in os.environ:

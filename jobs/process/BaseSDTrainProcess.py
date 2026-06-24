@@ -112,6 +112,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # update modelconfig dtype to match train
         model_config['dtype'] = self.train_config.dtype
         self.model_config = ModelConfig(**model_config)
+        from toolkit.memory_management import MemoryManager
+        MemoryManager.set_offload_profile_enabled(
+            self.model_config.layer_offloading_profile
+        )
+        # Prefetch (slice 2B) needs the frozen access trace to know what to
+        # pre-pin, so enabling it implies tracing.
+        prefetch_enabled = self.model_config.layer_offloading_prefetch
+        MemoryManager.set_offload_trace_enabled(
+            self.model_config.layer_offloading_trace or prefetch_enabled
+        )
+        MemoryManager.set_offload_prefetch_enabled(prefetch_enabled)
+        MemoryManager.set_fp8_grad_input_enabled(
+            self.model_config.layer_offloading_fp8_grad_input
+        )
 
         self.save_config = SaveConfig(**self.get_conf('save', {}))
         self.sample_config = SampleConfig(**self.get_conf('sample', {}))
@@ -125,6 +139,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.logging_config = LoggingConfig(**self.get_conf('logging', {}))
         self.logger = create_logger(self.logging_config, config, self.save_root)
         self.performance_log_path = os.path.join(self.save_root, 'performance_log.jsonl')
+        self._archive_previous_performance_log()
         self.timer.add_after_print_hook(self._write_performance_timing_log)
         self.optimizer: torch.optim.Optimizer = None
         self.lr_scheduler = None
@@ -367,10 +382,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
         
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        # send to be generated. Keep the transformer fully resident during the sample loop so
+        # layer offloading doesn't re-stream (and re-dequantize) every weight on every denoise
+        # step — that turns sampling from minutes-per-step into seconds. No-op when offloading is
+        # off; falls back to streaming if the model doesn't fit resident.
+        from toolkit.memory_management import MemoryManager
+        transformer = getattr(self.sd, 'unet', None)
+        with MemoryManager.inference_resident(transformer, self.device_torch):
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        
+        # Restoring offload may have moved the base transformer to CPU and back; if the LoRA
+        # network rode along, make sure it's back on the training device before training resumes.
+        if getattr(self, 'network', None) is not None:
+            try:
+                self.network.to(self.device_torch)
+            except Exception:
+                pass
+
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
@@ -721,10 +750,59 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.logger.start()
         self.prepare_accelerator()
+        if self.accelerator.is_main_process:
+            try:
+                from toolkit.memory_management import MemoryManager
+                memory = MemoryManager.training_runtime_diagnostics(
+                    getattr(self.sd, 'unet', None), self.device_torch
+                )
+            except Exception as error:
+                print_acc(
+                    f"[MemoryManager] pre-training diagnostic failed: {error}"
+                )
+                memory = None
+            if memory is not None:
+                print_acc(
+                    "[MemoryManager] pre-training smart layout: "
+                    f"resident={memory['planned_resident_gb']:.2f} GiB "
+                    f"offloaded_cpu={memory['offloaded_cpu_gb']:.2f} GiB "
+                    f"streamed_layers={memory['managed_layers']}/"
+                    f"{memory['candidate_layers']} "
+                    f"ring_reserve={memory['planned_ring_gb']:.2f} GiB "
+                    f"training_headroom={memory['training_headroom_gb']:.2f} GiB "
+                    f"allocated={memory['torch_allocated_gb']:.2f} GiB "
+                    f"reserved={memory['torch_reserved_gb']:.2f} GiB "
+                    f"device_free={memory['device_free_gb']:.2f} GiB"
+                )
 
     def resolve_performance_timers(self):
         """Resolve model-specific asynchronous timers before logging the rolling window."""
         pass
+
+    def _archive_previous_performance_log(self):
+        """Move an existing performance_log.jsonl aside before a new run.
+
+        Mirrors the UI's handling of log.txt (ui/cron/actions/startJob.ts):
+        the old file is moved into a 'logs' subfolder and renamed
+        '{num}_performance_log.jsonl', choosing the next free number. Doing
+        it here (rather than only in the UI) also covers CLI runs.
+        """
+        if not self.accelerator.is_main_process:
+            return
+        try:
+            if not os.path.exists(self.performance_log_path):
+                return
+            logs_folder = os.path.join(self.save_root, 'logs')
+            os.makedirs(logs_folder, exist_ok=True)
+            num = 0
+            while os.path.exists(os.path.join(logs_folder, f'{num}_performance_log.jsonl')):
+                num += 1
+            os.replace(
+                self.performance_log_path,
+                os.path.join(logs_folder, f'{num}_performance_log.jsonl'),
+            )
+        except Exception as error:
+            print_acc(f"Could not archive previous performance log: {error}")
 
     def _write_performance_timing_log(self, timing_dict):
         """Append one reconciled timing window to performance_log.jsonl."""
@@ -827,6 +905,45 @@ class BaseSDTrainProcess(BaseTrainProcess):
             'optimizer_step_s': optimizer,
             'other_overhead_s': max(0.0, total - accounted),
         }
+        try:
+            from toolkit.memory_management import MemoryManager
+            smart_memory = MemoryManager.training_runtime_diagnostics(
+                getattr(self.sd, 'unet', None), self.device_torch
+            )
+        except Exception as error:
+            smart_memory = {'diagnostic_error': str(error)}
+        if smart_memory is not None:
+            record['smart_training_offload'] = smart_memory
+            if 'diagnostic_error' not in smart_memory:
+                print_acc(
+                    "[MemoryManager] smart training runtime: "
+                    f"resident={smart_memory['planned_resident_gb']:.2f} GiB "
+                    f"offloaded_cpu={smart_memory['offloaded_cpu_gb']:.2f} GiB "
+                    f"ring={smart_memory['live_ring_gb']:.2f}/"
+                    f"{smart_memory['planned_ring_gb']:.2f} GiB "
+                    f"working={smart_memory['working_headroom_used_gb']:.2f}/"
+                    f"{smart_memory['training_headroom_gb']:.2f} GiB "
+                    f"allocated={smart_memory['torch_allocated_gb']:.2f} GiB "
+                    f"reserved={smart_memory['torch_reserved_gb']:.2f} GiB "
+                    f"device={smart_memory['device_used_gb']:.2f}/"
+                    f"{smart_memory['device_total_gb']:.2f} GiB "
+                    f"free={smart_memory['device_free_gb']:.2f} GiB"
+                )
+        try:
+            from toolkit.memory_management import MemoryManager
+            offload_profile = MemoryManager.offload_profile_report(reset=True)
+        except Exception as error:
+            offload_profile = f"[OffloadProfile] report failed: {error}"
+        if offload_profile:
+            record['offload_profile'] = offload_profile
+            print_acc(offload_profile)
+        try:
+            prefetch_report = MemoryManager.offload_prefetch_report(reset=True)
+        except Exception as error:
+            prefetch_report = f"[BouncePool] report failed: {error}"
+        if prefetch_report:
+            record['offload_prefetch'] = prefetch_report
+            print_acc(prefetch_report)
         os.makedirs(os.path.dirname(self.performance_log_path), exist_ok=True)
         with open(self.performance_log_path, 'a', encoding='utf-8') as handle:
             handle.write(json.dumps(record, separators=(',', ':')) + '\n')
@@ -1303,6 +1420,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.sd.is_flux or 'flex' in self.sd.arch or self.sd.arch == 'zimage':
                         # flux/zimage is a patch size of 1, but latents are divided by 2, so we need to double it
                         patch_size = 2
+                    elif getattr(self.sd, 'patch_size', None) is not None:
+                        # models that declare their own patch size (e.g. krea2, whose transformer
+                        # config exposes `patch`, not `patch_size`) — use it so image_seq_len is right
+                        patch_size = self.sd.patch_size
                     elif hasattr(self.sd.unet, 'config') and hasattr(self.sd.unet.config, 'patch_size'):
                         patch_size = self.sd.unet.config.patch_size
                     
@@ -1695,13 +1816,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if os.environ.get('AITK_IS_TE_WORKER', '0') == '1':
             return False
         # only archs with a te_only / skip_te load path
-        if self.model_config.arch not in ('zimage', 'anima', 'ideogram4'):
+        if self.model_config.arch not in ('zimage', 'anima', 'ideogram4', 'krea2'):
             return False
         if not (hasattr(self, 'cache_text_encoder_outputs_to_disk') and hasattr(self, 'aux_cache_is_ready')):
             return False
 
-        # already fully cached for this exact config — use it, no worker needed
-        if self.aux_cache_is_ready():
+        # already fully cached for this exact config and the current authoritative
+        # .txt sidecars — use it, no worker needed
+        if self.aux_cache_is_ready() and self._te_caption_manifest_is_current():
             print_acc("[te-worker] aux embedding cache already complete; using cached embeds (skip_te)")
             return True
 
@@ -1726,13 +1848,81 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"Text-encoder cache worker failed (exit code {result.returncode}). "
                 f"Config: {worker_config_path}"
             )
-        if not self.aux_cache_is_ready():
+        if not (
+            self.aux_cache_is_ready()
+            and self._te_caption_manifest_is_current()
+        ):
             raise RuntimeError(
-                "Text-encoder cache worker finished but the aux embedding cache is still "
-                "incomplete. Refusing to train with skip_te (embeddings would be missing)."
+                "Text-encoder cache worker finished but the embedding cache or authoritative "
+                ".txt caption manifest is still incomplete. Refusing to train with skip_te."
             )
         print_acc("[te-worker] cache complete; trainer will load without the text encoder (skip_te)")
         return True
+
+    def _te_caption_source_digest(self) -> str:
+        """Digest authoritative caption sidecars without constructing a dataset.
+
+        This runs before any model is loaded. captions.json is intentionally not
+        considered: image-adjacent files matching caption_ext are authoritative.
+        """
+        import hashlib
+
+        digest = hashlib.sha256()
+        for index, cfg in enumerate(self.dataset_configs or []):
+            ext = str(getattr(cfg, 'caption_ext', '.txt') or '.txt')
+            if not ext.startswith('.'):
+                ext = '.' + ext
+            settings = (
+                index,
+                ext,
+                getattr(cfg, 'default_caption', None),
+                getattr(cfg, 'trigger_word', None),
+                tuple(getattr(cfg, 'replacements', []) or []),
+                bool(getattr(cfg, 'use_short_captions', False)),
+            )
+            digest.update(repr(settings).encode('utf-8'))
+            roots = []
+            for value in (
+                getattr(cfg, 'folder_path', None),
+                getattr(cfg, 'dataset_path', None),
+            ):
+                if value and os.path.isdir(value):
+                    roots.append(os.path.abspath(value))
+            for root in sorted(set(roots)):
+                matches = []
+                for dirpath, dirnames, filenames in os.walk(root):
+                    # Cache directories can be huge and never contain source captions.
+                    dirnames[:] = [d for d in dirnames if d not in ('_t_e_cache', '_latent_cache')]
+                    for filename in filenames:
+                        if filename.lower().endswith(ext.lower()):
+                            matches.append(os.path.join(dirpath, filename))
+                for path in sorted(matches, key=lambda p: os.path.normcase(p)):
+                    digest.update(os.path.normcase(os.path.abspath(path)).encode('utf-8'))
+                    with open(path, 'rb') as handle:
+                        for chunk in iter(lambda: handle.read(1 << 20), b''):
+                            digest.update(chunk)
+        return digest.hexdigest()
+
+    def _te_caption_manifest_path(self):
+        return os.path.join(self.save_root, '.pipeline', 'te_caption_sources.sha256')
+
+    def _te_caption_manifest_is_current(self) -> bool:
+        try:
+            with open(self._te_caption_manifest_path(), 'r', encoding='utf-8') as handle:
+                saved = handle.read().strip()
+            return saved == self._te_caption_source_digest()
+        except (FileNotFoundError, OSError):
+            return False
+
+    def _write_te_caption_manifest(self) -> None:
+        path = self._te_caption_manifest_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        from toolkit.cache_utils import atomic_write
+        digest = self._te_caption_source_digest()
+        atomic_write(
+            path,
+            lambda tmp: tmp.write_text(digest, encoding='utf-8'),
+        )
 
     def run_te_cache_worker(self):
         """Entry for the throwaway text-encoder cache worker process.
@@ -1742,7 +1932,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         (dataset captions, DOP, and aux blank/trigger/uncond/sample embeds), then returns
         so the process can exit and let the OS reclaim all text-encoder memory.
 
-        Only supported on archs that implement the te_only load path (zimage, anima) and
+        Only supported on archs that implement the te_only load path and
         on process classes that implement cache_text_encoder_outputs_to_disk (SDTrainer).
         """
         BaseTrainProcess.run(self)
@@ -1760,6 +1950,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             noise_scheduler=sampler,
         )
         self.sd.te_only = True
+        self.sd.skip_te = False
 
         self.hook_after_sd_init_before_load()
         self.sd.load_model()
@@ -1769,6 +1960,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 "This process type does not support the text-encoder cache worker."
             )
         self.cache_text_encoder_outputs_to_disk()
+        self._write_te_caption_manifest()
 
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
@@ -2627,16 +2819,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.torch_profiler.start()
             did_oom = False
             loss_dict = None
+            MemoryManager.offload_step_begin()
+            offload_step_completed = False
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
+                offload_step_completed = True
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
+                if "out of memory" in str(e).lower():
                     did_oom = True
                 else:
                     raise  # not an OOM; surface real errors
+            finally:
+                if offload_step_completed:
+                    MemoryManager.offload_step_end()
+                else:
+                    MemoryManager.offload_step_abort()
             if did_oom:
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
@@ -2644,6 +2844,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 optimizer.zero_grad(set_to_none=True)
                 flush()
                 torch.cuda.ipc_collect()
+                if torch.cuda.is_available():
+                    dev = self.device_torch
+                    gib = 1024 ** 3
+                    allocated = torch.cuda.memory_allocated(dev) / gib
+                    reserved = torch.cuda.memory_reserved(dev) / gib
+                    peak_allocated = torch.cuda.max_memory_allocated(dev) / gib
+                    peak_reserved = torch.cuda.max_memory_reserved(dev) / gib
+                    print_acc(
+                        "[MemoryManager] OOM snapshot before ring reset: "
+                        f"allocated={allocated:.2f} GiB "
+                        f"reserved={reserved:.2f} GiB "
+                        f"peak_allocated={peak_allocated:.2f} GiB "
+                        f"peak_reserved={peak_reserved:.2f} GiB"
+                    )
+                    MemoryManager.recover_cuda_pipeline_after_oom()
+                    torch.cuda.reset_peak_memory_stats(dev)
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
@@ -2659,9 +2875,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print("\n==== Profile Results ====")
                 print(self.torch_profiler.key_averages().table(sort_by="cpu_time_total", row_limit=1000))
             self.timer.stop('train_loop')
-            if not did_first_flush:
+            if not did_first_flush and not did_oom:
                 flush()
                 did_first_flush = True
+                try:
+                    first_offload_profile = MemoryManager.offload_profile_report(
+                        reset=False
+                    )
+                except Exception as error:
+                    first_offload_profile = (
+                        f"[OffloadProfile] first-step report failed: {error}"
+                    )
+                if first_offload_profile:
+                    print_acc(first_offload_profile)
                 # one-time CUDA memory report after the first real training step, to see
                 # what is actually resident (allocated) vs what the caching allocator has
                 # reserved/committed (the gap is cached/fragmented, not leaked tensors).
@@ -2809,7 +3035,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 self.additional_logs = {}
 
 
-                    if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
+                    if (
+                        not did_oom
+                        and self.performance_log_every > 0
+                        and self.step_num % self.performance_log_every == 0
+                    ):
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
                         self.resolve_performance_timers()

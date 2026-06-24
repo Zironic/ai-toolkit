@@ -89,6 +89,10 @@ class SDTrainer(BaseSDTrainProcess):
         self._resolution_memory_stats = {}
         self._resolution_memory_baseline = None
         self._current_resolution_bucket = 256
+        self._checkpoint_autotuner = None
+        self._checkpoint_tunable = None
+        self._checkpoint_autotuner_off = False
+        self._checkpoint_timing_start = None
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
         
@@ -249,14 +253,108 @@ class SDTrainer(BaseSDTrainProcess):
             return 0
         return len(self.sample_config.prompts)
 
+
+    def _iter_text_cache_file_items(self):
+        def walk(ds):
+            if ds is None:
+                return
+            if isinstance(ds, ConcatDataset):
+                for child in ds.datasets:
+                    yield from walk(child)
+                return
+            if hasattr(ds, "datasets"):
+                for child in ds.datasets:
+                    yield from walk(child)
+                return
+            for item in getattr(ds, "file_list", []) or []:
+                yield ds, item
+
+        for root in (getattr(self, "datasets", None), getattr(self, "datasets_reg", None)):
+            yield from walk(root)
+
+
+    def _prepare_file_item_text_cache_signature(self, dataset, file_item):
+        # This is the value AiToolkitDataset would normally pass from sd:
+        # text_embedding_space_version=self.sd.model_config.arch
+        file_item.text_embedding_space_version = str(self.model_config.arch)
+
+        # Match the default used by FileItemDTO/TextEmbeddingFileItemDTOMixin.
+        if not hasattr(file_item, "text_embedding_version"):
+            file_item.text_embedding_version = 1
+
+        # Pre-worker check cannot inspect sd.encode_control_in_text_embeddings.
+        # Use a config-derived value if you have one; otherwise preserve whatever
+        # the file item already has.
+        if not hasattr(file_item, "encode_control_in_text_embeddings"):
+            file_item.encode_control_in_text_embeddings = bool(
+                getattr(self.model_config, "encode_control_in_text_embeddings", False)
+            )
+
+        # Always reload the source. A FileItem may already hold a caption from
+        # before its sidecar/captions.json entry was edited; hashing that memoized
+        # value would incorrectly let the parent skip the TE worker.
+        file_item.refresh_caption_for_text_embedding_cache()
+    def dataset_text_embedding_cache_is_ready(self) -> bool:
+        if not self.is_caching_text_embeddings:
+            return True
+
+        from pathlib import Path
+        from toolkit.cache_utils import find_cached_file
+
+        checked = 0
+
+        for dataset, file_item in self._iter_text_cache_file_items():
+            self._prepare_file_item_text_cache_signature(dataset, file_item)
+
+            expected = Path(file_item.get_text_embedding_path(recalculate=True))
+            if find_cached_file(expected) is None:
+                return False
+            file_item.is_text_embedding_cached = True
+            checked += 1
+
+            if self.train_config.diff_output_preservation:
+                from toolkit.prompt_utils import (
+                    build_dop_replacement_pairs,
+                    apply_dop_replacements,
+                )
+
+                pairs = build_dop_replacement_pairs(
+                    triggers_csv=self.trigger_word,
+                    classes_csv=self.train_config.diff_output_preservation_class,
+                    case_insensitive=False,
+                )
+
+                dop_caption = apply_dop_replacements(
+                    caption=file_item.caption,
+                    replacement_pairs=pairs,
+                    case_insensitive=False,
+                    debug=False,
+                )
+
+                dop_expected = Path(
+                    file_item.get_text_embedding_path(
+                        recalculate=True,
+                        dop_caption=dop_caption,
+                    )
+                )
+
+                # DOP loader waits on the exact DOP path, so use strict lookup here.
+                if not dop_expected.exists():
+                    return False
+
+        # If there were no dataset file items, do not block aux-only caching.
+        return True
     def aux_cache_is_ready(self) -> bool:
-        """True if every text embedding the trainer needs is already on disk for the
-        current config (so the trainer can load with skip_te and never touch the TE)."""
-        return aux_embed_cache.aux_cache_is_complete(
+        """True only if every embedding required by skip_te is already on disk."""
+        aux_ready = aux_embed_cache.aux_cache_is_complete(
             self.save_root,
             aux_embed_cache.compute_aux_config_hash(self._aux_config_params()),
             self._expected_aux_sample_count(),
         )
+        if not aux_ready:
+            return False
+
+        return self.dataset_text_embedding_cache_is_ready()
 
     def cache_text_encoder_outputs_to_disk(self):
         """Run in the throwaway TE worker process (model loaded te_only). Encodes and
@@ -1523,7 +1621,12 @@ class SDTrainer(BaseSDTrainProcess):
         start.record(stream)
         try:
             yield
-        finally:
+        except BaseException:
+            # Recording another CUDA event while unwinding an OOM can itself
+            # fail and replace the useful original exception. An incomplete
+            # phase is not a valid timing sample, so discard it unchanged.
+            raise
+        else:
             end.record(stream)
             self._gpu_phase_events.setdefault(name, []).append((start, end))
 
@@ -1549,24 +1652,119 @@ class SDTrainer(BaseSDTrainProcess):
         pixel_count = int(height) * int(width)
         return min((256, 512, 768, 1024), key=lambda size: abs(pixel_count - size * size))
 
-    def _start_resolution_memory_sample(self):
-        if not (
-            self.performance_log_every > 0
-            and torch.cuda.is_available()
-            and self.device_torch.type == 'cuda'
+    def _find_checkpoint_tunable(self):
+        """Find the module exposing selective-checkpointing (_checkpoint_keep_last
+        + a .blocks list), e.g. Krea's SingleStreamDiT, under the transformer."""
+        root = getattr(self.sd, 'unet', None)
+        if root is None:
+            return None
+        if hasattr(root, '_checkpoint_keep_last') and hasattr(root, 'blocks'):
+            return root
+        for module in root.modules():
+            if hasattr(module, '_checkpoint_keep_last') and hasattr(module, 'blocks'):
+                return module
+        return None
+
+    def _ensure_checkpoint_autotuner(self):
+        """Lazily build the autotuner when checkpoint_keep_last is set to -1 (auto)."""
+        if self._checkpoint_autotuner is not None:
+            return self._checkpoint_autotuner
+        if self._checkpoint_autotuner_off:
+            return None
+        keep_last_cfg = getattr(
+            self.model_config, 'layer_offloading_checkpoint_keep_last', 0
+        )
+        if keep_last_cfg != -1 or not (
+            torch.cuda.is_available() and self.device_torch.type == 'cuda'
         ):
+            self._checkpoint_autotuner_off = True
+            return None
+        module = self._find_checkpoint_tunable()
+        if module is None or not getattr(module, 'gradient_checkpointing', False):
+            self._checkpoint_autotuner_off = True
+            return None
+        from toolkit.memory_management.checkpoint_autotuner import (
+            CheckpointKeepLastAutotuner,
+        )
+        total = torch.cuda.get_device_properties(self.device_torch).total_memory
+        max_keep = max(0, len(module.blocks) - 1)
+
+        def _set(n, _m=module):
+            n = int(n)
+            if _m._checkpoint_keep_last != n:
+                _m._checkpoint_keep_last = n
+                # Selective checkpointing changes access order. Re-record now,
+                # before this step's first model access; the tuner treats this
+                # candidate's first step as an untimed prefetch warmup.
+                from toolkit.memory_management import MemoryManager
+                MemoryManager.reset_offload_trace_for_tuning()
+
+        self._checkpoint_tunable = module
+        self._checkpoint_autotuner = CheckpointKeepLastAutotuner(
+            total, max_keep, set_keep_last=_set
+        )
+        print(
+            f"[CheckpointAutotune] time-based keep_last enabled: blocks={len(module.blocks)} "
+            f"device_total={total / 1024 ** 3:.2f} GiB"
+        )
+        return self._checkpoint_autotuner
+
+    def _memory_sample_active(self):
+        return (
+            torch.cuda.is_available()
+            and self.device_torch.type == 'cuda'
+            and (
+                self.performance_log_every > 0
+                or self._checkpoint_autotuner is not None
+            )
+        )
+
+    def _start_resolution_memory_sample(self):
+        if not self._memory_sample_active():
             self._resolution_memory_baseline = None
+            self._checkpoint_timing_start = None
             return
         torch.cuda.reset_peak_memory_stats(self.device_torch)
         self._resolution_memory_baseline = torch.cuda.memory_allocated(self.device_torch)
+        if (
+            self._checkpoint_autotuner is not None
+            and not self._checkpoint_autotuner.is_settled(
+                self._current_resolution_bucket
+            )
+        ):
+            self._checkpoint_timing_start = torch.cuda.Event(enable_timing=True)
+            self._checkpoint_timing_start.record(
+                torch.cuda.current_stream(self.device_torch)
+            )
 
     def _finish_resolution_memory_sample(self, bucket):
         baseline = self._resolution_memory_baseline
         if baseline is None:
             return
+        step_time_s = None
+        if self._checkpoint_timing_start is not None:
+            timing_end = torch.cuda.Event(enable_timing=True)
+            timing_end.record(torch.cuda.current_stream(self.device_torch))
+            timing_end.synchronize()
+            step_time_s = self._checkpoint_timing_start.elapsed_time(timing_end) / 1000.0
+            self._checkpoint_timing_start = None
         allocated = torch.cuda.max_memory_allocated(self.device_torch)
         reserved = torch.cuda.max_memory_reserved(self.device_torch)
         incremental = max(0, allocated - baseline)
+        # Time chooses the candidate; reserved memory is only the hard WDDM
+        # spill guard. The CUDA event covers this accumulation's forward and
+        # backward without data-loading noise.
+        if self._checkpoint_autotuner is not None:
+            crossed_spill_guard = self._checkpoint_autotuner.observe(
+                bucket, reserved, step_time_s or 0.0
+            )
+            if crossed_spill_guard:
+                # The rejected candidate's cached segments would otherwise keep
+                # memory_reserved above the ceiling after we back off.
+                torch.cuda.empty_cache()
+        if self.performance_log_every <= 0:
+            self._resolution_memory_baseline = None
+            return
         stats = self._resolution_memory_stats.setdefault(bucket, {
             'count': 0, 'allocated_sum': 0, 'allocated_max': 0,
             'reserved_sum': 0, 'reserved_max': 0,
@@ -1588,6 +1786,12 @@ class SDTrainer(BaseSDTrainProcess):
             self._resolution_bucket_counts[resolution_bucket] = (
                 self._resolution_bucket_counts.get(resolution_bucket, 0) + 1
             )
+        # Auto selective-checkpointing: pick keep_last for this resolution before
+        # the forward reads it. Hill-climb elapsed time; reserved memory is only
+        # the hard spill ceiling.
+        tuner = self._ensure_checkpoint_autotuner()
+        if tuner is not None:
+            tuner.recommend(resolution_bucket)
         self._start_resolution_memory_sample()
         with torch.no_grad():
             self.timer.start('preprocess_batch')
@@ -2290,18 +2494,7 @@ class SDTrainer(BaseSDTrainProcess):
                             target_h = max(1, int(round(math.sqrt(target_latent_area * aspect_ratio))))
                             target_w = max(1, int(round(math.sqrt(target_latent_area / aspect_ratio))))
                             # transformer patch rounding
-                            try:
-                                tr = getattr(self.sd, 'transformer', None) or getattr(self.sd, 'unet', None)
-                                if tr is not None:
-                                    all_patch = getattr(tr, 'all_patch_size', None)
-                                    if all_patch:
-                                        patch_min = int(min(all_patch))
-                                    else:
-                                        patch_min = 1
-                                else:
-                                    patch_min = 1
-                            except Exception:
-                                patch_min = 1
+                            patch_min = self._dop_patch_min()
                             if patch_min > 1:
                                 target_h = max(patch_min, int(round(target_h / patch_min)) * patch_min)
                                 target_w = max(patch_min, int(round(target_w / patch_min)) * patch_min)
@@ -2628,12 +2821,16 @@ class SDTrainer(BaseSDTrainProcess):
         """Patchify factor used when computing image_seq_len for the flow-match shift.
 
         Mirrors the logic in BaseSDTrainProcess.process_general_training_batch: flux/flex/zimage
-        latents are divided by 2 (patch_size 2), others read unet.config.patch_size, default 1.
+        latents are divided by 2 (patch_size 2), then a model-declared self.patch_size (e.g. krea2),
+        then unet.config.patch_size, default 1.
         """
         sd = self.sd
         try:
             if getattr(sd, 'is_flux', False) or 'flex' in getattr(sd, 'arch', '') or getattr(sd, 'arch', '') == 'zimage':
                 return 2
+            ps = getattr(sd, 'patch_size', None)
+            if ps is not None:
+                return int(ps)
             unet = getattr(sd, 'unet', None)
             if unet is not None and hasattr(unet, 'config') and hasattr(unet.config, 'patch_size'):
                 return int(unet.config.patch_size)
@@ -2702,6 +2899,29 @@ class SDTrainer(BaseSDTrainProcess):
             return (shifted * 1000.0).to(dtype=timesteps.dtype)
         except Exception:
             return timesteps
+
+    def _dop_patch_min(self) -> int:
+        """Latent-space patch divisibility for DOP downsample targets.
+
+        DOP downsamples the latents and re-patchifies them through the transformer, so
+        the reduced latent dims must stay divisible by the transformer patch size or the
+        patchify rearrange fails (e.g. an odd latent dim with patch=2). Prefer the
+        transformer's advertised ``all_patch_size``; then the model's ``patch_size``
+        (single-stream DiTs like krea2 only expose this, not ``all_patch_size``); else 1.
+        """
+        try:
+            tr = getattr(self.sd, 'transformer', None) or getattr(self.sd, 'unet', None)
+            all_patch = getattr(tr, 'all_patch_size', None) if tr is not None else None
+            if all_patch:
+                return max(1, int(min(all_patch)))
+            ps = getattr(self.sd, 'patch_size', None)
+            if isinstance(ps, (list, tuple)) and ps:
+                return max(1, int(min(ps)))
+            if ps:
+                return max(1, int(ps))
+        except Exception:
+            pass
+        return 1
 
     def _dop_prior_cache_hash(self, file_item, target_h, target_w, samples):
         """Return the stable namespace digest for one image and DOP configuration."""
@@ -2869,18 +3089,7 @@ class SDTrainer(BaseSDTrainProcess):
         target_w = max(1, int(round(math.sqrt(target_latent_area / aspect_ratio))))
 
         # Ensure target dims are compatible with transformer patch sizes (avoid invalid view shapes)
-        try:
-            tr = getattr(self.sd, 'transformer', None) or getattr(self.sd, 'unet', None)
-            if tr is not None:
-                all_patch = getattr(tr, 'all_patch_size', None)
-                if all_patch:
-                    patch_min = int(min(all_patch))
-                else:
-                    patch_min = 1
-            else:
-                patch_min = 1
-        except Exception:
-            patch_min = 1
+        patch_min = self._dop_patch_min()
 
         # Round target dims to nearest multiple of patch_min (at least patch_min)
         if patch_min > 1:
@@ -3260,18 +3469,7 @@ class SDTrainer(BaseSDTrainProcess):
             else:
                 target_w = target_long
                 target_h = max(1, int(round(H * (target_w / W))))
-            try:
-                tr = getattr(self.sd, 'transformer', None)
-                if tr is not None:
-                    all_patch = getattr(tr, 'all_patch_size', None)
-                    if all_patch:
-                        patch_min = int(min(all_patch))
-                    else:
-                        patch_min = 1
-                else:
-                    patch_min = 1
-            except Exception:
-                patch_min = 1
+            patch_min = self._dop_patch_min()
             if patch_min > 1:
                 target_h = max(patch_min, int(round(target_h / patch_min)) * patch_min)
                 target_w = max(patch_min, int(round(target_w / patch_min)) * patch_min)

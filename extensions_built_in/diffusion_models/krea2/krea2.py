@@ -13,11 +13,13 @@ Flow-matching convention matches ai-toolkit exactly (t=1 noise -> t=0 clean,
 target = noise - clean), so ``get_noise_prediction`` does no time flip / negation.
 """
 
+import json
 import os
+import struct
 from typing import List, Optional
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 import huggingface_hub
 from huggingface_hub.errors import EntryNotFoundError
@@ -28,6 +30,7 @@ from transformers import (
     Qwen3VLForConditionalGeneration,
 )
 from optimum.quanto import freeze, QTensor
+from tqdm import tqdm
 
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.models.base_model import BaseModel
@@ -91,22 +94,69 @@ QWEN_IMAGE_VAE_PATH = "Qwen/Qwen-Image"
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 
-def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
-    """Load the MMDiT weights from a local safetensors file/dir or the HF hub.
+_SAFETENSORS_DTYPES = {
+    "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+}
+
+
+def _read_safetensors_header(path: str) -> tuple[dict, int]:
+    """Read the JSON header without mapping the weight payload."""
+    with open(path, "rb") as handle:
+        raw_length = handle.read(8)
+        if len(raw_length) != 8:
+            raise RuntimeError(f"[krea2] invalid safetensors header in {path}")
+        header_length = struct.unpack("<Q", raw_length)[0]
+        header = json.loads(handle.read(header_length).decode("utf-8"))
+    header.pop("__metadata__", None)
+    return header, 8 + header_length
+
+
+def _read_safetensors_tensor(handle, data_start: int, spec: dict) -> torch.Tensor:
+    """Read one tensor byte range through normal I/O, avoiding a whole-file mmap."""
+    dtype_name = spec["dtype"]
+    if dtype_name not in _SAFETENSORS_DTYPES:
+        raise RuntimeError(f"[krea2] unsupported safetensors dtype {dtype_name!r}")
+    begin, end = spec["data_offsets"]
+    payload = bytearray(end - begin)
+    handle.seek(data_start + begin)
+    view = memoryview(payload)
+    position = 0
+    while position < len(payload):
+        read = handle.readinto(view[position:])
+        if not read:
+            raise EOFError("[krea2] truncated safetensors tensor payload")
+        position += read
+    tensor = torch.frombuffer(payload, dtype=_SAFETENSORS_DTYPES[dtype_name])
+    return tensor.reshape(spec["shape"])
+
+
+def _resolve_mmdit_checkpoint_path(name_or_path: str, filename: Optional[str]) -> str:
+    """Resolve the MMDiT weights to a local ``.safetensors`` file path (downloading from the hub
+    if needed) without loading it. Returning the path lets the caller stream tensors in lazily
+    instead of materializing the whole checkpoint (plus a cast copy) in RAM at once.
 
     ``name_or_path`` may be: a ``.safetensors`` file, a directory containing one
     (``filename`` or the lone ``.safetensors`` in it), or a hub repo id (the
     file ``filename`` is downloaded, defaulting to ``model.safetensors``).
     """
     if name_or_path.endswith(".safetensors") and os.path.isfile(name_or_path):
-        return load_file(name_or_path)
+        return name_or_path
 
     if os.path.isdir(name_or_path):
         if filename is not None:
-            return load_file(os.path.join(name_or_path, filename))
+            return os.path.join(name_or_path, filename)
         candidates = [f for f in os.listdir(name_or_path) if f.endswith(".safetensors")]
         if len(candidates) == 1:
-            return load_file(os.path.join(name_or_path, candidates[0]))
+            return os.path.join(name_or_path, candidates[0])
         raise FileNotFoundError(
             f"Could not pick an MMDiT checkpoint in {name_or_path}: found "
             f"{candidates}. Set model.model_kwargs.checkpoint_filename."
@@ -125,7 +175,114 @@ def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
             f"Could not find {fname!r} in hub repo {name_or_path!r}. Set "
             "model.model_kwargs.checkpoint_filename to the weight file name."
         ) from e
-    return load_file(path)
+    return path
+
+
+def _assign_tensor_by_name(module: torch.nn.Module, key: str, tensor: torch.Tensor) -> None:
+    """Place ``tensor`` at the dotted ``key`` in ``module``, replacing the (meta) param/buffer in
+    place — the single-entry equivalent of ``load_state_dict(assign=True)``. Preserves the original
+    parameter's ``requires_grad`` so streaming a checkpoint in matches the eager load exactly.
+    """
+    *parents, leaf = key.split(".")
+    target = module
+    for p in parents:
+        target = getattr(target, p)
+    if leaf in target._parameters:
+        old = target._parameters[leaf]
+        requires_grad = bool(old.requires_grad) if old is not None else False
+        target._parameters[leaf] = torch.nn.Parameter(tensor, requires_grad=requires_grad)
+    elif leaf in target._buffers:
+        target._buffers[leaf] = tensor
+    else:
+        raise KeyError(f"[krea2] no parameter/buffer named {key!r} in transformer")
+
+
+def _module_by_name(module: torch.nn.Module, name: str) -> torch.nn.Module:
+    target = module
+    for part in name.split("."):
+        target = getattr(target, part)
+    return target
+
+
+def _quantization_unit_for_key(key: str) -> str:
+    """Return a bounded submodule that can be fully materialized and quantized alone."""
+    parts = key.split(".")
+    if parts[0] == "blocks":
+        return ".".join(parts[:2])
+    if parts[:2] in (["txtfusion", "layerwise_blocks"], ["txtfusion", "refiner_blocks"]):
+        return ".".join(parts[:3])
+    if parts[:2] == ["txtfusion", "projector"]:
+        return "txtfusion.projector"
+    return parts[0]
+
+
+def _validate_checkpoint_keys(transformer, header: dict, checkpoint_path: str) -> list[str]:
+    target_keys = list(transformer.state_dict().keys())
+    file_keys = set(header)
+    missing = [key for key in target_keys if key not in file_keys]
+    unexpected = sorted(file_keys.difference(target_keys))
+    if missing or unexpected:
+        raise RuntimeError(
+            f"[krea2] checkpoint key mismatch for {checkpoint_path}: "
+            f"{len(missing)} missing ({missing[:5]}), "
+            f"{len(unexpected)} unexpected ({unexpected[:5]})"
+        )
+    return target_keys
+
+
+def _load_checkpoint_tensor(handle, data_start, header, key, expected_shape, dtype):
+    tensor = _read_safetensors_tensor(handle, data_start, header[key])
+    if tuple(tensor.shape) != tuple(expected_shape):
+        raise RuntimeError(
+            f"[krea2] shape mismatch for {key}: checkpoint {tuple(tensor.shape)}, "
+            f"model {tuple(expected_shape)}"
+        )
+    if tensor.is_floating_point() and tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+    return tensor
+
+
+def _stream_checkpoint(transformer, checkpoint_path: str, dtype) -> None:
+    header, data_start = _read_safetensors_header(checkpoint_path)
+    target_state = transformer.state_dict()
+    target_keys = _validate_checkpoint_keys(transformer, header, checkpoint_path)
+    with open(checkpoint_path, "rb", buffering=0) as handle:
+        for key in tqdm(target_keys, desc="Loading Krea 2 tensors"):
+            tensor = _load_checkpoint_tensor(
+                handle, data_start, header, key, target_state[key].shape, dtype
+            )
+            _assign_tensor_by_name(transformer, key, tensor)
+            del tensor
+
+
+def _stream_and_quantize_checkpoint(base_model, transformer, checkpoint_path, dtype) -> None:
+    """Materialize, quantize, and release one bounded submodule at a time."""
+    from toolkit.dequantize import patch_dequantization_on_save
+
+    header, data_start = _read_safetensors_header(checkpoint_path)
+    target_state = transformer.state_dict()
+    target_keys = _validate_checkpoint_keys(transformer, header, checkpoint_path)
+    units = {}
+    for key in target_keys:
+        units.setdefault(_quantization_unit_for_key(key), []).append(key)
+
+    quantization_type = get_qtype(base_model.model_config.qtype)
+    with open(checkpoint_path, "rb", buffering=0) as handle:
+        for unit_name, keys in tqdm(units.items(), desc="Loading + quantizing Krea 2"):
+            for key in keys:
+                tensor = _load_checkpoint_tensor(
+                    handle, data_start, header, key, target_state[key].shape, dtype
+                )
+                _assign_tensor_by_name(transformer, key, tensor)
+                del tensor
+            unit = _module_by_name(transformer, unit_name)
+            unit.to(base_model.device_torch, dtype=dtype)
+            quantize(unit, weights=quantization_type)
+            freeze(unit)
+            unit.to("cpu")
+            flush()
+
+    patch_dequantization_on_save(transformer)
 
 
 class Krea2Model(BaseModel):
@@ -158,6 +315,7 @@ class Krea2Model(BaseModel):
         # reference's separate processor pass).
         self.processor = None
         self.use_old_lokr_format = False
+        self._transformer_quantized_during_load = False
 
     @staticmethod
     def get_train_scheduler():
@@ -183,17 +341,22 @@ class Krea2Model(BaseModel):
             transformer = SingleStreamDiT(config)
 
         self.print_and_status_update("  - fetching transformer weights")
-        state_dict = _load_mmdit_state_dict(
+        checkpoint_path = _resolve_mmdit_checkpoint_path(
             self.model_config.name_or_path,
             self.model_config.model_kwargs.get("checkpoint_filename", None),
         )
-        state_dict = {
-            k: (v.to(dtype) if v.is_floating_point() else v)
-            for k, v in state_dict.items()
-        }
-        self.print_and_status_update("  - loading transformer state dict")
-        transformer.load_state_dict(state_dict, strict=True, assign=True)
-        del state_dict
+
+        self.print_and_status_update("  - loading transformer through ranged disk reads")
+        stream_quantized = (
+            self.model_config.quantize
+            and self.model_config.accuracy_recovery_adapter is None
+        )
+        if stream_quantized:
+            _stream_and_quantize_checkpoint(self, transformer, checkpoint_path, dtype)
+            self._transformer_quantized_during_load = True
+        else:
+            _stream_checkpoint(transformer, checkpoint_path, dtype)
+
         flush()
         return transformer
 
@@ -234,61 +397,128 @@ class Krea2Model(BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Krea 2 model")
 
-        transformer = self._load_transformer()
+        transformer = None
+        if self.te_only:
+            # TE cache worker: only the text encoder is needed, skip the transformer.
+            self.print_and_status_update("Skipping transformer (te_only load)")
+        else:
+            transformer = self._load_transformer()
 
-        if self.model_config.quantize:
-            self.print_and_status_update("Quantizing transformer")
-            quantize_model(self, transformer)
-            flush()
+            if self.model_config.quantize and not self._transformer_quantized_during_load:
+                self.print_and_status_update("Quantizing transformer")
+                quantize_model(self, transformer)
+                flush()
 
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-                ignore_modules=[
+            if (
+                self.model_config.layer_offloading
+                and (
+                    self.model_config.layer_offloading_smart
+                    or self.model_config.layer_offloading_transformer_percent > 0
+                )
+            ):
+                ignore_modules = [
                     module
                     for module in transformer.modules()
                     if isinstance(module, (SimpleModulation, DoubleSharedModulation))
-                ],
-            )
+                ]
+                if self.model_config.layer_offloading_smart:
+                    MemoryManager.attach_smart_training(
+                        transformer,
+                        self.device_torch,
+                        headroom_gib=self.model_config.layer_offloading_smart_headroom_gb,
+                        ignore_modules=ignore_modules,
+                        fp8_training_forward=self.model_config.layer_offloading_fp8_forward,
+                    )
+                    # Smart offload budgets weights, but an uncheckpointed Krea
+                    # graph retains every block's activations (~16 GiB at the
+                    # observed training shape). On low-VRAM cards that defeats
+                    # offloading before backward can begin. Checkpointing is a
+                    # requirement for this mode; it is gated by grad-enabled in
+                    # SingleStreamDiT.forward, so inference/sampling is unchanged.
+                    keep_last = self.model_config.layer_offloading_checkpoint_keep_last
+                    # -1 = auto: start fully checkpointed; the trainer hill-climbs
+                    # elapsed time per resolution under a hard spill guard.
+                    transformer.enable_gradient_checkpointing(
+                        keep_last=max(0, keep_last)
+                    )
+                    if keep_last == -1:
+                        self.print_and_status_update(
+                            "  - gradient checkpointing enabled; auto-tuning "
+                            "uncheckpointed trailing blocks"
+                        )
+                    elif keep_last:
+                        self.print_and_status_update(
+                            "  - selective gradient checkpointing enabled "
+                            f"(last {keep_last} blocks kept resident)"
+                        )
+                    else:
+                        self.print_and_status_update(
+                            "  - gradient checkpointing enabled for smart training offload"
+                        )
+                else:
+                    MemoryManager.attach(
+                        transformer,
+                        self.device_torch,
+                        offload_percent=self.model_config.layer_offloading_transformer_percent,
+                        ignore_modules=ignore_modules,
+                    )
 
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer to CPU")
-            transformer.to("cpu")
-        else:
-            transformer.to(self.device_torch, dtype=dtype)
-        flush()
-
-        tokenizer, processor, text_encoder = self._load_text_encoder()
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing text encoder")
-            text_encoder.to(self.device_torch)
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
+            if self.model_config.low_vram:
+                self.print_and_status_update("Moving transformer to CPU")
+                transformer.to("cpu")
+            elif self.model_config.quantize:
+                # Move device-only. Passing dtype to .to() on a quantized model dequantizes the
+                # ENTIRE model to fp32 in a single allocation (~52 GB for Krea2) and OOMs. The
+                # weights are already at the correct (quantized) precision from quantize_model.
+                transformer.to(self.device_torch)
+            else:
+                transformer.to(self.device_torch, dtype=dtype)
             flush()
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+
+        if self.skip_te:
+            # Trainer running off a pre-built embedding cache: never load the heavy Qwen3-VL
+            # text encoder. Keep the cheap tokenizers so the model stays well-formed.
+            from toolkit.unloader import FakeTextEncoder
+            self.print_and_status_update("Skipping text encoder (skip_te load)")
+            te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
+            tokenizer = AutoTokenizer.from_pretrained(
+                te_path, max_length=self.max_text_length, token=HF_TOKEN
             )
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving text encoder to CPU")
-            text_encoder.to("cpu")
+            processor = Qwen2TokenizerFast.from_pretrained(
+                te_path, max_length=self.max_text_length, token=HF_TOKEN
+            )
+            text_encoder = FakeTextEncoder(device=self.device_torch, dtype=dtype)
         else:
-            text_encoder.to(self.device_torch)
-        flush()
+            tokenizer, processor, text_encoder = self._load_text_encoder()
+            if self.model_config.quantize_te:
+                self.print_and_status_update("Quantizing text encoder")
+                text_encoder.to(self.device_torch)
+                quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+                freeze(text_encoder)
+                flush()
+            if (
+                self.model_config.layer_offloading
+                and self.model_config.layer_offloading_text_encoder_percent > 0
+            ):
+                MemoryManager.attach(
+                    text_encoder,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+                )
 
-        vae = self._load_vae()
-        vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
+            if self.model_config.low_vram:
+                self.print_and_status_update("Moving text encoder to CPU")
+                text_encoder.to("cpu")
+            else:
+                text_encoder.to(self.device_torch)
+            flush()
+
+        vae = None
+        if self.te_only:
+            self.print_and_status_update("Skipping VAE (te_only load)")
+        else:
+            vae = self._load_vae()
+            vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
 
         self.noise_scheduler = Krea2Model.get_train_scheduler()
 
