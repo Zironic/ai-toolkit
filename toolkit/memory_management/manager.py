@@ -816,6 +816,8 @@ class MemoryManager:
         only make the retry less likely to recover, so rebuild it from empty.
         """
         MemoryManager._clear_cuda_pipeline_state()
+        for pool in bounce_pool.all_pools():
+            pool.abort_step()
 
     @staticmethod
     def offload_profile_report(reset: bool = False):
