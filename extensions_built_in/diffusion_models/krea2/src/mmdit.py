@@ -342,6 +342,7 @@ class SingleStreamDiT(nn.Module):
         super().__init__()
         self.config = config
         self.gradient_checkpointing = False
+        self._checkpoint_keep_last = 0
 
         headdim = config.features // config.heads
         axes = [
@@ -404,11 +405,13 @@ class SingleStreamDiT(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, keep_last: int = 0):
         self.gradient_checkpointing = True
+        self._checkpoint_keep_last = max(0, int(keep_last))
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+        self._checkpoint_keep_last = 0
 
     def forward(
         self,
@@ -442,8 +445,13 @@ class SingleStreamDiT(nn.Module):
 
         freqs = self.posemb(pos)
 
-        for block in self.blocks:
-            if self.gradient_checkpointing and torch.is_grad_enabled():
+        checkpoint_cutoff = len(self.blocks) - self._checkpoint_keep_last
+        for i, block in enumerate(self.blocks):
+            if (
+                self.gradient_checkpointing
+                and torch.is_grad_enabled()
+                and i < checkpoint_cutoff
+            ):
                 combined = checkpoint(
                     block,
                     combined,

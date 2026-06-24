@@ -335,22 +335,50 @@ class Krea2Model(BaseModel):
 
         if (
             self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-                ignore_modules=[
-                    module
-                    for module in transformer.modules()
-                    if isinstance(module, (SimpleModulation, DoubleSharedModulation))
-                ],
+            and (
+                self.model_config.layer_offloading_smart
+                or self.model_config.layer_offloading_transformer_percent > 0
             )
+        ):
+            ignore_modules = [
+                module
+                for module in transformer.modules()
+                if isinstance(module, (SimpleModulation, DoubleSharedModulation))
+            ]
+            if self.model_config.layer_offloading_smart:
+                MemoryManager.attach_smart_training(
+                    transformer,
+                    self.device_torch,
+                    headroom_gib=self.model_config.layer_offloading_smart_headroom_gb,
+                    ignore_modules=ignore_modules,
+                    fp8_training_forward=self.model_config.layer_offloading_fp8_forward,
+                )
+                keep_last = self.model_config.layer_offloading_checkpoint_keep_last
+                transformer.enable_gradient_checkpointing(keep_last=max(0, keep_last))
+                if keep_last == -1:
+                    self.print_and_status_update(
+                        "  - smart offload enabled; selective checkpointing will auto-tune"
+                    )
+                else:
+                    self.print_and_status_update(
+                        "  - smart offload enabled with gradient checkpointing "
+                        f"(keep_last={keep_last})"
+                    )
+            else:
+                MemoryManager.attach(
+                    transformer,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_transformer_percent,
+                    ignore_modules=ignore_modules,
+                )
 
         if self.model_config.low_vram:
             self.print_and_status_update("Moving transformer to CPU")
             transformer.to("cpu")
+        elif self.model_config.quantize:
+            # Supplying dtype to a quantized module may materialize the entire
+            # transformer at once. Its weights already have the intended dtype.
+            transformer.to(self.device_torch)
         else:
             transformer.to(self.device_torch, dtype=dtype)
         flush()

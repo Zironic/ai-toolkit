@@ -373,8 +373,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
         
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        # Sampling has no backward graph, so it can use a separate residency
+        # budget and restore the training streaming layout afterward.
+        transformer = getattr(self.sd, 'unet', None)
+        with MemoryManager.inference_resident(transformer, self.device_torch):
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
         
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
@@ -2428,16 +2431,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.torch_profiler.start()
             did_oom = False
             loss_dict = None
+            MemoryManager.offload_step_begin()
+            offload_step_completed = False
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
+                offload_step_completed = True
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
+                if "out of memory" in str(e).lower():
                     did_oom = True
                 else:
                     raise  # not an OOM; surface real errors
+            finally:
+                if offload_step_completed:
+                    MemoryManager.offload_step_end()
+                else:
+                    MemoryManager.offload_step_abort()
             if did_oom:
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
@@ -2445,6 +2456,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 optimizer.zero_grad(set_to_none=True)
                 flush()
                 torch.cuda.ipc_collect()
+                MemoryManager.recover_cuda_pipeline_after_oom()
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
