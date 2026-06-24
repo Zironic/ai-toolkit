@@ -287,6 +287,24 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.layer_offloading_smart_sampling': {
+    title: 'Smart Sampling Layout',
+    description: (
+      <>
+        Temporarily replaces the training offload layout with a forward-only,
+        byte-budgeted sampling layout, then restores training state. Disabled by default.
+      </>
+    ),
+  },
+  'model.layer_offloading_fp8_sampling': {
+    title: 'Native FP8 Sampling',
+    description: (
+      <>
+        Uses compatible on-device FP8 weights directly during smart sampling.
+        Requires an FP8-quantized model and supported CUDA hardware; otherwise it falls back safely.
+      </>
+    ),
+  },
   'model.layer_offloading_profile': {
     title: 'Profile Layer Offloading',
     description: (

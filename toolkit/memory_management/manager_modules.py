@@ -795,6 +795,14 @@ def _fp8_grad_input_supported(w_q_gpu, grad_out):
     """Whether grad_input can use the native FP8 path for this rowwise weight."""
     if not _FP8_GRAD_INPUT or _FP8_GRAD_VERIFIED is False:
         return False
+    try:
+        if (
+            not hasattr(torch, "_scaled_mm")
+            or torch.cuda.get_device_capability(grad_out.device) < (8, 9)
+        ):
+            return False
+    except Exception:
+        return False
     qdata = getattr(w_q_gpu, "qdata", None)
     scale = getattr(w_q_gpu, "scale", None)
     if qdata is None or scale is None:
@@ -998,8 +1006,14 @@ def fp8_linear_inference(
     qdata = weight.qdata
     scale = weight.scale
     if (
-        qdata.dtype != torch.float8_e4m3fn
+        not hasattr(torch, "_scaled_mm")
+        or torch.cuda.get_device_capability(x.device) < (8, 9)
+        or qdata.device != x.device
+        or scale.device != x.device
+        or (bias is not None and bias.device != x.device)
+        or qdata.dtype != torch.float8_e4m3fn
         or qdata.ndim != 2
+        or scale.numel() != qdata.shape[0]
         or x.shape[-1] != qdata.shape[1]
         or qdata.shape[0] % 16
         or qdata.shape[1] % 16

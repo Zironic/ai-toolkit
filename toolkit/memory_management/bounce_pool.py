@@ -544,6 +544,12 @@ def all_pools() -> list:
     return list(_DEVICE_PREFETCH.values())
 
 
+def destroy_all_pools():
+    """Stop and remove every process-local pool at a job boundary."""
+    for device in list(_DEVICE_PREFETCH):
+        destroy_pool(device)
+
+
 def destroy_pool(device):
     device = torch.device(device)
     pool = _DEVICE_PREFETCH.pop(device, None)

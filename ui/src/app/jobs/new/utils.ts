@@ -49,6 +49,8 @@ export const handleModelArchChange = (
       delete newModel.layer_offloading_transformer_percent;
       delete newModel.layer_offloading_smart;
       delete newModel.layer_offloading_smart_headroom_gb;
+      delete newModel.layer_offloading_smart_sampling;
+      delete newModel.layer_offloading_fp8_sampling;
       delete newModel.layer_offloading_profile;
       delete newModel.layer_offloading_prefetch;
       delete newModel.layer_offloading_fp8_forward;
@@ -63,7 +65,9 @@ export const handleModelArchChange = (
       setJobConfig(1.0, 'config.process[0].model.layer_offloading_text_encoder_percent');
       setJobConfig(1.0, 'config.process[0].model.layer_offloading_transformer_percent');
       setJobConfig(false, 'config.process[0].model.layer_offloading_smart');
-      setJobConfig(4, 'config.process[0].model.layer_offloading_smart_headroom_gb');
+      setJobConfig(7, 'config.process[0].model.layer_offloading_smart_headroom_gb');
+      setJobConfig(false, 'config.process[0].model.layer_offloading_smart_sampling');
+      setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_sampling');
       setJobConfig(false, 'config.process[0].model.layer_offloading_profile');
       setJobConfig(false, 'config.process[0].model.layer_offloading_prefetch');
       setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_forward');

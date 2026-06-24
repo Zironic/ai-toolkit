@@ -820,6 +820,21 @@ class MemoryManager:
             pool.abort_step()
 
     @staticmethod
+    def reset_job_runtime():
+        """Clear process-global offload state before configuring another job.
+
+        ai-toolkit jobs normally run sequentially within a process. Explicitly
+        tearing down pools, rings, traces, and feature flags prevents one job's
+        experimental settings from leaking into the next one.
+        """
+        bounce_pool.destroy_all_pools()
+        MemoryManager._clear_cuda_pipeline_state()
+        set_offload_profile_enabled(False, reset=True)
+        set_offload_trace_enabled(False)
+        MemoryManager.set_offload_prefetch_enabled(False)
+        set_fp8_grad_input_enabled(False)
+
+    @staticmethod
     def offload_profile_report(reset: bool = False):
         """Return the slice-1 streamed-step timing report, or None if disabled."""
         return summarize_offload_profile(reset=reset)
@@ -929,7 +944,7 @@ class MemoryManager:
 
     @classmethod
     @contextlib.contextmanager
-    def inference_resident(cls, module, device=None):
+    def inference_resident(cls, module, device=None, fp8_sampling=False):
         """Temporarily make an offloaded module fully GPU-resident for a forward-only run.
 
         Layer offloading re-streams (and, for quantized weights, re-dequantizes via fp32) every
@@ -1087,13 +1102,10 @@ class MemoryManager:
             return
 
         fp8_resident_layers = fp8_streamed_layers = 0
-        fp8_requested = os.environ.get(
-            "AI_TOOLKIT_FP8_SAMPLING", "1"
-        ).lower() not in ("0", "false", "no", "off")
         fp8_supported = False
-        if fp8_requested and target is not None and torch.device(target).type == "cuda":
+        if fp8_sampling and target is not None and torch.device(target).type == "cuda":
             major, minor = torch.cuda.get_device_capability(target)
-            fp8_supported = (major, minor) >= (8, 9)
+            fp8_supported = hasattr(torch, "_scaled_mm") and (major, minor) >= (8, 9)
         if fp8_supported:
             (
                 fp8_restores,
@@ -1119,7 +1131,8 @@ class MemoryManager:
             )
             print(
                 f"[MemoryManager] FP8 sampling: "
-                f"{'enabled' if fp8_supported else 'disabled'}; "
+                f"{'enabled' if fp8_supported else 'disabled'} "
+                f"(requested={bool(fp8_sampling)}); "
                 f"resident_linear_layers={fp8_resident_layers} "
                 f"streamed_linear_layers={fp8_streamed_layers}"
             )

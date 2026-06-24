@@ -749,7 +749,16 @@ class ModelConfig:
         # VRAM byte budget instead of a random percentage.
         self.layer_offloading_smart = kwargs.get("layer_offloading_smart", False)
         self.layer_offloading_smart_headroom_gb = kwargs.get(
-            "layer_offloading_smart_headroom_gb", 4.0
+            "layer_offloading_smart_headroom_gb", 7.0
+        )
+        # Sampling layout changes are independent from training offload and
+        # must be explicitly requested. Native FP8 sampling is a second,
+        # independently gated choice within that layout.
+        self.layer_offloading_smart_sampling = kwargs.get(
+            "layer_offloading_smart_sampling", False
+        )
+        self.layer_offloading_fp8_sampling = kwargs.get(
+            "layer_offloading_fp8_sampling", False
         )
         self.layer_offloading_profile = kwargs.get(
             "layer_offloading_profile", False

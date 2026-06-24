@@ -1,4 +1,5 @@
 import copy
+import contextlib
 import glob
 import inspect
 import json
@@ -113,6 +114,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
         model_config['dtype'] = self.train_config.dtype
         self.model_config = ModelConfig(**model_config)
         from toolkit.memory_management import MemoryManager
+        MemoryManager.reset_job_runtime()
+        fp8_weights_configured = bool(
+            self.model_config.quantize
+            and self.model_config.qtype in ('qfloat8', 'float8')
+        )
+        if not fp8_weights_configured and any((
+            self.model_config.layer_offloading_fp8_forward,
+            self.model_config.layer_offloading_fp8_grad_input,
+            self.model_config.layer_offloading_fp8_sampling,
+        )):
+            print_acc(
+                "[MemoryManager] native FP8 options ignored: transformer weights "
+                "are not configured as FP8"
+            )
         MemoryManager.set_offload_profile_enabled(
             self.model_config.layer_offloading_profile
         )
@@ -124,8 +139,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         MemoryManager.set_offload_prefetch_enabled(prefetch_enabled)
         MemoryManager.set_fp8_grad_input_enabled(
-            self.model_config.layer_offloading_fp8_grad_input
+            fp8_weights_configured
+            and self.model_config.layer_offloading_fp8_grad_input
         )
+        self._memory_manager_fp8_weights_configured = fp8_weights_configured
 
         self.save_config = SaveConfig(**self.get_conf('save', {}))
         self.sample_config = SampleConfig(**self.get_conf('sample', {}))
@@ -382,13 +399,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
         
-        # send to be generated. Keep the transformer fully resident during the sample loop so
-        # layer offloading doesn't re-stream (and re-dequantize) every weight on every denoise
-        # step — that turns sampling from minutes-per-step into seconds. No-op when offloading is
-        # off; falls back to streaming if the model doesn't fit resident.
-        from toolkit.memory_management import MemoryManager
+        # Sampling layout mutation is opt-in and separate from native FP8
+        # sampling. With it disabled, preserve the model's existing behavior.
         transformer = getattr(self.sd, 'unet', None)
-        with MemoryManager.inference_resident(transformer, self.device_torch):
+        sampling_context = (
+            MemoryManager.inference_resident(
+                transformer,
+                self.device_torch,
+                fp8_sampling=(
+                    self._memory_manager_fp8_weights_configured
+                    and self.model_config.layer_offloading_fp8_sampling
+                ),
+            )
+            if (
+                self.model_config.layer_offloading
+                and self.model_config.layer_offloading_smart
+                and self.model_config.layer_offloading_smart_sampling
+            )
+            else contextlib.nullcontext()
+        )
+        with sampling_context:
             self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
         # Restoring offload may have moved the base transformer to CPU and back; if the LoRA

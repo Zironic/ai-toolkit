@@ -427,7 +427,11 @@ class Krea2Model(BaseModel):
                         self.device_torch,
                         headroom_gib=self.model_config.layer_offloading_smart_headroom_gb,
                         ignore_modules=ignore_modules,
-                        fp8_training_forward=self.model_config.layer_offloading_fp8_forward,
+                        fp8_training_forward=(
+                            self.model_config.quantize
+                            and self.model_config.qtype in ('qfloat8', 'float8')
+                            and self.model_config.layer_offloading_fp8_forward
+                        ),
                     )
                     # Smart offload budgets weights, but an uncheckpointed Krea
                     # graph retains every block's activations (~16 GiB at the

@@ -366,11 +366,11 @@ export default function SimpleJob({
                           <NumberInput
                             label="Training VRAM Reserve (GB)"
                             value={
-                              jobConfig.config.process[0].model.layer_offloading_smart_headroom_gb ?? 4
+                              jobConfig.config.process[0].model.layer_offloading_smart_headroom_gb ?? 7
                             }
                             onChange={value =>
                               setJobConfig(
-                                value ?? 4,
+                                value ?? 7,
                                 'config.process[0].model.layer_offloading_smart_headroom_gb',
                               )
                             }
@@ -379,6 +379,28 @@ export default function SimpleJob({
                             docKey="model.layer_offloading_smart_headroom_gb"
                           />
                         )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart && (
+                          <Checkbox
+                            label="Use Smart Sampling Layout"
+                            checked={jobConfig.config.process[0].model.layer_offloading_smart_sampling || false}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].model.layer_offloading_smart_sampling')
+                            }
+                            docKey="model.layer_offloading_smart_sampling"
+                          />
+                        )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart_sampling &&
+                          jobConfig.config.process[0].model.quantize &&
+                          ['qfloat8', 'float8'].includes(jobConfig.config.process[0].model.qtype || '') && (
+                            <Checkbox
+                              label="Native FP8 Sampling"
+                              checked={jobConfig.config.process[0].model.layer_offloading_fp8_sampling || false}
+                              onChange={value =>
+                                setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_sampling')
+                              }
+                              docKey="model.layer_offloading_fp8_sampling"
+                            />
+                          )}
                         {jobConfig.config.process[0].model.layer_offloading_smart && (
                           <NumberInput
                             label="Uncheckpointed Trailing Blocks"
@@ -443,22 +465,28 @@ export default function SimpleJob({
                       }
                       docKey="model.layer_offloading_prefetch"
                     />
-                    <Checkbox
-                      label="Native FP8 Training"
-                      checked={jobConfig.config.process[0].model.layer_offloading_fp8_forward || false}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_forward')
-                      }
-                      docKey="model.layer_offloading_fp8_forward"
-                    />
-                    <Checkbox
-                      label="Native FP8 Grad Input"
-                      checked={jobConfig.config.process[0].model.layer_offloading_fp8_grad_input || false}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_grad_input')
-                      }
-                      docKey="model.layer_offloading_fp8_grad_input"
-                    />
+                    {jobConfig.config.process[0].model.layer_offloading_smart &&
+                      jobConfig.config.process[0].model.quantize &&
+                      ['qfloat8', 'float8'].includes(jobConfig.config.process[0].model.qtype || '') && (
+                        <>
+                          <Checkbox
+                            label="Native FP8 Training"
+                            checked={jobConfig.config.process[0].model.layer_offloading_fp8_forward || false}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_forward')
+                            }
+                            docKey="model.layer_offloading_fp8_forward"
+                          />
+                          <Checkbox
+                            label="Native FP8 Grad Input"
+                            checked={jobConfig.config.process[0].model.layer_offloading_fp8_grad_input || false}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_grad_input')
+                            }
+                            docKey="model.layer_offloading_fp8_grad_input"
+                          />
+                        </>
+                      )}
                   </div>
                 )}
               </>
