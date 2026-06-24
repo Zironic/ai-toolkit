@@ -226,21 +226,35 @@ class PinnedBouncePool:
     def step_begin(self):
         """Reset the consume/fill cursors and wake workers for a new step.
 
-        All transfers from the previous step are complete by a step boundary
-        (forward+backward finished), so every slot is safe to recycle. Clearing
-        them prevents last step's content at a position from being mistaken for
-        this step's, and returns the pinned buffers to the free pool."""
+        GPU consumers from the previous step are complete at this boundary, but
+        a prefetch worker may still be filling a future CPU slot outside the
+        lock. Such a buffer is detached, not recycled; its worker owns it until
+        the copy exits and observes the epoch change."""
         with self._cv:
-            for slot in self._slots.values():
-                if slot.leaves is not None:
-                    self._free_buffers.setdefault(slot.signature, []).append(slot.leaves)
-            self._slots.clear()
-            self._skipped_positions.clear()
-            self._inflight_bytes = 0
-            self._epoch += 1
-            self._consume_pos = 0
-            self._fill_pos = 0
-            self._cv.notify_all()
+            self._reset_step_locked()
+
+    def abort_step(self):
+        """Invalidate current scheduling without recycling worker-owned buffers."""
+        with self._cv:
+            self._reset_step_locked()
+
+    def _reset_step_locked(self):
+        self._epoch += 1
+        for slot in self._slots.values():
+            if slot.state == CPU_FILLING:
+                # The worker is copying outside the lock. Removing the slot is
+                # enough to invalidate publication; it will recycle its own
+                # leaves and decrement inflight bytes when the copy returns.
+                continue
+            if slot.leaves is not None:
+                self._free_buffers.setdefault(slot.signature, []).append(slot.leaves)
+            self._inflight_bytes -= slot.nbytes
+        self._slots.clear()
+        self._skipped_positions.clear()
+        self._inflight_bytes = max(0, self._inflight_bytes)
+        self._consume_pos = 0
+        self._fill_pos = 0
+        self._cv.notify_all()
 
     # -- training-thread API ----------------------------------------------
 
@@ -500,9 +514,12 @@ class PinnedBouncePool:
     def shutdown(self):
         with self._cv:
             self._stop = True
+            self._reset_step_locked()
             self._cv.notify_all()
         for w in self._workers:
-            w.join(timeout=1.0)
+            # A worker may be inside a pageable->pinned copy. Do not release
+            # its destination storage until it has left that copy section.
+            w.join()
         with self._cv:
             self._slots.clear()
             self._free_buffers.clear()
