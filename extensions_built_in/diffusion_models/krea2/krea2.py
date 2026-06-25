@@ -19,7 +19,7 @@ import struct
 from typing import List, Optional
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 import huggingface_hub
 from huggingface_hub.errors import EntryNotFoundError
@@ -32,7 +32,8 @@ from transformers import (
 from optimum.quanto import freeze, QTensor
 from tqdm import tqdm
 
-from toolkit.config_modules import GenerateImageConfig, ModelConfig
+from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
+from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
@@ -165,7 +166,9 @@ def _resolve_mmdit_checkpoint_path(name_or_path: str, filename: Optional[str]) -
     # Treat as a hub repo id. When no filename is given, derive it from the repo
     # name's trailing segment (e.g. "krea/Krea-2-Raw" -> "raw.safetensors",
     # "krea/Krea-2-Turbo" -> "turbo.safetensors").
-    fname = filename or (name_or_path.split("/")[-1].split("-")[-1].lower() + ".safetensors")
+    fname = filename or (
+        name_or_path.split("/")[-1].split("-")[-1].lower() + ".safetensors"
+    )
     try:
         path = huggingface_hub.hf_hub_download(
             repo_id=name_or_path, filename=fname, token=HF_TOKEN
@@ -350,6 +353,7 @@ class Krea2Model(BaseModel):
         stream_quantized = (
             self.model_config.quantize
             and self.model_config.accuracy_recovery_adapter is None
+            and self.model_config.assistant_lora_path is None
         )
         if stream_quantized:
             _stream_and_quantize_checkpoint(self, transformer, checkpoint_path, dtype)
@@ -393,6 +397,88 @@ class Krea2Model(BaseModel):
         vae.requires_grad_(False)
         return vae
 
+    def load_training_adapter(self, transformer: SingleStreamDiT):
+        self.print_and_status_update("Loading assistant LoRA")
+        lora_path = self.model_config.assistant_lora_path
+        if not os.path.exists(lora_path):
+            # assume it is a hub path
+            lora_splits = lora_path.split("/")
+            if len(lora_splits) != 3:
+                raise ValueError(
+                    f"Assistant LoRA path {lora_path} is not a valid local path or hub path."
+                )
+            repo_id = "/".join(lora_splits[:2])
+            filename = lora_splits[2]
+            try:
+                lora_path = huggingface_hub.hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    token=HF_TOKEN,
+                )
+                # upgrade path to the local download
+                self.model_config.assistant_lora_path = lora_path
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to download assistant LoRA from {lora_path}: {e}"
+                )
+        # load the adapter and merge it in. We will inference with a -1.0 multiplier so the adapter effects only work during training.
+        lora_state_dict = load_file(lora_path)
+        # detect the LoRA rank from the first down-projection weight.
+        dim_key = next(k for k in lora_state_dict if k.endswith("lora_A.weight"))
+        dim = int(lora_state_dict[dim_key].shape[0])
+
+        new_sd = {}
+        for key, value in lora_state_dict.items():
+            new_key = key.replace("diffusion_model.", "transformer.")
+            new_sd[new_key] = value
+        lora_state_dict = new_sd
+
+        network_config = {
+            "type": "lora",
+            "linear": dim,
+            "linear_alpha": dim,
+            "transformer_only": True,
+        }
+
+        network_config = NetworkConfig(**network_config)
+        LoRASpecialNetwork.LORA_PREFIX_UNET = "lora_transformer"
+        network = LoRASpecialNetwork(
+            text_encoder=None,
+            unet=transformer,
+            lora_dim=network_config.linear,
+            multiplier=1.0,
+            alpha=network_config.linear_alpha,
+            train_unet=True,
+            train_text_encoder=False,
+            network_config=network_config,
+            network_type=network_config.type,
+            transformer_only=network_config.transformer_only,
+            is_transformer=True,
+            target_lin_modules=self.target_lora_modules,
+            is_assistant_adapter=True,
+            is_ara=True,
+        )
+        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+        self.print_and_status_update("Merging in assistant LoRA")
+        network.force_to(self.device_torch, dtype=self.torch_dtype)
+        network._update_torch_multiplier()
+        network.load_weights(lora_state_dict)
+
+        network.merge_in(merge_weight=1.0)
+
+        # mark it as not merged so inference ignores it.
+        network.is_merged_in = False
+
+        # add the assistant so sampler will activate it while sampling
+        self.assistant_lora: LoRASpecialNetwork = network
+
+        # deactivate lora during training
+        self.assistant_lora.multiplier = -1.0
+        self.assistant_lora.is_active = False
+
+        # tell the model to invert assistant on inference since we want remove lora effects
+        self.invert_assistant_lora = True
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Krea 2 model")
@@ -403,6 +489,13 @@ class Krea2Model(BaseModel):
             self.print_and_status_update("Skipping transformer (te_only load)")
         else:
             transformer = self._load_transformer()
+
+            # Load and merge assistant LoRA before quantization; the adapter expects
+            # ordinary module weights.
+            if self.model_config.assistant_lora_path is not None:
+                self.load_training_adapter(transformer)
+                if self.model_config.qtype == "qfloat8":
+                    self.model_config.qtype = "float8"
 
             if self.model_config.quantize and not self._transformer_quantized_during_load:
                 self.print_and_status_update("Quantizing transformer")
@@ -701,7 +794,16 @@ class Krea2Model(BaseModel):
         )
         latents = latents * latents_std + latents_mean
 
-        images = self.vae.decode(latents).sample
+        # Full-resolution decode spikes VRAM; tile it when low on VRAM (decode
+        # only -- encode stays untiled).
+        tiled = self.model_config.low_vram
+        if tiled:
+            self.vae.enable_tiling()
+        try:
+            images = self.vae.decode(latents).sample
+        finally:
+            if tiled:
+                self.vae.disable_tiling()
         images = images.squeeze(2)  # drop frame dim
         return images.to(device, dtype=dtype)
 
