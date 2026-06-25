@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import glob
 import inspect
@@ -360,11 +361,37 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # let adapter know we are sampling
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
-        
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        
+        # Sampling-time memory layout is opt-in and only relevant when layer
+        # offloading is active (otherwise the model is already resident). FP8
+        # sampling is a second, independent gate; inference_resident detects
+        # FP8 weights and unsupported hardware at runtime and falls back.
+        transformer = getattr(self.sd, 'unet', None)
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_smart_sampling
+        ):
+            sampling_context = MemoryManager.inference_resident(
+                transformer,
+                self.device_torch,
+                fp8_sampling=self.model_config.layer_offloading_fp8_sampling,
+            )
+        else:
+            sampling_context = contextlib.nullcontext()
+
+        # send to be generated
+        with sampling_context:
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+
+        # Restoring offload may have moved the base transformer to CPU and back; if the
+        # LoRA network rode along, make sure it's back on the training device before
+        # training resumes.
+        if getattr(self, 'network', None) is not None:
+            try:
+                self.network.to(self.device_torch)
+            except Exception:
+                pass
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 

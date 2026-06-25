@@ -694,6 +694,16 @@ class ModelConfig:
         # 0 is off and 1.0 is 100% of the layers
         self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
         self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
+        # Sampling-time memory layout. With layer offloading on, every forward
+        # re-streams (and re-dequantizes) the model, which is ruinously slow for
+        # sampling. When enabled, temporarily make the model GPU-resident for the
+        # forward-only sampling run, then restore the training offload layout.
+        # Off by default; only takes effect alongside layer_offloading.
+        self.layer_offloading_smart_sampling = kwargs.get("layer_offloading_smart_sampling", False)
+        # Native FP8 GEMM during resident sampling (TorchAO rowwise float8 on
+        # SM89+). A second, independent gate; falls back to the ordinary forward
+        # on unsupported hardware or non-FP8 weights.
+        self.layer_offloading_fp8_sampling = kwargs.get("layer_offloading_fp8_sampling", False)
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for

@@ -26,6 +26,18 @@ _DEVICE_STATE = {}
 # stalling on a per-layer sync. Override with AI_TOOLKIT_OFFLOAD_DEPTH.
 PIPELINE_DEPTH = int(os.environ.get("AI_TOOLKIT_OFFLOAD_DEPTH", "4"))
 
+# Native FP8 sampling counters. Opt-in via MemoryManager.inference_resident(
+# fp8_sampling=True); the diagnostics print is gated on "enabled".
+_FP8_STATS = {
+    "enabled": False,
+    "kernel_calls": 0,
+    "fallback_calls": 0,
+}
+
+
+def _fp8_stats_enabled():
+    return _FP8_STATS["enabled"]
+
 
 def _get_device_state(device: torch.device):
     """Get or initialize per-device state."""
@@ -171,6 +183,138 @@ def _is_quantized_tensor(t: Optional[torch.Tensor]) -> bool:
         return True
     # packed/int formats (weight-only)
     return not t.dtype.is_floating_point
+
+
+def fp8_rowwise_qdata_scale(weight):
+    """Extract (qdata, scale) from a TorchAO rowwise float8 weight, or (None, None).
+
+    TorchAO has moved the fp8 storage around between releases: newer versions
+    expose a ``Float8Tensor`` with ``.qdata``/``.scale`` directly, while older
+    ones (e.g. the 0.10 line) wrap an ``AffineQuantizedTensor`` whose
+    ``tensor_impl`` holds ``float8_data`` + ``scale``. Rather than special-case
+    each class, discover the fp8 bytes and per-row scale through the stable
+    tensor-subclass ``__tensor_flatten__`` protocol: the bytes are the 2D
+    float8_e4m3fn leaf and the scale is the floating leaf sized to the output
+    rows (or a scalar). Non-float8 weights return (None, None) so the caller
+    falls back to the ordinary forward.
+    """
+    # Fast path: explicit attributes on newer torchao Float8Tensor.
+    qd = getattr(weight, "qdata", None)
+    sc = getattr(weight, "scale", None)
+    if (
+        isinstance(qd, torch.Tensor)
+        and qd.dtype == torch.float8_e4m3fn
+        and isinstance(sc, torch.Tensor)
+    ):
+        return qd, sc
+
+    qdata = None
+    scales = []
+
+    def _walk(t):
+        nonlocal qdata
+        flatten = getattr(t, "__tensor_flatten__", None)
+        if flatten is None:
+            return
+        try:
+            names, _ = flatten()
+        except Exception:
+            return
+        for name in names:
+            inner = getattr(t, name, None)
+            if inner is None:
+                continue
+            if hasattr(inner, "__tensor_flatten__"):
+                _walk(inner)
+            elif isinstance(inner, torch.Tensor):
+                if inner.dtype == torch.float8_e4m3fn and inner.ndim == 2:
+                    qdata = inner
+                elif inner.dtype in (torch.float32, torch.bfloat16, torch.float16):
+                    scales.append(inner)
+
+    _walk(weight)
+    if qdata is None:
+        return None, None
+    out_rows = qdata.shape[0]
+    for scale in scales:
+        if scale.numel() == out_rows or scale.numel() == 1:
+            return qdata, scale
+    return None, None
+
+
+def fp8_linear_inference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Native FP8 GEMM for TorchAO rowwise float8 weights on SM89+.
+
+    Ada cannot consume rowwise scales directly in torch._scaled_mm. Compute
+    with the raw FP8 bytes, then apply the existing per-output-row scales to
+    the bf16/fp16 result. Return None when the op is unsupported so the caller
+    falls back to the ordinary (dequantized) forward.
+    """
+    qdata, scale = fp8_rowwise_qdata_scale(weight)
+    if (
+        x.device.type != "cuda"
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or qdata is None
+        or scale is None
+    ):
+        if _fp8_stats_enabled():
+            _FP8_STATS["fallback_calls"] += 1
+        return None
+    if (
+        not hasattr(torch, "_scaled_mm")
+        or torch.cuda.get_device_capability(x.device) < (8, 9)
+        or qdata.device != x.device
+        or scale.device != x.device
+        or (bias is not None and bias.device != x.device)
+        or qdata.dtype != torch.float8_e4m3fn
+        or qdata.ndim != 2
+        or scale.numel() != qdata.shape[0]
+        or x.shape[-1] != qdata.shape[1]
+        or qdata.shape[0] % 16
+        or qdata.shape[1] % 16
+        or x.numel() == 0
+    ):
+        if _fp8_stats_enabled():
+            _FP8_STATS["fallback_calls"] += 1
+        return None
+
+    original_shape = x.shape
+    x_2d = x.reshape(-1, original_shape[-1])
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    scale_x = torch.clamp(
+        x_2d.abs().amax().float() / fp8_info.max,
+        min=torch.finfo(torch.float32).tiny,
+    )
+    x_fp8 = torch.clamp(
+        x_2d / scale_x.to(x_2d.dtype),
+        min=fp8_info.min,
+        max=fp8_info.max,
+    ).to(torch.float8_e4m3fn)
+    one = torch.ones((), device=x.device, dtype=torch.float32)
+    try:
+        out = torch._scaled_mm(
+            x_fp8,
+            qdata.t(),
+            scale_a=scale_x,
+            scale_b=one,
+            out_dtype=x.dtype,
+            use_fast_accum=True,
+        )
+    except RuntimeError:
+        if _fp8_stats_enabled():
+            _FP8_STATS["fallback_calls"] += 1
+        return None
+
+    if _fp8_stats_enabled():
+        _FP8_STATS["kernel_calls"] += 1
+    out = out * scale.reshape(1, -1).to(out.dtype)
+    if bias is not None:
+        out = out + bias.to(device=x.device, dtype=out.dtype)
+    return out.reshape(*original_shape[:-1], qdata.shape[0])
 
 
 def _pin_inner_tensors(t: torch.Tensor) -> None:
