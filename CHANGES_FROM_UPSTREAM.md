@@ -49,7 +49,7 @@ A config hash (model ID, prompts, trigger word, relevant hyperparams) is compute
 
 ---
 
-## 3. DOP (data-order prediction) improvements
+## 3. DOP (Differential Output Preservation n) improvements
 
 Files: `toolkit/dataloader_mixins.py`, `toolkit/prompt_utils.py`, `toolkit/data_transfer_object/data_loader.py`, `extensions_built_in/sd_trainer/SDTrainer.py`
 
