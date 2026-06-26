@@ -1,7 +1,6 @@
 # Changes from upstream (ostris/ai-toolkit)
 
-Branch: `faster-dop` diverged from `upstream/main`.
-62 files changed, ~13 700 insertions, ~680 deletions.
+Branch `faster-dop` — diverged from `upstream/main`.
 
 ---
 
@@ -24,16 +23,6 @@ The previous flat `headroom` parameter has been replaced with a dynamic **workin
 - A WDDM-cliff-aware governing signal: on Windows, the driver reclaims VRAM in large chunks near the ~500 MB cliff. The controller targets the cohabitation high-watermark against this cliff rather than a fixed free-memory target.
 - Sampling vs. training separation: the sampling-path reserve trusts the learned peak + 0.5 GiB pad; the flat 2 GiB floor is retained only for training (where backward pass peaks are harder to predict).
 - A `checkpoint_autotuner.py` records stable-run VRAM peaks and seeds future runs.
-- Design documented in `toolkit/memory_management/AUTOTUNE_PLAN.md`.
-
-### Vocabulary rename
-The env-var and internal naming was rationalised. Old names (`headroom`, `buffer_hard`, `target_free`, etc.) still work via backward-compatible aliases in `_ENV_ALIASES`.
-
-| Old name | New name |
-|---|---|
-| `training_headroom_gb` | `training_working_reserve_gb` |
-| `working_headroom_used_gb` | `working_reserve_used_gb` |
-| `AI_TOOLKIT_*_HEADROOM_*` | `AI_TOOLKIT_*_WORKING_RESERVE_*` |
 
 ### Offload profiling
 A per-layer timing/pinning profiler (`set_offload_profile_enabled`) can be enabled at runtime to emit a summary of transfer times, pin overhead, and peak cohabitation, useful for diagnosing slow offload configs.
@@ -72,9 +61,6 @@ DOP-transformed captions are now embedded and cached to disk alongside the regul
 
 ### DOP prior cache (`dop_prior_cache`)
 The model's own predictions on the class prompt (the "prior") can be cached to disk per image. The cache key combines the latent-identity hash (so crop/scale/flip changes invalidate it) with a DOP config hash (class prompt, model, resolution, sample count, shift params). Stored under `<image_dir>/_dop_prior_cache/`. Requires `dop_resolution` to be set to a reduced resolution for speed.
-
-### Single-backward mode (`dop_single_backward`)
-Opt-in mode that performs only one backward pass per step (using the DOP loss only), reducing peak VRAM during training when both a regular loss and a DOP loss would otherwise be computed.
 
 ---
 
@@ -156,7 +142,6 @@ A structured timing log is written to `<save_root>/performance_log.jsonl` as tra
 | `scripts/captions_from_json.py` | Write edited captions back from a JSON file to `.txt` sidecars. |
 | `scripts/generate_from_captions.py` | Run inference on every caption in a folder and save generated images alongside. |
 | `scripts/search_replace.py` | Search-and-replace across all `.txt` sidecar files in a dataset. |
-| `scripts/sim_working_reserve_controller.py` | Simulate the working-reserve controller against a recorded VRAM trace to tune parameters offline. |
 | `scripts/vram_calc_zimage.py` | Estimate Z-Image VRAM requirements for a given config. |
 | `tools/analyze_per_file_loss.py` | Parse a performance log and rank training images by their average loss, useful for finding outliers or mislabelled samples. |
 
@@ -172,7 +157,6 @@ A new `TimestepDistributionSparkline` component renders a live SVG preview of th
 ### DOP controls
 `SimpleJob.tsx` gained UI fields for:
 - `dop_resolution`: reduced resolution for prior cache generation.
-- `dop_single_backward`: opt-in single-backward mode.
 - `dop_prior_cache`: toggle disk caching of prior predictions.
 
 ### Documentation
@@ -197,7 +181,6 @@ Streaming checkpoint load and FP8 inference path, matching the Krea2 approach.
 - **`toolkit/util/quantize.py`**: more robust handling of TorchAO quantised models.
 - **`toolkit/assistant_lora.py`**: minor dtype fix.
 - **`requirements_base.txt`**: added `safetensors` streaming dependency.
-- **`.gitignore`**: added `MULTITRIGGER_DOP_REFACTOR_PLAN.md`, `.claude` (Claude Code memory directory).
 
 ---
 

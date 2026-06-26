@@ -30,6 +30,7 @@ import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleIm
 import SampleControlImage from '@/components/SampleControlImage';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
+import TimestepDistributionSparkline from '@/components/TimestepDistributionSparkline';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
 
@@ -782,6 +783,12 @@ export default function SimpleJob({
                     { value: 'content', label: 'High Noise' },
                     { value: 'style', label: 'Low Noise' },
                   ]}
+                />
+                <TimestepDistributionSparkline
+                  className="mt-2 rounded"
+                  timestepType={jobConfig.config.process[0].train.timestep_type ?? 'sigmoid'}
+                  contentOrStyle={jobConfig.config.process[0].train.content_or_style ?? 'balanced'}
+                  resolution={Math.max(...(jobConfig.config.process[0].datasets?.[0]?.resolution ?? [1024]))}
                 />
                 <SelectInput
                   label="Loss Type"
