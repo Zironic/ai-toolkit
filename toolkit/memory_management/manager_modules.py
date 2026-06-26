@@ -157,9 +157,18 @@ def _drain_pending_events(force: bool = False) -> None:
         if not force and not end_evt.query():
             keep.append(record)
             continue
-        if force:
-            end_evt.synchronize()
-        setattr(prof, field, getattr(prof, field) + start_evt.elapsed_time(end_evt))
+        try:
+            if force:
+                end_evt.synchronize()
+            elapsed_ms = start_evt.elapsed_time(end_evt)
+        except (RuntimeError, ValueError):
+            # The process can abort between recording the start/end events. Exit
+            # diagnostics should skip that partial timing instead of obscuring
+            # the real training error.
+            if not force:
+                keep.append(record)
+            continue
+        setattr(prof, field, getattr(prof, field) + elapsed_ms)
         _EVENT_POOL.append(start_evt)
         _EVENT_POOL.append(end_evt)
     _PENDING_EVENTS[:] = keep
@@ -265,7 +274,7 @@ def _print_offload_profile_atexit() -> None:
         return
     try:
         report = summarize_offload_profile()
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         # CUDA may be in an error state after a fatal allocation failure. Exit
         # diagnostics must never obscure the actual training exception.
         return
@@ -319,6 +328,8 @@ class _OffloadTrace:
         self.mode = "idle"            # idle | recording | replaying
         self.recording: list = []
         self.frozen: Optional[list] = None
+        self.schedule_by_shape_key: dict = {}
+        self.current_shape_key = None
         self.cursor = 0
         self.step_index = 0
         self.total_divergences = 0
@@ -330,9 +341,11 @@ class _OffloadTrace:
         # (e.g. the DOP warmup step before the steady-state shape settles).
         self.version = 0
 
-    def step_begin(self):
+    def step_begin(self, shape_key=None):
         if not self.enabled:
             return
+        self.current_shape_key = shape_key
+        self.frozen = self.schedule_by_shape_key.get(shape_key)
         self.cursor = 0
         self.diverged_this_step = False
         self.first_divergence = None
@@ -379,6 +392,7 @@ class _OffloadTrace:
             return
         if self.mode == "recording":
             self.frozen = self.recording
+            self.schedule_by_shape_key[self.current_shape_key] = self.frozen
             self.recording = []
             self.version += 1
             self._report_frozen()
@@ -399,6 +413,7 @@ class _OffloadTrace:
                         "[OffloadTrace] re-recording trace after "
                         f"{self.consecutive_divergences} divergences"
                     )
+                    self.schedule_by_shape_key.pop(self.current_shape_key, None)
                     self.frozen = None
                     self.consecutive_divergences = 0
             else:
@@ -429,22 +444,22 @@ class _OffloadTrace:
         )
 
     def report(self) -> Optional[str]:
-        if self.frozen is None:
+        if not self.schedule_by_shape_key:
             return None
-        gib = 1024 ** 3
-        unique = {a.layer_key for a in self.frozen}
+        frozen = self.frozen or next(iter(self.schedule_by_shape_key.values()))
+        unique = {a.layer_key for a in frozen}
         return (
-            f"[OffloadTrace] frozen accesses={len(self.frozen)} "
-            f"unique_layers={len(unique)} steps={self.step_index} "
-            f"divergences={self.total_divergences}"
+            f"[OffloadTrace] frozen accesses={len(frozen)} "
+            f"unique_layers={len(unique)} shapes={len(self.schedule_by_shape_key)} "
+            f"steps={self.step_index} divergences={self.total_divergences}"
         )
 
 
 _OFFLOAD_TRACE = _OffloadTrace()
 
 
-def offload_step_begin() -> None:
-    _OFFLOAD_TRACE.step_begin()
+def offload_step_begin(shape_key=None) -> None:
+    _OFFLOAD_TRACE.step_begin(shape_key=shape_key)
 
 
 def offload_step_end() -> None:
@@ -467,11 +482,22 @@ def offload_trace_report() -> Optional[str]:
     return _OFFLOAD_TRACE.report()
 
 
-def offload_trace_schedule() -> Optional[list]:
-    """Positional layer-key access order from the frozen trace, or None."""
-    if _OFFLOAD_TRACE.frozen is None:
+def offload_trace_schedule(shape_key=None) -> Optional[list]:
+    """Positional layer-key access order from the frozen trace, or None.
+
+    When a new resolution has not frozen its own trace yet, replay the latest
+    full trace from another shape instead of the cold unique-layer list. That is
+    usually closer to the real repeated macro-step access stream and avoids a
+    220-entry schedule against 800-1500 actual accesses.
+    """
+    frozen = _OFFLOAD_TRACE.schedule_by_shape_key.get(shape_key)
+    if frozen is None and shape_key == _OFFLOAD_TRACE.current_shape_key:
+        frozen = _OFFLOAD_TRACE.frozen
+    if frozen is None and _OFFLOAD_TRACE.schedule_by_shape_key:
+        frozen = next(reversed(_OFFLOAD_TRACE.schedule_by_shape_key.values()))
+    if frozen is None:
         return None
-    return [access.layer_key for access in _OFFLOAD_TRACE.frozen]
+    return [access.layer_key for access in frozen]
 
 
 def offload_trace_version() -> int:
@@ -480,10 +506,18 @@ def offload_trace_version() -> int:
 
 
 def reset_offload_trace_for_current_step() -> None:
-    """Re-record the active step after an execution-policy change."""
+    """Re-record after an execution-policy change.
+
+    Layout changes such as layer promotion/demotion alter which module calls are
+    streamed for every resolution, not just the currently active shape. Drop all
+    frozen schedules so the bounce pool cannot replay a trace from a stale
+    streamed-layer set.
+    """
     trace = _OFFLOAD_TRACE
     if not trace.enabled:
         return
+    trace.schedule_by_shape_key.clear()
+    trace.version += 1
     trace.frozen = None
     trace.recording = []
     trace.cursor = 0
@@ -1056,6 +1090,74 @@ def fp8_linear_inference(
     if bias is not None:
         out = out + bias.to(device=x.device, dtype=out.dtype)
     return out.reshape(*original_shape[:-1], qdata.shape[0])
+
+
+def fp8_sampling_qualifies(weight) -> bool:
+    """Install-time check that a resident layer can use the native FP8 GEMM.
+
+    This is every static precondition fp8_linear_inference checked per call —
+    capability, dtype, rank, 16-alignment, matching row-scale count. Hoisting
+    them here lets the compiled forward (_fp8_linear_compiled) be pure tensor
+    math with no branching, so torch.compile traces it without graph breaks.
+    The weight is already resident on its sampling device at install time.
+    """
+    qdata = getattr(weight, "qdata", None)
+    scale = getattr(weight, "scale", None)
+    if qdata is None or scale is None:
+        return False
+    if not hasattr(torch, "_scaled_mm"):
+        return False
+    if qdata.device.type != "cuda":
+        return False
+    if torch.cuda.get_device_capability(qdata.device) < (8, 9):
+        return False
+    return not (
+        qdata.dtype != torch.float8_e4m3fn
+        or qdata.ndim != 2
+        or scale.device != qdata.device
+        or scale.numel() != qdata.shape[0]
+        or qdata.shape[0] % 16
+        or qdata.shape[1] % 16
+    )
+
+
+def _fp8_linear_compiled(x, qdata_t, scale_row, bias):
+    """Compile-clean native FP8 GEMM for resident sampling layers.
+
+    Numerically equivalent to fp8_linear_inference, but every validation,
+    capability query, stats increment, try/except and Optional return has been
+    removed (validation is done once by fp8_sampling_qualifies at install time).
+    The body is pure tensor ops, so torch.compile traces it as a single graph.
+
+    ``qdata_t`` is the raw FP8 weight already transposed to (K, N); ``scale_row``
+    is the per-output-row fp32 scale; ``bias`` is a captured tensor or None
+    (the None test folds at trace time, it is not a data-dependent branch).
+    """
+    original_shape = x.shape
+    x_2d = x.reshape(-1, original_shape[-1])
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    scale_x = torch.clamp(
+        x_2d.abs().amax().float() / fp8_info.max,
+        min=torch.finfo(torch.float32).tiny,
+    )
+    x_fp8 = torch.clamp(
+        x_2d / scale_x.to(x_2d.dtype),
+        min=fp8_info.min,
+        max=fp8_info.max,
+    ).to(torch.float8_e4m3fn)
+    one = torch.ones((), device=x.device, dtype=torch.float32)
+    out = torch._scaled_mm(
+        x_fp8,
+        qdata_t,
+        scale_a=scale_x,
+        scale_b=one,
+        out_dtype=x.dtype,
+        use_fast_accum=True,
+    )
+    out = out * scale_row.reshape(1, -1).to(out.dtype)
+    if bias is not None:
+        out = out + bias.to(dtype=out.dtype)
+    return out.reshape(*original_shape[:-1], scale_row.shape[0])
 
 
 def _pin_inner_tensors(t: torch.Tensor, budget: int) -> int:
@@ -1683,6 +1785,12 @@ class LinearLayerMemoryManager(BaseLayerMemoryManager):
         # 2) Hijack forward
         self._original_forward = self._capture_base_forward()
 
+        # @torch.compiler.disable ensures Dynamo never traces into this function.
+        # _BouncingLinearFn is a custom autograd fn that does CPU→GPU staging,
+        # optional dequant, and FP8 branching — none of which is compilable.
+        # If this forward were inside a torch.compile region it would cause
+        # graph-break storms or a multi-minute freeze.
+        @torch.compiler.disable
         def _mm_forward(x, *args, **kwargs):
             # ensure we only use expected signature (Linear: x)
             if args or kwargs:

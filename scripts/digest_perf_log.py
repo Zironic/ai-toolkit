@@ -159,15 +159,17 @@ def summarize_record(record: dict, full: bool) -> list[str]:
     if offload and "diagnostic_error" not in offload:
         lines.append(
             "  offload: managed={ml} resident={res} offloaded={off} "
-            "ring={lr}/{pr} headroom={hu}/{ht} alloc={al} reserved={rv} "
+            "ring={lr}/{pr} working_reserve={hu}/{ht} alloc={al} reserved={rv} "
             "peak_reserved={prsv} cached={cg} fp8_fwd={fp8}".format(
                 ml=offload.get("managed_layers"),
                 res=g(offload.get("planned_resident_gb")),
                 off=g(offload.get("offloaded_cpu_gb")),
                 lr=g(offload.get("live_ring_gb")),
                 pr=g(offload.get("planned_ring_gb")),
-                hu=g(offload.get("working_headroom_used_gb")),
-                ht=g(offload.get("training_headroom_gb")),
+                hu=g(offload.get("working_reserve_used_gb",
+                                 offload.get("working_headroom_used_gb"))),
+                ht=g(offload.get("training_working_reserve_gb",
+                                 offload.get("training_headroom_gb"))),
                 al=g(offload.get("torch_allocated_gb")),
                 rv=g(offload.get("torch_reserved_gb")),
                 prsv=g(offload.get("peak_reserved_gb")),

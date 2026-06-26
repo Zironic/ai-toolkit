@@ -128,6 +128,7 @@ class ZImageModel(BaseModel):
             is_transformer=True,
             target_lin_modules=self.target_lora_modules,
             is_assistant_adapter=True,
+            base_model=self,
             is_ara=True,
         )
         network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
@@ -182,9 +183,6 @@ class ZImageModel(BaseModel):
             # load assistant lora if specified
             if self.model_config.assistant_lora_path is not None:
                 self.load_training_adapter(transformer)
-                # set qtype to be float8 if it is qfloat8
-                if self.model_config.qtype == "qfloat8":
-                    self.model_config.qtype = "float8"
 
             if self.model_config.quantize:
                 self.print_and_status_update("Quantizing Transformer")

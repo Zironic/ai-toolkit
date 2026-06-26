@@ -628,6 +628,10 @@ class TrainConfig:
         # will clip the loss to this amount to prevent wild outliers
         self.max_loss: Optional[float] = kwargs.get("max_loss", None)
 
+        # log per-file (per-sample) loss + resolution to a JSONL file for dataset analysis.
+        # True -> <training_folder>/per_file_loss.jsonl, or pass an explicit path string.
+        self.log_per_file_loss: Union[bool, str, None] = kwargs.get("log_per_file_loss", None)
+
         self.weight_noise: WeightNoiseConfig = WeightNoiseConfig(
             **(kwargs.get('weight_noise', {}) or {})
         )
@@ -752,14 +756,29 @@ class ModelConfig:
         # Krea 2 experimental mode: choose transformer layers from a measured
         # VRAM byte budget instead of a random percentage.
         self.layer_offloading_smart = kwargs.get("layer_offloading_smart", False)
-        self.layer_offloading_smart_headroom_gb = kwargs.get(
-            "layer_offloading_smart_headroom_gb", 7.0
+        # "working_reserve" = the VRAM we reserve for our own transient working
+        # set (activations / dequant / temporary workspace) during a step. -1 =
+        # auto (live controller tunes it). The pre-rename key was
+        # layer_offloading_smart_headroom_gb, still accepted for back-compat.
+        self.layer_offloading_smart_working_reserve_gb = kwargs.get(
+            "layer_offloading_smart_working_reserve_gb",
+            kwargs.get("layer_offloading_smart_headroom_gb", -1.0),
         )
         # Sampling layout changes are independent from training offload and
         # must be explicitly requested. Native FP8 sampling is a second,
         # independently gated choice within that layout.
         self.layer_offloading_smart_sampling = kwargs.get(
             "layer_offloading_smart_sampling", False
+        )
+        # Sampling has its own working reserve, separate from training: it is
+        # forward-only (no optimizer state, gradients, or backward activations),
+        # so it can run a much smaller reserve. -1 = auto (learn the real
+        # working set and converge the reserve down to it); a positive value
+        # pins a fixed reserve in GiB. Pre-rename key:
+        # layer_offloading_smart_sampling_headroom_gb (still accepted).
+        self.layer_offloading_smart_sampling_working_reserve_gb = kwargs.get(
+            "layer_offloading_smart_sampling_working_reserve_gb",
+            kwargs.get("layer_offloading_smart_sampling_headroom_gb", -1.0),
         )
         self.layer_offloading_fp8_sampling = kwargs.get(
             "layer_offloading_fp8_sampling", False
@@ -801,6 +820,7 @@ class ModelConfig:
 
         # compile the model with torch compile
         self.compile = kwargs.get("compile", False)
+        self.compile_sample = kwargs.get("compile_sample", False)
 
         if self.compile and self.quantize:
             print("Quantized model detected - allowing torch.compile (experimental)")
@@ -809,6 +829,12 @@ class ModelConfig:
         self.compile_fullgraph = kwargs.get("compile_fullgraph", False)
         self.compile_dynamic = kwargs.get("compile_dynamic", True)
         self.cache_size_limit = kwargs.get("cache_size_limit", None)
+        # Emit graph_breaks + recompiles + guards to stdout while compiling.
+        # Use this to confirm blocks are compile-clean and guards aren't failing
+        # on every timestep.  Much more informative than graph_breaks alone:
+        # recompiles catch guard failures (shape/device/object-id changes) that
+        # indicate the offload boundary is still too low-level.
+        self.compile_debug = kwargs.get("compile_debug", False)
         
         # kwargs to pass to the model
         self.model_kwargs = kwargs.get("model_kwargs", {})

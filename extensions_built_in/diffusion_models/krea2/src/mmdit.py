@@ -59,6 +59,20 @@ def attention(
     # plan reserves a multi-GiB workspace (observed as a 9.9 -> 24.4 GiB live
     # allocation spike on a 12 GiB Ada card). Automatic SDPA dispatch can use
     # Flash or another memory-efficient backend and retains the math fallback.
+    #
+    # But enable_gqa=True AND an explicit attn_mask disqualify *both* fast
+    # backends at once — Flash rejects arbitrary masks, the memory-efficient
+    # (cutlass) backend rejects enable_gqa — so dispatch silently falls to the
+    # math backend, which materializes the full (B, heads, L, L) score tensor
+    # (multiple GiB at sampling resolutions). When we have a mask, expand the KV
+    # heads to match Q here and drop enable_gqa, so the memory-efficient backend
+    # (which does accept masks) becomes eligible. This is numerically identical
+    # to enable_gqa=True: it repeats each KV head across its query-head group.
+    if gqa and mask is not None and k.shape[1] != q.shape[1]:
+        groups = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(groups, dim=1)
+        v = v.repeat_interleave(groups, dim=1)
+        gqa = False
     x = F.scaled_dot_product_attention(
         q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
     )
@@ -348,6 +362,15 @@ class SingleStreamDiT(nn.Module):
         # resident, no backward recompute). Trading a little VRAM for fewer
         # recompute-forward kernel launches once the step is launch-bound.
         self._checkpoint_keep_last = 0
+        # Populated by enable_compiled_sampling(): a per-block list where each
+        # entry is either a compiled block or None (run that block eager).
+        # A block is left eager when it still carries MemoryManager offload
+        # hooks (_BouncingLinearFn), which must not be traced by torch.compile.
+        self._compiled_blocks: list | None = None
+        # Fingerprint of which block indices were hook-free at compile time, so
+        # we can detect when inference_resident changed the residency layout and
+        # rebuild instead of running stale (guard-churning) compiled blocks.
+        self._compiled_fingerprint: tuple | None = None
 
         headdim = config.features // config.heads
         axes = [
@@ -418,6 +441,128 @@ class SingleStreamDiT(nn.Module):
         self.gradient_checkpointing = False
         self._checkpoint_keep_last = 0
 
+    @staticmethod
+    def _block_compile_safe(block) -> bool:
+        """True if no submodule streams weights.
+
+        Only the ``_layer_memory_manager`` streaming hook (_BouncingLinearFn, a
+        device-mutating custom autograd function) forces a block to stay eager.
+        Resident layers are compile-safe — including native FP8 sampling layers,
+        whose forward (_fp8_linear_compiled) is a pure torch._scaled_mm path with
+        all validation hoisted to install time. Checked per block after
+        inference_resident() has set residency.
+        """
+        return SingleStreamDiT._block_compile_safe_for(block, training=False)
+
+    @staticmethod
+    def _block_compile_reject_reasons(block, *, training: bool = False) -> list[str]:
+        """Return why a block is not a graph-clean compile candidate.
+
+        The sampler can lower resident FP8 Linear layers to a pure forward-only
+        ``_scaled_mm`` closure. Training cannot use that path blindly because it
+        also needs a correct grad-input path, so resident FP8 tensor subclasses
+        remain a blocker until a grad-safe lowering is installed.
+        """
+        reasons: list[str] = []
+        if any(hasattr(sub, "_layer_memory_manager") for sub in block.modules()):
+            reasons.append("streaming_hook")
+        if training:
+            for sub in block.modules():
+                weight = getattr(sub, "weight", None)
+                if (
+                    isinstance(weight, torch.nn.Parameter)
+                    and hasattr(weight.data, "qdata")
+                    and getattr(weight.data.qdata, "dtype", None) == torch.float8_e4m3fn
+                    and not getattr(sub, "_memory_management_training_compile_fp8", False)
+                ):
+                    reasons.append("resident_fp8_tensor_subclass")
+                    break
+        return reasons
+
+    @classmethod
+    def _block_compile_safe_for(cls, block, *, training: bool = False) -> bool:
+        return len(cls._block_compile_reject_reasons(block, training=training)) == 0
+
+    def training_compile_readiness(self, pinned_keys: set[str] | None = None):
+        """Classify permanent-resident blocks before enabling training compile.
+
+        This is intentionally only a diagnostic gate. A block is training-ready
+        only if it is permanent, uncheckpointed by construction, has no streaming
+        hooks, and does not call an unlowered FP8 tensor-subclass forward.
+        """
+        if pinned_keys is None:
+            mm = getattr(self, "_memory_manager", None)
+            pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
+        else:
+            pinned_keys = set(pinned_keys)
+        statuses = []
+        ready = 0
+        pinned = 0
+        for i, block in enumerate(self.blocks):
+            key = f"blocks.{i}"
+            is_pinned = key in pinned_keys
+            reasons = [] if not is_pinned else self._block_compile_reject_reasons(
+                block, training=True
+            )
+            if is_pinned:
+                pinned += 1
+                if not reasons:
+                    ready += 1
+            statuses.append(
+                {
+                    "index": i,
+                    "key": key,
+                    "pinned": is_pinned,
+                    "ready": bool(is_pinned and not reasons),
+                    "reasons": reasons,
+                }
+            )
+        return {
+            "pinned_blocks": pinned,
+            "ready_blocks": ready,
+            "blocked_blocks": pinned - ready,
+            "statuses": statuses,
+        }
+
+    def enable_compiled_sampling(self):
+        """Compile the hook-free SingleStreamBlocks for sampler-only use.
+
+        Call this from inside the sampling (inference_resident) context, after
+        residency is set. Blocks that are fully GPU-resident (no streaming hook)
+        are compiled; blocks that still stream weights are left eager. The
+        result is keyed by a fingerprint of which blocks were clean, so a later
+        sampling session with a different residency layout rebuilds instead of
+        replaying stale compiled blocks (which would guard-churn or, worse,
+        trace a hook that got re-attached).
+
+        Returns (compiled_count, eager_count).
+        """
+        clean = tuple(
+            i for i, block in enumerate(self.blocks)
+            if self._block_compile_safe(block)
+        )
+        if (
+            self._compiled_blocks is not None
+            and self._compiled_fingerprint == clean
+        ):
+            return len(clean), len(self.blocks) - len(clean)
+
+        compiled: list = [None] * len(self.blocks)
+        for i in clean:
+            compiled[i] = torch.compile(
+                self.blocks[i],
+                fullgraph=False,
+                dynamic=False,
+                mode="default",
+            )
+        self._compiled_blocks = compiled
+        self._compiled_fingerprint = clean
+        return len(clean), len(self.blocks) - len(clean)
+
+    def disable_compiled_sampling(self):
+        self._compiled_blocks = None
+        self._compiled_fingerprint = None
+
     def forward(
         self,
         img: Tensor,
@@ -438,13 +583,26 @@ class SingleStreamDiT(nn.Module):
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)
 
-        # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
-        fulllen = combined.shape[1]
-        _padlen = (-fulllen) % 256
-        if _padlen > 0:
-            combined = F.pad(combined, (0, 0, 0, _padlen))
-            mask = F.pad(mask, (0, _padlen), value=False)
-            pos = F.pad(pos, (0, 0, 0, _padlen))
+        use_compiled = (
+            self._compiled_blocks is not None
+            and not torch.is_grad_enabled()
+        )
+
+        # Pad the combined sequence to a multiple of 256 ONLY when the compiled
+        # blocks will actually run. The padding exists purely to quantize the
+        # sequence length so the dynamic=False compiled kernels see few distinct
+        # shapes (and so recompile rarely). In eager training / sampling it buys
+        # nothing and costs up to 255 junk tokens through every attention block,
+        # while also forcing the masked (cutlass) SDPA path. The pad slots are
+        # appended after the image tokens, masked False, and sliced off below,
+        # so gating this is numerically identical.
+        if use_compiled:
+            fulllen = combined.shape[1]
+            _padlen = (-fulllen) % 256
+            if _padlen > 0:
+                combined = F.pad(combined, (0, 0, 0, _padlen))
+                mask = F.pad(mask, (0, _padlen), value=False)
+                pos = F.pad(pos, (0, 0, 0, _padlen))
 
         mask = _mask(mask)
 
@@ -468,6 +626,10 @@ class SingleStreamDiT(nn.Module):
                     mask,
                     use_reentrant=False,
                 )
+            elif use_compiled and self._compiled_blocks[i] is not None:
+                # Hook-free block: run its compiled graph. The block that still
+                # streams weights falls through to the eager call below.
+                combined = self._compiled_blocks[i](combined, tvec, freqs, mask)
             else:
                 combined = block(combined, tvec, freqs, mask)
 

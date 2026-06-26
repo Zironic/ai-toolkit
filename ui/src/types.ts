@@ -184,6 +184,8 @@ export interface ModelConfig {
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
   layer_offloading_smart?: boolean;
+  layer_offloading_smart_working_reserve_gb?: number;
+  /** @deprecated renamed to layer_offloading_smart_working_reserve_gb; read for back-compat. */
   layer_offloading_smart_headroom_gb?: number;
   layer_offloading_smart_sampling?: boolean;
   layer_offloading_fp8_sampling?: boolean;

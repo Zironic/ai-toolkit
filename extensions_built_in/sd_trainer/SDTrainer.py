@@ -1238,8 +1238,11 @@ class SDTrainer(BaseSDTrainProcess):
                 # add min_snr_gamma
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
+        if self.train_config.log_per_file_loss:
+            self._log_per_file_loss(batch, loss, timesteps)
+
         loss = loss.mean()
-        
+
         # check for audio loss
         if batch.audio_pred is not None and batch.audio_target is not None:
             audio_loss = torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean")
@@ -1270,6 +1273,41 @@ class SDTrainer(BaseSDTrainProcess):
             loss = torch.clamp(loss, max=self.train_config.max_loss)
         
         return loss
+
+    def _log_per_file_loss(self, batch: 'DataLoaderBatchDTO', per_sample_loss: torch.Tensor, timesteps: torch.Tensor):
+        # per_sample_loss is shape [B], aligned with batch.file_items. One JSONL row per sample.
+        try:
+            if getattr(self, "_per_file_loss_path", None) is None:
+                cfg = self.train_config.log_per_file_loss
+                if isinstance(cfg, str) and cfg.strip():
+                    path = cfg
+                else:
+                    path = os.path.join(self.save_root, "per_file_loss.jsonl")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                self._per_file_loss_path = path
+
+            losses = per_sample_loss.detach().float().flatten().cpu().tolist()
+            ts = timesteps.detach().float().flatten().cpu().tolist() if timesteps is not None else None
+            rows = []
+            for i, fi in enumerate(batch.file_items):
+                if i >= len(losses):
+                    break
+                rows.append(json.dumps({
+                    "step": self.step_num,
+                    "path": fi.path,
+                    "name": os.path.basename(fi.path),
+                    "orig_w": fi.width,
+                    "orig_h": fi.height,
+                    "train_w": fi.crop_width,
+                    "train_h": fi.crop_height,
+                    "timestep": (ts[i] if ts is not None and i < len(ts) else None),
+                    "is_reg": bool(fi.is_reg),
+                    "loss": losses[i],
+                }))
+            with open(self._per_file_loss_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(rows) + "\n")
+        except Exception as e:
+            print_acc(f"[per_file_loss] failed to log: {e}")
 
     def preprocess_batch(self, batch: 'DataLoaderBatchDTO'):
         return batch
@@ -1700,6 +1738,7 @@ class SDTrainer(BaseSDTrainProcess):
                 # before this step's first model access; the tuner treats this
                 # candidate's first step as an untimed prefetch warmup.
                 from toolkit.memory_management import MemoryManager
+                MemoryManager.set_training_pinned_resident_blocks(_m, n)
                 MemoryManager.reset_offload_trace_for_tuning()
 
         self._checkpoint_tunable = module

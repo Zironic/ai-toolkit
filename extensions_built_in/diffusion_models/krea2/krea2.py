@@ -81,7 +81,8 @@ scheduler_config = {
     "base_image_seq_len": 256,
     "max_image_seq_len": 6400,
     "base_shift": 0.5,
-    "max_shift": 1.15,
+    "max_shift": 0.9,
+    "min_shift": 0.33,
     "num_train_timesteps": 1000,
     "shift": 1.0,
     "use_dynamic_shifting": True,
@@ -456,6 +457,7 @@ class Krea2Model(BaseModel):
             is_transformer=True,
             target_lin_modules=self.target_lora_modules,
             is_assistant_adapter=True,
+            base_model=self,
             is_ara=True,
         )
         network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
@@ -494,8 +496,6 @@ class Krea2Model(BaseModel):
             # ordinary module weights.
             if self.model_config.assistant_lora_path is not None:
                 self.load_training_adapter(transformer)
-                if self.model_config.qtype == "qfloat8":
-                    self.model_config.qtype = "float8"
 
             if self.model_config.quantize and not self._transformer_quantized_during_load:
                 self.print_and_status_update("Quantizing transformer")
@@ -515,11 +515,16 @@ class Krea2Model(BaseModel):
                     if isinstance(module, (SimpleModulation, DoubleSharedModulation))
                 ]
                 if self.model_config.layer_offloading_smart:
+                    keep_last = self.model_config.layer_offloading_checkpoint_keep_last
+                    pinned_resident_keys = MemoryManager.training_pinned_keys_for_keep_last(
+                        transformer, max(0, keep_last)
+                    )
                     MemoryManager.attach_smart_training(
                         transformer,
                         self.device_torch,
-                        headroom_gib=self.model_config.layer_offloading_smart_headroom_gb,
+                        working_reserve_gib=self.model_config.layer_offloading_smart_working_reserve_gb,
                         ignore_modules=ignore_modules,
+                        pinned_resident_keys=pinned_resident_keys,
                         fp8_training_forward=(
                             self.model_config.quantize
                             and self.model_config.qtype in ('qfloat8', 'float8')
@@ -532,7 +537,6 @@ class Krea2Model(BaseModel):
                     # offloading before backward can begin. Checkpointing is a
                     # requirement for this mode; it is gated by grad-enabled in
                     # SingleStreamDiT.forward, so inference/sampling is unchanged.
-                    keep_last = self.model_config.layer_offloading_checkpoint_keep_last
                     # -1 = auto: start fully checkpointed; the trainer hill-climbs
                     # elapsed time per resolution under a hard spill guard.
                     transformer.enable_gradient_checkpointing(
@@ -648,6 +652,33 @@ class Krea2Model(BaseModel):
         sc = self.get_bucket_divisibility()
         gen_config.width = int(gen_config.width // sc * sc)
         gen_config.height = int(gen_config.height // sc * sc)
+
+        if self.model_config.compile_sample:
+            # Regional (per-block) compilation. We are inside the sampling
+            # context (inference_resident) here, so residency is already
+            # decided: blocks the manager made GPU-resident have NO offload
+            # hooks and are compile-clean; any block still streaming weights
+            # carries _BouncingLinearFn (a device-mutating custom autograd fn)
+            # and must stay eager. enable_compiled_sampling() inspects each
+            # block and selects accordingly, so this is safe even with
+            # layer_offloading=True — fully-resident sampling gets the full
+            # win, partial offload compiles whatever is resident.
+            compiled_count, eager_count = self.model.enable_compiled_sampling()
+            if not getattr(self, '_compile_sample_reported', False):
+                if compiled_count == 0:
+                    self.print_and_status_update(
+                        "compile_sample=True but every transformer block still "
+                        "streams weights (offload hooks present); nothing to "
+                        "compile. Reduce offload (or sampling working reserve) so whole "
+                        "blocks fit resident."
+                    )
+                else:
+                    self.print_and_status_update(
+                        f"Compiling transformer blocks for sampling (regional): "
+                        f"{compiled_count} compiled, {eager_count} left eager "
+                        f"(still streaming). First preview will be slow."
+                    )
+                self._compile_sample_reported = True
 
         img = pipeline(
             conditional_embeds=conditional_embeds,

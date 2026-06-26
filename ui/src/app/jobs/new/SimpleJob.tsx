@@ -366,17 +366,19 @@ export default function SimpleJob({
                           <NumberInput
                             label="Training VRAM Reserve (GB)"
                             value={
-                              jobConfig.config.process[0].model.layer_offloading_smart_headroom_gb ?? 7
+                              jobConfig.config.process[0].model.layer_offloading_smart_working_reserve_gb ??
+                              jobConfig.config.process[0].model.layer_offloading_smart_headroom_gb ??
+                              -1
                             }
                             onChange={value =>
                               setJobConfig(
-                                value ?? 7,
-                                'config.process[0].model.layer_offloading_smart_headroom_gb',
+                                value ?? -1,
+                                'config.process[0].model.layer_offloading_smart_working_reserve_gb',
                               )
                             }
-                            min={1}
+                            min={-1}
                             max={24}
-                            docKey="model.layer_offloading_smart_headroom_gb"
+                            docKey="model.layer_offloading_smart_working_reserve_gb"
                           />
                         )}
                         {jobConfig.config.process[0].model.layer_offloading_smart && (

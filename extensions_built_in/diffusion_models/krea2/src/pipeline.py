@@ -238,9 +238,7 @@ class Krea2Pipeline:
         x2 = (maxres // align) ** 2
         ts = timesteps(gh * gw, num_inference_steps, x1, x2, y1=y1, y2=y2, mu=mu)
 
-        # Euler integration of the flow ODE (with optional CFG).
-        for tcurr, tprev in zip(ts[:-1], ts[1:]):
-            t = torch.full((latents.shape[0],), tcurr, dtype=dtype, device=device)
+        def _step(t):
             v_cond = predict_velocity(
                 transformer, latents.to(dtype), t, cond_feats, cond_mask
             )
@@ -248,9 +246,26 @@ class Krea2Pipeline:
                 v_uncond = predict_velocity(
                     transformer, latents.to(dtype), t, uncond_feats, uncond_mask
                 )
-                v = v_cond + guidance_scale * (v_cond - v_uncond)
-            else:
-                v = v_cond
+                return v_cond + guidance_scale * (v_cond - v_uncond)
+            return v_cond
+
+        # Euler integration of the flow ODE (with optional CFG). The residency
+        # plan is fixed for the run, so an external VRAM grab can OOM a step.
+        # On OOM, demote the transformer to fully-streamed (frees the resident
+        # weights to CPU), drop the now-stale compiled blocks, and retry the step
+        # — latents are only mutated after v is computed, so the retry is safe.
+        for tcurr, tprev in zip(ts[:-1], ts[1:]):
+            t = torch.full((latents.shape[0],), tcurr, dtype=dtype, device=device)
+            try:
+                v = _step(t)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                demote = getattr(transformer, "_mm_sampling_demote", None)
+                if demote is not None and demote():
+                    transformer.disable_compiled_sampling()
+                    v = _step(t)
+                else:
+                    raise
             latents = latents + (tprev - tcurr) * v.to(torch.float32)
 
         images = model.decode_latents(latents, device=device, dtype=dtype)

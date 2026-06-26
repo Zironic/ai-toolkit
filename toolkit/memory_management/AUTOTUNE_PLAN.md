@@ -1,6 +1,22 @@
-# Dynamic headroom + keep_last autotune — implementation plan
+# Dynamic working-reserve + keep_last autotune — implementation plan
 
-Goal: stop hand-picking `layer_offloading_smart_headroom_gb` and
+> **Terminology (renamed).** The single word "headroom" used to mean two
+> different things; the budget is now split into named buckets:
+>
+> | Term | Meaning | Source |
+> | --- | --- | --- |
+> | **working_reserve** | *our* transient working set — activations, dequant, temporary workspace — during a step (the old "headroom") | learned (sampling) / set (training) |
+> | **system_reserve** | VRAM we do *not* control — CUDA context, cuDNN/cublas, cudagraphs, Windows/WDDM/display, other processes | **measured** (`device_used − torch_reserved`) |
+> | **wddm_margin** | the cushion above the ~500 MB WDDM churn cliff we never cross (old `buffer_hard`/`buffer_stop`/`hold_high`/`target_free`/`vram_safety`) | constant + deadband |
+> | **usable** | `total − system_reserve − working_reserve − wddm_margin`, the budget we place resident weights + ring into | derived |
+>
+> Config: `layer_offloading_smart_working_reserve_gb` (+ sampling variant),
+> formerly `*_headroom_gb` (old keys still accepted). Env: `AI_TOOLKIT_*_WORKING_RESERVE_*`
+> and `AI_TOOLKIT_*_WDDM_*`, with the old `*_HEADROOM_*` / `*_BUFFER_*` names
+> still read for back-compat. Prose below predates the rename; read "headroom"
+> as **working_reserve** unless it clearly means the WDDM cliff.
+
+Goal: stop hand-picking `layer_offloading_smart_working_reserve_gb` and
 `layer_offloading_checkpoint_keep_last`. Tune the split between
 **resident weights**, **streaming**, and **activations** automatically, per
 resolution, on any card — while never triggering the WDDM shared-memory spill.

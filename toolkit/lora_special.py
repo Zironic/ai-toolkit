@@ -13,7 +13,7 @@ from toolkit.models.lokr import LokrModule
 
 from .config_modules import NetworkConfig
 from .lorm import count_parameters
-from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin
+from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin, _assistant_inverse_module_scale, _calibrate_assistant_inverse_scale
 
 from toolkit.kohya_lora import LoRANetwork
 from toolkit.models.DoRA import DoRAModule
@@ -211,6 +211,7 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         multiplier = network.torch_multiplier
         # weight space application can't be done per sample, so use the mean (same as the DoRA path)
         mult = multiplier.mean() if isinstance(multiplier, torch.Tensor) else multiplier
+        mult = mult * _assistant_inverse_module_scale(self)
 
         orig_weight = om._parameters['weight']
         # dequantize quantized weights to full precision so the delta can be added (the original
@@ -247,7 +248,12 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         org_weight = om.weight
         orig_dtype = org_weight.dtype
         # dequantize torchao weights so we can fold the full precision delta in
-        merged_weight = _dequantize_if_needed(org_weight).float() + merge_weight * self.diff.float().to(org_weight.device)
+        base_weight = _dequantize_if_needed(org_weight)
+        merged_weight = base_weight.float() + merge_weight * self.diff.float().to(org_weight.device)
+        if getattr(self.network_ref(), 'is_assistant_adapter', False):
+            self.assistant_inverse_scale = _calibrate_assistant_inverse_scale(
+                self, base_weight, merged_weight, orig_dtype
+            )
         if self.weight_is_quantized:
             # re-quantize so the model stays quantized across continuous merge/reset cycles
             from toolkit.util.quantize import get_torchao_config, requantize_module_weight

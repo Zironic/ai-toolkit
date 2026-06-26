@@ -16,6 +16,10 @@ DEFAULT_DATASETS = (
     "jinx_nobg_mini_natural",
     "live_action_jinx",
     "studio_alts",
+    "live_action_jinx",
+    "live_action_body",
+    "live_action_jinx_canon",
+    "live_action_krea_synths"
 )
 
 

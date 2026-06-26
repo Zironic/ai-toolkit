@@ -5,6 +5,9 @@ import inspect
 import json
 import random
 import shutil
+import sys
+import subprocess
+import time
 from collections import OrderedDict
 import os
 import re
@@ -74,6 +77,101 @@ from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
 
+
+def _find_vcvars64_bat() -> Optional[str]:
+    candidates = []
+    vswhere = os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        "Microsoft Visual Studio",
+        "Installer",
+        "vswhere.exe",
+    )
+    if os.path.isfile(vswhere):
+        try:
+            install_path = subprocess.check_output(
+                [
+                    vswhere,
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if install_path:
+                candidates.append(
+                    os.path.join(install_path, "VC", "Auxiliary", "Build", "vcvars64.bat")
+                )
+        except Exception:
+            pass
+
+    roots = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Microsoft Visual Studio"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Microsoft Visual Studio"),
+    ]
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for year in ("2022", "2019", "2017"):
+            year_root = os.path.join(root, year)
+            if not os.path.isdir(year_root):
+                continue
+            for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+                candidates.append(
+                    os.path.join(year_root, edition, "VC", "Auxiliary", "Build", "vcvars64.bat")
+                )
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _ensure_windows_msvc_env() -> bool:
+    if not sys.platform.startswith("win") or shutil.which("cl") is not None:
+        return True
+
+    vcvars = _find_vcvars64_bat()
+    if vcvars is None:
+        return False
+
+    try:
+        env_output = subprocess.check_output(
+            f'cmd /s /c ""{vcvars}" >nul && set"',
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception as e:
+        print_acc(f"WARNING: failed to activate MSVC environment from {vcvars}: {e}")
+        return False
+
+    for line in env_output.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            os.environ[key] = value
+
+    return shutil.which("cl") is not None
+
+
+def _torch_compile_backend_unavailable_reason() -> Optional[str]:
+    try:
+        from torch.utils._triton import has_triton
+        if not bool(has_triton()):
+            return "PyTorch Inductor cannot find a working Triton backend on this system."
+    except Exception as e:
+        return f"PyTorch Inductor Triton check failed: {e}"
+
+    if not _ensure_windows_msvc_env():
+        return (
+            "Triton is installed, but MSVC cl.exe could not be activated. "
+            "Install Visual Studio Build Tools with the C++ toolchain."
+        )
+
+    return None
 
 class BaseSDTrainProcess(BaseTrainProcess):
 
@@ -409,6 +507,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 fp8_sampling=(
                     self._memory_manager_fp8_weights_configured
                     and self.model_config.layer_offloading_fp8_sampling
+                ),
+                working_reserve_gib=(
+                    self.model_config.layer_offloading_smart_sampling_working_reserve_gb
                 ),
             )
             if (
@@ -807,7 +908,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"streamed_layers={memory['managed_layers']}/"
                     f"{memory['candidate_layers']} "
                     f"ring_reserve={memory['planned_ring_gb']:.2f} GiB "
-                    f"training_headroom={memory['training_headroom_gb']:.2f} GiB "
+                    f"working_reserve={memory['training_working_reserve_gb']:.2f} GiB "
                     f"allocated={memory['torch_allocated_gb']:.2f} GiB "
                     f"reserved={memory['torch_reserved_gb']:.2f} GiB "
                     f"device_free={memory['device_free_gb']:.2f} GiB"
@@ -959,8 +1060,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"offloaded_cpu={smart_memory['offloaded_cpu_gb']:.2f} GiB "
                     f"ring={smart_memory['live_ring_gb']:.2f}/"
                     f"{smart_memory['planned_ring_gb']:.2f} GiB "
-                    f"working={smart_memory['working_headroom_used_gb']:.2f}/"
-                    f"{smart_memory['training_headroom_gb']:.2f} GiB "
+                    f"working={smart_memory['working_reserve_used_gb']:.2f}/"
+                    f"{smart_memory['training_working_reserve_gb']:.2f} GiB "
                     f"allocated={smart_memory['torch_allocated_gb']:.2f} GiB "
                     f"reserved={smart_memory['torch_reserved_gb']:.2f} GiB "
                     f"device={smart_memory['device_used_gb']:.2f}/"
@@ -2514,6 +2615,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ### HOOK ###
         self.hook_before_train_loop()
 
+        compile_unavailable_reason = (
+            _torch_compile_backend_unavailable_reason()
+            if self.model_config.compile
+            else None
+        )
+        if compile_unavailable_reason is not None:
+            print_acc("WARNING: compile is disabled.")
+            print_acc(compile_unavailable_reason)
+            print_acc("Install a working 'triton' package and compiler toolchain to use torch.compile.")
+            self.model_config.compile = False
+
         # ============================================================
         # COMPILE
         #
@@ -2540,26 +2652,96 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if not is_unet_offloaded:
                     self.sd.unet.to(self.device_torch)
 
+                compile_debug = getattr(self.model_config, 'compile_debug', False)
+                if compile_debug:
+                    # graph_breaks: where Dynamo had to split compiled regions.
+                    # recompiles:   whether the same block keeps being retraced because
+                    #               guards fail (shape/device/object-id changes) — the
+                    #               more dangerous failure mode with 28 compiled blocks.
+                    # guards:       what conditions are being checked before each call.
+                    torch._logging.set_logs(
+                        graph_breaks=True,
+                        recompiles=True,
+                        # guards=True floods output (one line per guard per block per
+                        # call). Enable via TORCH_LOGS=guards only when chasing a
+                        # specific recompile reason.
+                    )
+                    # stdout/stderr are unreachable — training runs in a subprocess
+                    # and print_acc is the only channel that reaches the user.
+                    # Route dynamo log records through print_acc via a custom handler.
+                    import logging as _logging
+
+                    class _PrintAccHandler(_logging.Handler):
+                        def __init__(self, fn):
+                            super().__init__()
+                            self._fn = fn
+                        def emit(self, record):
+                            try:
+                                self._fn(self.format(record))
+                            except Exception:
+                                pass
+
+                    _dynamo_logger = _logging.getLogger("torch._dynamo")
+                    if not any(isinstance(h, _PrintAccHandler) for h in _dynamo_logger.handlers):
+                        _h = _PrintAccHandler(print_acc)
+                        _h.setLevel(_logging.DEBUG)
+                        _dynamo_logger.addHandler(_h)
+                        _dynamo_logger.setLevel(_logging.DEBUG)
+                    print_acc(
+                        "compile_debug=True: graph_breaks and recompiles routed through "
+                        "print_acc. Recompile messages every timestep = guard failures "
+                        "(shape/device/object-id changed)."
+                    )
+
                 cache_size_limit = getattr(self.model_config, 'cache_size_limit', None)
                 user_set_cache_limit = cache_size_limit is not None
                 if user_set_cache_limit:
                     torch._dynamo.config.cache_size_limit = cache_size_limit
-                torch._dynamo.config.suppress_errors = False
+                torch._dynamo.config.suppress_errors = bool(is_quantized)
+                if is_quantized:
+                    print_acc(
+                        "Quantized model detected: suppressing unsupported "
+                        "torch.compile trace failures and falling back to eager where needed."
+                    )
 
                 compile_mode = getattr(self.model_config, 'compile_mode', 'default')
                 compile_dynamic = getattr(self.model_config, 'compile_dynamic', True)
                 compile_fullgraph = getattr(self.model_config, 'compile_fullgraph', False)
                 block_compile = getattr(self.model_config, 'block_compile', False)
 
-                # quantized + offloaded unet is incompatible with fullgraph; force it off
-                if is_unet_quantized and is_unet_offloaded and compile_fullgraph:
+                if is_quantized and block_compile:
                     print_acc(
-                        "Quantized offloaded Transformer detected: fullgraph=True is incompatible, "
+                        "Quantized model detected: block-level compile requested; "
+                        "avoiding model/offload wrapper code."
+                    )
+
+                if is_quantized and compile_mode == 'default':
+                    print_acc(
+                        "Quantized model detected: using torch.compile mode='default'. "
+                        "Set compile_mode explicitly to opt into more aggressive modes."
+                    )
+
+                if is_quantized and compile_fullgraph:
+                    print_acc(
+                        "Quantized model detected: fullgraph=True is incompatible, "
                         "switching to fullgraph=False."
                     )
                     compile_fullgraph = False
 
                 cache_info = ""
+
+                # Whole-model compile wraps every offload-hooked Linear in one
+                # large graph, producing graph-break storms or a multi-minute freeze.
+                # Block compile keeps each block as its own compilation unit so the
+                # pure-math interior benefits while the offload hooks stay at the boundary.
+                if is_unet_offloaded and not block_compile:
+                    print_acc(
+                        "Layer offloading detected: whole-model compile is incompatible "
+                        "(offload hooks inside the compiled graph cause graph-break storms). "
+                        "Switching to block_compile=True automatically."
+                    )
+                    block_compile = True
+
                 # ====================================================
                 # BLOCK COMPILE
                 # ====================================================
@@ -2873,7 +3055,43 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.torch_profiler.start()
             did_oom = False
             loss_dict = None
-            MemoryManager.offload_step_begin()
+            offload_shape_key = MemoryManager.offload_shape_key_from_batch(
+                batch_list,
+                dop_enabled=bool(getattr(self.train_config, 'diff_output_preservation', False)),
+                dop_resolution=getattr(
+                    self.train_config, 'diff_output_preservation_resolution', None
+                ),
+                dop_single_backward=bool(
+                    getattr(self.train_config, 'dop_single_backward', False)
+                ),
+                dop_prior_cache=bool(
+                    getattr(self.train_config, 'dop_prior_cache', False)
+                ),
+                blank_preservation_enabled=bool(
+                    getattr(self.train_config, 'blank_prompt_preservation', False)
+                ),
+                blank_preservation_resolution=getattr(
+                    self.train_config, 'blank_prompt_preservation_resolution', None
+                ),
+                checkpoint_policy_id=getattr(
+                    getattr(self, '_checkpoint_tunable', None), '_checkpoint_keep_last', None
+                ),
+                fp8_forward_enabled=bool(
+                    getattr(getattr(self.sd, 'unet', None), '_memory_manager', None)
+                    and getattr(
+                        getattr(self.sd.unet, '_memory_manager', None),
+                        '_fp8_training_layers',
+                        0,
+                    )
+                ),
+            )
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.reset_peak_memory_stats(self.device_torch)
+                except Exception:
+                    pass
+            step_started_at = time.perf_counter()
+            MemoryManager.offload_step_begin(shape_key=offload_shape_key)
             offload_step_completed = False
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
@@ -2913,6 +3131,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         f"peak_reserved={peak_reserved:.2f} GiB"
                     )
                     MemoryManager.recover_cuda_pipeline_after_oom()
+                    try:
+                        MemoryManager.auto_tune_training_memory(
+                            getattr(self.sd, 'unet', None),
+                            self.device_torch,
+                            shape_key=offload_shape_key,
+                            step_num=self.step_num,
+                            step_time_s=time.perf_counter() - step_started_at,
+                            did_oom=True,
+                        )
+                    except Exception as error:
+                        print_acc(
+                            f"[MemoryManager] training autotune after OOM failed: {error}"
+                        )
                     torch.cuda.reset_peak_memory_stats(dev)
                 # skip this step and keep going
                 print_acc("")
@@ -2922,6 +3153,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("")
             else:
                 self.num_consecutive_oom = 0
+                try:
+                    MemoryManager.auto_tune_training_memory(
+                        getattr(self.sd, 'unet', None),
+                        self.device_torch,
+                        shape_key=offload_shape_key,
+                        step_num=self.step_num,
+                        step_time_s=time.perf_counter() - step_started_at,
+                        did_oom=False,
+                    )
+                except Exception as error:
+                    print_acc(
+                        f"[MemoryManager] training autotune failed: {error}"
+                    )
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()

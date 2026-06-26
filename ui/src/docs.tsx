@@ -278,12 +278,13 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
-  'model.layer_offloading_smart_headroom_gb': {
+  'model.layer_offloading_smart_working_reserve_gb': {
     title: 'Training VRAM Reserve',
     description: (
       <>
-        VRAM kept free for activations, LoRA weights, gradients, optimizer state, and temporary kernels. Increase this
-        if training runs out of memory; decrease it to keep more transformer layers resident.
+        Working reserve: VRAM kept free for our own transient working set — activations, dequant, gradients, optimizer
+        state, and temporary kernels — during a training step. -1 = auto (the live controller learns and tunes it).
+        Increase a fixed value if training runs out of memory; decrease it to keep more transformer layers resident.
       </>
     ),
   },

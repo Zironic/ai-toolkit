@@ -96,6 +96,15 @@ def _layer_specs(weight, bias) -> list:
     return specs
 
 
+def _shape_key_label(shape_key) -> str:
+    if shape_key is None:
+        return "none"
+    text = repr(shape_key)
+    if len(text) > 160:
+        return text[:157] + "..."
+    return text
+
+
 def _spec_bytes(specs) -> int:
     total = 0
     for dtype, shape in specs:
@@ -172,12 +181,20 @@ class PinnedBouncePool:
         device,
         budget_bytes: int,
         lookahead: int = 8,
+        target_ready_bytes: Optional[int] = None,
         num_workers: int = 2,
         ram_floor_bytes: int = 2 * 1024 ** 3,
     ):
         self.device = torch.device(device)
         self.budget_bytes = int(budget_bytes)
         self.lookahead = int(lookahead)
+        self.max_lookahead_positions = self.lookahead
+        if target_ready_bytes is None:
+            target_ready_bytes = int(
+                float(os.environ.get("AI_TOOLKIT_BOUNCE_TARGET_READY_GIB", "3.5"))
+                * 1024 ** 3
+            )
+        self.target_ready_bytes = int(target_ready_bytes)
         self.num_workers = max(1, int(num_workers))
         self.ram_floor_bytes = int(ram_floor_bytes)
 
@@ -185,7 +202,9 @@ class PinnedBouncePool:
         self._cv = threading.Condition(self._lock)
         self._sources: dict = {}        # layer_key -> weakref(module)
         self._scheduled: list = []      # positional layer_key access order
+        self._observed_step: list = []  # actual access order from previous step
         self.schedule_version = -1      # trace version this schedule came from
+        self.schedule_shape_key = None  # execution shape this schedule came from
         self._slots: dict = {}          # position -> _Slot
         self._skipped_positions: set = set()
         self._free_buffers: dict = {}   # signature -> list[leaves]
@@ -222,8 +241,44 @@ class PinnedBouncePool:
     def set_schedule(self, layer_keys):
         with self._cv:
             self._scheduled = list(layer_keys)
+            self._observed_step = []
+            self._cv.notify_all()
 
-    def step_begin(self):
+    def seed_schedule_from_sources(self):
+        """Use registration order until a shape-specific trace is frozen.
+
+        Deliberately does NOT clear ``_observed_step``: the manager re-seeds on
+        every cold step, and the observed access order recorded last step is the
+        only input ``step_begin``'s promotion has. Clearing it here would erase
+        that record immediately before the promotion runs, so the pool could
+        never escape the cold source-order schedule. ``_promote_observed_
+        schedule_locked`` owns the buffer's lifecycle (it clears it each step)."""
+        with self._cv:
+            self._scheduled = list(self._sources.keys())
+            self.schedule_version = -1
+            self.schedule_shape_key = None
+            self._cv.notify_all()
+
+    def set_budget(self, budget_bytes: int):
+        """Resize the pool budget without invalidating useful in-flight work."""
+        with self._cv:
+            self.budget_bytes = int(budget_bytes)
+            self._trim_free_buffers_locked()
+            self._cv.notify_all()
+
+    def tune(self, *, budget_bytes=None, target_ready_bytes=None, lookahead=None):
+        """Adjust prefetch capacity/coverage without clearing the schedule."""
+        with self._cv:
+            if budget_bytes is not None:
+                self.budget_bytes = int(budget_bytes)
+            if target_ready_bytes is not None:
+                self.target_ready_bytes = int(target_ready_bytes)
+            if lookahead is not None:
+                self.max_lookahead_positions = max(1, int(lookahead))
+            self._trim_free_buffers_locked()
+            self._cv.notify_all()
+
+    def step_begin(self, warmup_bytes=0, warmup_timeout_s=0.02):
         """Reset the consume/fill cursors and wake workers for a new step.
 
         GPU consumers from the previous step are complete at this boundary, but
@@ -231,7 +286,17 @@ class PinnedBouncePool:
         lock. Such a buffer is detached, not recycled; its worker owns it until
         the copy exits and observes the epoch change."""
         with self._cv:
+            self._promote_observed_schedule_locked()
             self._reset_step_locked()
+            deadline = time.perf_counter() + float(warmup_timeout_s)
+            warmup_bytes = int(warmup_bytes)
+            while (
+                warmup_bytes > 0
+                and self._ready_and_filling_bytes_locked() < warmup_bytes
+                and time.perf_counter() < deadline
+            ):
+                self._cv.notify_all()
+                self._cv.wait(timeout=0.002)
 
     def abort_step(self):
         """Invalidate current scheduling without recycling worker-owned buffers."""
@@ -256,6 +321,44 @@ class PinnedBouncePool:
         self._fill_pos = 0
         self._cv.notify_all()
 
+    def _promote_observed_schedule_locked(self):
+        """Recover when the cold source-order schedule never matched reality."""
+        observed_len = len(self._observed_step)
+        total = self.hits + self.soft_misses + self.hard_misses
+        hard_miss_rate = self.hard_misses / max(1, total)
+        stale_or_short = observed_len > len(self._scheduled) + max(1, self.max_lookahead_positions)
+        cold_schedule = self.schedule_shape_key is None
+        if observed_len and cold_schedule and stale_or_short and (total == 0 or hard_miss_rate > 0.25):
+            self._scheduled = list(self._observed_step)
+            self.schedule_version = -2
+            self.schedule_shape_key = "observed"
+        self._observed_step = []
+
+    def _free_buffer_bytes_locked(self):
+        total = 0
+        for signature, buffers in self._free_buffers.items():
+            total += _spec_bytes(signature) * len(buffers)
+        return total
+
+    def _pop_one_free_buffer_locked(self):
+        for signature, buffers in list(self._free_buffers.items()):
+            if not buffers:
+                del self._free_buffers[signature]
+                continue
+            buffers.pop()
+            if not buffers:
+                del self._free_buffers[signature]
+            return True
+        return False
+
+    def _trim_free_buffers_locked(self):
+        while (
+            self._inflight_bytes + self._free_buffer_bytes_locked()
+            > self.budget_bytes
+        ):
+            if not self._pop_one_free_buffer_locked():
+                break
+
     # -- training-thread API ----------------------------------------------
 
     def acquire(self, layer_key, weight_cpu, bias_cpu):
@@ -264,6 +367,7 @@ class PinnedBouncePool:
         with self._cv:
             pos = self._consume_pos
             self._consume_pos += 1
+            self._observed_step.append(layer_key)
             scheduled_match = (
                 self._scheduled
                 and pos < len(self._scheduled)
@@ -311,6 +415,7 @@ class PinnedBouncePool:
         with self._cv:
             pos = self._consume_pos
             self._consume_pos += 1
+            self._observed_step.append(layer_key)
             self.skips += 1
             self._skipped_positions.add(pos)
             slot = self._slots.get(pos)
@@ -360,13 +465,39 @@ class PinnedBouncePool:
                 del self._slots[pos]
 
     def _next_fill_target_locked(self):
-        """Pick the next schedulable position within the lookahead window."""
-        end = min(len(self._scheduled), self._consume_pos + self.lookahead)
+        """Pick the next schedulable position within byte and position limits."""
+        target_ready_bytes = min(self.budget_bytes, self.target_ready_bytes)
+        if self._ready_and_filling_bytes_locked() >= target_ready_bytes:
+            return None
+        end = min(
+            len(self._scheduled),
+            self._consume_pos + self.max_lookahead_positions,
+        )
         for pos in range(max(self._consume_pos, self._fill_pos), end):
             if pos in self._slots:
                 continue
+            if pos in self._skipped_positions:
+                continue
             return pos
         return None
+
+    def _ready_and_filling_bytes_locked(self):
+        total = 0
+        for slot in self._slots.values():
+            if slot.state in (CPU_FILLING, CPU_READY):
+                total += slot.nbytes
+        return total
+
+    def _slot_bytes_by_state_locked(self):
+        by_state = {
+            CPU_FILLING: 0,
+            CPU_READY: 0,
+            IN_USE: 0,
+            FREE: 0,
+        }
+        for slot in self._slots.values():
+            by_state[slot.state] = by_state.get(slot.state, 0) + slot.nbytes
+        return by_state
 
     def _take_buffers_locked(self, signature, nbytes):
         if self._inflight_bytes + nbytes > self.budget_bytes:
@@ -483,6 +614,7 @@ class PinnedBouncePool:
             copy_gbps = (
                 (self.copy_bytes / gib) / self.copy_s if self.copy_s > 0 else 0.0
             )
+            states = self._slot_bytes_by_state_locked()
             result = {
                 "acquires": total,
                 "hits": self.hits,
@@ -493,8 +625,22 @@ class PinnedBouncePool:
                 "cpu_wait_s": self.cpu_wait_s,
                 "copy_s": self.copy_s,
                 "copy_gbps": copy_gbps,
+                "budget_gib": self.budget_bytes / gib,
+                "ready_gib": states.get(CPU_READY, 0) / gib,
+                "filling_gib": states.get(CPU_FILLING, 0) / gib,
+                "in_use_gib": states.get(IN_USE, 0) / gib,
+                "free_buffer_gib": self._free_buffer_bytes_locked() / gib,
+                "target_ready_gib": min(
+                    self.budget_bytes, self.target_ready_bytes
+                ) / gib,
                 "inflight_gib": self._inflight_bytes / gib,
                 "live_slots": len(self._slots),
+                "consume_pos": self._consume_pos,
+                "fill_pos": self._fill_pos,
+                "schedule_len": len(self._scheduled),
+                "observed_len": len(self._observed_step),
+                "schedule_shape_key": _shape_key_label(self.schedule_shape_key),
+                "lookahead": self.max_lookahead_positions,
             }
             if reset:
                 self._reset_stats_locked()
@@ -508,7 +654,14 @@ class PinnedBouncePool:
             f"hit={s['hits']} soft_miss={s['soft_misses']} hard_miss={s['hard_misses']} "
             f"hit_rate={s['hit_rate']:.1%} cpu_wait={s['cpu_wait_s']:.1f}s "
             f"copy={s['copy_s']:.1f}s@{s['copy_gbps']:.2f}GB/s "
-            f"inflight={s['inflight_gib']:.2f}GiB slots={s['live_slots']}"
+            f"budget={s['budget_gib']:.2f}GiB ready={s['ready_gib']:.2f}GiB "
+            f"filling={s['filling_gib']:.2f}GiB in_use={s['in_use_gib']:.2f}GiB "
+            f"free_buffer={s['free_buffer_gib']:.2f}GiB "
+            f"target_ready={s['target_ready_gib']:.2f}GiB "
+            f"inflight={s['inflight_gib']:.2f}GiB slots={s['live_slots']} "
+            f"pos={s['consume_pos']}/{s['fill_pos']} "
+            f"schedule={s['schedule_len']} shape={s['schedule_shape_key']} "
+            f"lookahead={s['lookahead']}"
         )
 
     def shutdown(self):

@@ -56,6 +56,88 @@ def print_once(msg):
         printed_messages.append(msg)
 
 
+def _assistant_inverse_module_scale(module, default=1.0):
+    network = module.network_ref()
+    if not getattr(network, 'is_assistant_adapter', False):
+        return default
+    return getattr(module, 'assistant_inverse_scale', default)
+
+
+def _get_network_base_model(network):
+    base_ref = getattr(network, 'base_model_ref', None)
+    return base_ref() if base_ref is not None else None
+
+
+def _dequantized_probe_weight(module):
+    if hasattr(module, 'weight'):
+        weight = module.weight
+        if hasattr(weight, 'dequantize'):
+            return weight.dequantize().float()
+        return weight.float()
+
+    state = module.state_dict()
+    if 'weight._data' in state and 'weight._scale' in state:
+        return (state['weight._data'].float() * state['weight._scale'].float()).float()
+
+    raise RuntimeError(f"Cannot dequantize probe module {module.__class__.__name__}")
+
+
+def _quantized_probe_weight(fp_weight, orig_dtype, qtype, bias=False):
+    from toolkit.util.quantize import get_qtype, quantize
+
+    probe = torch.nn.Sequential(
+        torch.nn.Linear(
+            fp_weight.shape[1],
+            fp_weight.shape[0],
+            bias=bias,
+            device=fp_weight.device,
+            dtype=orig_dtype,
+        )
+    )
+    probe[0].weight = torch.nn.Parameter(
+        fp_weight.detach().clone().to(orig_dtype), requires_grad=False
+    )
+    quantize(probe, weights=get_qtype(qtype))
+    return _dequantized_probe_weight(probe[0])
+
+
+def _calibrate_assistant_inverse_scale(module, base_weight, merged_weight, orig_dtype):
+    network = module.network_ref()
+    if not getattr(network, 'is_assistant_adapter', False):
+        return 1.0
+
+    base_model = _get_network_base_model(network)
+    model_config = getattr(base_model, 'model_config', None)
+    qtype = getattr(model_config, 'qtype', None)
+    if model_config is None or not getattr(model_config, 'quantize', False) or qtype is None:
+        return 1.0
+
+    org_module = module.org_module[0]
+    if org_module.__class__.__name__ not in LINEAR_MODULES:
+        return 1.0
+
+    delta_original = (merged_weight.float() - base_weight.float()).detach()
+    denom = torch.dot(delta_original.flatten(), delta_original.flatten())
+    if denom <= 0:
+        return 1.0
+
+    try:
+        has_bias = getattr(org_module, 'bias', None) is not None
+        q_base = _quantized_probe_weight(base_weight, orig_dtype, qtype, bias=has_bias)
+        q_merged = _quantized_probe_weight(merged_weight, orig_dtype, qtype, bias=has_bias)
+        delta_effective = q_merged.to(delta_original.device) - q_base.to(delta_original.device)
+        scale = torch.dot(delta_original.flatten(), delta_effective.flatten()) / denom
+        scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0)
+        scale = torch.clamp(scale, min=0.0, max=2.0)
+        return float(scale.item())
+    except Exception as e:
+        print_once(
+            f"Warning: assistant LoRA inverse calibration failed for "
+            f"{getattr(module, 'lora_name', '?')}: {e}"
+        )
+        return 1.0
+
+
 def broadcast_and_multiply(tensor, multiplier):
     # Determine the number of dimensions required
     num_extra_dims = tensor.dim() - multiplier.dim()
@@ -301,6 +383,10 @@ class ToolkitModuleMixin:
             # todo check if this is correct, do we just concat when doing cfg?
             multiplier = multiplier.repeat_interleave(num_interleaves)
 
+        module_inverse_scale = _assistant_inverse_module_scale(self)
+        if module_inverse_scale != 1.0:
+            lora_output = lora_output * module_inverse_scale
+
         scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
         scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)
 
@@ -375,7 +461,8 @@ class ToolkitModuleMixin:
         is_ao_quantized = is_quantized_tensor(org_weight)
         orig_dtype = org_weight.dtype
         # dequantize torchao weights so the delta can be merged in full precision
-        weight = (org_weight.dequantize() if is_ao_quantized else org_weight).float()
+        base_weight = org_weight.dequantize() if is_ao_quantized else org_weight
+        weight = base_weight.float()
 
         multiplier = merge_weight
         scale = self.scale
@@ -407,6 +494,11 @@ class ToolkitModuleMixin:
             conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
             # print(conved.size(), weight.size(), module.stride, module.padding)
             weight = weight + multiplier * conved * scale
+
+        if getattr(self.network_ref(), 'is_assistant_adapter', False):
+            self.assistant_inverse_scale = _calibrate_assistant_inverse_scale(
+                self, base_weight, weight, orig_dtype
+            )
 
         # write the merged weight back, re-quantizing if the original was torchao quantized so the
         # model stays quantized across continuous merge/reset cycles
