@@ -2,6 +2,7 @@ import os
 import random
 import hashlib
 import json
+import concurrent.futures
 from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Union, Literal, List, Optional
@@ -88,6 +89,13 @@ class SDTrainer(BaseSDTrainProcess):
         self._resolution_bucket_counts = {}
         self._resolution_memory_stats = {}
         self._resolution_memory_baseline = None
+        # Step-level peak high-water, aggregated across accumulations. The inner
+        # per-accumulation sampler resets the global CUDA peak counter, so the
+        # live counter only reflects the LAST accumulation. The smart-offload
+        # controller governs on the within-step peak, so it must see the max
+        # across all accumulations, not just the last one.
+        self._step_peak_allocated_bytes = 0
+        self._step_peak_reserved_bytes = 0
         self._current_resolution_bucket = 256
         self._checkpoint_autotuner = None
         self._checkpoint_tunable = None
@@ -95,6 +103,7 @@ class SDTrainer(BaseSDTrainProcess):
         self._checkpoint_timing_start = None
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
+        self._dop_cache_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         
         if self.train_config.diff_output_preservation:
             if self.trigger_word is None:
@@ -374,6 +383,7 @@ class SDTrainer(BaseSDTrainProcess):
             ds_cfg.cache_latents = False
             ds_cfg.cache_latents_to_disk = False
             ds_cfg.cache_clip_vision_to_disk = False
+            ds_cfg.cache_text_embeddings_to_memory = False
             ds_cfg.controls = []
 
         # 1) dataset caption embeddings (+reg) -> disk, triggered by building the loaders
@@ -385,6 +395,18 @@ class SDTrainer(BaseSDTrainProcess):
             self.data_loader_reg = get_dataloader_from_datasets(
                 self.datasets_reg, self.train_config.batch_size, self.sd
             )
+
+        # The worker's only contract is the on-disk cache. Drop normal dataloader
+        # references before aux encoding so large text-encoder outputs cannot pile up
+        # across datasets in this short-lived process.
+        dop_datasets = []
+        if self.train_config.diff_output_preservation and self.data_loader is not None:
+            dop_datasets = list(get_dataloader_datasets(self.data_loader))
+        self.data_loader = None
+        self.data_loader_reg = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # 2) aux embeds (blank / unconditional / trigger / DOP / samples)
         with torch.no_grad():
@@ -408,14 +430,14 @@ class SDTrainer(BaseSDTrainProcess):
                 trigger = self.sd.encode_prompt(self.trigger_word, **encode_kwargs).to('cpu')
 
             # DOP embeds write their own per-file disk cache
-            if self.train_config.diff_output_preservation and self.data_loader is not None:
+            if self.train_config.diff_output_preservation and dop_datasets:
                 from toolkit.prompt_utils import build_dop_replacement_pairs
                 triggers_csv = self.trigger_word
                 classes_csv = self.train_config.diff_output_preservation_class
                 self._dop_replacement_pairs = build_dop_replacement_pairs(
                     triggers_csv=triggers_csv, classes_csv=classes_csv, case_insensitive=False
                 )
-                for dataset in get_dataloader_datasets(self.data_loader):
+                for dataset in dop_datasets:
                     dataset.precompute_dop_embeddings(
                         triggers_csv=triggers_csv,
                         classes_csv=classes_csv,
@@ -1459,8 +1481,6 @@ class SDTrainer(BaseSDTrainProcess):
             pure_loss.requires_grad_(True)
 
         loss = loss.mean()
-        if loss.item() > 1e3:
-            pass
         with self._gpu_phase(f'normal_backward/{self._current_resolution_bucket}'):
             self.accelerator.backward(loss)
         return pure_loss
@@ -1616,6 +1636,11 @@ class SDTrainer(BaseSDTrainProcess):
 
     def end_of_training_loop(self):
         pass
+
+    def done_hook(self):
+        if self._dop_cache_executor is not None:
+            self._dop_cache_executor.shutdown(wait=True)
+            self._dop_cache_executor = None
 
     def predict_noise(
         self,
@@ -1792,6 +1817,12 @@ class SDTrainer(BaseSDTrainProcess):
             self._checkpoint_timing_start = None
         allocated = torch.cuda.max_memory_allocated(self.device_torch)
         reserved = torch.cuda.max_memory_reserved(self.device_torch)
+        # Carry this accumulation's peak into the step-level high-water before the
+        # next accumulation's _start resets the global counter. The controller
+        # reads max(this accumulator, live counter), so earlier accumulations'
+        # peaks are not lost on multi-accumulation steps.
+        self._step_peak_allocated_bytes = max(self._step_peak_allocated_bytes, allocated)
+        self._step_peak_reserved_bytes = max(self._step_peak_reserved_bytes, reserved)
         incremental = max(0, allocated - baseline)
         # Time chooses the candidate; reserved memory is only the hard WDDM
         # spill guard. The CUDA event covers this accumulation's forward and
@@ -3021,18 +3052,55 @@ class SDTrainer(BaseSDTrainProcess):
 
     def _dop_prior_cache_add_batch(self, batch, target_h, target_w, samples,
                                    noisy_small, timesteps, prior_small):
-        """Append each live image result to its persistent cache until full."""
+        """Append each live image result to its persistent cache until full.
+
+        GPU→CPU transfers are non-blocking; the actual disk write runs in a
+        background thread so the caller can submit loss kernels to the GPU
+        immediately rather than stalling during file I/O.
+        """
         items = getattr(batch, 'file_items', None)
         if not items or len(items) != prior_small.shape[0]:
             return
-        ts = timesteps.detach().float().reshape(-1).cpu()
-        if ts.shape[0] == 1 and len(items) > 1:
-            ts = ts.expand(len(items)).contiguous()
-        if ts.shape[0] != len(items):
+
+        # Shape checks use tensor metadata only — no data access, no sync.
+        ts_gpu = timesteps.detach().float().reshape(-1)
+        if ts_gpu.shape[0] == 1 and len(items) > 1:
+            ts_gpu = ts_gpu.expand(len(items)).contiguous()
+        if ts_gpu.shape[0] != len(items):
             return
-        noisy_cpu, prior_cpu = noisy_small.detach().cpu(), prior_small.detach().cpu()
-        for idx, item in enumerate(items):
-            path = item.get_dop_prior_path(self._dop_prior_cache_hash(item, target_h, target_w, samples))
+
+        # Kick off async GPU→CPU copies. Data is not valid until event fires.
+        ts_cpu = ts_gpu.to('cpu', non_blocking=True)
+        noisy_cpu = noisy_small.detach().to('cpu', non_blocking=True)
+        prior_cpu = prior_small.detach().to('cpu', non_blocking=True)
+
+        # Record a CUDA event so the worker knows when the transfers are done.
+        event = torch.cuda.Event()
+        event.record()
+
+        paths = [
+            item.get_dop_prior_path(self._dop_prior_cache_hash(item, target_h, target_w, samples))
+            for item in items
+        ]
+
+        if self._dop_cache_executor is None:
+            self._dop_cache_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        def _write():
+            try:
+                event.synchronize()
+                self._dop_prior_cache_write_items(
+                    paths, target_h, target_w, samples, ts_cpu, noisy_cpu, prior_cpu
+                )
+            except Exception as exc:
+                print_acc(f'[DOP cache] background write failed: {exc}')
+
+        self._dop_cache_executor.submit(_write)
+
+    def _dop_prior_cache_write_items(self, paths, target_h, target_w, samples,
+                                     ts, noisy_cpu, prior_cpu):
+        """Write per-image cache entries to disk (called from background thread)."""
+        for idx, path in enumerate(paths):
             state = None
             if os.path.exists(path):
                 try:
@@ -3411,6 +3479,10 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             batch_list = [batch]
         total_loss = None
+        # New step: clear the step-level peak high-water. Accumulations fold their
+        # per-accumulation peak in via _finish_resolution_memory_sample.
+        self._step_peak_allocated_bytes = 0
+        self._step_peak_reserved_bytes = 0
         self.optimizer.zero_grad()
         for batch in batch_list:
             if self.sd.is_multistage:
@@ -3473,7 +3545,7 @@ class SDTrainer(BaseSDTrainProcess):
                 self.adapter.restore_embeddings()
 
         loss_dict = OrderedDict(
-            {'loss': (total_loss / len(batch_list)).item()}
+            {'loss': total_loss / len(batch_list)}
         )
 
         if self._last_weight_noise_norm is not None:

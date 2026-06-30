@@ -236,6 +236,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.model_config.layer_offloading_trace or prefetch_enabled
         )
         MemoryManager.set_offload_prefetch_enabled(prefetch_enabled)
+        MemoryManager.set_offload_prefetch_trace_capture(
+            self.model_config.layer_offloading_prefetch_trace_capture,
+            self.model_config.layer_offloading_prefetch_trace_capture_steps,
+        )
         MemoryManager.set_fp8_grad_input_enabled(
             fp8_weights_configured
             and self.model_config.layer_offloading_fp8_grad_input
@@ -483,6 +487,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ctrl_img_2=sample_item.ctrl_img_2,
                 ctrl_img_3=sample_item.ctrl_img_3,
                 do_cfg_norm=sample_config.do_cfg_norm,
+                batch_cfg=sample_config.batch_cfg,
                 **extra_args
             ))
 
@@ -510,6 +515,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ),
                 working_reserve_gib=(
                     self.model_config.layer_offloading_smart_sampling_working_reserve_gb
+                ),
+                wddm_margin_gib=(
+                    self.model_config.layer_offloading_smart_sampling_wddm_margin_gb
+                ),
+                wddm_hard_gib=(
+                    self.model_config.layer_offloading_smart_sampling_wddm_hard_gb
                 ),
             )
             if (
@@ -1060,13 +1071,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"offloaded_cpu={smart_memory['offloaded_cpu_gb']:.2f} GiB "
                     f"ring={smart_memory['live_ring_gb']:.2f}/"
                     f"{smart_memory['planned_ring_gb']:.2f} GiB "
-                    f"working={smart_memory['working_reserve_used_gb']:.2f}/"
+                    f"working_peak={smart_memory.get('working_reserve_peak_gb', smart_memory['working_reserve_used_gb']):.2f}/"
                     f"{smart_memory['training_working_reserve_gb']:.2f} GiB "
+                    f"(residual={smart_memory.get('working_reserve_residual_gb', smart_memory['working_reserve_used_gb']):.2f}) "
                     f"allocated={smart_memory['torch_allocated_gb']:.2f} GiB "
                     f"reserved={smart_memory['torch_reserved_gb']:.2f} GiB "
-                    f"device={smart_memory['device_used_gb']:.2f}/"
+                    # Headline the PEAK footprint/free (what the spill cliff sees);
+                    # the step-end trough follows in parens so it can't mislead.
+                    f"device_peak={smart_memory.get('device_used_peak_gb', smart_memory['device_used_gb']):.2f}/"
                     f"{smart_memory['device_total_gb']:.2f} GiB "
-                    f"free={smart_memory['device_free_gb']:.2f} GiB"
+                    f"free_peak={smart_memory.get('device_free_peak_gb', smart_memory['device_free_gb']):.2f} GiB "
+                    f"(trough {smart_memory['device_used_gb']:.2f}/"
+                    f"{smart_memory['device_total_gb']:.2f}, "
+                    f"free {smart_memory['device_free_gb']:.2f})"
                 )
         try:
             from toolkit.memory_management import MemoryManager
@@ -2153,6 +2170,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # Ensure all text embeddings are cached to disk (running a throwaway TE worker if
         # needed) so the trainer can load without the text encoder.
         self._use_cached_te = self.maybe_run_te_cache_worker()
+        if self._use_cached_te and not self._te_caption_manifest_is_current():
+            print_acc("[te-worker] caption sources changed after cache worker; refreshing TE cache before skip_te load")
+            self._use_cached_te = self.maybe_run_te_cache_worker()
 
         self.sd = ModelClass(
             # todo handle single gpu and multi gpu here
@@ -2603,6 +2623,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         ### HOOk ###
         self.before_dataset_load()
+        if self._use_cached_te and not self._te_caption_manifest_is_current():
+            raise RuntimeError(
+                "Caption sidecar files changed after the text-encoder cache worker finished. "
+                "Restart the job so the TE worker can encode the updated captions before "
+                "the trainer loads with skip_te."
+            )
         # load datasets if passed in the root process
         if self.datasets is not None:
             self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
@@ -3073,8 +3099,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 blank_preservation_resolution=getattr(
                     self.train_config, 'blank_prompt_preservation_resolution', None
                 ),
-                checkpoint_policy_id=getattr(
-                    getattr(self, '_checkpoint_tunable', None), '_checkpoint_keep_last', None
+                checkpoint_policy_id=(
+                    getattr(self, '_checkpoint_tunable', None)._checkpoint_keep_last
+                    if getattr(self, '_checkpoint_tunable', None) is not None
+                    else getattr(self.model_config, 'layer_offloading_checkpoint_keep_last', 0)
                 ),
                 fp8_forward_enabled=bool(
                     getattr(getattr(self.sd, 'unet', None), '_memory_manager', None)
@@ -3131,6 +3159,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         f"peak_reserved={peak_reserved:.2f} GiB"
                     )
                     MemoryManager.recover_cuda_pipeline_after_oom()
+                    # True within-step peak across accumulations (the per-accumulation
+                    # sampler resets the live counter, so max it with the step-level
+                    # high-water the trainer carried forward).
+                    peak_alloc_override = max(
+                        getattr(self, '_step_peak_allocated_bytes', 0),
+                        int(torch.cuda.max_memory_allocated(dev)),
+                    )
+                    peak_reserved_override = max(
+                        getattr(self, '_step_peak_reserved_bytes', 0),
+                        int(torch.cuda.max_memory_reserved(dev)),
+                    )
                     try:
                         MemoryManager.auto_tune_training_memory(
                             getattr(self.sd, 'unet', None),
@@ -3139,6 +3178,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             step_num=self.step_num,
                             step_time_s=time.perf_counter() - step_started_at,
                             did_oom=True,
+                            peak_allocated_override=peak_alloc_override,
+                            peak_reserved_override=peak_reserved_override,
                         )
                     except Exception as error:
                         print_acc(
@@ -3153,6 +3194,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("")
             else:
                 self.num_consecutive_oom = 0
+                # True within-step peak across accumulations (the per-accumulation
+                # sampler resets the live counter, so max it with the step-level
+                # high-water the trainer carried forward).
+                peak_alloc_override = None
+                peak_reserved_override = None
+                if torch.cuda.is_available():
+                    _dev = self.device_torch
+                    peak_alloc_override = max(
+                        getattr(self, '_step_peak_allocated_bytes', 0),
+                        int(torch.cuda.max_memory_allocated(_dev)),
+                    )
+                    peak_reserved_override = max(
+                        getattr(self, '_step_peak_reserved_bytes', 0),
+                        int(torch.cuda.max_memory_reserved(_dev)),
+                    )
                 try:
                     MemoryManager.auto_tune_training_memory(
                         getattr(self.sd, 'unet', None),
@@ -3161,6 +3217,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         step_num=self.step_num,
                         step_time_s=time.perf_counter() - step_started_at,
                         did_oom=False,
+                        peak_allocated_override=peak_alloc_override,
+                        peak_reserved_override=peak_reserved_override,
                     )
                 except Exception as error:
                     print_acc(
@@ -3236,6 +3294,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
+                    loss_dict = {
+                        k: (v.item() if hasattr(v, 'item') else v)
+                        for k, v in loss_dict.items()
+                    }
                     prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
