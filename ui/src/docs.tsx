@@ -278,6 +278,17 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.layer_offloading_block_stream_only': {
+    title: 'Block-Only Streaming',
+    description: (
+      <>
+        Streams the transformer in whole-block units and keeps every non-block layer (embedders, the final projection,
+        standalone norms and Linears) permanently resident. The prefetch worker then stages a block's weights in one
+        batched fill instead of one request per Linear, cutting the CPU overhead of the offload path. Trades a little
+        extra resident VRAM and a larger prefetch ring for far fewer small requests.
+      </>
+    ),
+  },
   'model.layer_offloading_smart_working_reserve_gb': {
     title: 'Training VRAM Reserve',
     description: (
@@ -288,12 +299,57 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.layer_offloading_smart_wddm_margin_gb': {
+    title: 'Training WDDM Margin',
+    description: (
+      <>
+        Driver-level free VRAM to preserve at the training peak. Increase this on Windows if WDDM paging or desktop
+        pressure causes slowdowns; smart offload will stream more layers to keep the margin free.
+      </>
+    ),
+  },
+  'model.layer_offloading_smart_wddm_hard_gb': {
+    title: 'Training WDDM Hard Floor',
+    description: (
+      <>
+        Emergency driver-level free VRAM floor for training. If realized free drops below this value, smart offload trims
+        cache and demotes resident layers immediately. Keep it at or below the WDDM margin.
+      </>
+    ),
+  },
   'model.layer_offloading_smart_sampling': {
     title: 'Smart Sampling Layout',
     description: (
       <>
         Temporarily replaces the training offload layout with a forward-only,
         byte-budgeted sampling layout, then restores training state. Disabled by default.
+      </>
+    ),
+  },
+  'model.layer_offloading_smart_sampling_working_reserve_gb': {
+    title: 'Sampling VRAM Reserve',
+    description: (
+      <>
+        VRAM kept free for sampling-only transient allocations. -1 = auto; use a fixed value to pin the sampling reserve
+        independently from training.
+      </>
+    ),
+  },
+  'model.layer_offloading_smart_sampling_wddm_margin_gb': {
+    title: 'Sampling WDDM Margin',
+    description: (
+      <>
+        Driver-level free VRAM to preserve during sampling. Increase this if validation images trigger WDDM shared-memory
+        paging or compete with desktop/browser memory.
+      </>
+    ),
+  },
+  'model.layer_offloading_smart_sampling_wddm_hard_gb': {
+    title: 'Sampling WDDM Hard Floor',
+    description: (
+      <>
+        Emergency driver-level free VRAM floor for sampling. The sampling guard demotes resident blocks before predicted
+        peak free crosses this value. Keep it at or below the sampling WDDM margin.
       </>
     ),
   },
@@ -324,6 +380,23 @@ const docs: { [key: string]: ConfigDoc } = {
         recorded per-step access order, so the training thread no longer blocks while staging pageable weights. This can
         sharply reduce step time when offloading is bottlenecked by pageable/pagefile stalls. Enables access tracing
         automatically and keeps a bounded pinned pool sized to available RAM.
+      </>
+    ),
+  },
+  'model.layer_offloading_prefetch_trace_capture': {
+    title: 'Prefetch Trace Capture',
+    description: (
+      <>
+        Optional JSONL output path for replaying real prefetch schedules and observed access streams with
+        scripts/replay_prefetch_trace.py. Leave empty for normal training.
+      </>
+    ),
+  },
+  'model.layer_offloading_prefetch_trace_capture_steps': {
+    title: 'Prefetch Capture Steps',
+    description: (
+      <>
+        Maximum number of steps to write to the prefetch trace capture file. Set 0 for unlimited capture.
       </>
     ),
   },

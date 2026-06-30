@@ -19,7 +19,10 @@ DEFAULT_DATASETS = (
     "live_action_jinx",
     "live_action_body",
     "live_action_jinx_canon",
-    "live_action_krea_synths"
+    "live_action_jinx_head_blue",
+    "live_action_jinx_head_violet",
+    "krea_body_synths",
+    "krea_clothes_synths"
 )
 
 

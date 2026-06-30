@@ -157,17 +157,45 @@ def summarize_record(record: dict, full: bool) -> list[str]:
 
     offload = record.get("smart_training_offload")
     if offload and "diagnostic_error" not in offload:
+        # Peak within-step device footprint / free. New logs carry it explicitly;
+        # for older logs derive it the same way the manager does so the digest
+        # never shows a step-end trough under a "peak" label:
+        #   other = device_used - torch_reserved   (non-allocator, ~constant)
+        #   used_peak = peak_reserved + other ; free_peak = total - used_peak
+        used_peak = offload.get("device_used_peak_gb")
+        free_peak = offload.get("device_free_peak_gb")
+        if used_peak is None and offload.get("peak_reserved_gb") is not None:
+            other = max(
+                0.0,
+                (offload.get("device_used_gb") or 0.0)
+                - (offload.get("torch_reserved_gb") or 0.0),
+            )
+            used_peak = offload["peak_reserved_gb"] + other
+            total = offload.get("device_total_gb")
+            if total is not None:
+                free_peak = max(0.0, total - used_peak)
         lines.append(
             "  offload: managed={ml} resident={res} offloaded={off} "
-            "ring={lr}/{pr} working_reserve={hu}/{ht} alloc={al} reserved={rv} "
-            "peak_reserved={prsv} cached={cg} fp8_fwd={fp8}".format(
+            "ring={lr}/{pr} working_reserve={hp}/{ht} (residual={hu}) alloc={al} reserved={rv} "
+            "peak_reserved={prsv} cached={cg} device_peak={dup}/{dt} free_peak={dfp} fp8_fwd={fp8}".format(
                 ml=offload.get("managed_layers"),
                 res=g(offload.get("planned_resident_gb")),
                 off=g(offload.get("offloaded_cpu_gb")),
                 lr=g(offload.get("live_ring_gb")),
                 pr=g(offload.get("planned_ring_gb")),
-                hu=g(offload.get("working_reserve_used_gb",
-                                 offload.get("working_headroom_used_gb"))),
+                # Peak within-step device footprint / free (what the spill cliff
+                # sees), derived above so old logs are correct too.
+                dup=g(used_peak),
+                dt=g(offload.get("device_total_gb")),
+                dfp=g(free_peak),
+                # Prefer the truthful within-step peak; fall back to the old
+                # trough field for logs written before this metric existed.
+                hp=g(offload.get("working_reserve_peak_gb",
+                                 offload.get("working_reserve_used_gb",
+                                             offload.get("working_headroom_used_gb")))),
+                hu=g(offload.get("working_reserve_residual_gb",
+                                 offload.get("working_reserve_used_gb",
+                                             offload.get("working_headroom_used_gb")))),
                 ht=g(offload.get("training_working_reserve_gb",
                                  offload.get("training_headroom_gb"))),
                 al=g(offload.get("torch_allocated_gb")),
@@ -177,6 +205,20 @@ def summarize_record(record: dict, full: bool) -> list[str]:
                 fp8=offload.get("fp8_training_forward_layers"),
             )
         )
+        if offload.get("bounce_fill_batches") is not None:
+            # Worker-side request count (the "small requests by the workers").
+            # fill_batches = worker lock-cycles; group>1 means block-batched.
+            lines.append(
+                "  worker_fills: fills={f} batches={b} group={grp}({fpb}/batch) "
+                "copy={cs}s@{cg}GB/s".format(
+                    f=offload.get("bounce_fills"),
+                    b=offload.get("bounce_fill_batches"),
+                    grp=offload.get("bounce_fill_group_size"),
+                    fpb=g(offload.get("bounce_fills_per_batch"), 1),
+                    cs=g(offload.get("bounce_copy_s"), 1),
+                    cg=g(offload.get("bounce_copy_gbps")),
+                )
+            )
     elif offload:
         lines.append(f"  offload: diagnostic_error={offload.get('diagnostic_error')}")
 

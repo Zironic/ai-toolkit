@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { PrismaClient } from '@prisma/client';
+import { loadDiskJobConfig } from '@/server/jobs';
 
 const prisma = new PrismaClient();
 
@@ -12,6 +13,15 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
 
   if (!job) {
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+  }
+
+  // reload config from disk if available, so edits to .job_config.json take effect on next run
+  const diskConfig = await loadDiskJobConfig(job.name);
+  if (diskConfig !== null && diskConfig !== job.job_config) {
+    await prisma.job.update({
+      where: { id: jobID },
+      data: { job_config: diskConfig },
+    });
   }
 
   // get highest queue position

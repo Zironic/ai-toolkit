@@ -329,6 +329,7 @@ class _OffloadTrace:
         self.recording: list = []
         self.frozen: Optional[list] = None
         self.schedule_by_shape_key: dict = {}
+        self.compatible_fallback_blocked_shape_keys = set()
         self.current_shape_key = None
         self.cursor = 0
         self.step_index = 0
@@ -393,6 +394,7 @@ class _OffloadTrace:
         if self.mode == "recording":
             self.frozen = self.recording
             self.schedule_by_shape_key[self.current_shape_key] = self.frozen
+            self.compatible_fallback_blocked_shape_keys.discard(self.current_shape_key)
             self.recording = []
             self.version += 1
             self._report_frozen()
@@ -414,7 +416,9 @@ class _OffloadTrace:
                         f"{self.consecutive_divergences} divergences"
                     )
                     self.schedule_by_shape_key.pop(self.current_shape_key, None)
+                    self.compatible_fallback_blocked_shape_keys.add(self.current_shape_key)
                     self.frozen = None
+                    self.version += 1
                     self.consecutive_divergences = 0
             else:
                 self.consecutive_divergences = 0
@@ -478,45 +482,116 @@ def record_weight_access(
     _OFFLOAD_TRACE.record(layer_key, operation, fp8_bytes, materialized_bytes)
 
 
+
+def _trace_execution_order_key(shape_key):
+    """Part of an offload shape key that controls access order, not memory size."""
+    if (
+        isinstance(shape_key, tuple)
+        and len(shape_key) == 2
+        and isinstance(shape_key[1], tuple)
+    ):
+        return shape_key[1]
+    return shape_key
+
+
+def _compatible_frozen_trace(shape_key):
+    if shape_key in _OFFLOAD_TRACE.compatible_fallback_blocked_shape_keys:
+        return None
+    target_order_key = _trace_execution_order_key(shape_key)
+    for candidate_key, frozen in reversed(_OFFLOAD_TRACE.schedule_by_shape_key.items()):
+        if _trace_execution_order_key(candidate_key) == target_order_key:
+            return frozen
+    return None
+
 def offload_trace_report() -> Optional[str]:
     return _OFFLOAD_TRACE.report()
 
 
 def offload_trace_schedule(shape_key=None) -> Optional[list]:
-    """Positional layer-key access order from the frozen trace, or None.
+    """Positional semantic access order from the frozen trace, or None.
 
     When a new resolution has not frozen its own trace yet, replay the latest
-    full trace from another shape instead of the cold unique-layer list. That is
-    usually closer to the real repeated macro-step access stream and avoids a
-    220-entry schedule against 800-1500 actual accesses.
+    full trace from another shape instead of the cold unique-layer list. Schedule
+    entries deliberately include operation and per-layer occurrence so local
+    resync cannot jump from a forward access to a later backward/recompute access
+    of the same layer key.
     """
     frozen = _OFFLOAD_TRACE.schedule_by_shape_key.get(shape_key)
     if frozen is None and shape_key == _OFFLOAD_TRACE.current_shape_key:
         frozen = _OFFLOAD_TRACE.frozen
-    if frozen is None and _OFFLOAD_TRACE.schedule_by_shape_key:
-        frozen = next(reversed(_OFFLOAD_TRACE.schedule_by_shape_key.values()))
+    if frozen is None:
+        frozen = _compatible_frozen_trace(shape_key)
     if frozen is None:
         return None
-    return [access.layer_key for access in frozen]
+    occurrences = collections.Counter()
+    schedule = []
+    for access in frozen:
+        occurrence = occurrences[access.layer_key]
+        occurrences[access.layer_key] += 1
+        schedule.append((access.layer_key, access.operation, occurrence))
+    return schedule
 
+
+def offload_trace_schedule_confidence(shape_key=None) -> str:
+    if _OFFLOAD_TRACE.schedule_by_shape_key.get(shape_key) is not None:
+        return "exact"
+    if shape_key == _OFFLOAD_TRACE.current_shape_key and _OFFLOAD_TRACE.frozen is not None:
+        return "exact"
+    if _compatible_frozen_trace(shape_key) is not None:
+        return "compatible"
+    return "cold"
 
 def offload_trace_version() -> int:
     """Monotonic id of the current frozen trace (changes on re-record)."""
     return _OFFLOAD_TRACE.version
 
 
-def reset_offload_trace_for_current_step() -> None:
-    """Re-record after an execution-policy change.
+def mark_transfer_plan_dirty(reason: str = "") -> None:
+    """Mark transfer planning dirty without dropping execution traces.
 
-    Layout changes such as layer promotion/demotion alter which module calls are
-    streamed for every resolution, not just the currently active shape. Drop all
-    frozen schedules so the bounce pool cannot replay a trace from a stale
-    streamed-layer set.
+    Layout changes such as layer promotion/demotion alter which accesses require
+    H2D transfer, but they normally do not alter the execution order. Keep frozen
+    schedules so the bounce pool can continue using them as hints; bump the
+    version so consumers refresh derived transfer state at the next boundary.
     """
     trace = _OFFLOAD_TRACE
     if not trace.enabled:
         return
+    trace.version += 1
+    trace.cursor = 0
+    trace.diverged_this_step = False
+    trace.first_divergence = None
+
+
+def invalidate_offload_trace_for_shape(shape_key=None) -> None:
+    """Drop only one exact trace and block compatible fallback for that shape.
+
+    Used when a best-effort compatible schedule proves bad for the current
+    resolution. Other shapes with the same execution policy keep their traces.
+    """
+    trace = _OFFLOAD_TRACE
+    if not trace.enabled:
+        return
+    key = trace.current_shape_key if shape_key is None else shape_key
+    trace.schedule_by_shape_key.pop(key, None)
+    trace.compatible_fallback_blocked_shape_keys.add(key)
+    if key == trace.current_shape_key:
+        trace.frozen = None
+        trace.recording = []
+        trace.cursor = 0
+        trace.diverged_this_step = False
+        trace.first_divergence = None
+        trace.consecutive_divergences = 0
+        trace.mode = "recording"
+    trace.version += 1
+
+def invalidate_execution_trace(reason: str = "") -> None:
+    """Drop execution traces after a real access-order policy change."""
+    trace = _OFFLOAD_TRACE
+    if not trace.enabled:
+        return
     trace.schedule_by_shape_key.clear()
+    trace.compatible_fallback_blocked_shape_keys.clear()
     trace.version += 1
     trace.frozen = None
     trace.recording = []
@@ -525,7 +600,6 @@ def reset_offload_trace_for_current_step() -> None:
     trace.first_divergence = None
     trace.consecutive_divergences = 0
     trace.mode = "recording"
-
 
 def set_offload_trace_enabled(enabled: bool) -> None:
     # _TRACE_ENABLED gates the per-access recording on the autograd hot path;
@@ -607,7 +681,7 @@ def _stage_forward_weight(
     ticket = None
     src_w, src_b = weight_cpu, bias_cpu
     if pool is not None:
-        src_w, src_b, ticket = pool.acquire(layer_key, weight_cpu, bias_cpu)
+        src_w, src_b, ticket = pool.acquire(layer_key, weight_cpu, bias_cpu, operation=operation)
     prof = (
         _begin_layer_profile(src_w, src_b, layer_key, operation)
         if _PROFILE_ENABLED else None
@@ -721,7 +795,7 @@ def _stage_backward_weight(
             state["backward_reuse_bytes"] += _profile_bytes(weight_cpu)
             pool = get_prefetch_pool(device)
             if pool is not None:
-                pool.consume_without_transfer(layer_key)
+                pool.consume_without_transfer(layer_key, operation="backward")
             return reuse_idx, candidate
     state["backward_reuse_misses"] += 1
     idx, weight, _ = _stage_forward_weight(

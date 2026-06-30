@@ -23,10 +23,14 @@ from .manager_modules import (
     offload_step_abort,
     offload_trace_report,
     offload_trace_schedule,
+    offload_trace_schedule_confidence,
     offload_trace_version,
-    reset_offload_trace_for_current_step,
+    mark_transfer_plan_dirty,
+    invalidate_offload_trace_for_shape,
+    invalidate_execution_trace,
     set_offload_trace_enabled,
     set_fp8_grad_input_enabled,
+    record_weight_access,
 )
 from . import bounce_pool
 import random
@@ -120,6 +124,7 @@ class MemoryManager:
             * 1024 ** 3
         )
         self._prefetch_pool = None
+        self._resident_trace_hooks = {}
 
     def memory_managed_to(self, *args, **kwargs):
         # check for a dtype argument
@@ -254,12 +259,13 @@ class MemoryManager:
                     module._memory_manager.unmanaged_modules.append(child_module)
                 else:
                     continue
-        # Assign each managed layer a stable identity from its module path. The
-        # trace scheduler keys on this rather than id(weight), which would not
+        # Assign each streamable candidate a stable identity from its module path.
+        # The trace scheduler keys on this rather than id(weight), which would not
         # survive the Parameter replacement that sampling detach/restore does.
         for name, child in module.named_modules():
-            if hasattr(child, "_layer_memory_manager"):
+            if child.__class__.__name__ in LINEAR_MODULES or child.__class__.__name__ in CONV_MODULES:
                 child._mm_layer_key = name or child.__class__.__name__
+        cls._refresh_resident_trace_hooks(module, module._memory_manager)
         if cls._diagnostics_enabled():
             gib = 1024 ** 3
             managed = sum(
@@ -289,6 +295,7 @@ class MemoryManager:
         if pool is not None:
             bounce_pool.destroy_pool(pool.device)
             module._memory_manager._prefetch_pool = None
+        cls._clear_resident_trace_hooks(module._memory_manager)
 
         for unmanaged in module._memory_manager.unmanaged_modules:
             try:
@@ -496,6 +503,114 @@ class MemoryManager:
                 total += cls._tensor_storage_bytes(param.data)
         return total
 
+    @staticmethod
+    def _first_tensor_output(output):
+        if isinstance(output, torch.Tensor):
+            return output
+        if isinstance(output, (list, tuple)):
+            for item in output:
+                found = MemoryManager._first_tensor_output(item)
+                if found is not None:
+                    return found
+        if isinstance(output, dict):
+            for item in output.values():
+                found = MemoryManager._first_tensor_output(item)
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _trace_bytes_for_module(module):
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            return 0, 0
+        try:
+            storage = MemoryManager._tensor_storage_bytes(weight.data)
+            materialized = weight.numel() * 2 if _is_quantized_tensor(weight.data) else storage
+            return storage, materialized
+        except Exception:
+            return 0, 0
+
+    @classmethod
+    def _install_resident_trace_hook(cls, module, key):
+        fp8_bytes, materialized_bytes = cls._trace_bytes_for_module(module)
+
+        def _pre_hook(_module, _inputs, _key=key, _fp8=fp8_bytes, _mat=materialized_bytes):
+            record_weight_access(_key, "forward", _fp8, _mat)
+
+        def _post_hook(_module, _inputs, output, _key=key, _fp8=fp8_bytes, _mat=materialized_bytes):
+            tensor = MemoryManager._first_tensor_output(output)
+            if tensor is None or not getattr(tensor, "requires_grad", False):
+                return
+
+            def _backward_hook(grad):
+                record_weight_access(_key, "backward", _fp8, _mat)
+                return grad
+
+            try:
+                tensor.register_hook(_backward_hook)
+            except Exception:
+                pass
+
+        return (
+            module.register_forward_pre_hook(_pre_hook),
+            module.register_forward_hook(_post_hook),
+        )
+
+    @classmethod
+    def _clear_resident_trace_hooks(cls, mm):
+        hooks = getattr(mm, "_resident_trace_hooks", None)
+        if not hooks:
+            return
+        for handles in list(hooks.values()):
+            for handle in handles:
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+        hooks.clear()
+
+    @classmethod
+    def _refresh_resident_trace_hooks(cls, module, mm):
+        """Trace resident streamable layers so future demotion can reuse order."""
+        if mm is None:
+            return
+        args = getattr(mm, "_attach_args", {}) or {}
+        pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
+        current = getattr(mm, "_resident_trace_hooks", None)
+        if current is None:
+            current = {}
+            mm._resident_trace_hooks = current
+        wanted = {}
+        for item in cls._training_layout_candidates(
+            module, args.get("ignore_modules", []), pinned_keys
+        ):
+            child = item["module"]
+            if item["managed"]:
+                continue
+            key = item["name"]
+            child._mm_layer_key = key
+            wanted[id(child)] = (child, key)
+        for child_id in list(current):
+            if child_id in wanted:
+                continue
+            for handle in current.pop(child_id):
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+        for child_id, (child, key) in wanted.items():
+            existing_key = getattr(child, "_mm_resident_trace_key", None)
+            if child_id in current and existing_key == key:
+                continue
+            if child_id in current:
+                for handle in current.pop(child_id):
+                    try:
+                        handle.remove()
+                    except Exception:
+                        pass
+            child._mm_resident_trace_key = key
+            current[child_id] = cls._install_resident_trace_hook(child, key)
     @classmethod
     def _enable_fp8_sampling(cls, module):
         """Install native FP8 forwards without bypassing attached LoRA modules."""
@@ -613,8 +728,40 @@ class MemoryManager:
                 return ".".join(parts[: i + 1])
         return name
 
+    @staticmethod
+    def _block_parent_of(group_key: str):
+        """Parent prefix of a ``prefix.N`` block group key, else ``None``.
+
+        ``blocks.7`` -> ``blocks``; ``final_layer.proj`` (no trailing index)
+        -> ``None``. Used to tell a repeated-block layer from a one-off layer.
+        """
+        head, _, tail = group_key.rpartition(".")
+        if head and tail.isdigit():
+            return head
+        return None
+
     @classmethod
-    def _smart_sampling_plan(cls, module, free_bytes, working_reserve_bytes, ignore_modules):
+    def _streaming_block_parents(cls, group_keys) -> set:
+        """Parents that own >= 2 indexed children (i.e. a ModuleList of blocks).
+
+        A repeated transformer block (``blocks.0`` .. ``blocks.37``) shows up as
+        a parent (``blocks``) with many numeric children. A one-off layer that
+        merely sits at a Sequential index (``final_layer.adaLN_modulation.1``,
+        the only candidate under that parent) does not, so it is not treated as
+        a streaming block.
+        """
+        children: dict = {}
+        for gk in group_keys:
+            parent = cls._block_parent_of(gk)
+            if parent is not None:
+                children.setdefault(parent, set()).add(gk)
+        return {p for p, kids in children.items() if len(kids) >= 2}
+
+    @classmethod
+    def _smart_sampling_plan(
+        cls, module, free_bytes, working_reserve_bytes, ignore_modules,
+        wddm_margin_bytes=0, wddm_hard_bytes=0,
+    ):
         """Comfy-style byte budget, but offloading whole blocks rather than
         individual Linears.
 
@@ -647,7 +794,9 @@ class MemoryManager:
                 group["ids"].append(id(child))
 
         total_model_bytes = cls._module_bytes(module)
-        usable_bytes = max(0, free_bytes - working_reserve_bytes)
+        wddm_hard_bytes = max(0, int(wddm_hard_bytes or 0))
+        wddm_margin_bytes = max(wddm_hard_bytes, int(wddm_margin_bytes or 0))
+        usable_bytes = max(0, free_bytes - working_reserve_bytes - wddm_margin_bytes)
         resident_bytes = total_model_bytes
         offload_ids: set = set()
         offloaded_stream_layers: list = []
@@ -679,6 +828,8 @@ class MemoryManager:
             "ring_bytes": ring_bytes,
             "model_bytes": total_model_bytes,
             "working_reserve_bytes": working_reserve_bytes,
+            "wddm_margin_bytes": wddm_margin_bytes,
+            "wddm_hard_bytes": wddm_hard_bytes,
             "usable_bytes": usable_bytes,
             "fits": fits,
         }
@@ -693,9 +844,11 @@ class MemoryManager:
         must_resident_keys=("tproj.1",),
         resident_floor_gib=2.0,
         wddm_margin_gib=1.5,
+        wddm_hard_gib=None,
         prefetch_healthy=False,
         pinned_resident_keys=None,
         cold_growth=False,
+        block_stream_only=False,
     ):
         """Choose training-resident layers with stream buffers before growth."""
         ignore_modules = list(ignore_modules or [])
@@ -715,7 +868,14 @@ class MemoryManager:
             0, device_used_bytes - torch.cuda.memory_reserved(device)
         )
         working_reserve_bytes = int(float(working_reserve_gib) * 1024 ** 3)
-        wddm_margin_bytes = int(float(wddm_margin_gib) * 1024 ** 3)
+        wddm_hard_gib = (
+            float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0"))
+            if wddm_hard_gib is None
+            else float(wddm_hard_gib)
+        )
+        wddm_margin_gib = max(float(wddm_margin_gib), wddm_hard_gib)
+        wddm_margin_bytes = int(wddm_margin_gib * 1024 ** 3)
+        wddm_hard_bytes = int(wddm_hard_gib * 1024 ** 3)
         usable_bytes = max(0, free_bytes - wddm_margin_bytes - working_reserve_bytes)
         total_model_bytes = cls._module_bytes(module)
         names = {id(child): name for name, child in module.named_modules()}
@@ -735,14 +895,36 @@ class MemoryManager:
         non_candidate_bytes = max(0, total_model_bytes - candidate_resident_bytes)
         must_tokens = tuple(must_resident_keys or ())
         pinned_keys = set(pinned_resident_keys or ())
+
+        # Block-only streaming: in ``block_stream_only`` mode every layer that is
+        # NOT part of a repeated transformer block (a ModuleList of indexed
+        # entries, e.g. ``blocks.0`` .. ``blocks.37``) is forced resident, so the
+        # streaming ring only ever moves uniform block-sized groups. This trades
+        # a little resident VRAM for far fewer scattered small transfers — one-off
+        # layers (embedders, the final projection, standalone Sequential Linears)
+        # otherwise each submit a tiny copy and flood the offload worker with
+        # high-frequency requests.
+        block_parents = cls._streaming_block_parents(
+            cls._offload_group_key(item["key"]) for item in candidates
+        )
+
+        def _is_streaming_block(group_key):
+            parent = cls._block_parent_of(group_key)
+            return parent is not None and parent in block_parents
+
         resident = []
         offloaded = []
         for item in candidates:
             group_key = cls._offload_group_key(item["key"])
             item["group_key"] = group_key
             item["pinned_resident"] = group_key in pinned_keys
-            if item["pinned_resident"] or any(
-                token and token in item["key"] for token in must_tokens
+            item["block_stream_resident"] = bool(
+                block_stream_only and not _is_streaming_block(group_key)
+            )
+            if (
+                item["pinned_resident"]
+                or item["block_stream_resident"]
+                or any(token and token in item["key"] for token in must_tokens)
             ):
                 resident.append(item)
             else:
@@ -827,6 +1009,12 @@ class MemoryManager:
             "must_resident_bytes": must_resident_bytes,
             "pinned_resident_bytes": pinned_resident_bytes,
             "pinned_resident_keys": set(pinned_keys),
+            "block_stream_only": bool(block_stream_only),
+            "block_stream_resident_bytes": sum(
+                item["resident_bytes"]
+                for item in resident
+                if item.get("block_stream_resident")
+            ),
             "training_compile_readiness": compile_readiness,
             "generic_resident_bytes": generic_resident_bytes,
             "ring_bytes": gpu_stream_budget_bytes,
@@ -834,6 +1022,7 @@ class MemoryManager:
             "gpu_stream_budget_bytes": gpu_stream_budget_bytes,
             "working_reserve_bytes": working_reserve_bytes,
             "wddm_margin_bytes": wddm_margin_bytes,
+            "wddm_hard_bytes": wddm_hard_bytes,
             "system_reserve_bytes": system_reserve_bytes,
             "usable_bytes": usable_bytes,
             "free_bytes": free_bytes,
@@ -875,7 +1064,20 @@ class MemoryManager:
             return current_gib + retreat_gib, new_danger, "retreat"
 
         target_gib = measured_peak_gib + pad_gib
-        # 2. Shrink only with proven slack: after a step we must still clear the
+        # 2. RESPECT the working set: the activation peak is a physical given, not
+        #    something to minimise. If the reserve sits BELOW what the backward
+        #    actually peaked at, climb straight up to meet it — growing the reserve
+        #    only sets aside more FREE VRAM, so it is always safe. This is the
+        #    branch that was missing: the shrink path below only ever walked DOWN
+        #    toward the target, so a reserve seeded under the real peak (auto seeds
+        #    ~2-3 GiB) could never reach it. It then under-reserved the activations,
+        #    which overflowed into the allocator's prefetch/cache every step →
+        #    eviction → bounce misses → prefetch never healthy → resident growth
+        #    locked out. Meeting the measured peak is the root fix.
+        if current_gib < target_gib:
+            return target_gib, danger_gib, "grow"
+
+        # 3. Shrink only with proven slack: after a step we must still clear the
         #    stop-line, we must stay at/above the real backward need, and we must
         #    not approach a known danger level.
         if min_device_free_gib > wddm_stop_gib + step_gib and current_gib > target_gib:
@@ -884,8 +1086,122 @@ class MemoryManager:
                 return current_gib, danger_gib, "danger_locked"
             return candidate, danger_gib, "shrink"
 
-        # 3. Settled — at the reserve the measurement and margin both endorse.
+        # 4. Settled — at the reserve the measurement and margin both endorse.
         return current_gib, danger_gib, "hold"
+
+    @staticmethod
+    def _prefetch_trace_invalid(
+        *,
+        schedule_len: int,
+        consume_pos: int,
+        lookahead: int,
+        hard_miss_rate: float,
+        mismatch_rate: float,
+        duplicate_key_block_rate: float,
+        hard_miss_threshold: float = 0.25,
+        mismatch_threshold: float = 0.10,
+    ) -> bool:
+        if schedule_len <= 0:
+            return False
+        if consume_pos > schedule_len + max(1, lookahead) and hard_miss_rate > hard_miss_threshold:
+            return True
+        if mismatch_rate > mismatch_threshold:
+            return True
+        if duplicate_key_block_rate > mismatch_threshold:
+            return True
+        return False
+
+    @staticmethod
+    def _prefetch_recovery_action(*, prefetch_missing: bool, prefetch_invalid: bool):
+        if prefetch_invalid:
+            return "reset_prefetch_trace"
+        if prefetch_missing:
+            return "seed_prefetch_schedule"
+        return None
+
+    @staticmethod
+    def _prefetch_allows_resident_growth(
+        *,
+        pool_present: bool,
+        schedule_confidence: str,
+        prefetch_healthy: bool,
+    ) -> bool:
+        """Whether prefetch evidence is strong enough to grow residency.
+
+        Compatible traces are useful hints for hiding transfers, but they are not
+        proof that the current execution/memory profile is stable enough to add
+        resident pressure.
+        """
+        if not pool_present:
+            return True
+        if schedule_confidence not in ("exact", "observed"):
+            return False
+        return bool(prefetch_healthy)
+
+    @staticmethod
+    def _training_working_reserve_signal(
+        measured_peak_gib,
+        working_ema_gib,
+        *,
+        steps,
+        stable_windows,
+        min_working_reserve_gib,
+        pad_gib,
+    ):
+        """Per-step target signal for the working_reserve decision (pure, CPU-testable).
+
+        ``measured_peak_gib`` MUST be the truthful within-step activation peak
+        (``max_memory_allocated - resident - ring``), not the step-end residual.
+        Feeding the residual here was the bug that made auto-working_reserve "not
+        work": the residual reads the trough (~1 GiB, after the backward graph
+        frees) while the real peak is several GiB, so the controller shrank the
+        budget below the activation footprint and spilled.
+
+        Once a bucket is warmed up (``steps >= stable_windows``) we drive off the
+        smoothed peak so single-step jitter does not move the reserve; before that,
+        off the raw peak. Floored at ``min_working_reserve - pad`` so a quiet
+        bucket cannot starve the reserve below the configured minimum.
+        """
+        if steps >= stable_windows and working_ema_gib is not None:
+            return max(
+                working_ema_gib, measured_peak_gib, min_working_reserve_gib - pad_gib
+            )
+        return measured_peak_gib
+
+    @staticmethod
+    def _training_timing_spill_floor(
+        step_time_s,
+        best_step_time_s,
+        min_device_free_gib,
+        *,
+        steps,
+        warmup_steps=4,
+        slowdown_ratio=3.0,
+        max_signal_free_gib=2.0,
+        pad_gib=0.25,
+    ):
+        """Infer a learned WDDM hard floor from a catastrophic timing cliff.
+
+        WDDM spill is often silent: no OOM, just a sudden multi-x slowdown once
+        the committed footprint crosses the driver cliff. Treat timing as WDDM
+        evidence only after a bucket has a stable baseline and the measured
+        peak-free signal is already near the configured safety band.
+        """
+        if step_time_s is None or best_step_time_s is None:
+            return None
+        try:
+            step_time_s = float(step_time_s)
+            best_step_time_s = float(best_step_time_s)
+            min_device_free_gib = float(min_device_free_gib)
+        except (TypeError, ValueError):
+            return None
+        if steps < int(warmup_steps) or best_step_time_s <= 0.0:
+            return None
+        if step_time_s < best_step_time_s * float(slowdown_ratio):
+            return None
+        if min_device_free_gib > float(max_signal_free_gib):
+            return None
+        return max(0.0, min_device_free_gib + float(pad_gib))
 
     @staticmethod
     def _training_layout_action(
@@ -1026,10 +1342,11 @@ class MemoryManager:
         if hasattr(child, "_memory_management_device"):
             del child._memory_management_device
         del child._layer_memory_manager
+        cls._refresh_resident_trace_hooks(lmm.manager.module, lmm.manager)
         return True
 
     @classmethod
-    def demote_layer(cls, child, manager):
+    def demote_layer(cls, child, manager, layer_key=None):
         """Stream one resident layer, in place (resident -> offloaded).
 
         Reuses the per-layer manager attach, which moves ``param.data`` to
@@ -1046,14 +1363,18 @@ class MemoryManager:
             ConvLayerMemoryManager.attach(child, manager)
         else:
             return False
-        child._mm_layer_key = getattr(child, "_mm_layer_key", None) or name
+        child._mm_layer_key = layer_key or getattr(child, "_mm_layer_key", None) or name
+        cls._refresh_resident_trace_hooks(manager.module, manager)
         return True
 
     @classmethod
     def attach_smart_training(
         cls, module, device, working_reserve_gib=2.0, ignore_modules=None,
+        wddm_margin_gib=None,
+        wddm_hard_gib=None,
         fp8_training_forward=False,
         pinned_resident_keys=None,
+        block_stream_only=False,
     ):
         ignore_modules = list(ignore_modules or [])
         pinned_resident_keys = set(pinned_resident_keys or ())
@@ -1076,10 +1397,21 @@ class MemoryManager:
             )
         plan = cls.smart_training_plan(
             module, device, working_reserve_gib, ignore_modules,
+            wddm_margin_gib=(
+                float(_env("AI_TOOLKIT_TRAINING_WDDM_MARGIN_GIB", "1.0"))
+                if wddm_margin_gib is None
+                else wddm_margin_gib
+            ),
+            wddm_hard_gib=(
+                float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0"))
+                if wddm_hard_gib is None
+                else wddm_hard_gib
+            ),
             pinned_resident_keys=pinned_resident_keys,
             # Manual working_reserve has no live loop to climb later, so fill the
             # surplus at attach. Auto working_reserve leaves the climb to the live loop.
             cold_growth=not auto_working_reserve,
+            block_stream_only=block_stream_only,
         )
         cls.attach(
             module,
@@ -1091,6 +1423,7 @@ class MemoryManager:
         )
         module._memory_manager._smart_training_plan = plan
         module._memory_manager._training_pinned_resident_keys = set(pinned_resident_keys)
+        module._memory_manager._training_block_stream_only = bool(block_stream_only)
         module._memory_manager._training_autotune_enabled = auto_working_reserve
         module._memory_manager._training_autotune_state = {
             "current_working_reserve_gib": plan["working_reserve_bytes"] / (1024 ** 3),
@@ -1134,11 +1467,16 @@ class MemoryManager:
             f"compile_ready={(plan.get('training_compile_readiness') or {}).get('ready_blocks', 0)}/"
             f"{(plan.get('training_compile_readiness') or {}).get('pinned_blocks', 0)} blocks "
             f"generic_resident={plan['generic_resident_bytes'] / gib:.2f} GiB "
-            f"streamed_layers={plan['offloaded_layers']}/{plan['candidate_layers']} "
+            + (
+                f"block_stream_only_resident={plan.get('block_stream_resident_bytes', 0) / gib:.2f} GiB "
+                if plan.get("block_stream_only") else ""
+            )
+            + f"streamed_layers={plan['offloaded_layers']}/{plan['candidate_layers']} "
             f"gpu_stream={plan['gpu_stream_budget_bytes'] / gib:.2f}/"
             f"{plan['gpu_stream_need_bytes'] / gib:.2f} GiB "
             f"training_working_reserve={plan['working_reserve_bytes'] / gib:.2f} GiB "
             f"wddm_margin={plan['wddm_margin_bytes'] / gib:.2f} GiB "
+            f"wddm_hard={plan.get('wddm_hard_bytes', 0) / gib:.2f} GiB "
             f"free={plan['free_bytes'] / gib:.2f} GiB "
             f"resident_growth_allowed={plan['resident_growth_allowed']} "
             f"blocked={plan['resident_growth_blocked_reason']} "
@@ -1191,12 +1529,21 @@ class MemoryManager:
             working_reserve_bytes = int(old_plan.get("working_reserve_bytes", 0))
         else:
             working_reserve_bytes = int(float(working_reserve_gib) * gib)
-        wddm_margin_bytes = int(
+        wddm_hard_bytes = int(
             old_plan.get(
-                "wddm_margin_bytes",
-                float(_env("AI_TOOLKIT_TRAINING_WDDM_MARGIN_GIB", "1.0"))
-                * gib,
+                "wddm_hard_bytes",
+                float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0")) * gib,
             )
+        )
+        wddm_margin_bytes = max(
+            wddm_hard_bytes,
+            int(
+                old_plan.get(
+                    "wddm_margin_bytes",
+                    float(_env("AI_TOOLKIT_TRAINING_WDDM_MARGIN_GIB", "1.0"))
+                    * gib,
+                )
+            ),
         )
         try:
             free_bytes = cls._torch_allocatable_bytes(device)
@@ -1252,6 +1599,7 @@ class MemoryManager:
                 "gpu_stream_budget_bytes": gpu_stream_budget_bytes,
                 "working_reserve_bytes": working_reserve_bytes,
                 "wddm_margin_bytes": wddm_margin_bytes,
+                "wddm_hard_bytes": wddm_hard_bytes,
                 "usable_bytes": usable_bytes,
                 "free_bytes": free_bytes,
                 "fits": resident_bytes + stream_need_bytes <= usable_bytes,
@@ -1287,27 +1635,49 @@ class MemoryManager:
         pool = getattr(mm, "_prefetch_pool", None)
         if pool is None:
             return
+        sources = []
         for child in module.modules():
             key = getattr(child, "_mm_layer_key", None)
             if key is not None and hasattr(child, "_layer_memory_manager"):
+                sources.append((key, child))
+        if hasattr(pool, "sync_sources"):
+            pool.sync_sources(sources)
+        else:
+            for key, child in sources:
                 pool.register_source(key, child)
-
     @classmethod
     def _demote_training_layers(cls, module, mm, count, *, largest=True):
         args = getattr(mm, "_attach_args", {}) or {}
         pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
+        layout = list(cls._training_layout_candidates(
+            module, args.get("ignore_modules", []), pinned_keys
+        ))
+        # In block_stream_only mode, non-block resident layers are kept resident
+        # by design — the live controller must not demote them back to streaming,
+        # which would reintroduce the scattered small transfers this mode avoids.
+        block_only = bool(getattr(mm, "_training_block_stream_only", False))
+        block_parents = (
+            cls._streaming_block_parents(item["group_key"] for item in layout)
+            if block_only else set()
+        )
+
+        def _streamable(item):
+            if not block_only:
+                return True
+            return cls._block_parent_of(item["group_key"]) in block_parents
+
         candidates = [
-            item for item in cls._training_layout_candidates(
-                module, args.get("ignore_modules", []), pinned_keys
-            )
-            if not item["managed"] and not item.get("pinned_resident")
+            item for item in layout
+            if not item["managed"]
+            and not item.get("pinned_resident")
+            and _streamable(item)
         ]
         candidates.sort(
             key=lambda item: item["resident_bytes"], reverse=bool(largest)
         )
         changed = 0
         for item in candidates[: max(0, int(count))]:
-            if cls.demote_layer(item["module"], mm):
+            if cls.demote_layer(item["module"], mm, layer_key=item["name"]):
                 changed += 1
         if changed:
             cls._register_training_prefetch_sources(module, mm)
@@ -1357,7 +1727,7 @@ class MemoryManager:
             except Exception:
                 free_after = stop_bytes
             if free_after < stop_bytes:
-                cls.demote_layer(child, mm)
+                cls.demote_layer(child, mm, layer_key=item["name"])
                 cls._refresh_training_fp8_flags(module, mm)
                 cls._refresh_training_plan_from_layout(module, mm)
                 cls.reset_trace_due_to_execution_shape_change()
@@ -1434,7 +1804,7 @@ class MemoryManager:
                 free_after = stop_bytes
             if free_after < stop_bytes:
                 # Overshot the stop line: undo this one and stop the batch.
-                cls.demote_layer(child, mm)
+                cls.demote_layer(child, mm, layer_key=item["name"])
                 break
             promoted += 1
             consumed_bytes += int(item["resident_bytes"])
@@ -1463,6 +1833,8 @@ class MemoryManager:
         step_num=None,
         step_time_s=None,
         did_oom=False,
+        peak_allocated_override=None,
+        peak_reserved_override=None,
     ):
         """Conservative live tuning for smart training offload.
 
@@ -1496,12 +1868,18 @@ class MemoryManager:
         state.setdefault("buckets", {})
         state.setdefault("current_working_reserve_gib", plan["working_reserve_bytes"] / gib)
         state.setdefault("danger_working_reserve_gib", None)
+        state.setdefault("learned_wddm_hard_gib", None)
         state.setdefault("last_step", -1)
         state.setdefault("stopped", False)
         mm._training_autotune_state = state
 
-        wddm_hard_gib = float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0"))
+        wddm_hard_gib = max(
+            float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0")),
+            float(plan.get("wddm_hard_bytes", 0)) / gib,
+        )
         wddm_stop_gib = float(_env("AI_TOOLKIT_TRAINING_WDDM_STOP_GIB", "1.5"))
+        configured_wddm_margin_gib = float(plan.get("wddm_margin_bytes", 0)) / gib
+        wddm_stop_gib = max(wddm_stop_gib, configured_wddm_margin_gib)
         pad_gib = float(_env("AI_TOOLKIT_TRAINING_WORKING_RESERVE_PAD_GIB", "0.5"))
         step_gib = float(_env("AI_TOOLKIT_TRAINING_WORKING_RESERVE_STEP_GIB", "0.5"))
         retreat_gib = float(_env("AI_TOOLKIT_TRAINING_RETREAT_GIB", "1.0"))
@@ -1514,8 +1892,22 @@ class MemoryManager:
         unhealthy_promote_slack_gib = float(
             _env("AI_TOOLKIT_TRAINING_UNHEALTHY_PROMOTE_SLACK_GIB", "1.5")
         )
+        timing_spill_ratio = float(
+            _env("AI_TOOLKIT_TRAINING_WDDM_TIMING_SPILL_RATIO", "3.0")
+        )
+        timing_spill_warmup = int(
+            _env("AI_TOOLKIT_TRAINING_WDDM_TIMING_SPILL_WARMUP_STEPS", "4")
+        )
+        timing_spill_pad_gib = float(
+            _env("AI_TOOLKIT_TRAINING_WDDM_TIMING_SPILL_PAD_GIB", "0.25")
+        )
 
-        diagnostics = cls.training_runtime_diagnostics(module, device)
+        diagnostics = cls.training_runtime_diagnostics(
+            module,
+            device,
+            peak_allocated_override=peak_allocated_override,
+            peak_reserved_override=peak_reserved_override,
+        )
         if diagnostics is None:
             return None
         # Residents on the card that are NOT in our caching allocator: other CUDA
@@ -1564,16 +1956,21 @@ class MemoryManager:
             },
         )
         bucket["steps"] += 1
+        # Smooth and signal off the truthful within-step PEAK, never the step-end
+        # residual (the trough that previously starved the reserve into a spill).
         working_ema = bucket.get("working_ema_gib")
         bucket["working_ema_gib"] = (
-            working_gib if working_ema is None else 0.8 * working_ema + 0.2 * working_gib
+            measured_peak_gib if working_ema is None
+            else 0.8 * working_ema + 0.2 * measured_peak_gib
         )
-        if bucket["steps"] >= stable_windows:
-            working_reserve_signal_gib = max(
-                bucket["working_ema_gib"], working_gib, min_working_reserve_gib - pad_gib
-            )
-        else:
-            working_reserve_signal_gib = measured_peak_gib
+        working_reserve_signal_gib = cls._training_working_reserve_signal(
+            measured_peak_gib,
+            bucket["working_ema_gib"],
+            steps=bucket["steps"],
+            stable_windows=stable_windows,
+            min_working_reserve_gib=min_working_reserve_gib,
+            pad_gib=pad_gib,
+        )
         bucket["peak_working_gib"] = max(
             bucket["peak_working_gib"], working_reserve_signal_gib
         )
@@ -1585,6 +1982,7 @@ class MemoryManager:
         # free margin recovers, so the deadband can authorize promotion again once
         # a transient dip passes instead of latching low forever.
         bucket["last_free_gib"] = min_device_free_gib
+        previous_best_step_time_s = bucket.get("best_step_time_s")
         if step_time_s is not None:
             last_time = bucket.get("last_step_time_s")
             if last_time is None:
@@ -1598,6 +1996,29 @@ class MemoryManager:
             elif bucket["steps"] > 3:
                 bucket["no_improve"] += 1
 
+        learned_floor = cls._training_timing_spill_floor(
+            step_time_s,
+            previous_best_step_time_s,
+            min_device_free_gib,
+            steps=bucket["steps"],
+            warmup_steps=timing_spill_warmup,
+            slowdown_ratio=timing_spill_ratio,
+            max_signal_free_gib=wddm_stop_gib,
+            pad_gib=timing_spill_pad_gib,
+        )
+        timing_spill = learned_floor is not None
+        if timing_spill:
+            state["learned_wddm_hard_gib"] = max(
+                state.get("learned_wddm_hard_gib") or 0.0,
+                learned_floor,
+            )
+        learned_wddm_hard_gib = state.get("learned_wddm_hard_gib")
+        if learned_wddm_hard_gib is not None:
+            wddm_hard_gib = max(wddm_hard_gib, float(learned_wddm_hard_gib))
+            wddm_stop_gib = max(wddm_stop_gib, wddm_hard_gib)
+            plan["wddm_hard_bytes"] = int(wddm_hard_gib * gib)
+            if plan.get("wddm_margin_bytes", 0) < plan["wddm_hard_bytes"]:
+                plan["wddm_margin_bytes"] = plan["wddm_hard_bytes"]
         current_gib = float(state["current_working_reserve_gib"])
         if did_oom:
             action = "oom_retreat"
@@ -1606,9 +2027,15 @@ class MemoryManager:
                 state.get("danger_working_reserve_gib") or 0.0, current_gib
             )
         else:
+            # Worst-case resolution governs the reserve: a quiet low-res step must
+            # not shrink the budget below what the highest-res bucket peaked at.
+            governing_reserve_signal_gib = max(
+                [working_reserve_signal_gib]
+                + [b.get("peak_working_gib", 0.0) for b in state["buckets"].values()]
+            )
             new_working_reserve, danger, action = cls._training_working_reserve_decision(
                 current_gib,
-                working_reserve_signal_gib,
+                governing_reserve_signal_gib,
                 min(bucket["min_device_free_gib"], min_device_free_gib),
                 state.get("danger_working_reserve_gib"),
                 wddm_hard_gib=wddm_hard_gib,
@@ -1636,6 +2063,7 @@ class MemoryManager:
                 "AI_TOOLKIT_TRAINING_WDDM_HOLD_HIGH_GIB", str(wddm_stop_gib + step_gib)
             )
         )
+        wddm_hold_high_gib = max(wddm_hold_high_gib, wddm_stop_gib + step_gib)
         move = cls._training_layout_action(
             governing_free_gib,
             wddm_hard_gib=wddm_hard_gib,
@@ -1643,37 +2071,59 @@ class MemoryManager:
             did_oom=did_oom,
         )
 
+        pool = getattr(mm, "_prefetch_pool", None)
+        schedule_confidence = diagnostics.get("prefetch_schedule_confidence", "cold")
+        prefetch_ok = cls._prefetch_allows_resident_growth(
+            pool_present=pool is not None,
+            schedule_confidence=schedule_confidence,
+            prefetch_healthy=diagnostics.get("prefetch_healthy", False),
+        )
+        prefetch_reason = diagnostics.get("prefetch_reason")
+        prefetch_missing = bool(diagnostics.get("prefetch_missing_schedule", False))
+        prefetch_invalid = bool(diagnostics.get("prefetch_invalid_trace", False))
+        prefetch_recovery_action = cls._prefetch_recovery_action(
+            prefetch_missing=prefetch_missing,
+            prefetch_invalid=prefetch_invalid,
+        )
+        grew_prefetch = False
         changed_layers = 0
         layout_action = "hold"
-        # "hold" (free inside the band) deliberately does nothing: no layer move
-        # and no reset_trace, so the bounce-pool schedule survives and prefetch
-        # reaches the same steady state as a fixed smart_working_reserve.
+        # WDDM safety demotion wins over prefetch repair. Otherwise repair a bad
+        # prefetch schedule even while the memory deadband is holding steady.
         if move == "down":
             changed_layers = cls._demote_training_layers(
                 module, mm, retreat_layers, largest=True
             )
             state["stopped"] = False
             layout_action = "demote" if changed_layers else "demote_unavailable"
+        elif prefetch_recovery_action is not None:
+            if prefetch_invalid:
+                invalidate_offload_trace_for_shape(shape_key)
+            else:
+                cls.reset_trace_due_to_execution_shape_change()
+            if pool is not None and hasattr(pool, "seed_schedule_from_sources"):
+                pool.seed_schedule_from_sources()
+            layout_action = prefetch_recovery_action
         elif move == "up":
             last_step = int(state.get("last_step", -1))
             step_index = int(step_num if step_num is not None else bucket["steps"])
             cadence_ready = last_step < 0 or step_index - last_step >= promote_interval
-            pool = getattr(mm, "_prefetch_pool", None)
-            prefetch_ok = (
-                diagnostics.get("prefetch_healthy", False)
-                or pool is None
-            )
-            prefetch_reason = diagnostics.get("prefetch_reason")
-            prefetch_missing = bool(diagnostics.get("prefetch_missing_schedule", False))
-            prefetch_invalid = bool(diagnostics.get("prefetch_invalid_trace", False))
-            free_slack_gib = min_device_free_gib - wddm_stop_gib
-            grew_prefetch = False
-            if prefetch_missing or prefetch_invalid:
-                cls.reset_trace_due_to_execution_shape_change()
-                if pool is not None and hasattr(pool, "seed_schedule_from_sources"):
-                    pool.seed_schedule_from_sources()
-                layout_action = "seed_prefetch_schedule" if prefetch_missing else "reset_prefetch_trace"
-            elif pool is not None and not prefetch_ok:
+            # Promote on MEASUREMENT + headroom, NOT on prefetch health. move=="up"
+            # already proved peak-free headroom (the deadband); we only require the
+            # working set for this bucket to have been measured first — start
+            # conservative (singletons only) -> measure -> THEN promote blocks. We do
+            # NOT wait for prefetch_healthy: promoting only converts a streamed layer
+            # into a resident one (same demand-load fallback) and REDUCES streaming,
+            # so gating it on hit-rate was a deadlock — under multi-resolution
+            # shuffling the trace never validates, so the controller streamed
+            # everything forever despite free headroom. cadence + "stopped"
+            # hysteresis stop thrash; the trace is re-seeded after each promote.
+            measured = bucket["steps"] >= stable_windows
+            promoting = cadence_ready and measured
+            if pool is not None and not prefetch_ok and not promoting:
+                # Not promoting this step (still measuring, or off-cadence) and the
+                # trace is unhealthy: spend the move improving prefetch coverage so
+                # the layers we are still streaming hide better.
                 max_budget_gib = float(_env("AI_TOOLKIT_BOUNCE_MAX_POOL_GIB", "6.0"))
                 grow_gib = float(_env("AI_TOOLKIT_BOUNCE_GROW_GIB", "0.5"))
                 grow_floor_gib = float(_env("AI_TOOLKIT_BOUNCE_GROW_FREE_FLOOR_GIB", str(wddm_stop_gib)))
@@ -1699,12 +2149,7 @@ class MemoryManager:
                     layout_action = f"grow_prefetch:{prefetch_reason}"
                 else:
                     layout_action = f"prefetch_maxed:{prefetch_reason}"
-            if (
-                not grew_prefetch
-                and not prefetch_missing
-                and not prefetch_invalid
-                and cadence_ready
-            ):
+            if not grew_prefetch and promoting:
                 changed_layers, layout_action = cls._promote_training_layer(
                     module,
                     mm,
@@ -1718,13 +2163,12 @@ class MemoryManager:
                         state["stopped"] = True
                 elif layout_action in ("no_offloaded_layers", "stop_line"):
                     state["stopped"] = True
-            elif not grew_prefetch and (prefetch_missing or prefetch_invalid):
-                pass
             elif grew_prefetch:
                 pass
+            elif not measured:
+                layout_action = f"measuring_working_set:{bucket['steps']}/{stable_windows}"
             else:
                 layout_action = "wait_cadence"
-
         effective_working_reserve = new_working_reserve
         state["current_working_reserve_gib"] = float(effective_working_reserve)
         plan = cls._refresh_training_plan_from_layout(module, mm, effective_working_reserve)
@@ -1742,6 +2186,8 @@ class MemoryManager:
             "min_device_free_gb": min_device_free_gib,
             "measured_peak_gb": measured_peak_gib,
             "danger_working_reserve_gb": state.get("danger_working_reserve_gib"),
+            "learned_wddm_hard_gb": state.get("learned_wddm_hard_gib"),
+            "timing_spill": timing_spill,
         }
         state["last_action"] = f"{action}:{layout_action}"
         if cls._diagnostics_enabled() and (
@@ -1754,7 +2200,8 @@ class MemoryManager:
                 f"resident={result['resident_gb']:.2f} GiB "
                 f"streamed_layers={result['streamed_layers']} "
                 f"min_free={min_device_free_gib:.2f} GiB "
-                f"peak_working={measured_peak_gib:.2f} GiB"
+                f"peak_working={measured_peak_gib:.2f} GiB "
+                f"learned_wddm_hard={state.get('learned_wddm_hard_gib') or 0.0:.2f} GiB"
             )
         return result
 
@@ -1785,12 +2232,17 @@ class MemoryManager:
             return None
 
         gib = 1024 ** 3
-        hard_gib = float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0"))
+        hard_gib = max(
+            float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0")),
+            float(plan.get("wddm_hard_bytes", 0)) / gib,
+        )
         retreat_layers = max(1, int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "3")))
         max_demote = int(_env("AI_TOOLKIT_TRAINING_SAFETY_MAX_DEMOTE", "12"))
 
         free_gib = torch.cuda.mem_get_info(device)[0] / gib
-        if not did_oom and free_gib >= hard_gib:
+        if cls._training_cliff_guard_action(
+            free_gib, wddm_hard_gib=hard_gib, did_oom=did_oom
+        ) == "ok":
             return None  # comfortably inside the budget — no work, no overhead
 
         before_gib = free_gib
@@ -1812,7 +2264,12 @@ class MemoryManager:
         #    out of demotable layers. _demote_training_layers re-syncs and empties
         #    the cache itself, so the re-measure below is accurate.
         demoted = 0
-        while (did_oom or free_gib < hard_gib) and demoted < max_demote:
+        while (
+            cls._training_cliff_guard_action(
+                free_gib, wddm_hard_gib=hard_gib, did_oom=did_oom
+            ) == "reclaim"
+            and demoted < max_demote
+        ):
             changed = cls._demote_training_layers(
                 module, mm, retreat_layers, largest=True
             )
@@ -2056,6 +2513,28 @@ class MemoryManager:
         ram_floor = int(
             float(_env("AI_TOOLKIT_BOUNCE_RAM_FLOOR_GIB", "2.0")) * gib
         )
+        # Block streaming: batch each worker fill over a whole block's worth of
+        # Linears so the per-Linear lock/CV/slot overhead is paid once per block
+        # instead of once per Linear. Derive the group size from the largest
+        # streamed block (in block_stream_only mode every streamed source is a
+        # block layer); an explicit env override always wins.
+        mm = getattr(module, "_memory_manager", None)
+        fill_group_size = None
+        if getattr(mm, "_training_block_stream_only", False):
+            group_counts: dict = {}
+            for key, _child in sources:
+                gk = cls._offload_group_key(key)
+                group_counts[gk] = group_counts.get(gk, 0) + 1
+            block_parents = cls._streaming_block_parents(group_counts.keys())
+            block_counts = [
+                n for gk, n in group_counts.items()
+                if cls._block_parent_of(gk) in block_parents
+            ]
+            if block_counts:
+                fill_group_size = max(block_counts)
+        env_group = _env("AI_TOOLKIT_BOUNCE_FILL_GROUP", "").strip()
+        if env_group:
+            fill_group_size = max(1, int(env_group))
         pool = bounce_pool.create_pool(
             device,
             budget_bytes=budget,
@@ -2063,6 +2542,7 @@ class MemoryManager:
             target_ready_bytes=target_ready,
             num_workers=workers,
             ram_floor_bytes=ram_floor,
+            fill_group_size=fill_group_size,
         )
         cold_start_schedule = []
         for key, child in sources:
@@ -2085,13 +2565,27 @@ class MemoryManager:
             f"[MemoryManager] bounce pool attached: device={device} "
             f"budget={budget / gib:.2f} GiB lookahead={lookahead} "
             f"target_ready={target_ready / gib:.2f} GiB "
-            f"workers={workers} sources={registered} "
+            f"workers={workers} fill_group={pool.fill_group_size} sources={registered} "
             f"cold_start_schedule={len(cold_start_schedule)}{history_text}"
         )
 
     @classmethod
-    def training_runtime_diagnostics(cls, module, device=None):
-        """Snapshot a smart training layout and its actual runtime memory."""
+    def training_runtime_diagnostics(
+        cls,
+        module,
+        device=None,
+        peak_allocated_override=None,
+        peak_reserved_override=None,
+    ):
+        """Snapshot a smart training layout and its actual runtime memory.
+
+        ``peak_allocated_override`` / ``peak_reserved_override`` (bytes) let the
+        caller supply the true within-step peak high-water aggregated across
+        gradient accumulations. The live CUDA peak counter is reset per
+        accumulation by the trainer's resolution sampler, so on multi-accumulation
+        steps it under-reports; pass the step-aggregated peak so the controller
+        governs on the real high-water.
+        """
         while module is not None and not hasattr(module, "_memory_manager"):
             wrapped = getattr(module, "module", None)
             if wrapped is None or wrapped is module:
@@ -2120,9 +2614,30 @@ class MemoryManager:
 
         allocated_bytes = int(memory[0] * 1024 ** 3)
         reserved_bytes = int(memory[1] * 1024 ** 3)
-        working_bytes = max(
+        # Working set has two very different readings:
+        #   - residual: current allocation MINUS resident/ring at the diagnostics
+        #     snapshot (step end). The backward graph is already freed here, so it
+        #     reads the trough — misleadingly small (it is NOT "barely any of the
+        #     budget was needed").
+        #   - peak: the within-step high-water (max_memory_allocated, reset every
+        #     step) MINUS resident/ring. This is the activation/dequant footprint
+        #     that actually has to fit under the reserve.
+        # Report both; the peak is the one that matters for sizing the budget.
+        peak_allocated_bytes = int(
+            peak_allocated_override
+            if peak_allocated_override is not None
+            else torch.cuda.max_memory_allocated(device)
+        )
+        working_residual_bytes = max(
             0, allocated_bytes - plan["resident_bytes"] - ring_bytes
         )
+        working_peak_bytes = max(
+            0, peak_allocated_bytes - plan["resident_bytes"] - ring_bytes
+        )
+        # Kept under the original name for back-compat: the live auto-controller's
+        # EMA reads ``working_reserve_used_gb``; changing its meaning would alter
+        # tuning dynamics, so it stays the residual. New code/logs use the peak.
+        working_bytes = working_residual_bytes
         pool = getattr(mm, "_prefetch_pool", None)
         pool_stats = None
         if pool is not None:
@@ -2137,24 +2652,50 @@ class MemoryManager:
         bounce_hit_rate = pool_stats.get("hit_rate", 0.0) if pool_stats else 0.0
         bounce_acquires = pool_stats.get("acquires", 0) if pool_stats else 0
         bounce_soft_miss = pool_stats.get("soft_misses", 0) if pool_stats else 0
+        bounce_resyncs = pool_stats.get("resyncs", 0) if pool_stats else 0
+        bounce_mismatches = pool_stats.get("mismatches", 0) if pool_stats else 0
+        duplicate_key_blocked = pool_stats.get("duplicate_key_resync_blocked", 0) if pool_stats else 0
         hard_miss_rate = bounce_hard_miss / max(1, bounce_acquires)
         soft_miss_rate = bounce_soft_miss / max(1, bounce_acquires)
+        resync_rate = bounce_resyncs / max(1, bounce_acquires)
+        mismatch_rate = bounce_mismatches / max(1, bounce_acquires)
+        duplicate_key_block_rate = duplicate_key_blocked / max(1, bounce_acquires)
         schedule_len = pool_stats.get("schedule_len", 0) if pool_stats else 0
         consume_pos = pool_stats.get("consume_pos", 0) if pool_stats else 0
         lookahead = pool_stats.get("lookahead", 0) if pool_stats else 0
+        schedule_confidence = pool_stats.get("schedule_confidence", "cold") if pool_stats else "none"
         target_ready_gb = pool_stats.get("target_ready_gib", 0.0) if pool_stats else 0.0
         cpu_wait_s = pool_stats.get("cpu_wait_s", 0.0) if pool_stats else 0.0
+        bounce_fills = pool_stats.get("fills", 0) if pool_stats else 0
+        bounce_fill_batches = pool_stats.get("fill_batches", 0) if pool_stats else 0
+        bounce_fill_group_size = pool_stats.get("fill_group_size", 1) if pool_stats else 1
+        bounce_fills_per_batch = pool_stats.get("fills_per_batch", 0.0) if pool_stats else 0.0
+        bounce_copy_s = pool_stats.get("copy_s", 0.0) if pool_stats else 0.0
+        bounce_copy_gbps = pool_stats.get("copy_gbps", 0.0) if pool_stats else 0.0
         missing_schedule = bool(
             pool_stats is not None
             and schedule_len == 0
             and bounce_acquires > 0
             and hard_miss_rate > 0.25
         )
+        invalid_hard_miss_rate = float(
+            _env("AI_TOOLKIT_BOUNCE_INVALID_HARD_MISS_RATE", "0.25")
+        )
+        invalid_mismatch_rate = float(
+            _env("AI_TOOLKIT_BOUNCE_INVALID_MISMATCH_RATE", "0.10")
+        )
         invalid_trace = bool(
             pool_stats is not None
-            and schedule_len > 0
-            and consume_pos > schedule_len + max(1, lookahead)
-            and hard_miss_rate > 0.25
+            and cls._prefetch_trace_invalid(
+                schedule_len=schedule_len,
+                consume_pos=consume_pos,
+                lookahead=lookahead,
+                hard_miss_rate=hard_miss_rate,
+                mismatch_rate=mismatch_rate,
+                duplicate_key_block_rate=duplicate_key_block_rate,
+                hard_miss_threshold=invalid_hard_miss_rate,
+                mismatch_threshold=invalid_mismatch_rate,
+            )
         )
         capacity_limited = bool(
             pool_stats is not None
@@ -2207,6 +2748,24 @@ class MemoryManager:
             )
         )
         autotune_state = getattr(mm, "_training_autotune_state", {}) or {}
+        # --- Peak-based device footprint (what actually matters for the cliff) --
+        # device_used_gb / device_free_gb (memory[2]/[3]) are read at step END --
+        # the TROUGH, after the backward graph frees. They overstate free because
+        # the activation peak is already gone. The number that governs spill is the
+        # WITHIN-STEP peak: our allocator high-water (peak_reserved, which already
+        # includes resident weights + ring + activations) plus the non-allocator
+        # overhead (CUDA ctx, cuDNN, WDDM/desktop, other apps). That overhead is
+        # measured at the trough but is ~constant across the step since only our
+        # allocator grows during the forward/backward. resident + ring are inside
+        # peak_reserved, so they are never added again.
+        peak_reserved_gb = (
+            peak_reserved_override
+            if peak_reserved_override is not None
+            else torch.cuda.max_memory_reserved(device)
+        ) / 1024 ** 3
+        device_other_gb = max(0.0, memory[2] - memory[1])
+        device_used_peak_gb = peak_reserved_gb + device_other_gb
+        device_free_peak_gb = max(0.0, memory[4] - device_used_peak_gb)
         return {
             "strategy": "smart",
             "managed_layers": sum(
@@ -2239,21 +2798,37 @@ class MemoryManager:
             "cpu_bounce_budget_gb": cpu_bounce_budget_gb,
             "prefetch_pool_budget_gb": (pool_stats or {}).get("budget_gib", 0.0),
             "wddm_margin_gb": plan.get("wddm_margin_bytes", 0) / 1024 ** 3,
+            "wddm_hard_gb": plan.get("wddm_hard_bytes", 0) / 1024 ** 3,
             "resident_growth_allowed": plan.get("resident_growth_allowed", False),
             "resident_growth_blocked_reason": plan.get(
                 "resident_growth_blocked_reason"
             ),
+            "bounce_fills": bounce_fills,
+            "bounce_fill_batches": bounce_fill_batches,
+            "bounce_fill_group_size": bounce_fill_group_size,
+            "bounce_fills_per_batch": bounce_fills_per_batch,
+            "bounce_copy_s": bounce_copy_s,
+            "bounce_copy_gbps": bounce_copy_gbps,
             "bounce_hard_miss": bounce_hard_miss,
             "bounce_soft_miss": bounce_soft_miss,
+            "bounce_resyncs": bounce_resyncs,
+            "bounce_mismatches": bounce_mismatches,
+            "bounce_duplicate_key_resync_blocked": duplicate_key_blocked,
             "bounce_hit_rate": bounce_hit_rate,
             "bounce_hard_miss_rate": hard_miss_rate,
             "bounce_soft_miss_rate": soft_miss_rate,
+            "bounce_resync_rate": resync_rate,
+            "bounce_mismatch_rate": mismatch_rate,
+            "bounce_duplicate_key_resync_block_rate": duplicate_key_block_rate,
             "prefetch_reason": prefetch_reason,
             "prefetch_missing_schedule": missing_schedule,
             "prefetch_invalid_trace": invalid_trace,
+            "prefetch_invalid_hard_miss_threshold": invalid_hard_miss_rate,
+            "prefetch_invalid_mismatch_threshold": invalid_mismatch_rate,
             "prefetch_capacity_limited": capacity_limited,
             "prefetch_budget_limited": budget_limited,
             "prefetch_schedule_len": schedule_len,
+            "prefetch_schedule_confidence": schedule_confidence,
             "prefetch_consume_pos": consume_pos,
             "prefetch_lookahead": lookahead,
             "prefetch_target_ready_gb": target_ready_gb,
@@ -2262,16 +2837,31 @@ class MemoryManager:
             "live_ring_gb": ring_bytes / 1024 ** 3,
             "pinned_cpu_gb": mm.pinned_weight_bytes / 1024 ** 3,
             "training_working_reserve_gb": plan["working_reserve_bytes"] / 1024 ** 3,
+            # Peak within-step working set — the truthful "how much of the reserve
+            # did we actually need" number. Use this when reading logs.
+            "working_reserve_peak_gb": working_peak_bytes / 1024 ** 3,
+            # Step-end residual (trough); kept for back-compat / controller EMA.
             "working_reserve_used_gb": working_bytes / 1024 ** 3,
+            "working_reserve_residual_gb": working_residual_bytes / 1024 ** 3,
+            # Spare budget measured against the PEAK, not the trough, so it no
+            # longer overstates how much reserve is sitting idle.
             "working_reserve_remaining_gb": (
-                plan["working_reserve_bytes"] - working_bytes
+                plan["working_reserve_bytes"] - working_peak_bytes
             ) / 1024 ** 3,
             "torch_allocated_gb": memory[0],
             "torch_reserved_gb": memory[1],
             "allocator_cached_gb": max(0.0, memory[1] - memory[0]),
+            # TROUGH (step-end): looks generous because the activation peak has
+            # already been freed. For "is the cliff close?" read *_peak below.
             "device_used_gb": memory[2],
             "device_free_gb": memory[3],
             "device_total_gb": memory[4],
+            # Non-allocator residents (CUDA ctx, cuDNN, WDDM/desktop, other apps).
+            "device_other_gb": device_other_gb,
+            # PEAK (within-step): the footprint and free margin the spill cliff
+            # actually sees. This is what the auto controller governs on.
+            "device_used_peak_gb": device_used_peak_gb,
+            "device_free_peak_gb": device_free_peak_gb,
             "peak_allocated_gb": (
                 torch.cuda.max_memory_allocated(device) / 1024 ** 3
             ),
@@ -2285,9 +2875,8 @@ class MemoryManager:
             "autotune_working_reserve_gb": autotune_state.get("current_working_reserve_gib"),
             "autotune_danger_working_reserve_gb": autotune_state.get(
                 "danger_working_reserve_gib"
-            ),            "peak_reserved_gb": (
-                torch.cuda.max_memory_reserved(device) / 1024 ** 3
             ),
+            "peak_reserved_gb": peak_reserved_gb,
         }
 
     @staticmethod
@@ -2350,6 +2939,7 @@ class MemoryManager:
         pools = bounce_pool.all_pools()
         if pools:
             schedule = offload_trace_schedule(shape_key=shape_key)
+            confidence = offload_trace_schedule_confidence(shape_key=shape_key)
             version = offload_trace_version()
             warmup_bytes = int(
                 float(_env("AI_TOOLKIT_BOUNCE_WARMUP_GIB", "0.375"))
@@ -2365,7 +2955,7 @@ class MemoryManager:
                     pool.schedule_version != version
                     or getattr(pool, "schedule_shape_key", None) != shape_key
                 ):
-                    pool.set_schedule(schedule)
+                    pool.set_schedule(schedule, confidence=confidence)
                     pool.schedule_version = version
                     pool.schedule_shape_key = shape_key
                 elif schedule is None and (
@@ -2400,18 +2990,21 @@ class MemoryManager:
 
     @staticmethod
     def reset_trace_due_to_execution_shape_change():
-        """Invalidate trace/prefetch after an execution-shape policy change."""
-        reset_offload_trace_for_current_step()
+        """Refresh derived transfer plans after a layout/residency change."""
+        mark_transfer_plan_dirty()
         for pool in bounce_pool.all_pools():
-            pool.set_schedule([])
-            pool.schedule_version = -1
-            pool.schedule_shape_key = None
             pool.abort_step()
 
     @staticmethod
     def reset_offload_trace_for_tuning():
         """Invalidate trace/prefetch after selective-checkpoint policy changes."""
-        MemoryManager.reset_trace_due_to_execution_shape_change()
+        invalidate_execution_trace()
+        for pool in bounce_pool.all_pools():
+            pool.set_schedule([])
+            pool.schedule_version = -1
+            pool.schedule_shape_key = None
+            pool.schedule_confidence = "cold"
+            pool.abort_step()
 
     @staticmethod
     def update_memory_budget_only(
@@ -2443,6 +3036,10 @@ class MemoryManager:
     def set_offload_prefetch_enabled(enabled: bool):
         global _OFFLOAD_PREFETCH_ENABLED
         _OFFLOAD_PREFETCH_ENABLED = bool(enabled)
+
+    @staticmethod
+    def set_offload_prefetch_trace_capture(path=None, steps=None):
+        bounce_pool.configure_trace_capture(path, steps)
 
     @staticmethod
     def set_fp8_grad_input_enabled(enabled: bool):
@@ -2552,10 +3149,108 @@ class MemoryManager:
             return max(int(floor_bytes), int(learned_bytes) + int(pad_bytes)), "measured"
         return int(cold_start_bytes), "cold-start"
 
+    @staticmethod
+    def _sampling_guard_predicted_peak_free(total_b, free_b, reserved_b, peak_reserved_b):
+        """Predicted free VRAM at the next forward's peak (pure, CPU-testable).
+
+        ``other = (total - free) - reserved`` is everything not in our allocator
+        (Windows desktop, other apps, CUDA context). ``peak_reserved`` is our
+        worst forward's reserved high-water. Their sum is what the next peak will
+        occupy; the prediction is ``total`` minus that. It shrinks one-for-one as
+        external use grows — which is the cohabitation guard's trigger. Forward-
+        only sampling never OOMs at the cliff (it pages silently), so the guard
+        watches this instead of waiting for an exception.
+        """
+        other_b = max(0, (total_b - free_b) - reserved_b)
+        return total_b - (peak_reserved_b + other_b)
+
+    @staticmethod
+    def _sampling_step_should_trim(free_before_b, trim_margin_b):
+        """Whether realized device-free warrants a per-step cache trim (pure).
+
+        WDDM pages on the committed footprint silently, so the trigger is realized
+        free, not an allocated-side or peak signal. Trim (empty_cache) is cheap and
+        non-destructive, so the bar is just "free has dropped into the margin."
+        """
+        return free_before_b < trim_margin_b
+
+    @staticmethod
+    def _sampling_step_should_demote(free_after_b, hard_floor_b):
+        """Whether to escalate to a block demote after a trim (pure).
+
+        Only when trimming left free still under the hard floor — i.e. there was
+        no idle cache to reclaim, so the pressure is real (external) and the only
+        way down is to stream a resident block. Demotion adds streaming churn, so
+        it is the last resort.
+        """
+        return free_after_b < hard_floor_b
+
+    @classmethod
+    def _sampling_demote_largest_block(cls, module, plan, target, *, ignore_modules=None):
+        """Stream the largest still-resident sampling block; refresh the plan.
+
+        Returns bytes freed (0 if nothing demotable remains). Shared by the
+        setup-time spill-guard and the live per-image cohabitation guard so both
+        stay consistent: demote whole blocks largest-first, then re-derive the
+        plan's resident/offload accounting from the new layout.
+        """
+        mm = getattr(module, "_memory_manager", None)
+        if mm is None:
+            return 0
+        ignored_ids = {id(m) for m in (ignore_modules or [])}
+        resident_blocks: dict = {}
+        for name, child in module.named_modules():
+            if (
+                id(child) in ignored_ids
+                or hasattr(child, "_layer_memory_manager")
+                or (
+                    child.__class__.__name__ not in LINEAR_MODULES
+                    and child.__class__.__name__ not in CONV_MODULES
+                )
+            ):
+                continue
+            key = cls._offload_group_key(name)
+            entry = resident_blocks.setdefault(key, {"layers": [], "bytes": 0})
+            entry["layers"].append((name, child))
+            entry["bytes"] += cls._direct_module_bytes(child)
+        if not resident_blocks:
+            return 0
+        key = max(resident_blocks, key=lambda k: resident_blocks[k]["bytes"])
+        freed = resident_blocks[key]["bytes"]
+        for name, child in resident_blocks[key]["layers"]:
+            cls.demote_layer(child, mm, layer_key=name)
+        if (
+            target is not None
+            and torch.device(target).type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize(target)
+            torch.cuda.empty_cache()
+        offloaded_stream_layers = []
+        offloaded_ids = set()
+        offloaded_keys = set()
+        resident_bytes = plan["model_bytes"]
+        for name, child in module.named_modules():
+            if not hasattr(child, "_layer_memory_manager"):
+                continue
+            offloaded_ids.add(id(child))
+            offloaded_keys.add(cls._offload_group_key(name))
+            resident_bytes -= cls._direct_module_bytes(child)
+            offloaded_stream_layers.append(cls._stream_bytes(child))
+        plan["offload_ids"] = offloaded_ids
+        plan["offloaded_layers"] = len(offloaded_stream_layers)
+        plan["offloaded_blocks"] = len(offloaded_keys)
+        plan["resident_bytes"] = resident_bytes
+        plan["ring_bytes"] = sum(
+            sorted(offloaded_stream_layers, reverse=True)[:PIPELINE_DEPTH]
+        )
+        return freed
+
     @classmethod
     @contextlib.contextmanager
     def inference_resident(
-        cls, module, device=None, fp8_sampling=False, working_reserve_gib=None
+        cls, module, device=None, fp8_sampling=False, working_reserve_gib=None,
+        wddm_margin_gib=None, wddm_hard_gib=None,
     ):
         """Temporarily make an offloaded module fully GPU-resident for a forward-only run.
 
@@ -2616,7 +3311,13 @@ class MemoryManager:
         # Mutable teardown state shared with the mid-denoise demote path, so the
         # finally block disables whatever fp8 forwards are CURRENTLY installed
         # (resident ones, or the streamed set after an emergency demote).
-        sampling_state = {"fp8_restores": fp8_restores, "fully_streamed": False}
+        sampling_state = {
+            "fp8_restores": fp8_restores,
+            "fully_streamed": False,
+            "trim_count": 0,
+            "trim_freed_bytes": 0,
+            "trim_demotes": 0,
+        }
 
         def _restore_offload():
             _FP8_STATS["enabled"] = False
@@ -2694,12 +3395,33 @@ class MemoryManager:
             floor_bytes=working_reserve_floor,
             pad_bytes=working_reserve_pad,
         )
+        wddm_hard_bytes = int(
+            float(
+                _env("AI_TOOLKIT_SAMPLING_WDDM_HARD_GIB", "1.0")
+                if wddm_hard_gib is None
+                else wddm_hard_gib
+            )
+            * gib
+        )
+        wddm_margin_bytes = int(
+            max(
+                float(
+                    _env("AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB", "1.0")
+                    if wddm_margin_gib is None
+                    else wddm_margin_gib
+                ),
+                wddm_hard_bytes / gib,
+            )
+            * gib
+        )
         free_bytes = int(after_clear[3] * gib) if after_clear is not None else 0
         plan = cls._smart_sampling_plan(
             module,
             free_bytes,
             working_reserve_bytes,
             args.get("ignore_modules", []),
+            wddm_margin_bytes=wddm_margin_bytes,
+            wddm_hard_bytes=wddm_hard_bytes,
         )
 
         if diagnostics:
@@ -2711,6 +3433,8 @@ class MemoryManager:
                 f"transfer_reserve={plan['ring_bytes'] / gib:.2f} GiB "
                 f"sampling_working_reserve={plan['working_reserve_bytes'] / gib:.2f} GiB "
                 f"({working_reserve_source}) "
+                f"wddm_margin={plan['wddm_margin_bytes'] / gib:.2f} GiB "
+                f"wddm_hard={plan.get('wddm_hard_bytes', 0) / gib:.2f} GiB "
                 f"free={free_bytes / gib:.2f} GiB"
             )
 
@@ -2759,9 +3483,9 @@ class MemoryManager:
             and torch.cuda.is_available()
         )
         if retreat_cuda:
-            wddm_hard_bytes = int(
-                float(_env("AI_TOOLKIT_SAMPLING_WDDM_HARD_GIB", "1.0"))
-                * gib
+            wddm_hard_bytes = max(
+                int(float(_env("AI_TOOLKIT_SAMPLING_WDDM_HARD_GIB", "1.0")) * gib),
+                int(plan.get("wddm_hard_bytes", 0)),
             )
             # Room for the denoising working set (working_reserve) plus the spill cushion.
             wddm_margin_bytes = working_reserve_bytes + wddm_hard_bytes
@@ -2775,66 +3499,26 @@ class MemoryManager:
                         ignore_modules=args.get("ignore_modules", []),
                         _offload_module_ids=set(),
                     )
-                ignored_ids = {id(m) for m in args.get("ignore_modules", [])}
-                resident_blocks: dict = {}
-                for name, child in module.named_modules():
-                    if (
-                        id(child) in ignored_ids
-                        or hasattr(child, "_layer_memory_manager")
-                        or (
-                            child.__class__.__name__ not in LINEAR_MODULES
-                            and child.__class__.__name__ not in CONV_MODULES
-                        )
-                    ):
-                        continue
-                    key = cls._offload_group_key(name)
-                    entry = resident_blocks.setdefault(key, {"layers": [], "bytes": 0})
-                    entry["layers"].append(child)
-                    entry["bytes"] += cls._direct_module_bytes(child)
-                mm = module._memory_manager
                 demoted_blocks = 0
-                for key in sorted(
-                    resident_blocks, key=lambda k: resident_blocks[k]["bytes"],
-                    reverse=True,
-                ):
-                    if free_now >= wddm_margin_bytes:
+                while free_now < wddm_margin_bytes:
+                    freed = cls._sampling_demote_largest_block(
+                        module, plan, target,
+                        ignore_modules=args.get("ignore_modules", []),
+                    )
+                    if not freed:
                         break
-                    for child in resident_blocks[key]["layers"]:
-                        cls.demote_layer(child, mm)
-                    torch.cuda.synchronize(target)
-                    torch.cuda.empty_cache()
                     free_now = torch.cuda.mem_get_info(target)[0]
                     demoted_blocks += 1
-                if demoted_blocks:
-                    offloaded_stream_layers = []
-                    offloaded_ids = set()
-                    offloaded_keys = set()
-                    resident_bytes = plan["model_bytes"]
-                    for name, child in module.named_modules():
-                        if not hasattr(child, "_layer_memory_manager"):
-                            continue
-                        offloaded_ids.add(id(child))
-                        offloaded_keys.add(cls._offload_group_key(name))
-                        layer_bytes = cls._direct_module_bytes(child)
-                        resident_bytes -= layer_bytes
-                        offloaded_stream_layers.append(cls._stream_bytes(child))
-                    plan["offload_ids"] = offloaded_ids
-                    plan["offloaded_layers"] = len(offloaded_stream_layers)
-                    plan["offloaded_blocks"] = len(offloaded_keys)
-                    plan["resident_bytes"] = resident_bytes
-                    plan["ring_bytes"] = sum(
-                        sorted(offloaded_stream_layers, reverse=True)[:PIPELINE_DEPTH]
+                if demoted_blocks and diagnostics:
+                    floor_status = (
+                        "cleared" if free_now >= wddm_margin_bytes else "still low"
                     )
-                    if diagnostics:
-                        floor_status = (
-                            "cleared" if free_now >= wddm_margin_bytes else "still low"
-                        )
-                        print(
-                            f"[MemoryManager] spill-guard retreat: demoted "
-                            f"{demoted_blocks} resident block(s), floor={floor_status}; "
-                            f"device_free={free_now / gib:.2f} GiB "
-                            f"(target={wddm_margin_bytes / gib:.2f} GiB)"
-                        )
+                    print(
+                        f"[MemoryManager] spill-guard retreat: demoted "
+                        f"{demoted_blocks} resident block(s), floor={floor_status}; "
+                        f"device_free={free_now / gib:.2f} GiB "
+                        f"(target={wddm_margin_bytes / gib:.2f} GiB)"
+                    )
         fp8_resident_layers = fp8_streamed_layers = 0
         fp8_supported = False
         if fp8_sampling and target is not None and torch.device(target).type == "cuda":
@@ -2934,6 +3618,134 @@ class MemoryManager:
         # external memory pressure instead of crashing the whole sampling run.
         module._mm_sampling_demote = _demote_to_streamed
 
+        def _sampling_guard():
+            """Reactive cohabitation guard, called per image before compile.
+
+            Forward-only sampling does NOT raise when it crosses the WDDM cliff —
+            it silently pages to shared memory and runs ~5x slower, so the OOM
+            recovery above never fires. This proactively gives VRAM back: if an
+            external grab (Windows desktop, another app) would push the next
+            forward's peak within the spill margin, stream one resident block.
+            Reactive by design (per-image): a sudden spike may page one image
+            before the next check catches it. Returns blocks demoted.
+            """
+            if not cuda_target or sampling_state["fully_streamed"]:
+                return 0
+            guard_margin = int(
+                max(
+                    float(_env("AI_TOOLKIT_SAMPLING_GUARD_MARGIN_GIB", "0.5")),
+                    plan.get("wddm_hard_bytes", 0) / gib,
+                )
+                * gib
+            )
+            free_b, total_b = torch.cuda.mem_get_info(target)
+            reserved_b = torch.cuda.memory_reserved(target)
+            peak_reserved_b = torch.cuda.max_memory_reserved(target)
+            # Predicted device-free at the next forward's peak. (peak stats are
+            # reset at sampling start, so this reflects only sampling forwards.)
+            predicted_peak_free = cls._sampling_guard_predicted_peak_free(
+                total_b, free_b, reserved_b, peak_reserved_b
+            )
+            if predicted_peak_free >= guard_margin:
+                return 0
+            freed = cls._sampling_demote_largest_block(
+                module, plan, target, ignore_modules=args.get("ignore_modules", [])
+            )
+            if not freed:
+                return 0
+            # The high-water no longer reflects the smaller layout; let the next
+            # forward re-establish it so the following check stays accurate.
+            torch.cuda.reset_peak_memory_stats(target)
+            if diagnostics:
+                print(
+                    f"[MemoryManager] sampling guard: external pressure "
+                    f"(predicted peak free {predicted_peak_free / gib:.2f} < "
+                    f"{guard_margin / gib:.2f} GiB) -> streamed 1 block, "
+                    f"freed {freed / gib:.2f} GiB"
+                )
+            return 1
+
+        # Exposed so the per-image generate loop can pre-empt WDDM paging when
+        # external VRAM use grows mid-run (paging is silent, not an OOM).
+        module._mm_sampling_guard = _sampling_guard
+
+        def _sampling_step_trim():
+            """Per-denoise-step cache trim, called before each forward.
+
+            Streaming FP8 layers re-allocate transient buffers (input cast,
+            _scaled_mm output, unpacked qdata) every forward; the caching
+            allocator keeps those freed blocks at its reserved high-water rather
+            than returning them to the driver. The more blocks stream, the larger
+            that idle high-water grows -- so a *bigger* working_reserve (which
+            forces more streaming) can push device-used UP, toward the WDDM cliff,
+            even though live activations are small. WDDM pages on the committed
+            (reserved) footprint and does so silently, so neither the OOM retry
+            nor an allocated-side signal catches it.
+
+            Remedy, escalating and gated so it is a no-op when there is slack:
+              1. If realized device-free has dropped within the trim margin,
+                 empty_cache() to return idle cached blocks to the driver (cheap,
+                 non-destructive). The next forward re-allocates fresh, defragmented
+                 blocks, so free typically recovers and later steps stop trimming.
+              2. Only if free is STILL under the hard floor after trimming (no
+                 idle cache left to reclaim -> genuine external pressure) demote
+                 one resident block. Demotion adds streaming churn, so it is the
+                 last resort, not the first.
+            Triggers on realized free (not the peak high-water) so it never resets
+            the peak stats the teardown uses to LEARN the working reserve.
+            Returns bytes reclaimed by the trim (demotion counted separately).
+            """
+            if not cuda_target or sampling_state["fully_streamed"]:
+                return 0
+            trim_margin = int(
+                max(
+                    float(_env("AI_TOOLKIT_SAMPLING_STEP_TRIM_GIB", "1.5")),
+                    plan.get("wddm_margin_bytes", 0) / gib,
+                )
+                * gib
+            )
+            hard_floor = int(
+                max(
+                    float(_env("AI_TOOLKIT_SAMPLING_WDDM_HARD_GIB", "1.0")),
+                    plan.get("wddm_hard_bytes", 0) / gib,
+                )
+                * gib
+            )
+            before = torch.cuda.mem_get_info(target)[0]
+            if not cls._sampling_step_should_trim(before, trim_margin):
+                return 0
+            torch.cuda.empty_cache()
+            free_b = torch.cuda.mem_get_info(target)[0]
+            freed = max(0, free_b - before)
+            sampling_state["trim_count"] += 1
+            sampling_state["trim_freed_bytes"] += freed
+            # Escalate to demotion only if trimming did not buy back the floor.
+            demoted_blocks = 0
+            if cls._sampling_step_should_demote(free_b, hard_floor):
+                demoted = cls._sampling_demote_largest_block(
+                    module, plan, target,
+                    ignore_modules=args.get("ignore_modules", []),
+                )
+                if demoted:
+                    demoted_blocks = 1
+                    sampling_state["trim_demotes"] += 1
+                    if diagnostics:
+                        free_b = torch.cuda.mem_get_info(target)[0]
+                        print(
+                            f"[MemoryManager] step trim: cache trim left "
+                            f"{(before + freed) / gib:.2f} GiB free (< hard floor "
+                            f"{hard_floor / gib:.2f}); demoted 1 block, freed "
+                            f"{demoted / gib:.2f} GiB -> {free_b / gib:.2f} GiB free"
+                        )
+            # Returns blocks demoted THIS step: the caller must invalidate any
+            # compiled-block set, because a demoted block just gained a streaming
+            # hook and its stale compiled graph would replay resident weights.
+            return demoted_blocks
+
+        # Exposed so the denoise loop can collapse the streaming-churn reserved
+        # high-water each step before it silently crosses the WDDM cliff.
+        module._mm_sampling_step_trim = _sampling_step_trim
+
         try:
             yield
         finally:
@@ -2956,11 +3768,27 @@ class MemoryManager:
                 previous_working_reserve, observed_working_reserve
             )
             if diagnostics and cuda_target:
+                # Everything below is already raw; the only new thing is the
+                # synthesis: how many MORE same-batch forwards the free VRAM holds.
+                # Denominator is the activation/workspace that scales with batch
+                # (learned reserve — ring excluded, it is fixed streaming buffers).
+                # Free is taken conservatively AT the peak: total - (peak_reserved +
+                # non-torch other), so it does not overstate room using step-end
+                # free. >= 1.0 spare => one extra concurrent sample (batched CFG)
+                # fits at this batch.
+                peak_reserved = torch.cuda.max_memory_reserved(target) / gib
+                other_gib = max(0.0, sample_end[2] - sample_end[1]) if sample_end else 0.0
+                free_at_peak = max(0.0, sample_end[4] - (peak_reserved + other_gib)) if sample_end else 0.0
+                per_forward_gib = module._sampling_peak_working_reserve_bytes / gib
+                batch_room = (
+                    free_at_peak / per_forward_gib if per_forward_gib > 1e-6 else float("inf")
+                )
                 print(
                     f"[MemoryManager] sampling peak: "
                     f"torch_allocated={peak_allocated / gib:.2f} GiB "
                     f"sampling_extra={sampling_working_reserve / gib:.2f} GiB "
-                    f"learned_working_reserve={module._sampling_peak_working_reserve_bytes / gib:.2f} GiB; "
+                    f"learned_working_reserve={per_forward_gib:.2f} GiB "
+                    f"(free fits ~{batch_room:.1f} more forwards); "
                     f"{cls._format_cuda_memory(sample_end)}"
                 )
             if diagnostics and fp8_supported:
@@ -2969,8 +3797,21 @@ class MemoryManager:
                     f"native_calls={_FP8_STATS['kernel_calls']} "
                     f"fallback_calls={_FP8_STATS['fallback_calls']}"
                 )
+            if diagnostics and sampling_state["trim_count"]:
+                print(
+                    f"[MemoryManager] step trim summary: trimmed cache on "
+                    f"{sampling_state['trim_count']} step(s), reclaimed "
+                    f"{sampling_state['trim_freed_bytes'] / gib:.2f} GiB total, "
+                    f"{sampling_state['trim_demotes']} demote escalation(s). "
+                    f"Frequent trims => working_reserve is too high (too much "
+                    f"streaming); lower it for more resident/compiled blocks."
+                )
             if hasattr(module, "_mm_sampling_demote"):
                 del module._mm_sampling_demote
+            if hasattr(module, "_mm_sampling_guard"):
+                del module._mm_sampling_guard
+            if hasattr(module, "_mm_sampling_step_trim"):
+                del module._mm_sampling_step_trim
             restore_started = time.perf_counter()
             _restore_offload()
             if diagnostics:

@@ -2084,6 +2084,23 @@ class TextEmbeddingCachingMixin:
                 print_acc("All text embeddings already cached, skipping encoding")
                 return
 
+            text_encoder = getattr(self.sd, 'text_encoder', None)
+            encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+            has_fake_text_encoder = any(
+                getattr(getattr(te, '__class__', None), '__name__', '') == 'FakeTextEncoder'
+                for te in encoders
+                if te is not None
+            )
+            if getattr(self.sd, 'skip_te', False) or has_fake_text_encoder:
+                missing = '\n'.join([f' - {file_item.path}' for file_item in files_needing_encode[:10]])
+                more = '' if len(files_needing_encode) <= 10 else f'\n - ... and {len(files_needing_encode) - 10} more'
+                raise RuntimeError(
+                    'Text embedding cache is incomplete, but the text encoder is not loaded. '
+                    'This usually means a caption sidecar changed after the TE cache worker finished. '
+                    'Restart the job so the worker can encode the updated captions.\n'
+                    f'Missing text embedding cache for {len(files_needing_encode)} file(s):\n{missing}{more}'
+                )
+
             did_move = False
 
             # use tqdm to show progress (only for files that need encoding)
@@ -2151,6 +2168,7 @@ class TextEmbeddingCachingMixin:
                     except Exception:
                         pass
                 i += 1
+            flush()
             # restore device state
             # if did_move:
             #     self.sd.restore_device_state()

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { PrismaClient } from '@prisma/client';
 import { isMac } from '@/helpers/basic';
+import { loadDiskJobConfig, saveDiskJobConfig } from '@/server/jobs';
 
 const prisma = new PrismaClient();
 
@@ -12,9 +13,18 @@ export async function GET(request: Request) {
 
   try {
     if (id) {
-      const job = await prisma.job.findUnique({
+      let job = await prisma.job.findUnique({
         where: { id },
       });
+      if (job) {
+        const diskConfig = await loadDiskJobConfig(job.name);
+        if (diskConfig !== null && diskConfig !== job.job_config) {
+          job = await prisma.job.update({
+            where: { id },
+            data: { job_config: diskConfig },
+          });
+        }
+      }
       return NextResponse.json(job);
     }
     if (job_ref) {
@@ -56,16 +66,18 @@ export async function POST(request: Request) {
     }
 
     if (id) {
+      const jobConfigString = JSON.stringify(job_config);
       // Update existing training
       const training = await prisma.job.update({
         where: { id },
         data: {
           name,
           gpu_ids,
-          job_config: JSON.stringify(job_config),
+          job_config: jobConfigString,
           ...extra,
         },
       });
+      await saveDiskJobConfig(name, jobConfigString);
       return NextResponse.json(training);
     } else {
       // find the highest queue position and add 1000

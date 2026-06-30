@@ -364,6 +364,16 @@ export default function SimpleJob({
                           docKey="model.layer_offloading_smart"
                         />
                         {jobConfig.config.process[0].model.layer_offloading_smart && (
+                          <Checkbox
+                            label="Block-Only Streaming (lower CPU)"
+                            checked={jobConfig.config.process[0].model.layer_offloading_block_stream_only || false}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].model.layer_offloading_block_stream_only')
+                            }
+                            docKey="model.layer_offloading_block_stream_only"
+                          />
+                        )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart && (
                           <NumberInput
                             label="Training VRAM Reserve (GB)"
                             value={
@@ -383,6 +393,36 @@ export default function SimpleJob({
                           />
                         )}
                         {jobConfig.config.process[0].model.layer_offloading_smart && (
+                          <NumberInput
+                            label="Training WDDM Margin (GB)"
+                            value={jobConfig.config.process[0].model.layer_offloading_smart_wddm_margin_gb ?? 1}
+                            onChange={value =>
+                              setJobConfig(
+                                value ?? 1,
+                                'config.process[0].model.layer_offloading_smart_wddm_margin_gb',
+                              )
+                            }
+                            min={0}
+                            max={8}
+                            docKey="model.layer_offloading_smart_wddm_margin_gb"
+                          />
+                        )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart && (
+                          <NumberInput
+                            label="Training WDDM Hard Floor (GB)"
+                            value={jobConfig.config.process[0].model.layer_offloading_smart_wddm_hard_gb ?? 1}
+                            onChange={value =>
+                              setJobConfig(
+                                value ?? 1,
+                                'config.process[0].model.layer_offloading_smart_wddm_hard_gb',
+                              )
+                            }
+                            min={0}
+                            max={8}
+                            docKey="model.layer_offloading_smart_wddm_hard_gb"
+                          />
+                        )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart && (
                           <Checkbox
                             label="Use Smart Sampling Layout"
                             checked={jobConfig.config.process[0].model.layer_offloading_smart_sampling || false}
@@ -390,6 +430,53 @@ export default function SimpleJob({
                               setJobConfig(value, 'config.process[0].model.layer_offloading_smart_sampling')
                             }
                             docKey="model.layer_offloading_smart_sampling"
+                          />
+                        )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart_sampling && (
+                          <NumberInput
+                            label="Sampling VRAM Reserve (GB)"
+                            value={
+                              jobConfig.config.process[0].model.layer_offloading_smart_sampling_working_reserve_gb ?? -1
+                            }
+                            onChange={value =>
+                              setJobConfig(
+                                value ?? -1,
+                                'config.process[0].model.layer_offloading_smart_sampling_working_reserve_gb',
+                              )
+                            }
+                            min={-1}
+                            max={24}
+                            docKey="model.layer_offloading_smart_sampling_working_reserve_gb"
+                          />
+                        )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart_sampling && (
+                          <NumberInput
+                            label="Sampling WDDM Margin (GB)"
+                            value={jobConfig.config.process[0].model.layer_offloading_smart_sampling_wddm_margin_gb ?? 1}
+                            onChange={value =>
+                              setJobConfig(
+                                value ?? 1,
+                                'config.process[0].model.layer_offloading_smart_sampling_wddm_margin_gb',
+                              )
+                            }
+                            min={0}
+                            max={8}
+                            docKey="model.layer_offloading_smart_sampling_wddm_margin_gb"
+                          />
+                        )}
+                        {jobConfig.config.process[0].model.layer_offloading_smart_sampling && (
+                          <NumberInput
+                            label="Sampling WDDM Hard Floor (GB)"
+                            value={jobConfig.config.process[0].model.layer_offloading_smart_sampling_wddm_hard_gb ?? 1}
+                            onChange={value =>
+                              setJobConfig(
+                                value ?? 1,
+                                'config.process[0].model.layer_offloading_smart_sampling_wddm_hard_gb',
+                              )
+                            }
+                            min={0}
+                            max={8}
+                            docKey="model.layer_offloading_smart_sampling_wddm_hard_gb"
                           />
                         )}
                         {jobConfig.config.process[0].model.layer_offloading_smart_sampling &&
@@ -467,6 +554,24 @@ export default function SimpleJob({
                         setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch')
                       }
                       docKey="model.layer_offloading_prefetch"
+                    />
+                    <TextInput
+                      label="Prefetch Trace Capture"
+                      value={jobConfig.config.process[0].model.layer_offloading_prefetch_trace_capture || ''}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch_trace_capture')
+                      }
+                      placeholder="output/prefetch_capture.jsonl"
+                      docKey="model.layer_offloading_prefetch_trace_capture"
+                    />
+                    <NumberInput
+                      label="Prefetch Capture Steps"
+                      value={jobConfig.config.process[0].model.layer_offloading_prefetch_trace_capture_steps ?? 256}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch_trace_capture_steps')
+                      }
+                      min={0}
+                      docKey="model.layer_offloading_prefetch_trace_capture_steps"
                     />
                     {jobConfig.config.process[0].model.layer_offloading_smart &&
                       jobConfig.config.process[0].model.quantize &&
@@ -1502,6 +1607,12 @@ export default function SimpleJob({
                   className="pt-4 pl-2"
                   checked={jobConfig.config.process[0].sample.walk_seed}
                   onChange={value => setJobConfig(value, 'config.process[0].sample.walk_seed')}
+                />
+                <Checkbox
+                  label="Batch CFG (cond+uncond in one forward; faster, ~2x activation VRAM)"
+                  className="pt-4 pl-2"
+                  checked={jobConfig.config.process[0].sample.batch_cfg ?? false}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.batch_cfg')}
                 />
               </div>
               <div>

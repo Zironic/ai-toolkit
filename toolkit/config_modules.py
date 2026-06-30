@@ -111,7 +111,13 @@ class SampleConfig:
         self.samples = [SampleItem(self, **item) for item in raw_samples]
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
-        
+        # Run the CFG conditional + unconditional in one batched (batch=2) forward
+        # instead of two sequential ones. For weight-bandwidth-bound sampling this
+        # is ~the same wall time as a single forward (weights read once), nearly
+        # halving CFG cost — at the price of ~2x the activation peak. Only models
+        # with a custom CFG loop honor it (Krea2); diffusers pipelines already batch.
+        self.batch_cfg: bool = kwargs.get('batch_cfg', False)
+
     @property
     def prompts(self):
         # for backwards compatibility as this is checked for length frequently
@@ -756,6 +762,14 @@ class ModelConfig:
         # Krea 2 experimental mode: choose transformer layers from a measured
         # VRAM byte budget instead of a random percentage.
         self.layer_offloading_smart = kwargs.get("layer_offloading_smart", False)
+        # Pure block-based streaming: keep every non-block layer (embedders, final
+        # projection, standalone norms/Linears) permanently resident and only
+        # stream uniform transformer-block groups. Reduces CPU load from the
+        # offload worker by eliminating scattered small transfer requests, at the
+        # cost of a little extra resident VRAM.
+        self.layer_offloading_block_stream_only = kwargs.get(
+            "layer_offloading_block_stream_only", False
+        )
         # "working_reserve" = the VRAM we reserve for our own transient working
         # set (activations / dequant / temporary workspace) during a step. -1 =
         # auto (live controller tunes it). The pre-rename key was
@@ -763,6 +777,14 @@ class ModelConfig:
         self.layer_offloading_smart_working_reserve_gb = kwargs.get(
             "layer_offloading_smart_working_reserve_gb",
             kwargs.get("layer_offloading_smart_headroom_gb", -1.0),
+        )
+        self.layer_offloading_smart_wddm_margin_gb = kwargs.get(
+            "layer_offloading_smart_wddm_margin_gb",
+            kwargs.get("layer_offloading_smart_buffer_gb", 1.0),
+        )
+        self.layer_offloading_smart_wddm_hard_gb = kwargs.get(
+            "layer_offloading_smart_wddm_hard_gb",
+            kwargs.get("layer_offloading_smart_hard_buffer_gb", 1.0),
         )
         # Sampling layout changes are independent from training offload and
         # must be explicitly requested. Native FP8 sampling is a second,
@@ -780,6 +802,14 @@ class ModelConfig:
             "layer_offloading_smart_sampling_working_reserve_gb",
             kwargs.get("layer_offloading_smart_sampling_headroom_gb", -1.0),
         )
+        self.layer_offloading_smart_sampling_wddm_margin_gb = kwargs.get(
+            "layer_offloading_smart_sampling_wddm_margin_gb",
+            kwargs.get("layer_offloading_smart_sampling_buffer_gb", 1.0),
+        )
+        self.layer_offloading_smart_sampling_wddm_hard_gb = kwargs.get(
+            "layer_offloading_smart_sampling_wddm_hard_gb",
+            kwargs.get("layer_offloading_smart_sampling_hard_buffer_gb", 1.0),
+        )
         self.layer_offloading_fp8_sampling = kwargs.get(
             "layer_offloading_fp8_sampling", False
         )
@@ -791,6 +821,12 @@ class ModelConfig:
         )
         self.layer_offloading_prefetch = kwargs.get(
             "layer_offloading_prefetch", False
+        )
+        self.layer_offloading_prefetch_trace_capture = kwargs.get(
+            "layer_offloading_prefetch_trace_capture", None
+        )
+        self.layer_offloading_prefetch_trace_capture_steps = kwargs.get(
+            "layer_offloading_prefetch_trace_capture_steps", 256
         )
         self.layer_offloading_fp8_forward = kwargs.get(
             "layer_offloading_fp8_forward", False
@@ -1081,7 +1117,7 @@ class DatasetConfig:
         # cache latents will store them in memory
         self.cache_latents: bool = kwargs.get('cache_latents', False)
         # cache latents to disk will store them on disk. If both are true, it will save to disk, but keep in memory
-        self.cache_latents_to_disk: bool = kwargs.get('cache_latents_to_disk', False)
+        self.cache_latents_to_disk: bool = kwargs.get('cache_latents_to_disk', True)
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
         self.load_image_when_caching_latents: bool = kwargs.get('load_image_when_caching_latents', False)
@@ -1216,6 +1252,7 @@ class GenerateImageConfig:
             fps: int = 15,
             ctrl_idx: int = 0,
             do_cfg_norm: bool = False,
+            batch_cfg: bool = False,
     ):
         self.width: int = width
         self.height: int = height
@@ -1287,6 +1324,7 @@ class GenerateImageConfig:
         self.logger = logger
         
         self.do_cfg_norm: bool = do_cfg_norm
+        self.batch_cfg: bool = batch_cfg
 
     def set_gen_time(self, gen_time: int = None):
         if gen_time is not None:

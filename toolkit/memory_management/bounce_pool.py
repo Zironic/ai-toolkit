@@ -26,6 +26,8 @@ it degrades to plain tensors so the scheduling/state logic stays unit-testable.
 Everything here is inert unless a pool is explicitly created for a device.
 """
 
+import collections
+import json
 import os
 import threading
 import time
@@ -37,6 +39,10 @@ import torch
 # device -> PinnedBouncePool. The autograd staging path looks the active pool
 # up here; absent an entry it behaves exactly as before.
 _DEVICE_PREFETCH: dict = {}
+_TRACE_CAPTURE_PATH = os.environ.get("AI_TOOLKIT_BOUNCE_TRACE_CAPTURE", "").strip()
+_TRACE_CAPTURE_STEPS = max(
+    0, int(os.environ.get("AI_TOOLKIT_BOUNCE_TRACE_CAPTURE_STEPS", "256"))
+)
 
 # Slot states.
 FREE = "FREE"
@@ -47,6 +53,14 @@ IN_USE = "IN_USE"
 HIT = "hit"
 SOFT_MISS = "soft_miss"   # worker was mid-copy; we waited for it (still off-thread copy)
 HARD_MISS = "hard_miss"   # not staged at all; fall back to the pageable source
+
+
+def configure_trace_capture(path=None, steps=None):
+    """Configure optional JSONL trace capture for subsequently-created pools."""
+    global _TRACE_CAPTURE_PATH, _TRACE_CAPTURE_STEPS
+    _TRACE_CAPTURE_PATH = str(path or "").strip()
+    if steps is not None:
+        _TRACE_CAPTURE_STEPS = max(0, int(steps))
 
 
 def _pin_enabled() -> bool:
@@ -103,6 +117,51 @@ def _shape_key_label(shape_key) -> str:
     if len(text) > 160:
         return text[:157] + "..."
     return text
+
+
+
+def _jsonable_entry(entry):
+    if isinstance(entry, tuple):
+        return list(entry)
+    return entry
+
+
+def _schedule_layer_key(entry):
+    """Layer source key for a schedule entry.
+
+    Cold schedules are raw layer keys. Trace schedules are semantic entries:
+    (layer_key, operation, occurrence).
+    """
+    if isinstance(entry, tuple) and entry:
+        return entry[0]
+    return entry
+
+
+def _make_access_key(layer_key, operation="forward", occurrence=None):
+    if occurrence is None:
+        return (layer_key, operation)
+    return (layer_key, operation, occurrence)
+
+
+def _entry_matches_access(entry, access_key):
+    if isinstance(entry, tuple):
+        return entry == access_key
+    return entry == access_key[0]
+
+
+def _entry_same_layer(entry, layer_key):
+    return _schedule_layer_key(entry) == layer_key
+
+
+def _slot_matches_request(slot, layer_key, weight, bias) -> bool:
+    if slot is None:
+        return False
+    if slot.layer_key != layer_key:
+        return False
+    try:
+        return slot.signature == tuple(_layer_specs(weight, bias))
+    except Exception:
+        return False
 
 
 def _spec_bytes(specs) -> int:
@@ -184,11 +243,20 @@ class PinnedBouncePool:
         target_ready_bytes: Optional[int] = None,
         num_workers: int = 2,
         ram_floor_bytes: int = 2 * 1024 ** 3,
+        fill_group_size: Optional[int] = None,
     ):
         self.device = torch.device(device)
         self.budget_bytes = int(budget_bytes)
         self.lookahead = int(lookahead)
         self.max_lookahead_positions = self.lookahead
+        # Block streaming: how many schedulable positions a worker claims and
+        # publishes per lock cycle. 1 = per-Linear (default). Set to a block's
+        # Linear count to amortize the lock/CV/slot-dict overhead across a whole
+        # block instead of paying it per Linear (the "small requests" cost). The
+        # copies themselves are still per-Linear and happen outside the lock.
+        if fill_group_size is None:
+            fill_group_size = int(os.environ.get("AI_TOOLKIT_BOUNCE_FILL_GROUP", "1"))
+        self.fill_group_size = max(1, int(fill_group_size))
         if target_ready_bytes is None:
             target_ready_bytes = int(
                 float(os.environ.get("AI_TOOLKIT_BOUNCE_TARGET_READY_GIB", "3.5"))
@@ -201,10 +269,12 @@ class PinnedBouncePool:
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._sources: dict = {}        # layer_key -> weakref(module)
-        self._scheduled: list = []      # positional layer_key access order
+        self._scheduled: list = []      # positional layer keys or semantic access tuples
         self._observed_step: list = []  # actual access order from previous step
+        self._access_occurrences = collections.Counter()
         self.schedule_version = -1      # trace version this schedule came from
         self.schedule_shape_key = None  # execution shape this schedule came from
+        self.schedule_confidence = "cold"
         self._slots: dict = {}          # position -> _Slot
         self._skipped_positions: set = set()
         self._free_buffers: dict = {}   # signature -> list[leaves]
@@ -213,6 +283,9 @@ class PinnedBouncePool:
         self._fill_pos = 0
         self._stop = False
         self._epoch = 0
+        self._capture_path = _TRACE_CAPTURE_PATH
+        self._capture_limit = _TRACE_CAPTURE_STEPS
+        self._capture_count = 0
 
         # stats
         self.hits = 0
@@ -221,7 +294,17 @@ class PinnedBouncePool:
         self.cpu_wait_s = 0.0
         self.copy_s = 0.0
         self.copy_bytes = 0
+        # Worker-side request accounting (the "small requests by the workers").
+        # ``fills`` = individual Linear pageable->pinned copies published.
+        # ``fill_batches`` = worker claim/publish cycles. With fill_group_size>1
+        # one batch publishes a whole block, so fills/fill_batches ~= block size
+        # and fill_batches is the per-step worker lock-cycle count Slice 1 cuts.
+        self.fills = 0
+        self.fill_batches = 0
         self.skips = 0
+        self.resyncs = 0
+        self.mismatches = 0
+        self.duplicate_key_resync_blocked = 0
 
         self._workers = [
             threading.Thread(target=self._worker_loop, daemon=True,
@@ -238,10 +321,21 @@ class PinnedBouncePool:
             return
         self._sources[layer_key] = weakref.ref(module)
 
-    def set_schedule(self, layer_keys):
+    def sync_sources(self, sources):
+        """Replace known streamable layer sources without clearing schedules."""
+        with self._cv:
+            self._sources = {
+                key: weakref.ref(module)
+                for key, module in sources
+                if key is not None and module is not None
+            }
+            self._cv.notify_all()
+
+    def set_schedule(self, layer_keys, confidence="exact"):
         with self._cv:
             self._scheduled = list(layer_keys)
             self._observed_step = []
+            self.schedule_confidence = confidence
             self._cv.notify_all()
 
     def seed_schedule_from_sources(self):
@@ -257,6 +351,7 @@ class PinnedBouncePool:
             self._scheduled = list(self._sources.keys())
             self.schedule_version = -1
             self.schedule_shape_key = None
+            self.schedule_confidence = "cold"
             self._cv.notify_all()
 
     def set_budget(self, budget_bytes: int):
@@ -266,7 +361,8 @@ class PinnedBouncePool:
             self._trim_free_buffers_locked()
             self._cv.notify_all()
 
-    def tune(self, *, budget_bytes=None, target_ready_bytes=None, lookahead=None):
+    def tune(self, *, budget_bytes=None, target_ready_bytes=None, lookahead=None,
+             fill_group_size=None):
         """Adjust prefetch capacity/coverage without clearing the schedule."""
         with self._cv:
             if budget_bytes is not None:
@@ -275,6 +371,8 @@ class PinnedBouncePool:
                 self.target_ready_bytes = int(target_ready_bytes)
             if lookahead is not None:
                 self.max_lookahead_positions = max(1, int(lookahead))
+            if fill_group_size is not None:
+                self.fill_group_size = max(1, int(fill_group_size))
             self._trim_free_buffers_locked()
             self._cv.notify_all()
 
@@ -319,10 +417,45 @@ class PinnedBouncePool:
         self._inflight_bytes = max(0, self._inflight_bytes)
         self._consume_pos = 0
         self._fill_pos = 0
+        self._access_occurrences.clear()
         self._cv.notify_all()
+
+    def _capture_observed_step_locked(self):
+        if not self._capture_path or not self._observed_step:
+            return
+        if self._capture_limit and self._capture_count >= self._capture_limit:
+            return
+        record = {
+            "time": time.time(),
+            "device": str(self.device),
+            "schedule": [_jsonable_entry(entry) for entry in self._scheduled],
+            "observed": [_jsonable_entry(entry) for entry in self._observed_step],
+            "schedule_confidence": self.schedule_confidence,
+            "schedule_shape_key": _shape_key_label(self.schedule_shape_key),
+            "schedule_version": self.schedule_version,
+            "lookahead": self.max_lookahead_positions,
+            "consume_pos": self._consume_pos,
+            "resyncs": self.resyncs,
+            "mismatches": self.mismatches,
+            "duplicate_key_resync_blocked": self.duplicate_key_resync_blocked,
+            "hits": self.hits,
+            "soft_misses": self.soft_misses,
+            "hard_misses": self.hard_misses,
+            "skips": self.skips,
+        }
+        try:
+            directory = os.path.dirname(self._capture_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(self._capture_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            self._capture_count += 1
+        except Exception:
+            self._capture_path = ""
 
     def _promote_observed_schedule_locked(self):
         """Recover when the cold source-order schedule never matched reality."""
+        self._capture_observed_step_locked()
         observed_len = len(self._observed_step)
         total = self.hits + self.soft_misses + self.hard_misses
         hard_miss_rate = self.hard_misses / max(1, total)
@@ -332,7 +465,41 @@ class PinnedBouncePool:
             self._scheduled = list(self._observed_step)
             self.schedule_version = -2
             self.schedule_shape_key = "observed"
+            self.schedule_confidence = "observed"
         self._observed_step = []
+
+    def _discard_positions_locked(self, start, end):
+        for stale_pos in range(start, end):
+            self._skipped_positions.add(stale_pos)
+            slot = self._slots.get(stale_pos)
+            if slot is not None and slot.state == CPU_READY:
+                if slot.leaves is not None:
+                    self._free_buffers.setdefault(slot.signature, []).append(slot.leaves)
+                self._inflight_bytes -= slot.nbytes
+                del self._slots[stale_pos]
+
+    def _align_locked(self, access_key):
+        pos = self._consume_pos
+        if not self._scheduled:
+            return pos, "mismatch"
+        if pos < len(self._scheduled) and _entry_matches_access(
+            self._scheduled[pos], access_key
+        ):
+            return pos, "aligned"
+
+        layer_key = access_key[0]
+        end = min(len(self._scheduled), pos + 1 + self.max_lookahead_positions)
+        duplicate_layer_seen = False
+        for j in range(pos + 1, end):
+            entry = self._scheduled[j]
+            if _entry_matches_access(entry, access_key):
+                self._discard_positions_locked(pos, j)
+                return j, "resynced"
+            if _entry_same_layer(entry, layer_key):
+                duplicate_layer_seen = True
+        if duplicate_layer_seen:
+            self.duplicate_key_resync_blocked += 1
+        return pos, "mismatch"
 
     def _free_buffer_bytes_locked(self):
         total = 0
@@ -361,23 +528,37 @@ class PinnedBouncePool:
 
     # -- training-thread API ----------------------------------------------
 
-    def acquire(self, layer_key, weight_cpu, bias_cpu):
+    def acquire(self, layer_key, weight_cpu, bias_cpu, operation="forward"):
         """Return (weight_src, bias_src, ticket). ticket is None on a hard miss
         (caller uses the pageable originals unchanged)."""
         with self._cv:
-            pos = self._consume_pos
-            self._consume_pos += 1
-            self._observed_step.append(layer_key)
-            scheduled_match = (
-                self._scheduled
-                and pos < len(self._scheduled)
-                and self._scheduled[pos] == layer_key
-            )
-            if not scheduled_match:
+            occurrence = self._access_occurrences[layer_key]
+            self._access_occurrences[layer_key] += 1
+            access_key = _make_access_key(layer_key, operation, occurrence)
+            pos, status = self._align_locked(access_key)
+            self._consume_pos = pos + 1
+            self._observed_step.append(access_key)
+            if status == "resynced":
+                self.resyncs += 1
+            elif status == "mismatch":
+                self.mismatches += 1
                 self.hard_misses += 1
                 self._cv.notify_all()
                 return weight_cpu, bias_cpu, None
             slot = self._slots.get(pos)
+            if slot is not None and not _slot_matches_request(
+                slot, layer_key, weight_cpu, bias_cpu
+            ):
+                if slot.state == CPU_READY:
+                    if slot.leaves is not None:
+                        self._free_buffers.setdefault(slot.signature, []).append(
+                            slot.leaves
+                        )
+                    self._inflight_bytes -= slot.nbytes
+                    del self._slots[pos]
+                self.hard_misses += 1
+                self._cv.notify_all()
+                return weight_cpu, bias_cpu, None
             if slot is not None and slot.state == CPU_READY:
                 slot.state = IN_USE
                 self.hits += 1
@@ -399,6 +580,18 @@ class PinnedBouncePool:
         with self._cv:
             self.cpu_wait_s += time.perf_counter() - wait_t0
             slot = self._slots.get(pos)
+            if slot is not None and not _slot_matches_request(
+                slot, layer_key, weight_cpu, bias_cpu
+            ):
+                if slot.state == CPU_READY:
+                    if slot.leaves is not None:
+                        self._free_buffers.setdefault(slot.signature, []).append(
+                            slot.leaves
+                        )
+                    self._inflight_bytes -= slot.nbytes
+                    del self._slots[pos]
+                self._cv.notify_all()
+                return weight_cpu, bias_cpu, None
             if slot is not None and slot.state == CPU_READY:
                 slot.state = IN_USE
                 self._cv.notify_all()
@@ -406,17 +599,24 @@ class PinnedBouncePool:
             self._cv.notify_all()
         return weight_cpu, bias_cpu, None
 
-    def consume_without_transfer(self, layer_key):
+    def consume_without_transfer(self, layer_key, operation="forward"):
         """Advance one trace position when the GPU ring already owns the weight.
 
         This keeps positional prefetch aligned without waiting for, or issuing,
         a CPU bounce copy that the consumer no longer needs.
         """
         with self._cv:
-            pos = self._consume_pos
-            self._consume_pos += 1
-            self._observed_step.append(layer_key)
+            occurrence = self._access_occurrences[layer_key]
+            self._access_occurrences[layer_key] += 1
+            access_key = _make_access_key(layer_key, operation, occurrence)
+            pos, status = self._align_locked(access_key)
+            self._consume_pos = pos + 1
+            self._observed_step.append(access_key)
             self.skips += 1
+            if status == "resynced":
+                self.resyncs += 1
+            elif status == "mismatch":
+                self.mismatches += 1
             self._skipped_positions.add(pos)
             slot = self._slots.get(pos)
             if slot is not None and slot.state == CPU_READY:
@@ -516,87 +716,128 @@ class PinnedBouncePool:
         self._inflight_bytes += nbytes
         return leaves
 
+    def _claim_one_fill_locked(self):
+        """Reserve the next fillable position as a CPU_FILLING slot.
+
+        Returns ``(status, job)`` where status is one of:
+          "job"  -> job = (pos, slot, weight, bias, signature); slot registered.
+          "skip" -> position unfillable (no source/weight/too big); advanced.
+          "full" -> budget/buffers exhausted; caller should wait for a reclaim.
+          "none" -> no schedulable position right now (target_ready met or end).
+        """
+        pos = self._next_fill_target_locked() if self._scheduled else None
+        if pos is None:
+            return "none", None
+        layer_key = _schedule_layer_key(self._scheduled[pos])
+        src_ref = self._sources.get(layer_key)
+        module = src_ref() if src_ref is not None else None
+        if module is None:
+            # cannot stage an unknown source; skip it permanently
+            self._fill_pos = pos + 1
+            return "skip", None
+        weight = getattr(module, "weight", None)
+        bias = getattr(module, "bias", None)
+        if weight is None:
+            self._fill_pos = pos + 1
+            return "skip", None
+        specs = _layer_specs(weight, bias)
+        signature = tuple(specs)
+        nbytes = _spec_bytes(specs)
+        if nbytes > self.budget_bytes:
+            # never fits the pool; always demand-load this one
+            self._fill_pos = pos + 1
+            return "skip", None
+        leaves = self._take_buffers_locked(signature, nbytes)
+        if leaves is None:
+            # budget full; wait for a reclaim
+            return "full", None
+        slot = _Slot()
+        slot.position = pos
+        slot.layer_key = layer_key
+        slot.state = CPU_FILLING
+        slot.signature = signature
+        slot.leaves = leaves
+        slot.nbytes = nbytes
+        slot.ready_event.clear()
+        self._slots[pos] = slot
+        self._fill_pos = pos + 1
+        return "job", (pos, slot, weight, bias, signature)
+
     def _worker_loop(self):
         while True:
+            jobs = []
             with self._cv:
                 if self._stop:
                     return
                 self._reclaim_locked()
-                pos = self._next_fill_target_locked() if self._scheduled else None
-                if pos is None:
+                if not self._scheduled:
                     self._cv.wait(timeout=0.05)
                     continue
-                layer_key = self._scheduled[pos]
-                src_ref = self._sources.get(layer_key)
-                module = src_ref() if src_ref is not None else None
-                if module is None:
-                    # cannot stage an unknown source; skip it permanently
-                    self._fill_pos = pos + 1
+                # Claim up to fill_group_size positions under a single lock so a
+                # whole block's worth of fills shares one lock/CV cycle instead
+                # of one per Linear.
+                full = False
+                for _ in range(self.fill_group_size):
+                    status, job = self._claim_one_fill_locked()
+                    if status == "job":
+                        jobs.append(job)
+                        continue
+                    if status == "skip":
+                        continue
+                    full = status == "full"
+                    break
+                if not jobs:
+                    self._cv.wait(timeout=0.02 if full else 0.05)
                     continue
-                weight = getattr(module, "weight", None)
-                bias = getattr(module, "bias", None)
-                if weight is None:
-                    self._fill_pos = pos + 1
-                    continue
-                specs = _layer_specs(weight, bias)
-                signature = tuple(specs)
-                nbytes = _spec_bytes(specs)
-                if nbytes > self.budget_bytes:
-                    # never fits the pool; always demand-load this one
-                    self._fill_pos = pos + 1
-                    continue
-                leaves = self._take_buffers_locked(signature, nbytes)
-                if leaves is None:
-                    # budget full; wait for a reclaim
-                    self._cv.wait(timeout=0.02)
-                    continue
-                slot = _Slot()
-                slot.position = pos
-                slot.layer_key = layer_key
-                slot.state = CPU_FILLING
-                slot.signature = signature
-                slot.leaves = leaves
-                slot.nbytes = nbytes
-                slot.ready_event.clear()
-                self._slots[pos] = slot
-                self._fill_pos = pos + 1
                 epoch = self._epoch
 
             # Copy outside the lock so page faults / memcpy overlap the train
             # thread. PyTorch's copy_ releases the GIL for the actual transfer.
-            copy_t0 = time.perf_counter()
-            try:
-                leaves_iter = iter(slot.leaves)
-                pinned_weight = _rebuild_into(weight, leaves_iter)
+            results = []
+            for (pos, slot, weight, bias, signature) in jobs:
+                copy_t0 = time.perf_counter()
+                pinned_weight = None
                 pinned_bias = None
-                if bias is not None:
-                    pinned_bias = next(leaves_iter)
-                    pinned_bias.copy_(bias)
-                ok = True
-            except Exception:
-                ok = False
-            copy_dt = time.perf_counter() - copy_t0
+                try:
+                    leaves_iter = iter(slot.leaves)
+                    pinned_weight = _rebuild_into(weight, leaves_iter)
+                    if bias is not None:
+                        pinned_bias = next(leaves_iter)
+                        pinned_bias.copy_(bias)
+                    ok = True
+                except Exception:
+                    ok = False
+                copy_dt = time.perf_counter() - copy_t0
+                results.append(
+                    (pos, slot, signature, pinned_weight, pinned_bias, ok, copy_dt)
+                )
 
             with self._cv:
-                if (
-                    not ok
-                    or self._epoch != epoch
-                    or self._slots.get(pos) is not slot
-                    or pos in self._skipped_positions
-                ):
-                    # step rolled over or copy failed: discard this slot.
-                    if self._slots.get(pos) is slot:
-                        del self._slots[pos]
-                    self._free_buffers.setdefault(signature, []).append(slot.leaves)
-                    self._inflight_bytes -= slot.nbytes
-                    slot.ready_event.set()  # release any waiter -> falls back
-                    continue
-                slot.weight = pinned_weight
-                slot.bias = pinned_bias
-                slot.state = CPU_READY
-                self.copy_s += copy_dt
-                self.copy_bytes += slot.nbytes
-                slot.ready_event.set()
+                published = 0
+                for (pos, slot, signature, pinned_weight, pinned_bias, ok, copy_dt) in results:
+                    if (
+                        not ok
+                        or self._epoch != epoch
+                        or self._slots.get(pos) is not slot
+                        or pos in self._skipped_positions
+                    ):
+                        # step rolled over or copy failed: discard this slot.
+                        if self._slots.get(pos) is slot:
+                            del self._slots[pos]
+                        self._free_buffers.setdefault(signature, []).append(slot.leaves)
+                        self._inflight_bytes -= slot.nbytes
+                        slot.ready_event.set()  # release any waiter -> falls back
+                        continue
+                    slot.weight = pinned_weight
+                    slot.bias = pinned_bias
+                    slot.state = CPU_READY
+                    self.copy_s += copy_dt
+                    self.copy_bytes += slot.nbytes
+                    self.fills += 1
+                    published += 1
+                    slot.ready_event.set()
+                if published:
+                    self.fill_batches += 1
                 self._cv.notify_all()
 
     # -- diagnostics & teardown -------------------------------------------
@@ -604,8 +845,12 @@ class PinnedBouncePool:
     def _reset_stats_locked(self):
         self.hits = self.soft_misses = self.hard_misses = 0
         self.skips = 0
+        self.resyncs = 0
+        self.mismatches = 0
+        self.duplicate_key_resync_blocked = 0
         self.cpu_wait_s = self.copy_s = 0.0
         self.copy_bytes = 0
+        self.fills = self.fill_batches = 0
 
     def stats(self, reset: bool = False) -> dict:
         with self._lock:
@@ -621,10 +866,19 @@ class PinnedBouncePool:
                 "soft_misses": self.soft_misses,
                 "hard_misses": self.hard_misses,
                 "skips": self.skips,
+                "resyncs": self.resyncs,
+                "mismatches": self.mismatches,
+                "duplicate_key_resync_blocked": self.duplicate_key_resync_blocked,
                 "hit_rate": (self.hits / total) if total else 0.0,
                 "cpu_wait_s": self.cpu_wait_s,
                 "copy_s": self.copy_s,
                 "copy_gbps": copy_gbps,
+                "fills": self.fills,
+                "fill_batches": self.fill_batches,
+                "fill_group_size": self.fill_group_size,
+                "fills_per_batch": (
+                    self.fills / self.fill_batches if self.fill_batches else 0.0
+                ),
                 "budget_gib": self.budget_bytes / gib,
                 "ready_gib": states.get(CPU_READY, 0) / gib,
                 "filling_gib": states.get(CPU_FILLING, 0) / gib,
@@ -640,6 +894,7 @@ class PinnedBouncePool:
                 "schedule_len": len(self._scheduled),
                 "observed_len": len(self._observed_step),
                 "schedule_shape_key": _shape_key_label(self.schedule_shape_key),
+                "schedule_confidence": self.schedule_confidence,
                 "lookahead": self.max_lookahead_positions,
             }
             if reset:
@@ -651,9 +906,13 @@ class PinnedBouncePool:
         return (
             f"[BouncePool] acquires={s['acquires']} "
             f"skipped_gpu_resident={s['skips']} "
+            f"resync={s['resyncs']} mismatch={s['mismatches']} "
+            f"dup_block={s['duplicate_key_resync_blocked']} "
             f"hit={s['hits']} soft_miss={s['soft_misses']} hard_miss={s['hard_misses']} "
             f"hit_rate={s['hit_rate']:.1%} cpu_wait={s['cpu_wait_s']:.1f}s "
             f"copy={s['copy_s']:.1f}s@{s['copy_gbps']:.2f}GB/s "
+            f"fills={s['fills']} batches={s['fill_batches']} "
+            f"group={s['fill_group_size']}({s['fills_per_batch']:.1f}/batch) "
             f"budget={s['budget_gib']:.2f}GiB ready={s['ready_gib']:.2f}GiB "
             f"filling={s['filling_gib']:.2f}GiB in_use={s['in_use_gib']:.2f}GiB "
             f"free_buffer={s['free_buffer_gib']:.2f}GiB "
@@ -661,6 +920,7 @@ class PinnedBouncePool:
             f"inflight={s['inflight_gib']:.2f}GiB slots={s['live_slots']} "
             f"pos={s['consume_pos']}/{s['fill_pos']} "
             f"schedule={s['schedule_len']} shape={s['schedule_shape_key']} "
+            f"confidence={s['schedule_confidence']} "
             f"lookahead={s['lookahead']}"
         )
 

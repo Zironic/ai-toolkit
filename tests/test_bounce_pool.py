@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -34,7 +37,7 @@ class BouncePoolTests(unittest.TestCase):
             pool.step_begin(warmup_bytes=0, warmup_timeout_s=0.0)
 
             with pool._cv:
-                self.assertEqual(pool._scheduled, ["b", "c", "d"])
+                self.assertEqual(pool._scheduled, [("b", "forward", 0), ("c", "forward", 0), ("d", "forward", 0)])
                 self.assertEqual(pool.schedule_shape_key, "observed")
                 self.assertEqual(pool.schedule_version, -2)
                 self.assertEqual(pool._consume_pos, 0)
@@ -216,6 +219,357 @@ class BouncePoolTests(unittest.TestCase):
         finally:
             pool.shutdown()
 
+    def test_acquire_resyncs_exact_semantic_access(self):
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=4, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            weight = torch.empty(4)
+            pool.set_schedule([
+                ("a", "forward", 0),
+                ("b", "forward", 0),
+                ("a", "backward", 1),
+                ("b", "backward", 1),
+            ])
+            pool.acquire("b", weight, None, operation="forward")
+            stats = pool.stats()
+            self.assertEqual(stats["resyncs"], 1)
+            self.assertEqual(stats["mismatches"], 0)
+            self.assertEqual(stats["consume_pos"], 2)
+        finally:
+            pool.shutdown()
+
+    def test_resync_does_not_jump_to_later_duplicate_layer(self):
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=4, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            weight = torch.empty(4)
+            pool.set_schedule([
+                ("a", "forward", 0),
+                ("c", "forward", 0),
+                ("a", "backward", 1),
+                ("b", "backward", 1),
+            ])
+            pool.acquire("b", weight, None, operation="forward")
+            stats = pool.stats()
+            self.assertEqual(stats["resyncs"], 0)
+            self.assertEqual(stats["mismatches"], 1)
+            self.assertEqual(stats["duplicate_key_resync_blocked"], 1)
+            self.assertEqual(stats["consume_pos"], 1)
+        finally:
+            pool.shutdown()
+
+    def test_consume_without_transfer_resyncs_exact_semantic_access(self):
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=4, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            pool.set_schedule([
+                ("a", "forward", 0),
+                ("b", "forward", 0),
+                ("a", "backward", 1),
+                ("b", "backward", 1),
+            ])
+            pool.consume_without_transfer("b", operation="forward")
+            stats = pool.stats()
+            self.assertEqual(stats["resyncs"], 1)
+            self.assertEqual(stats["mismatches"], 0)
+            self.assertEqual(stats["skips"], 1)
+            self.assertEqual(stats["consume_pos"], 2)
+        finally:
+            pool.shutdown()
+
+    def test_trace_schedule_preserves_operation_and_occurrence(self):
+        from toolkit.memory_management import manager_modules
+
+        manager_modules.set_offload_trace_enabled(True)
+        try:
+            manager_modules._OFFLOAD_TRACE.schedule_by_shape_key.clear()
+            manager_modules._OFFLOAD_TRACE.frozen = None
+            manager_modules._OFFLOAD_TRACE.version = 0
+            manager_modules.offload_step_begin(shape_key="shape-a")
+            manager_modules.record_weight_access("a", "forward")
+            manager_modules.record_weight_access("b", "forward")
+            manager_modules.record_weight_access("a", "backward")
+            manager_modules.offload_step_end()
+
+            expected = [
+                ("a", "forward", 0),
+                ("b", "forward", 0),
+                ("a", "backward", 1),
+            ]
+            self.assertEqual(
+                manager_modules.offload_trace_schedule("shape-a"),
+                expected,
+            )
+
+            version = manager_modules.offload_trace_version()
+            manager_modules.mark_transfer_plan_dirty()
+            self.assertEqual(
+                manager_modules.offload_trace_schedule("shape-a"),
+                expected,
+            )
+            self.assertGreater(manager_modules.offload_trace_version(), version)
+        finally:
+            manager_modules.set_offload_trace_enabled(False)
+            manager_modules._OFFLOAD_TRACE.schedule_by_shape_key.clear()
+            manager_modules._OFFLOAD_TRACE.frozen = None
+
+    def test_sync_sources_replaces_sources_without_clearing_schedule(self):
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=2, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            module_a = torch.nn.Linear(8, 8)
+            module_b = torch.nn.Linear(8, 8)
+            pool.register_source("a", module_a)
+            pool.register_source("b", module_b)
+            pool.set_schedule([("a", "forward", 0), ("b", "forward", 0)])
+
+            pool.sync_sources([("b", module_b)])
+
+            with pool._cv:
+                self.assertNotIn("a", pool._sources)
+                self.assertIn("b", pool._sources)
+                self.assertEqual(
+                    pool._scheduled,
+                    [("a", "forward", 0), ("b", "forward", 0)],
+                )
+        finally:
+            pool.shutdown()
+
+    def test_trace_capture_writes_replay_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_path = os.path.join(tmp, "capture.jsonl")
+            old_path = bounce_pool._TRACE_CAPTURE_PATH
+            old_limit = bounce_pool._TRACE_CAPTURE_STEPS
+            bounce_pool.configure_trace_capture(capture_path, 1)
+            pool = None
+            try:
+                pool = bounce_pool.PinnedBouncePool(
+                    "cpu", budget_bytes=1 << 20, lookahead=2, num_workers=1,
+                    ram_floor_bytes=0,
+                )
+                weight = torch.empty(4)
+                pool.set_schedule([("a", "forward", 0), ("b", "forward", 0)])
+                pool.acquire("b", weight, None, operation="forward")
+
+                pool.step_begin(warmup_bytes=0, warmup_timeout_s=0.0)
+
+                with open(capture_path, "r", encoding="utf-8") as handle:
+                    records = [json.loads(line) for line in handle if line.strip()]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(
+                    records[0]["schedule"],
+                    [["a", "forward", 0], ["b", "forward", 0]],
+                )
+                self.assertEqual(records[0]["observed"], [["b", "forward", 0]])
+                self.assertEqual(records[0]["resyncs"], 1)
+            finally:
+                if pool is not None:
+                    pool.shutdown()
+                bounce_pool.configure_trace_capture(old_path, old_limit)
+
+    def test_ready_slot_wrong_layer_or_shape_is_hard_miss(self):
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=2, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            requested = torch.nn.Linear(4, 4)
+            wrong = torch.nn.Linear(8, 8)
+            pool.register_source("requested", requested)
+            pool.register_source("wrong", wrong)
+            pool.set_schedule([("requested", "forward", 0)])
+
+            wrong_signature = tuple(bounce_pool._layer_specs(wrong.weight, wrong.bias))
+            wrong_leaves = bounce_pool._alloc_pinned(wrong_signature)
+            slot = bounce_pool._Slot()
+            slot.position = 0
+            slot.layer_key = "wrong"
+            slot.state = bounce_pool.CPU_READY
+            slot.signature = wrong_signature
+            slot.leaves = wrong_leaves
+            slot.weight = wrong.weight
+            slot.bias = wrong.bias
+            slot.nbytes = bounce_pool._spec_bytes(wrong_signature)
+            with pool._cv:
+                pool._slots[0] = slot
+                pool._inflight_bytes = slot.nbytes
+
+            weight, bias, ticket = pool.acquire(
+                "requested", requested.weight, requested.bias, operation="forward"
+            )
+
+            self.assertIs(weight, requested.weight)
+            self.assertIs(bias, requested.bias)
+            self.assertIsNone(ticket)
+            stats = pool.stats()
+            self.assertEqual(stats["hits"], 0)
+            self.assertEqual(stats["hard_misses"], 1)
+            with pool._cv:
+                self.assertNotIn(0, pool._slots)
+        finally:
+            pool.shutdown()
+    def test_demote_layer_preserves_named_layer_key(self):
+        from toolkit.memory_management.manager import MemoryManager
+
+        root = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        mm = MemoryManager(root, torch.device("cpu"))
+
+        self.assertTrue(
+            MemoryManager.demote_layer(root[0], mm, layer_key="blocks.0.mlp.up")
+        )
+        self.assertEqual(root[0]._mm_layer_key, "blocks.0.mlp.up")
+    def test_resident_candidate_layers_are_recorded_in_trace(self):
+        from toolkit.memory_management import manager_modules
+        from toolkit.memory_management.manager import MemoryManager
+
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+        manager_modules.set_offload_trace_enabled(True)
+        try:
+            manager_modules._OFFLOAD_TRACE.schedule_by_shape_key.clear()
+            manager_modules._OFFLOAD_TRACE.frozen = None
+            manager_modules._OFFLOAD_TRACE.version = 0
+            MemoryManager.attach(
+                model,
+                torch.device("cpu"),
+                _offload_module_ids=set(),
+            )
+
+            manager_modules.offload_step_begin(shape_key="resident-shape")
+            x = torch.randn(2, 4, requires_grad=True)
+            model(x).sum().backward()
+            manager_modules.offload_step_end()
+
+            self.assertEqual(
+                manager_modules.offload_trace_schedule("resident-shape"),
+                [
+                    ("0", "forward", 0),
+                    ("1", "forward", 0),
+                    ("1", "backward", 1),
+                    ("0", "backward", 1),
+                ],
+            )
+        finally:
+            MemoryManager.detach(model)
+            manager_modules.set_offload_trace_enabled(False)
+            manager_modules._OFFLOAD_TRACE.schedule_by_shape_key.clear()
+            manager_modules._OFFLOAD_TRACE.frozen = None
+
+class BounceFillGroupTests(unittest.TestCase):
+    """Block-granular worker fill batching (fill_group_size)."""
+
+    def test_default_and_env_fill_group_size(self):
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, num_workers=1, ram_floor_bytes=0,
+        )
+        try:
+            self.assertEqual(pool.fill_group_size, 1)
+        finally:
+            pool.shutdown()
+
+        with mock.patch.dict(os.environ, {"AI_TOOLKIT_BOUNCE_FILL_GROUP": "8"}):
+            pool = bounce_pool.PinnedBouncePool(
+                "cpu", budget_bytes=1 << 20, num_workers=1, ram_floor_bytes=0,
+            )
+            try:
+                self.assertEqual(pool.fill_group_size, 8)
+            finally:
+                pool.shutdown()
+
+    def test_batched_fill_stages_every_position_as_a_hit(self):
+        # A batched (block-sized) fill must stage exactly the same positions as
+        # the per-Linear path: every scheduled layer ends CPU_READY and is a hit
+        # when consumed in order. Run both group sizes for parity.
+        for group in (1, 8):
+            pool = bounce_pool.PinnedBouncePool(
+                "cpu", budget_bytes=1 << 24, lookahead=8, num_workers=1,
+                ram_floor_bytes=0, target_ready_bytes=1 << 24,
+                fill_group_size=group,
+            )
+            try:
+                keys = [f"layer{i}" for i in range(8)]
+                modules = [torch.nn.Linear(16, 16) for _ in keys]  # keep strong refs
+                for k, m in zip(keys, modules):
+                    pool.register_source(k, m)
+                pool.set_schedule(keys)
+                staged = _wait_until(
+                    lambda: pool.stats()["live_slots"] >= 8, timeout=3.0
+                )
+                self.assertTrue(staged, f"group={group} did not stage all positions")
+                tickets = [
+                    pool.acquire(k, m.weight, m.bias)[2]
+                    for k, m in zip(keys, modules)
+                ]
+                self.assertTrue(
+                    all(t is not None for t in tickets),
+                    f"group={group} produced a non-hit: {tickets}",
+                )
+                stats = pool.stats()
+                self.assertEqual(stats["hits"], 8, f"group={group} hits")
+                self.assertEqual(stats["hard_misses"], 0, f"group={group} hard_misses")
+            finally:
+                pool.shutdown()
+
+    def test_fill_batches_counts_block_cycles(self):
+        # The worker-fill counters must show batching: same fills, but group=8
+        # publishes in far fewer batches (worker lock-cycles) than group=1.
+        batches_by_group = {}
+        for group in (1, 8):
+            pool = bounce_pool.PinnedBouncePool(
+                "cpu", budget_bytes=1 << 24, lookahead=8, num_workers=1,
+                ram_floor_bytes=0, target_ready_bytes=1 << 24,
+                fill_group_size=group,
+            )
+            try:
+                keys = [f"layer{i}" for i in range(8)]
+                modules = [torch.nn.Linear(16, 16) for _ in keys]
+                for k, m in zip(keys, modules):
+                    pool.register_source(k, m)
+                pool.set_schedule(keys)
+                self.assertTrue(_wait_until(
+                    lambda: pool.stats()["fills"] >= 8, timeout=3.0
+                ), f"group={group} did not fill all positions")
+                stats = pool.stats()
+                self.assertEqual(stats["fills"], 8, f"group={group} fills")
+                batches_by_group[group] = stats["fill_batches"]
+            finally:
+                pool.shutdown()
+        self.assertEqual(batches_by_group[1], 8, "group=1 should be one batch per fill")
+        self.assertLess(
+            batches_by_group[8], batches_by_group[1],
+            f"group=8 should batch: {batches_by_group}",
+        )
+
+    def test_batched_fill_respects_budget(self):
+        # fill_group_size must never exceed the byte budget: a group larger than
+        # what fits still stops at the budget instead of over-allocating.
+        lin_bytes = bounce_pool._spec_bytes(
+            bounce_pool._layer_specs(torch.nn.Linear(16, 16).weight, None)
+        )
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=lin_bytes * 3, lookahead=8, num_workers=1,
+            ram_floor_bytes=0, target_ready_bytes=lin_bytes * 8,
+            fill_group_size=8,
+        )
+        try:
+            keys = [f"layer{i}" for i in range(8)]
+            modules = [torch.nn.Linear(16, 16) for _ in keys]  # keep strong refs
+            for k, m in zip(keys, modules):
+                pool.register_source(k, m)
+            pool.set_schedule(keys)
+            _wait_until(lambda: pool.stats()["inflight_gib"] > 0, timeout=3.0)
+            time.sleep(0.05)
+            with pool._cv:
+                self.assertLessEqual(pool._inflight_bytes, pool.budget_bytes)
+        finally:
+            pool.shutdown()
 
 
 if __name__ == "__main__":

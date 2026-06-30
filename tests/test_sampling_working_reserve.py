@@ -1,5 +1,9 @@
 import unittest
 
+import pathlib
+
+import torch
+
 from toolkit.memory_management import MemoryManager
 
 GIB = 1024 ** 3
@@ -53,6 +57,54 @@ class SamplingWorkingReserveTests(unittest.TestCase):
         self.assertEqual(bytes_, 0)
         self.assertEqual(source, "fixed-config")
 
+    def test_sampling_plan_subtracts_wddm_margin(self):
+        module = torch.nn.Sequential(torch.nn.Linear(16, 16, bias=False))
+        base = MemoryManager._smart_sampling_plan(
+            module,
+            free_bytes=10 * GIB,
+            working_reserve_bytes=2 * GIB,
+            ignore_modules=[],
+            wddm_margin_bytes=0,
+        )
+        guarded = MemoryManager._smart_sampling_plan(
+            module,
+            free_bytes=10 * GIB,
+            working_reserve_bytes=2 * GIB,
+            ignore_modules=[],
+            wddm_margin_bytes=1 * GIB,
+        )
+        self.assertEqual(base["usable_bytes"], 8 * GIB)
+        self.assertEqual(guarded["usable_bytes"], 7 * GIB)
+        self.assertEqual(guarded["wddm_margin_bytes"], 1 * GIB)
+
+    def test_sampling_plan_never_sets_target_below_hard_floor(self):
+        module = torch.nn.Sequential(torch.nn.Linear(16, 16, bias=False))
+        plan = MemoryManager._smart_sampling_plan(
+            module,
+            free_bytes=10 * GIB,
+            working_reserve_bytes=2 * GIB,
+            ignore_modules=[],
+            wddm_margin_bytes=1 * GIB,
+            wddm_hard_bytes=2 * GIB,
+        )
+        self.assertEqual(plan["wddm_hard_bytes"], 2 * GIB)
+        self.assertEqual(plan["wddm_margin_bytes"], 2 * GIB)
+        self.assertEqual(plan["usable_bytes"], 6 * GIB)
+
+    def test_job_config_wires_training_and_sampling_wddm_margins(self):
+        source = pathlib.Path("toolkit/config_modules.py").read_text()
+        self.assertIn("self.layer_offloading_smart_wddm_margin_gb = kwargs.get", source)
+        self.assertIn('"layer_offloading_smart_wddm_margin_gb"', source)
+        self.assertIn('kwargs.get("layer_offloading_smart_buffer_gb", 1.0)', source)
+        self.assertIn("self.layer_offloading_smart_wddm_hard_gb = kwargs.get", source)
+        self.assertIn('"layer_offloading_smart_wddm_hard_gb"', source)
+        self.assertIn('kwargs.get("layer_offloading_smart_hard_buffer_gb", 1.0)', source)
+        self.assertIn("self.layer_offloading_smart_sampling_wddm_margin_gb = kwargs.get", source)
+        self.assertIn('"layer_offloading_smart_sampling_wddm_margin_gb"', source)
+        self.assertIn('kwargs.get("layer_offloading_smart_sampling_buffer_gb", 1.0)', source)
+        self.assertIn("self.layer_offloading_smart_sampling_wddm_hard_gb = kwargs.get", source)
+        self.assertIn('"layer_offloading_smart_sampling_wddm_hard_gb"', source)
+        self.assertIn('kwargs.get("layer_offloading_smart_sampling_hard_buffer_gb", 1.0)', source)
 
 if __name__ == "__main__":
     unittest.main()

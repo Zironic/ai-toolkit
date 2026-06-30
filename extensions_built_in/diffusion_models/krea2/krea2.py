@@ -523,8 +523,11 @@ class Krea2Model(BaseModel):
                         transformer,
                         self.device_torch,
                         working_reserve_gib=self.model_config.layer_offloading_smart_working_reserve_gb,
+                        wddm_margin_gib=self.model_config.layer_offloading_smart_wddm_margin_gb,
+                        wddm_hard_gib=self.model_config.layer_offloading_smart_wddm_hard_gb,
                         ignore_modules=ignore_modules,
                         pinned_resident_keys=pinned_resident_keys,
+                        block_stream_only=self.model_config.layer_offloading_block_stream_only,
                         fp8_training_forward=(
                             self.model_config.quantize
                             and self.model_config.qtype in ('qfloat8', 'float8')
@@ -653,6 +656,18 @@ class Krea2Model(BaseModel):
         gen_config.width = int(gen_config.width // sc * sc)
         gen_config.height = int(gen_config.height // sc * sc)
 
+        # Reactive cohabitation guard: if external VRAM growth (Windows desktop,
+        # another app) since the last image would push this forward's peak within
+        # the WDDM spill margin, stream one resident block back to CPU first.
+        # Runs before compile so enable_compiled_sampling() rebuilds for the new
+        # resident set. Paging is silent (not an OOM), so this must be proactive.
+        guard = getattr(self.model, "_mm_sampling_guard", None)
+        if guard is not None:
+            try:
+                guard()
+            except Exception as error:
+                print(f"[MemoryManager] sampling cohabitation guard failed: {error}")
+
         if self.model_config.compile_sample:
             # Regional (per-block) compilation. We are inside the sampling
             # context (inference_resident) here, so residency is already
@@ -689,6 +704,7 @@ class Krea2Model(BaseModel):
             guidance_scale=gen_config.guidance_scale,
             latents=gen_config.latents,
             generator=generator,
+            batch_cfg=getattr(gen_config, "batch_cfg", False),
         )[0]
         return img
 

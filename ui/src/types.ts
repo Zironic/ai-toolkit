@@ -184,13 +184,21 @@ export interface ModelConfig {
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
   layer_offloading_smart?: boolean;
+  layer_offloading_block_stream_only?: boolean;
   layer_offloading_smart_working_reserve_gb?: number;
+  layer_offloading_smart_wddm_margin_gb?: number;
+  layer_offloading_smart_wddm_hard_gb?: number;
   /** @deprecated renamed to layer_offloading_smart_working_reserve_gb; read for back-compat. */
   layer_offloading_smart_headroom_gb?: number;
   layer_offloading_smart_sampling?: boolean;
+  layer_offloading_smart_sampling_working_reserve_gb?: number;
+  layer_offloading_smart_sampling_wddm_margin_gb?: number;
+  layer_offloading_smart_sampling_wddm_hard_gb?: number;
   layer_offloading_fp8_sampling?: boolean;
   layer_offloading_profile?: boolean;
   layer_offloading_prefetch?: boolean;
+  layer_offloading_prefetch_trace_capture?: string;
+  layer_offloading_prefetch_trace_capture_steps?: number;
   layer_offloading_fp8_forward?: boolean;
   layer_offloading_fp8_grad_input?: boolean;
   layer_offloading_checkpoint_keep_last?: number;
@@ -236,6 +244,7 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  batch_cfg?: boolean;
 }
 
 export interface LoggingConfig {

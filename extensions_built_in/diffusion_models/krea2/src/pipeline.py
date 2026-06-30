@@ -193,6 +193,7 @@ class Krea2Pipeline:
         guidance_scale: float = 4.5,
         latents: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        batch_cfg: bool = False,
         **kwargs,
     ) -> List[Image.Image]:
         model = self.model
@@ -238,7 +239,27 @@ class Krea2Pipeline:
         x2 = (maxres // align) ** 2
         ts = timesteps(gh * gw, num_inference_steps, x1, x2, y1=y1, y2=y2, mu=mu)
 
+        # Batched CFG: run cond + uncond in one (batch=2) forward. Padding both
+        # caption feature lists together to a common length and masking the pads is
+        # numerically equivalent to the two separate forwards (masked text tokens
+        # do not contribute), but reads each weight once. Built once — invariant
+        # across timesteps. do_batch_cfg may be cleared on OOM to fall back.
+        do_batch_cfg = do_cfg and bool(batch_cfg)
+        cfg_feats = cfg_mask = None
+        if do_batch_cfg:
+            cfg_feats, cfg_mask = pad_text_features(
+                list(conditional_embeds.text_embeds)
+                + list(unconditional_embeds.text_embeds),
+                device,
+                dtype,
+            )
+
         def _step(t):
+            if do_batch_cfg:
+                lat = latents.to(dtype).repeat(2, 1, 1, 1)
+                v = predict_velocity(transformer, lat, t.repeat(2), cfg_feats, cfg_mask)
+                v_cond, v_uncond = v[0:1], v[1:2]
+                return v_cond + guidance_scale * (v_cond - v_uncond)
             v_cond = predict_velocity(
                 transformer, latents.to(dtype), t, cond_feats, cond_mask
             )
@@ -254,8 +275,22 @@ class Krea2Pipeline:
         # On OOM, demote the transformer to fully-streamed (frees the resident
         # weights to CPU), drop the now-stale compiled blocks, and retry the step
         # — latents are only mutated after v is computed, so the retry is safe.
+        # Collapse the streaming-churn reserved high-water before each forward so
+        # device-used stays off the WDDM cliff (paging is silent, not an OOM, so
+        # the except below never catches it). No-op when there is VRAM slack.
+        step_trim = getattr(transformer, "_mm_sampling_step_trim", None)
+
         for tcurr, tprev in zip(ts[:-1], ts[1:]):
             t = torch.full((latents.shape[0],), tcurr, dtype=dtype, device=device)
+            if step_trim is not None:
+                try:
+                    if step_trim():
+                        # A mid-step demote attached a streaming hook to a block
+                        # whose compiled graph is now stale; drop the compiled set
+                        # so the next forward runs it eager (rebuilt next image).
+                        transformer.disable_compiled_sampling()
+                except Exception as error:  # never let the guard break sampling
+                    print(f"[MemoryManager] step trim failed (ignored): {error}")
             try:
                 v = _step(t)
             except torch.cuda.OutOfMemoryError:
@@ -263,6 +298,11 @@ class Krea2Pipeline:
                 demote = getattr(transformer, "_mm_sampling_demote", None)
                 if demote is not None and demote():
                     transformer.disable_compiled_sampling()
+                    v = _step(t)
+                elif do_batch_cfg:
+                    # Batched CFG doubles the activation peak; drop to sequential
+                    # CFG (half the peak) for the rest of the run and retry.
+                    do_batch_cfg = False
                     v = _step(t)
                 else:
                     raise

@@ -47,6 +47,7 @@ export const defaultSampleConfig: SampleConfig = {
   sample_steps: 30,
   num_frames: 1,
   fps: 1,
+  batch_cfg: false,
 }
 
 export const defaultAudioSampleConfig: SampleConfig = {
