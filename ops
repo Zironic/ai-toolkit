@@ -1,1 +1,1 @@
-{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":5,"timestamp":1782911730,"nonce":"Aca8eoHTg7HAFAfL2XMkx+OKwH0=","added":["ui","mask","sam3","port","backlog"],"removed":null}]}
+{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":2,"timestamp":1782911740,"nonce":"8TveHx4VZLhIextvIXA8+OFjXfs=","title":"Port mask UI and SAM3 code from sister repository","was":"Goal:"}]}
