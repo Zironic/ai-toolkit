@@ -1,1 +1,1 @@
-{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":5,"timestamp":1782911188,"nonce":"pI6y6+ixQfrPt9zXGLbLeedgkLg=","added":["block-stream","perf","experiment"],"removed":null}]}
+{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":2,"timestamp":1782911385,"nonce":"ylHJV7KhHTVfLI/Dpi5/1f32dEQ=","title":"Block streaming: decide whether block GPU ring should stay gated","was":"Goal:"}]}
