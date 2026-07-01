@@ -1,1 +1,1 @@
-{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":2,"timestamp":1782911385,"nonce":"Afy0L1L7GrogbMqWlqhE2JJVOGM=","title":"Disk-backed offload: design RAM-optimized streaming prototype","was":"Goal:"}]}
+{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":3,"timestamp":1782913088,"nonce":"RqT4wLWP2X387N6uxXvew5eS7Qw=","message":"Spec/plan: tasks/open/DISK_OFFLOAD_TODO.md","files":null}]}
