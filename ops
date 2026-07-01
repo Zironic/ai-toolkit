@@ -1,1 +1,1 @@
-{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":5,"timestamp":1782911188,"nonce":"LTa8AhqH9azDUz9gUiA3MDxYUhU=","added":["process","docs","git-bug"],"removed":null}]}
+{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":2,"timestamp":1782911385,"nonce":"QuB4ZCihgEk3rpRYR9WhxX62I5k=","title":"Ticket migration: replace stateful Markdown with git-bug workflow","was":"Goal:"}]}
