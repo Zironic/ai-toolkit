@@ -1,1 +1,1 @@
-{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":5,"timestamp":1782911188,"nonce":"rJa0paA2sP6aIe7O9JJsOcWbl8k=","added":["upstream","pr","sampling"],"removed":null}]}
+{"author":{"id":"fb9734b7331903226ef3f5df545b960dd5ac64d18b49faee11e8b8e0bd561c91"},"ops":[{"type":2,"timestamp":1782911385,"nonce":"Ov396XEtfHdXjv1XWTkRJVxaZS4=","title":"Upstream PR stack: isolate resident sampling PR first","was":"Goal:"}]}
