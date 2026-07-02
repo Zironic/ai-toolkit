@@ -2,6 +2,7 @@ import os
 import random
 import hashlib
 import json
+import re
 import concurrent.futures
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -10,7 +11,6 @@ from typing import Union, Literal, List, Optional
 import numpy as np
 from diffusers import T2IAdapter, AutoencoderTiny, ControlNetModel
 
-import torch.functional as F
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader, ConcatDataset
 
@@ -724,7 +724,7 @@ class SDTrainer(BaseSDTrainProcess):
                 try:
                     vae.enable_gradient_checkpointing()
                     vae.train()
-                except:
+                except Exception:
                     pass
 
 
@@ -1242,7 +1242,7 @@ class SDTrainer(BaseSDTrainProcess):
         # multiply by our mask
         try:
             loss = loss * loss_multiplier
-        except:
+        except Exception:
             # todo handle mask with video models
             pass
         if prior_loss is not None:

@@ -1184,7 +1184,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
 
     def get_latest_save_path(self, name=None, post=''):
-        if name == None:
+        if name is None:
             name = self.job.name
         # get latest saved step
         latest_path = None
