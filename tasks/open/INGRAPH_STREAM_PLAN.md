@@ -303,6 +303,18 @@ already retired. The viable staging is the ladder below — each rung uses
 only endpoint machinery, so nothing is thrown away.
 
 **Rung 1 (Phase 4-pre) — resident-block training compile, no streaming.**
+DE-SCOPED to synthetic scale, 2026-07-04: production training on the
+reference card is keep_last=0 / fully streamed (keep_last=4 measured
+7.27 s/step vs 3.97 eager baseline at 512px — resident blocks push past
+the dedicated-VRAM cliff and WDDM paging costs more than residency
+saves; user had already concluded keep_last>0 is not worth it). Rung 1's
+risk items (LoRA in the AOTAutograd joint graph, fp8 grad path,
+checkpoint x compile) are de-risked on a synthetic resident model in
+tests/, not at Krea2 scale; the Krea2-scale A/B moves to Rung 2. The
+dormant enable_compiled_training machinery stays for cards with real
+resident sets (known blocker when revisited: pinned-resident layers are
+refused as resident_fp8_tensor_subclass -- _enable_fp8_training_compile
+skips them).
 This is `COMPILE_STREAMED_OFFLOAD_PLAN.md` Slice 2, ordered explicitly
 before any streamed training: compile pinned-resident blocks for training
 with the LoRA compile-clean fast path (parent Slice 2 — install-time
