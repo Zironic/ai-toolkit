@@ -31,6 +31,8 @@ import traceback
 from typing import Callable, Optional
 
 import torch
+from toolkit.memory_management import pin_manager
+
 
 
 def _fsync_path(path: str) -> None:
@@ -96,17 +98,19 @@ class PinnedStager:
         self._buf = None
         self._register = register
         self._registered_bytes = 0
+        self._pin_handle = None
 
     def _ensure_buf(self):
         if self._buf is None:
-            self._buf = torch.empty(self.cap_bytes, dtype=torch.uint8, pin_memory=True)
-            if self._register:
-                try:
-                    from toolkit.memory_management.bounce_pool import register_pinned_bytes
-                    register_pinned_bytes(self.cap_bytes)
-                    self._registered_bytes = self.cap_bytes
-                except Exception:
-                    pass
+            handle = pin_manager.pin_alloc(
+                self.cap_bytes,
+                "save_stager",
+                required=True,
+                mode="training",
+            )
+            self._pin_handle = handle
+            self._buf = handle.tensor
+            self._registered_bytes = self.cap_bytes if handle.pinned else 0
 
     def snapshot(self, items, out_dtype=torch.float16) -> "OrderedDict":
         """items: iterable of (key, device_tensor) -> OrderedDict[key -> cpu tensor]."""
@@ -158,12 +162,9 @@ class PinnedStager:
 
     def close(self):
         if self._registered_bytes:
-            try:
-                from toolkit.memory_management.bounce_pool import release_pinned_bytes
-                release_pinned_bytes(self._registered_bytes)
-            except Exception:
-                pass
+            pin_manager.release(self._pin_handle)
             self._registered_bytes = 0
+        self._pin_handle = None
         self._buf = None
 
 

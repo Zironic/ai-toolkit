@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import TYPE_CHECKING, Optional, Tuple
 from torch.overrides import has_torch_function_unary  # (ADD) torchao detection
+from . import pin_manager
+
 
 from .bounce_pool import (
     get_pool as get_prefetch_pool,
@@ -1012,7 +1014,8 @@ def stage_block_forward(device, block_key, linears, compute_dtype=None):
         total += leaf.numel() * leaf.element_size()
 
     # 2) Pack the leaves into one pinned host buffer (host memcpy, no CUDA submit).
-    host = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+    host_handle = pin_manager.pin_alloc(total, "block_stream", required=True)
+    host = host_handle.tensor
     for leaf, off in zip(src_leaves, offsets):
         nb = leaf.numel() * leaf.element_size()
         host[off:off + nb].view(leaf.dtype).reshape(leaf.shape).copy_(leaf)
@@ -1053,6 +1056,12 @@ def stage_block_forward(device, block_key, linears, compute_dtype=None):
         "bytes": int(total),
     })
     _record_ring_peak(state)
+    # The staging buffer is transient: it dies at function exit and returns to
+    # torch's caching host allocator (which keeps the storage safe until the
+    # async H2D completes, and keeps the commitment -- that cached footprint is
+    # the host-cache reserve's territory, not this ledger's). Without this
+    # release the ledger grows monotonically, one block per staging call.
+    pin_manager.release(host_handle)
 
 
 def block_forward_done(device, block_key):
@@ -1534,45 +1543,11 @@ _REGISTERED_HOST_PINS: dict[int, int] = {}
 
 
 def _pin_tensor_in_place(t: torch.Tensor) -> bool:
-    """Pin existing CPU tensor storage via cudaHostRegister when possible.
-
-    ``Tensor.pin_memory()`` allocates through PyTorch's cached pinned-host
-    allocator; in local DXGI probes, releasing that tensor returned the manager
-    ledger to zero but left NON_LOCAL usage committed for the process lifetime.
-    Registering the existing storage is reversible with cudaHostUnregister, so
-    layer-level unpin relief can actually free WDDM shared budget.
-    """
-    if t.device.type != "cpu" or t.is_pinned():
-        return False
-    try:
-        from torch.cuda import _pin_memory_utils as pin_memory_utils
-        ptr = int(t.data_ptr())
-        size = int(t.numel() * t.element_size())
-        if ptr == 0 or size <= 0:
-            return False
-        pin_memory_utils.pin_memory(ptr, size)
-    except Exception:
-        return False
-    with _REGISTERED_HOST_PIN_LOCK:
-        _REGISTERED_HOST_PINS[ptr] = size
-    return True
+    return pin_manager.pin_tensor_in_place(t, kind="weights")
 
 
 def _unpin_tensor_in_place(t: torch.Tensor) -> bool:
-    ptr = int(t.data_ptr())
-    with _REGISTERED_HOST_PIN_LOCK:
-        size = _REGISTERED_HOST_PINS.pop(ptr, None)
-    if size is None:
-        return False
-    try:
-        from torch.cuda import _pin_memory_utils as pin_memory_utils
-        pin_memory_utils.unpin_memory(ptr)
-        return True
-    except Exception:
-        # Keep the registry conservative if unregister failed.
-        with _REGISTERED_HOST_PIN_LOCK:
-            _REGISTERED_HOST_PINS[ptr] = size
-        return False
+    return pin_manager.unpin_tensor_in_place(t, kind="weights")
 
 
 def _pin_inner_tensors(t: torch.Tensor, budget: int) -> int:
@@ -1609,14 +1584,13 @@ def _pin_inner_tensors(t: torch.Tensor, budget: int) -> int:
                 continue
             if _pin_tensor_in_place(inner):
                 pinned += size
-                register_pinned_bytes(size)
             else:
-                try:
-                    setattr(t, name, inner.pin_memory())
+                handle = pin_manager.pin_alloc(size, "weights", required=False)
+                if handle.pinned:
+                    view = handle.tensor.view(inner.dtype).reshape(inner.shape)
+                    view.copy_(inner)
+                    setattr(t, name, view)
                     pinned += size
-                    register_pinned_bytes(size)
-                except Exception:
-                    pass
     return pinned
 
 
@@ -1655,10 +1629,8 @@ def _unpin_inner_tensors(t: torch.Tensor) -> bool:
             and inner.is_pinned()
         ):
             size = inner.numel() * inner.element_size()
-            if _unpin_tensor_in_place(inner):
-                release_pinned_bytes(size)
-            else:
-                release_pinned_bytes(size)
+            if not _unpin_tensor_in_place(inner):
+                release_pinned_bytes(size, kind="weights")
                 setattr(t, name, inner.clone())
             changed = True
     return changed
@@ -1690,10 +1662,8 @@ def _unpin_module_weights(module: nn.Module, manager) -> int:
                 and data.is_pinned()
             ):
                 size = data.numel() * data.element_size()
-                if _unpin_tensor_in_place(data):
-                    release_pinned_bytes(size)
-                else:
-                    release_pinned_bytes(size)
+                if not _unpin_tensor_in_place(data):
+                    release_pinned_bytes(size, kind="weights")
                     param.data = data.clone()
                 changed = True
     if not changed:
@@ -1781,14 +1751,12 @@ def _ensure_cpu_pinned(
         headroom = pinned_bytes_headroom()
         if headroom is None or size <= headroom:
             if _pin_tensor_in_place(t):
-                register_pinned_bytes(size)
                 return t, size
-            try:
-                t = t.pin_memory()
-                register_pinned_bytes(size)
-                return t, size
-            except RuntimeError:
-                pass
+            handle = pin_manager.pin_alloc(size, "weights", required=False)
+            if handle.pinned:
+                pinned_t = handle.tensor.view(t.dtype).reshape(t.shape)
+                pinned_t.copy_(t)
+                return pinned_t, size
     return t, 0
 
 

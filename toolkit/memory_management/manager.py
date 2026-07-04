@@ -41,6 +41,8 @@ from .manager_modules import (
 )
 from .ingraph_stream import fetch_report as ingraph_fetch_report
 from . import bounce_pool
+from . import pin_manager
+
 
 
 # The reserve vocabulary was renamed (headroom -> working_reserve; buffer_hard/
@@ -206,6 +208,7 @@ def _dxgi_attach_log_text(cuda_device_index: int = 0) -> str:
     return (
         dxgi_text
         + f"pinned_ledger_total={bounce_pool._pinned_bytes_total / 1024 ** 3:.2f} GiB "
+        + pin_manager.format_snapshot(cuda_device_index) + " "
         + f"dxgi_adapter_index={fields.get('dxgi_adapter_index')} "
         + f"dxgi_adapter_description={adapter_desc!r} "
         + f"dxgi_adapter_vendor_id={fields.get('dxgi_adapter_vendor_id')} "
@@ -549,12 +552,15 @@ class MemoryManager:
             device,
             block_stream_only=False,
         )
-        budget = cls._cap_auto_pin_budget(
-            desired_pin_bytes,
-            reserve_bytes=bounce_reserve_bytes,
+        pin_plan = pin_manager.plan_budgets(
+            offloaded_weight_bytes=desired_pin_bytes,
+            requested_bounce_bytes=bounce_reserve_bytes,
             device=device,
+            mode="training",
         )
+        budget = int(pin_plan["weight_budget_bytes"])
         module._memory_manager.pinned_weight_budget_bytes = budget
+        module._memory_manager._pin_plan = pin_plan
 
         # attach to all modules. The actual per-layer attach (which consumes the
         # pinned-weight budget greedily) is deferred to `deferred_attach` and run
@@ -727,7 +733,8 @@ class MemoryManager:
                         _unpin_inner_tensors(param.data)
                     if param.data.is_pinned():
                         bounce_pool.release_pinned_bytes(
-                            param.data.numel() * param.data.element_size()
+                            param.data.numel() * param.data.element_size(),
+                            kind="weights",
                         )
                         object.__setattr__(
                             child,
@@ -2215,7 +2222,7 @@ class MemoryManager:
             lmm.manager.pinned_weight_bytes = max(
                 0, lmm.manager.pinned_weight_bytes - freed
             )
-            bounce_pool.release_pinned_bytes(freed)
+            bounce_pool.release_pinned_bytes(freed, kind="weights")
             child._mm_pinned_bytes = 0
         del child._layer_memory_manager
         cls._refresh_resident_trace_hooks(lmm.manager.module, lmm.manager)
@@ -3788,30 +3795,28 @@ class MemoryManager:
             max_budget_gib,
             max(0.0, float(_env("AI_TOOLKIT_BOUNCE_EMERGENCY_FLOOR_GIB", "0.25"))),
         ) if auto_budget else 0.0
-        # This pool's buffers pin the SAME finite resource as the pinned-weight
-        # auto-budget (see MemoryManager._cap_auto_pin_budget): cap the initial
-        # size by the shared ledger's headroom too, so it does not spend the
-        # rest of the run repeatedly hitting (and being rejected by) the live
-        # per-allocation check in _take_buffers_locked.
-        ledger_headroom = bounce_pool.pinned_bytes_headroom(
-            bounce_pool._cuda_device_index(device)
-        )
-        if ledger_headroom is not None:
-            capped_gib = ledger_headroom / gib
-            if capped_gib < budget_gib:
+        pin_plan = getattr(getattr(module, "_memory_manager", None), "_pin_plan", None)
+        if pin_plan is not None:
+            planned_budget_gib = int(pin_plan.get("bounce_budget_bytes", 0) or 0) / gib
+            if planned_budget_gib < budget_gib:
                 print(
-                    "[MemoryManager] bounce-pool auto-budget capped: "
-                    f"want={budget_gib:.2f} GiB -> {capped_gib:.2f} GiB "
-                    "(shared pinned-memory headroom already spent by weight "
-                    "pinning -- set AI_TOOLKIT_BOUNCE_POOL_GIB to override)"
+                    "[MemoryManager] bounce-pool budget from pin manager: "
+                    f"want={budget_gib:.2f} GiB -> {planned_budget_gib:.2f} GiB "
+                    f"strategy={pin_plan.get('strategy')}"
                 )
-            budget_gib = min(budget_gib, capped_gib)
-            if auto_budget:
-                # Keep the pool alive for the unpinned tail and for layers that
-                # shared-cliff relief returns to pageable CPU. This is only a
-                # budget floor; live allocation still checks host RAM and fresh
-                # DXGI headroom before pinning any buffer.
-                budget_gib = max(emergency_floor_gib, budget_gib)
+            budget_gib = min(budget_gib, planned_budget_gib)
+        else:
+            ledger_headroom = bounce_pool.pinned_bytes_headroom(
+                bounce_pool._cuda_device_index(device)
+            )
+            if ledger_headroom is not None:
+                budget_gib = min(budget_gib, ledger_headroom / gib)
+        if budget_gib <= 0:
+            print(
+                "[MemoryManager] bounce pool disabled by pin manager: "
+                f"strategy={pin_plan.get('strategy') if pin_plan else 'zero_budget'}"
+            )
+            return
         env_target = _env("AI_TOOLKIT_BOUNCE_TARGET_READY_GIB", None)
         target_ready_gib = float(env_target) if env_target is not None else default_target_gib
         target_ready_gib = min(budget_gib, target_ready_gib)
@@ -4613,7 +4618,7 @@ class MemoryManager:
     @contextlib.contextmanager
     def inference_resident(
         cls, module, device=None, fp8_sampling=False, working_reserve_gib=None,
-        wddm_margin_gib=None, wddm_hard_gib=None,
+        wddm_margin_gib=None, wddm_hard_gib=None, reserve_pin_for_ingraph=False,
     ):
         """Temporarily make an offloaded module fully GPU-resident for a forward-only run.
 
@@ -4826,7 +4831,7 @@ class MemoryManager:
 
         move_started = time.perf_counter()
         try:
-            if not plan["fits"]:
+            if not plan["fits"] and not reserve_pin_for_ingraph:
                 raise torch.cuda.OutOfMemoryError(
                     "model, streaming buffers, and sampling working_reserve do not fit"
                 )
@@ -4837,7 +4842,9 @@ class MemoryManager:
                     offload_percent=1.0,
                     ignore_modules=args.get("ignore_modules", []),
                     _offload_module_ids=plan["offload_ids"],
-                    pinned_weight_gib=args.get("pinned_weight_gib"),
+                    pinned_weight_gib=(
+                        0.0 if reserve_pin_for_ingraph else args.get("pinned_weight_gib")
+                    ),
                 )
                 cls._move_unmanaged_parameters(module, target)
             elif target is not None:
@@ -4986,7 +4993,9 @@ class MemoryManager:
             cls.attach(
                 module, target, offload_percent=1.0,
                 ignore_modules=ignore, _offload_module_ids=all_ids,
-                pinned_weight_gib=args.get("pinned_weight_gib"),
+                pinned_weight_gib=(
+                    0.0 if reserve_pin_for_ingraph else args.get("pinned_weight_gib")
+                ),
             )
             cls._move_unmanaged_parameters(module, target)
             if cuda_target:

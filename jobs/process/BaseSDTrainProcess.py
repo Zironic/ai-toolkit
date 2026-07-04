@@ -602,6 +602,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 wddm_hard_gib=(
                     self.model_config.layer_offloading_smart_sampling_wddm_hard_gb
                 ),
+                reserve_pin_for_ingraph=bool(
+                    getattr(self.model_config, 'layer_offloading_compile_streamed', False)
+                    or getattr(self.model_config, 'layer_offloading_ingraph_sampling', False)
+                ),
             )
             if (
                 self.model_config.layer_offloading

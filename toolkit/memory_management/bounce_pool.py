@@ -35,6 +35,8 @@ import weakref
 from typing import Optional
 
 import torch
+from . import pin_manager
+
 
 dxgi_meminfo = None
 
@@ -122,24 +124,29 @@ def _host_ram_available() -> Optional[int]:
 # separate buffer budget pushed the *combined* total past the real ceiling.
 # Any code path that calls .pin_memory() / pin_memory=True must register the
 # bytes here, and release them when the pinning is undone.
-_pinned_bytes_lock = threading.Lock()
-_pinned_bytes_total = 0
+#
+# The ledger itself now lives in pin_manager (per-consumer-class); these
+# functions are delegating shims kept for external callers, and the old
+# module-global `_pinned_bytes_total` is served read-only via __getattr__
+# below. Do not assign to it.
 
 
-def register_pinned_bytes(n: int) -> None:
-    global _pinned_bytes_total
+def register_pinned_bytes(n: int, kind: str = "unknown") -> None:
     if n <= 0:
         return
-    with _pinned_bytes_lock:
-        _pinned_bytes_total += int(n)
+    pin_manager.register_pinned_bytes(int(n), kind=kind)
 
 
-def release_pinned_bytes(n: int) -> None:
-    global _pinned_bytes_total
+def release_pinned_bytes(n: int, kind: str = "unknown") -> None:
     if n <= 0:
         return
-    with _pinned_bytes_lock:
-        _pinned_bytes_total = max(0, _pinned_bytes_total - int(n))
+    pin_manager.release_pinned_bytes(int(n), kind=kind)
+
+
+def __getattr__(name):
+    if name == "_pinned_bytes_total":
+        return pin_manager.total_pinned_bytes()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -186,6 +193,8 @@ def set_spill_reserve_policy(
     resolved job config rather than an env var.
     """
     global _SPILL_RESERVE_FLOOR_GIB_OVERRIDE, _SPILL_RESERVE_PCT_OVERRIDE
+    pin_manager.set_spill_reserve_policy(floor_gib=floor_gib, pct=pct)
+
     if floor_gib is not None:
         _SPILL_RESERVE_FLOOR_GIB_OVERRIDE = max(0.0, float(floor_gib))
     if pct is not None:
@@ -291,8 +300,7 @@ def pinned_bytes_headroom(cuda_device_index: Optional[int] = None) -> Optional[i
     if fraction <= 0:
         return None
     ceiling = int(total * fraction)
-    with _pinned_bytes_lock:
-        return max(0, ceiling - _pinned_bytes_total)
+    return max(0, ceiling - pin_manager.total_pinned_bytes())
 
 
 def _leaf_specs(t) -> list:
@@ -386,12 +394,29 @@ def _spec_bytes(specs) -> int:
     return total
 
 
-def _alloc_pinned(specs) -> list:
-    pin = _pin_enabled()
-    return [
-        torch.empty(shape, dtype=dtype, pin_memory=pin)
-        for (dtype, shape) in specs
-    ]
+def _alloc_pinned(specs) -> tuple[list, int]:
+    if not _pin_enabled():
+        return [torch.empty(shape, dtype=dtype) for (dtype, shape) in specs], 0
+    leaves = []
+    pinned_bytes = 0
+    try:
+        for dtype, shape in specs:
+            leaf, pinned = pin_manager.pin_empty(
+                shape,
+                dtype,
+                "bounce",
+                required=True,
+            )
+            leaves.append(leaf)
+            if pinned:
+                pinned_bytes += leaf.numel() * leaf.element_size()
+    except Exception:
+        # A leaf mid-signature failed: the earlier leaves' grants would leak
+        # (their tensors are discarded here, and accounting is explicit).
+        if pinned_bytes:
+            release_pinned_bytes(pinned_bytes, kind="bounce")
+        raise
+    return leaves, pinned_bytes
 
 
 def _rebuild_into(src, leaves_iter):
@@ -525,6 +550,8 @@ class PinnedBouncePool:
         ]
         for w in self._workers:
             w.start()
+        pin_manager.register_evictable(self.shrink)
+
 
     # -- registration & schedule ------------------------------------------
 
@@ -739,7 +766,7 @@ class PinnedBouncePool:
                 del self._free_buffers[signature]
                 continue
             buffers.pop()
-            release_pinned_bytes(_spec_bytes(signature))
+            release_pinned_bytes(_spec_bytes(signature), kind="bounce")
             if not buffers:
                 del self._free_buffers[signature]
             return True
@@ -946,14 +973,15 @@ class PinnedBouncePool:
             if headroom is not None and nbytes > headroom:
                 return None
             try:
-                leaves = _alloc_pinned(signature)
+                leaves, pinned_bytes = _alloc_pinned(signature)
             except Exception:
                 # The proxy above is a heuristic, not a guarantee -- if the
                 # driver still refuses (cudaErrorMemoryAllocation), demand-load
                 # this position from the pageable source instead of taking the
                 # worker thread down.
                 return None
-            register_pinned_bytes(nbytes)
+            if _pin_enabled() and pinned_bytes <= 0:
+                return None
         self._inflight_bytes += nbytes
         return leaves
 
@@ -1173,7 +1201,26 @@ class PinnedBouncePool:
             f"lookahead={s['lookahead']}"
         )
 
+    def shrink(self, target_bytes: int = 0) -> int:
+        """Drop idle free buffers for pin-manager reconciliation."""
+        freed = 0
+        with self._cv:
+            for signature, buffers in list(self._free_buffers.items()):
+                while buffers and (target_bytes <= 0 or freed < target_bytes):
+                    buffers.pop()
+                    nbytes = _spec_bytes(signature)
+                    freed += nbytes
+                    release_pinned_bytes(nbytes, kind="bounce")
+                if not buffers:
+                    del self._free_buffers[signature]
+                if target_bytes > 0 and freed >= target_bytes:
+                    break
+            self._cv.notify_all()
+        return freed
+
     def shutdown(self):
+        pin_manager.unregister_evictable(self.shrink)
+
         with self._cv:
             self._stop = True
             self._reset_step_locked()
@@ -1183,7 +1230,7 @@ class PinnedBouncePool:
             # its destination storage until it has left that copy section.
             w.join()
         with self._cv:
-            release_pinned_bytes(self._inflight_bytes + self._free_buffer_bytes_locked())
+            release_pinned_bytes(self._inflight_bytes + self._free_buffer_bytes_locked(), kind="bounce")
             self._slots.clear()
             self._free_buffers.clear()
             self._inflight_bytes = 0

@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest import mock
 
-from toolkit.memory_management import bounce_pool, dxgi_meminfo
+from toolkit.memory_management import bounce_pool, dxgi_meminfo, pin_manager
 
 GIB = 1024 ** 3
 
@@ -22,9 +22,14 @@ class _FakePsutil:
 
 class DxgiHeadroomTests(unittest.TestCase):
     def setUp(self):
-        self._saved_pinned = bounce_pool._pinned_bytes_total
-        bounce_pool._pinned_bytes_total = 0
-        self.addCleanup(lambda: setattr(bounce_pool, "_pinned_bytes_total", self._saved_pinned))
+        self._saved_pinned = pin_manager.pinned_bytes_by_kind()
+        pin_manager._LEDGER.clear()
+
+        def _restore():
+            pin_manager._LEDGER.clear()
+            pin_manager._LEDGER.update(self._saved_pinned)
+
+        self.addCleanup(_restore)
 
     def test_compute_non_local_headroom_normal_case(self):
         self.assertEqual(
@@ -81,7 +86,7 @@ class DxgiHeadroomTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                bounce_pool._pinned_bytes_total = 4 * GIB
+                bounce_pool.register_pinned_bytes(4 * GIB)
                 # pct pinned to 0 -> reserve is exactly the 1 GiB floor, so the
                 # focus is the double-subtract invariant (ledger not subtracted).
                 self.assertEqual(bounce_pool.pinned_bytes_headroom(0), 5 * GIB)

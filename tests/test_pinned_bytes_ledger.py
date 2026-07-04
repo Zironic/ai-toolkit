@@ -4,7 +4,7 @@ from unittest import mock
 
 import torch
 
-from toolkit.memory_management import bounce_pool
+from toolkit.memory_management import bounce_pool, pin_manager
 
 GIB = 1024 ** 3
 
@@ -22,13 +22,18 @@ class PinnedBytesLedgerTests(unittest.TestCase):
     always reflect the combined total, not just one subsystem's slice."""
 
     def setUp(self):
-        # The ledger is a module-level global (by design -- it tracks the
-        # WHOLE process's pinned bytes across every subsystem and manager
-        # instance). Snapshot and restore it so tests don't bleed into each
-        # other or into unrelated tests elsewhere in the suite.
-        self._saved = bounce_pool._pinned_bytes_total
-        bounce_pool._pinned_bytes_total = 0
-        self.addCleanup(lambda: setattr(bounce_pool, "_pinned_bytes_total", self._saved))
+        # The ledger is process-global (by design -- it tracks the WHOLE
+        # process's pinned bytes across every subsystem). It now lives in
+        # pin_manager; bounce_pool._pinned_bytes_total is a read-only view.
+        # Snapshot and restore so tests don't bleed into each other.
+        self._saved = pin_manager.pinned_bytes_by_kind()
+        pin_manager._LEDGER.clear()
+
+        def _restore():
+            pin_manager._LEDGER.clear()
+            pin_manager._LEDGER.update(self._saved)
+
+        self.addCleanup(_restore)
 
     def test_register_and_release_round_trip(self):
         bounce_pool.register_pinned_bytes(100)

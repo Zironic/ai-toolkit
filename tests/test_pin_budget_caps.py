@@ -4,7 +4,7 @@ from unittest import mock
 
 import torch
 
-from toolkit.memory_management import bounce_pool
+from toolkit.memory_management import bounce_pool, pin_manager
 from toolkit.memory_management.manager import MemoryManager
 from toolkit.memory_management.manager_modules import _move_params_to_cpu_and_pin
 
@@ -40,9 +40,14 @@ _ENV = {
 
 class CapAutoPinBudgetTests(unittest.TestCase):
     def setUp(self):
-        self._saved_pinned = bounce_pool._pinned_bytes_total
-        bounce_pool._pinned_bytes_total = 0
-        self.addCleanup(lambda: setattr(bounce_pool, "_pinned_bytes_total", self._saved_pinned))
+        self._saved_pinned = pin_manager.pinned_bytes_by_kind()
+        pin_manager._LEDGER.clear()
+
+        def _restore():
+            pin_manager._LEDGER.clear()
+            pin_manager._LEDGER.update(self._saved_pinned)
+
+        self.addCleanup(_restore)
 
     """The auto pinned-weight budget is capped by the WDDM shared pinned-memory
     proxy, not psutil's reported available pageable RAM. Permanent weight pinning

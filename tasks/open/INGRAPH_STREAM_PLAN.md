@@ -340,6 +340,18 @@ checkpoint x compile at Krea2 scale.
 
 ### Phase 5 — Scheduling and shape policy
 
+- **Residency granularity vs the ring (added 2026-07-04).** Historical
+  measurement: per-layer streaming sustained ~3 GB of resident weights,
+  block streaming only ~1 GB — the >=2-block ring plus whole-block
+  residency quantization eats the difference, and in the transfer-bound
+  regime resident bytes are pure H2D savings. The pack (transfer quantum)
+  and the residency quantum are separable: high-traffic layers of a
+  streamed block may be copied device-resident once at attach and the
+  per-pass fetch reduced to the remainder slice of the flat buffer
+  (offset/length are trace-time constants, covered by the
+  fingerprint-on-index-set rule). Evaluate partial-block residency here
+  before accepting whole-block quantization as the default.
+
 - Tier-1 K-ahead pipelining in the model loop (trivial after Phase 3;
   land with measurement).
 - Dynamic shapes: training buckets -> per-bucket recompile with a bounded
@@ -356,6 +368,14 @@ checkpoint x compile at Krea2 scale.
   backward graph under the depth-K budget.
 
 ### Phase 6 — Manager/planner integration + config surface
+
+- **Observed 2026-07-04 (all-28 smoke): double residency.** The
+  inference_resident smart plan does not know ingraph will stream every
+  block: it makes ~25 blocks GPU-resident (~6 GiB) and then the
+  leaves-passing forward never reads them -- dead VRAM while the same
+  bytes cross PCIe each pass. The planner must either zero block
+  residency under ingraph_stream_all or (better, Phase 5 item) stream
+  only the non-resident set.
 
 - `ModelConfig`: `layer_offloading_ingraph_sampling` and
   `layer_offloading_ingraph_depth` land in Phase 3 (the smoke needs

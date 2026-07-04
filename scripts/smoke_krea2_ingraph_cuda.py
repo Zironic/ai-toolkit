@@ -471,6 +471,10 @@ def main():
         working_reserve_gib=config.layer_offloading_smart_sampling_working_reserve_gb,
         wddm_margin_gib=config.layer_offloading_smart_sampling_wddm_margin_gb,
         wddm_hard_gib=config.layer_offloading_smart_sampling_wddm_hard_gb,
+        reserve_pin_for_ingraph=bool(
+            config.layer_offloading_compile_streamed
+            or config.layer_offloading_ingraph_sampling
+        ),
     ):
         image = model.generate_single_image(
             model.pipeline,

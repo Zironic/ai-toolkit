@@ -17,6 +17,8 @@ from typing import Iterable
 
 import torch
 import torch.nn.functional as F
+from toolkit.memory_management import pin_manager
+
 from toolkit.memory_management.manager_modules import _fp8_linear_compiled
 
 
@@ -124,18 +126,13 @@ def _fp8_rowwise_qualifies(qdata: torch.Tensor, scale: torch.Tensor) -> bool:
 def _empty_host_flat(nbytes: int, *, pin: bool = True) -> tuple[torch.Tensor, bool]:
     if not pin:
         return torch.empty(nbytes, dtype=torch.uint8), False
-    try:
-        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), True
-    except RuntimeError:
-        pass
-    # The caching host allocator retains pinned D2H staging buffers (e.g. from
-    # a sampler-mode restore), which commit against the WDDM shared budget and
-    # can starve pack pinning. Release them and retry once before giving up.
-    try:
-        torch._C._host_emptyCache()
-        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), True
-    except (RuntimeError, AttributeError):
-        return torch.empty(nbytes, dtype=torch.uint8), False
+    handle = pin_manager.pin_alloc(
+        nbytes,
+        "ingraph_pack",
+        required=False,
+        mode="sampling",
+    )
+    return handle.tensor, bool(handle.pinned)
 
 
 def pack_block_host(block_key: str, linears, *, repoint: bool = True, pin: bool = True) -> BlockPack:
