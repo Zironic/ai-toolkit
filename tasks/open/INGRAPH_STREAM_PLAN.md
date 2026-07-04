@@ -6,6 +6,10 @@
 > plan's Slice 1 (grad-safe FP8 linear) and Slice 2 (LoRA compile-clean path).
 > Related: `BLOCK_STREAM_PLAN.md` (block staging machinery this absorbs),
 > the DXGI pin-for-speed effort (hard prerequisite, see Phase 1/6).
+> Phase 3 has a self-contained execution plan:
+> `INGRAPH_PHASE3_SAMPLER_PLAN.md` (fully streamed compiled sampling).
+> Decisions resolved during implementation are marked DECIDED inline;
+> lessons from Phases 0-3 live in "Cross-cutting design rules".
 
 ## Goal
 
@@ -57,38 +61,65 @@ opt in:
      (uint8, cuda). Impl: pop the ticket, make the current stream wait the
      event, return the device buffer. Fake impl:
      `torch.empty(nbytes, dtype=uint8, device='cuda')`.
-   - Both registered with `torch.library.custom_op`, `mutates_args=()`,
-     marked non-differentiable. The wait output is a fresh graph tensor
-     (the impl's buffer is not graph-visible before wait), satisfying the
-     no-aliasing contract. Slicing the flat buffer into per-leaf views
-     happens **in-graph** as normal view ops so Inductor sees and plans
-     them (this is why the op returns one flat tensor, not a leaf list —
-     a custom op must not return aliased outputs).
+   - `torch.ops.mm.fetch_free(token: Tensor) -> Tensor`: records the
+     block's compute-done event so the ticket's device buffer may be
+     reused. (DECIDED in Phase 2: three-op design, explicit free — the
+     two-op alternative was rejected once implementation started.)
+   - All registered with `torch.library.custom_op`, `mutates_args=()`,
+     marked non-differentiable, validated with `torch.library.opcheck`.
+     The wait output is a fresh graph tensor (the impl's buffer is not
+     graph-visible before wait), satisfying the no-aliasing contract.
+     Slicing the flat buffer into per-leaf views happens **in-graph** as
+     normal view ops so Inductor sees and plans them (this is why the op
+     returns one flat tensor, not a leaf list — a custom op must not
+     return aliased outputs).
    - Depth guard: the runtime refuses > K outstanding tickets (K = ring
      depth, default 2) by making `fetch_start` block the *host* on the
      oldest ticket's free event — the VRAM bound survives any schedule.
+   - **Buffer-lifetime invariant (Phase 0 lesson, non-negotiable):** a
+     device buffer allocated on the transfer stream and consumed on the
+     compute stream must not be recycled until the compute stream is past
+     its last read — the ticket ring's free events are what enforce this
+     (`record_stream` was only the spike's stopgap). Violation is silent
+     numeric corruption; a standing regression test hammers reuse at
+     depth=2 (see the Phase 3 execution plan, S7).
 
-3. **`StreamedLinear` module (compile-visible compute).** At attach, each
-   streamed Linear is swapped for (or its block rewired around) a module
-   whose forward is pure traced math over the fetched leaf views:
-   fp8-native path -> `_fp8_linear_training` (grad-safe `_scaled_mm`, from
-   the parent plan's Slice 1); other quant formats -> in-graph dequant +
-   GEMM (Inductor fuses and memory-plans the dequant output — retiring the
-   hand-rolled `w_dest` slot-reuse machinery); float -> plain GEMM. The
-   fetch itself is issued at BLOCK granularity in the block's forward, and
-   the block passes the leaf views to its Linears. No forward hijack, no
-   `_layer_memory_manager` attribute on these modules.
+3. **Leaves-passing block forward (compile-visible compute).** DECIDED in
+   Phase 3: rewire, not module swap — the block's forward takes an
+   optional `leaves` struct and, when present, every streamed Linear
+   computes pure traced math from the passed views and never touches
+   module weight params (`leaves=None` preserves legacy behavior
+   bit-for-bit). Compute paths, selected at PACK time (trace-time
+   constant, not a data-dependent branch): fp8-native sampling ->
+   `_fp8_linear_compiled` on the in-graph `qdata.t()` view (raw layout in
+   the pack; `.t()` is a free view); fp8-native training ->
+   `_fp8_linear_training` (grad-safe, parent plan Slice 1); other quant
+   formats -> in-graph dequant + GEMM (Inductor fuses and memory-plans
+   the dequant output — retiring the hand-rolled `w_dest` slot-reuse
+   machinery); float -> plain GEMM. The fetch is issued at BLOCK
+   granularity, and the compile region must pass the region audit: no
+   module hooks, no `_layer_memory_manager`, and no instance-attribute
+   `forward` hijacks (`'forward' in module.__dict__` — how legacy
+   streaming, LoRA, and the fp8 installer all attach).
 
-4. **Backward re-fetch via selective activation checkpointing (SAC).**
-   Blocks are wrapped in non-reentrant `torch.utils.checkpoint` with a
-   `context_fn` policy: `mm.fetch_start` / `mm.fetch_wait` (and, for
-   dequant formats, the dequant ops) are `MUST_RECOMPUTE`; activation
-   save/recompute for everything else stays a separate, orthogonal choice:
-   - "SAC-min" mode: only fetches recompute -> weights re-fetched in
-     backward, activations saved (no double compute; more VRAM).
-   - "Full checkpoint" mode: today's whole-block recompute (less VRAM).
-   Both use the same mechanism; the planner picks per block. Weights are
-   never saved for backward in either mode.
+4. **Backward re-fetch via checkpointing, staged as a ladder.**
+   Blocks are wrapped in non-reentrant `torch.utils.checkpoint`; the two
+   modes share one mechanism and land in order (Phase 4a then 4b):
+   - "Full checkpoint" mode (FIRST rung, no SAC policy at all): the
+     whole block recomputes in backward, and because the fetch ops are
+     inside the checkpointed callable, backward re-fetch falls out of
+     plain checkpoint semantics. Less VRAM, double compute — today's
+     training structure.
+   - "SAC-min" mode (second rung): `context_fn` policy marks
+     `mm.fetch_start`/`mm.fetch_wait` (and, for dequant formats, the
+     dequant ops) MUST_RECOMPUTE; everything else saves. Weights
+     re-fetched in backward, activations kept (no double compute; more
+     VRAM) — this is what preserves `keep_last`'s meaning.
+   The planner picks per block. Weights are never saved for backward in
+   either mode. Grad-mode calls WITHOUT checkpoint-or-SAC are forbidden
+   by construction: the default partitioner would save every fetched
+   weight for backward (28 x ~0.9 GB -> OOM), so there is no cheap
+   "just enable grad" probe between sampling and training compile.
 
 5. **Prefetch scheduling.** Two tiers:
    - **Tier 0 (free): host run-ahead.** The compiled forward calls
@@ -108,6 +139,33 @@ opt in:
      `reorder_for_compute_comm_overlap`), covering the AOT-generated
      backward graph where source-level scheduling can't reach. Only built
      if Tier 0 measurement shows backward stalls that matter.
+
+## Cross-cutting design rules (amendments from Phases 0-3)
+
+- **Fail closed, everywhere.** Ingraph requested but unavailable raises
+  with a machine-readable reason from a fixed vocabulary
+  (`wrapper_pack_missing`, `hook_present`, `forward_hijack_present`, ...);
+  no code path silently falls back to regional compile, legacy streaming,
+  or eager. The first implementation pass fell back open and produced a
+  trace that looked like an ingraph run but was regional compile
+  recompiling on legacy hook identity — strictness is what makes results
+  mean anything.
+- **Compile region = wrapper-free by construction.** Only modules that
+  pass the region audit may sit inside a compiled trunk. Resident modules
+  whose params are still TorchAO wrappers (e.g. Krea2's `first`/
+  `txtfusion`/`last`) stay OUTSIDE the region until unpacked — otherwise
+  their wrappers become graph inputs, the exact subclass-in-graph failure
+  this design exists to avoid. For Phase 3 the region is the blocks trunk
+  only.
+- **Weights-as-inputs must stay guard-free.** A repack (new host tensors,
+  same values) and a residency-preserving layout change must cause zero
+  recompiles; only a change to the streamed-block index set (traced code
+  path) may. This is the property the whole architecture leans on, and it
+  is test-enforced, not assumed.
+- **Parity is compiled-vs-compiled.** Inductor's bf16 epilogue rounding
+  makes compiled-vs-eager non-bitwise by construction (Phase 0 finding);
+  bitwise assertions compare against a compiled resident reference,
+  end-to-end comparisons use documented tolerances.
 
 ## Phases
 
@@ -144,7 +202,14 @@ No manager integration; synthetic 2-block model, plain bf16 weights.
 - `pack_block_host(block_key, linears) -> BlockPack`: flatten leaves
   (reuse `_flatten_leaves`), one aligned pinned buffer (layout code lifted
   from `stage_block_forward` lines ~994-1018), leaf metadata table
-  (offsets, dtypes, shapes, per-Linear grouping).
+  (offsets, dtypes, shapes, per-Linear grouping, per-leaf role:
+  qdata/scale/bias/float_weight).
+- **Quantized TorchAO wrappers are in scope from the start** — they are
+  the entire point (the streamed Krea2 weights are fp8 wrappers). A
+  plain-tensor-only pack does NOT complete this phase; the first
+  implementation pass deferred wrapper packing and the Phase 3 sampler
+  smoke could not run at all as a result. Unknown wrapper layouts (leaf
+  count != 2, non-fp8 qdata) fail closed as `unsupported_quant_wrapper`.
 - Re-point wrappers: rebuild each weight/bias wrapper onto host-buffer
   views (`_rebuild_from_leaves`), replacing the old storages. Assert
   `state_dict()` round-trips bitwise (test) and the checkpoint save path
@@ -167,13 +232,14 @@ No manager integration; synthetic 2-block model, plain bf16 weights.
 ### Phase 2 — Production fetch ops + ticket runtime
 
 - Harden the spike ops: ticket table keyed by monotonically increasing id;
-  depth-K guard with free events recorded in-graph via a
-  `mm.fetch_free(token)`-style op called after the block's last consumer
-  (or, simpler and chosen by default: free = the NEXT fetch_start waiting
-  the (i-K)th ticket's event, no third op needed).
-  Decide in-phase; the plan's default is the two-op design.
+  depth-K guard with free events recorded in-graph via
+  `mm.fetch_free(token)` after the block's last consumer. (DECIDED: the
+  three-op design; the two-op "next fetch_start frees" alternative was
+  dropped during implementation. `fetch_free` is also what enforces the
+  buffer-lifetime invariant — see component 2.)
 - Error surface: fail fast (repo convention) — non-pinned source, ticket
-  overflow, device mismatch all raise, never silently sync.
+  overflow, device mismatch, unknown ticket all raise, never silently
+  sync; `torch.library.opcheck` coverage for all three ops.
 - Profiling: per-fetch H2D ms + bytes recorded into the existing perf
   ledger (`_begin_layer_profile` equivalents at block granularity);
   perf-log fields `ingraph_fetches`, `ingraph_h2d_ms`,
@@ -184,60 +250,93 @@ No manager integration; synthetic 2-block model, plain bf16 weights.
 
 ### Phase 3 — Compile-visible block forward, sampling first
 
-Model-side refactor (Krea2 `mmdit.py` as reference integration).
+> Execution plan: `INGRAPH_PHASE3_SAMPLER_PLAN.md` (re-scoped after the
+> first implementation pass fell back to regional compile: fail-closed
+> smoke, wrapper packing pulled forward from the deferred slice, region
+> audit incl. forward hijacks, blocks-trunk-only compile region).
 
-- `SingleStreamBlock` gains a functional weight path: block forward takes
-  an optional `leaves` struct; when present, its Linears compute from the
-  passed views instead of `self.*.weight`. (Rewire, not module swap, keeps
-  LoRA wrappers' `org_forward` chain intact — LoRA adds its delta around
-  the same call.)
-- `mmdit.forward` in ingraph mode: per block, `token = fetch_start(pack)`
-  (Tier-1: issued K blocks early), `flat = fetch_wait(token)`, slice to
-  views via the metadata table (in-graph), call block with leaves.
-- Whole-forward compile region: `torch.compile` the transformer trunk
-  (blocks loop + first/last layers), `fullgraph=True`. Sampler-only at
-  this phase (`torch.no_grad`), so no SAC yet.
-- Retire for ingraph mode: `enable_compiled_sampling`'s per-block
-  compile + fingerprint machinery, the eager/compiled fork and pad-to-256
-  logic in `forward` (keep for legacy mode); resident-trace hooks and
-  block stage pre-hooks must not be installed on ingraph modules
-  (`manager.py` `_install_resident_trace_hook` / hook wiring gated off).
-- Residency: blocks the planner keeps resident simply skip fetch ops and
-  read their own (GPU) params — same graph shape, weights as inputs; no
-  separate compiled artifact per residency layout. A residency change is
-  a graph-input change, not a recompile, EXCEPT streamed<->resident block
-  set changes, which change the traced code path -> recompile (fingerprint
-  on the streamed-block index set; reuse the `_compiled_fingerprint`
-  pattern).
-- Tests: `tests/test_ingraph_sampler.py` — output parity vs legacy eager
-  streamed sampler (bit-close), one H2D per streamed block per pass,
-  zero breaks, recompile count flat across shape-stable calls.
+Model-side refactor (Krea2 `mmdit.py` as reference integration). The
+execution plan is authoritative for this phase's work items and
+definition of done; design summary:
 
-### Phase 4 — Training: SAC backward re-fetch + LoRA
+- `SingleStreamBlock.forward(..., leaves=None)`: when passed, streamed
+  Linears compute from the leaf views (component 3); `None` preserves
+  legacy behavior bit-for-bit.
+- **Compile region = the blocks trunk only** (`trunk(x, tvec, freqs,
+  mask, packs)`, `fullgraph=True`, no-grad). The quantized-resident
+  preamble/tail (`first`/`tmlp`/`txtfusion`/`txtmlp`/`posemb`/`last`)
+  runs eager outside the region this phase (see cross-cutting rules:
+  wrapper-free by construction). NOT the whole `mmdit.forward` — the
+  first implementation pass compiled the whole forward and put resident
+  wrappers into the graph as inputs.
+- Milestone default: ALL 28 blocks streamed (the fully-streamed proof);
+  residency optimization is not this phase's job. Wrapper-free resident
+  blocks may join the region later; wrapper-bearing ones may not (audit
+  enforces). Fingerprint on (streamed-index set, depth, seq bucket);
+  reuse `_compiled_ingraph_fingerprint`.
+- Fail-closed wiring: `enable_ingraph_sampling()` computes the
+  unavailable-reason list, runs the region audit, and raises in strict
+  mode rather than falling back to `enable_compiled_sampling()` regional
+  compile; the legacy machinery is kept for legacy mode only, and legacy
+  hooks/hijacks are never installed on ingraph modules.
+- Config: `layer_offloading_ingraph_sampling: bool = False` +
+  `layer_offloading_ingraph_depth: int = 2` land here (smoke needs them);
+  UI schema follows in Phase 6.
+- No K-ahead pipelining until the simple schedule is correct (Tier-0
+  run-ahead is free); K-ahead is a measured add-on at the end of the
+  phase.
+- Tests + acceptance: see the execution plan (region audit, guard
+  stability incl. repack, buffer-reuse regression, one H2D per streamed
+  block per pass, tolerance-based parity vs legacy eager streaming).
 
-Depends on parent plan Slice 1 (`_fp8_linear_training`) and the LoRA
-compile-clean fast path (parent Slice 2 — install-time specialization of
-`network_mixins.py:375`'s wrapper to `org + (x @ A.T @ B.T) * m`).
+### Phase 4 — Training compile, as a three-rung risk ladder
 
-- Wrap each streamed block in `checkpoint(block_fn, ..., 
-  use_reentrant=False, context_fn=_mm_sac_policy)`; `_mm_sac_policy`
-  returns MUST_RECOMPUTE for `mm.fetch_*` (+ dequant ops in dequant mode),
-  default otherwise. Planner chooses SAC-min vs full-checkpoint per block
-  from the VRAM plan; `keep_last` maps to SAC-min blocks (activations
-  saved, weights still re-fetched — `keep_last`'s "no recompute" meaning
-  survives without needing residency).
-- Compile the trunk with autograd (AOTAutograd joint graph); LoRA A/B are
-  ordinary trainable graph inputs.
-- Backward overlap: measure Tier-0 run-ahead first (host enqueues block
-  i's recomputed fetch while GPU runs block i+1's backward). Only if the
-  step profile shows real fetch stalls in backward does Tier-2 (Inductor
-  pass) get built.
+Grad mode cannot be approached incrementally by "compiling only the
+forward": AOTAutograd fires the moment a compiled callable sees
+grad-enabled inputs, and without checkpoint-or-SAC the partitioner saves
+every fetched weight (OOM by construction — see component 4). A
+"forward-compiled / eager-backward" bridge via a custom autograd.Function
+was CONSIDERED AND REJECTED: it resurrects the hijack architecture this
+plan deletes, needs a second throwaway eager re-fetch path, splits
+forward/backward math when LoRA is present, and avoids only risks Phase 0
+already retired. The viable staging is the ladder below — each rung uses
+only endpoint machinery, so nothing is thrown away.
+
+**Rung 1 (Phase 4-pre) — resident-block training compile, no streaming.**
+This is `COMPILE_STREAMED_OFFLOAD_PLAN.md` Slice 2, ordered explicitly
+before any streamed training: compile pinned-resident blocks for training
+with the LoRA compile-clean fast path (parent Slice 2 — install-time
+specialization of `network_mixins.py:375`'s wrapper to
+`org + (x @ A.T @ B.T) * m`) and `_fp8_linear_training` (parent Slice 1).
+Zero fetch ops involved: this rung isolates exactly what Phase 0 did NOT
+de-risk — LoRA in the AOTAutograd joint graph, the fp8 grad path, and
+checkpoint x compile at Krea2 scale.
+
+**Rung 2 (Phase 4a) — full-checkpoint streamed training, no SAC.**
+- Wrap each streamed block as `checkpoint(block_fn, ...,
+  use_reentrant=False)` where `block_fn` contains the fetch ops and the
+  leaves-passing block call. Backward re-fetch falls out of plain
+  checkpoint recompute — no `context_fn`, no partitioner policy.
+- Compile the trunk with autograd; LoRA A/B are ordinary trainable graph
+  inputs (LoRA joins here only after Rung 1 proves it in-graph).
+- Backward overlap: measure Tier-0 run-ahead (host enqueues block i's
+  recomputed fetch while the GPU runs block i+1's backward). Only if the
+  step profile shows real fetch stalls does Tier-2 get built.
 - Tests: `tests/test_ingraph_training.py` — loss + LoRA-grad parity vs
   legacy eager streaming on a synthetic multi-block model (pattern from
   `test_block_forward_stage.py` gradient-parity); no weight tensor among
-  saved-for-backward (inspect ctx saved tensors / memory snapshot); ring
-  peak respects depth K in fwd AND bwd; zero breaks over a full
-  fwd+bwd+step.
+  saved-for-backward (memory snapshot); ring peak respects depth K in
+  fwd AND bwd; zero breaks over a full fwd+bwd+step.
+
+**Rung 3 (Phase 4b) — SAC-min.**
+- `_mm_sac_policy` returns MUST_RECOMPUTE for `mm.fetch_*` (+ dequant ops
+  in dequant mode), save otherwise; planner chooses SAC-min vs
+  full-checkpoint per block from the VRAM plan. `keep_last` maps to
+  SAC-min blocks (activations saved, weights still re-fetched —
+  `keep_last`'s "no recompute" meaning survives without residency).
+- Tests extend Rung 2's: per-mode parity, VRAM delta between modes
+  matches the activation-residency prediction, mode flip -> exactly one
+  recompile (fingerprint includes per-block mode).
 
 ### Phase 5 — Scheduling and shape policy
 
@@ -258,10 +357,12 @@ compile-clean fast path (parent Slice 2 — install-time specialization of
 
 ### Phase 6 — Manager/planner integration + config surface
 
-- `ModelConfig`: `layer_offloading_ingraph: bool = False`,
-  `layer_offloading_ingraph_depth: int = 2` (+ UI schema in
-  `ui/src/app/jobs/new/jobConfig.ts` / docs entries, same pattern as
-  `layer_offloading_block_stream_only`). No env vars for runtime behavior.
+- `ModelConfig`: `layer_offloading_ingraph_sampling` and
+  `layer_offloading_ingraph_depth` land in Phase 3 (the smoke needs
+  them); Phase 6 adds `layer_offloading_ingraph_training: bool = False`
+  and the UI schema for all three (`ui/src/app/jobs/new/jobConfig.ts` /
+  docs entries, same pattern as `layer_offloading_block_stream_only`).
+  No env vars for runtime behavior.
 - `attach_smart_training(..., ingraph=True)`: planner runs unchanged
   (residency split, working reserve, pin budget), then routes streamed
   blocks to pack+rewire instead of `LinearLayerMemoryManager.attach`.
@@ -312,12 +413,17 @@ compile-clean fast path (parent Slice 2 — install-time specialization of
 
 ## Acceptance criteria
 
+Phase 3 has its own self-contained definition of done in
+`INGRAPH_PHASE3_SAMPLER_PLAN.md` (fully streamed compiled sampling).
+Endpoint criteria for the whole plan:
+
 - `torch._dynamo.explain` over one full training step (offload on, LoRA
   on, FP8 base): 0 graph breaks; one compiled trunk fwd+bwd.
 - No weight tensor saved for backward (memory snapshot proof); peak VRAM
   bounded by resident set + K blocks + working set, fwd and bwd.
-- Parity: sampler images bit-close to legacy; training loss/LoRA-grad
-  parity within FP8/GEMM noise.
+- Parity: sampler latents within documented tolerance of legacy eager
+  streaming (compiled-vs-eager is never bitwise — see cross-cutting
+  rules); training loss/LoRA-grad parity within FP8/GEMM noise.
 - Perf on a real Krea2 run (user go-ahead; `digest_perf_log.py`):
   step time <= legacy eager streaming, with the win itemized (Python
   dispatch removal, fusion, overlap). If it loses in the transfer-bound
@@ -329,7 +435,9 @@ compile-clean fast path (parent Slice 2 — install-time specialization of
 | Risk | Exposure | Mitigation |
 |---|---|---|
 | SAC/partitioner won't MUST_RECOMPUTE custom ops cleanly | Phase 0 | go/no-go spike; fallback = full-checkpoint mode only |
-| Custom-op aliasing/DCE subtleties (wait output, token liveness) | Phase 0/2 | flat-buffer return + in-graph views; token is a data dependency, never dead |
+| Custom-op aliasing/DCE subtleties (wait output, token liveness) | Phase 0/2 | flat-buffer return + in-graph views; token is a data dependency, never dead; opcheck |
+| Cross-stream buffer recycle -> silent numeric corruption (HIT in Phase 0) | Phase 2/3 | ticket-ring free events own buffer lifetime; standing depth=2 reuse regression test |
+| Fail-open fallbacks make traces lie (HIT in Phase 3) | all | strict mode + reason taxonomy + region audit; fallback branches removed from ingraph paths |
 | Host run-ahead insufficient in backward (fetch stalls) | Phase 4 | measured before Tier-2 is built; Tier-2 pass is scoped small |
 | Recompile storms (buckets x SAC modes x residency sets) | Phase 5/6 | freeze-after-warmup policy; fingerprint + bounded cache + log |
 | DXGI budget can't hold all packs | Phase 6 | per-block demotion to legacy path; two-cliff ledger from pin-for-speed governs |
@@ -339,9 +447,13 @@ compile-clean fast path (parent Slice 2 — install-time specialization of
 
 ## Sequencing and rough sizes
 
-Critical path: 0 -> 1 -> 2 -> 3 -> 4 -> 6; 5 rides along 3/4; 7/8 trail.
-Parent-plan Slice 1 (FP8 grad-safe) can proceed in parallel and is needed
-by Phase 4. Rough sizes: 0=S(spike, timeboxed), 1=M, 2=M, 3=L (model
-refactor), 4=L, 5=S(+L if Tier-2), 6=M, 7=M?, 8=S. The plan is
-deliberately front-loaded so the riskiest unknowns (0) and the
-independently-valuable pieces (1) come first.
+Critical path: 0 -> 1 -> 2 -> 3 -> 4-pre -> 4a -> 4b -> 6; 5 rides along
+3/4; 7/8 trail. Parent-plan Slices 1 and 2 (FP8 grad-safe linear, LoRA
+clean path) can proceed in parallel to Phases 1-3 and gate Rung 1
+(Phase 4-pre). Rough sizes: 0=S (spike, timeboxed), 1=M, 2=M, 3=L (model
+refactor; see execution plan), 4-pre=M, 4a=M, 4b=S, 5=S (+L if Tier-2),
+6=M, 7=M?, 8=S. The plan is deliberately front-loaded so the riskiest
+unknowns (0) and the independently-valuable pieces (1) come first, and
+Phase 4's risk is graded: each rung adds exactly one new variable
+(Rung 1: LoRA/fp8-grad in-graph; 4a: streamed fetch under autograd;
+4b: partitioner policy).

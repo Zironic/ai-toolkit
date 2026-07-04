@@ -1308,6 +1308,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if prefetch_report:
             record['offload_prefetch'] = prefetch_report
             print_acc(prefetch_report)
+        try:
+            ingraph_report = MemoryManager.ingraph_fetch_report(reset=True)
+        except Exception as error:
+            ingraph_report = f"[InGraphStream] report failed: {error}"
+        if ingraph_report:
+            record['ingraph_stream'] = ingraph_report
+            print_acc(ingraph_report)
         os.makedirs(os.path.dirname(self.performance_log_path), exist_ok=True)
         with open(self.performance_log_path, 'a', encoding='utf-8') as handle:
             handle.write(json.dumps(record, separators=(',', ':')) + '\n')

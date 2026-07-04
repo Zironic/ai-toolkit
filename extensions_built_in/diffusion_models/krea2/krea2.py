@@ -13,6 +13,7 @@ Flow-matching convention matches ai-toolkit exactly (t=1 noise -> t=0 clean,
 target = noise - clean), so ``get_noise_prediction`` does no time flip / negation.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -43,6 +44,7 @@ from toolkit.accelerator import unwrap_model
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
 from toolkit.memory_management import MemoryManager
+from toolkit.compile_cache import load_compile_cache, save_compile_cache
 
 from .src.mmdit import (
     DoubleSharedModulation,
@@ -95,6 +97,22 @@ QWEN3_VL_PATH = "Qwen/Qwen3-VL-4B-Instruct"
 QWEN_IMAGE_VAE_PATH = "Qwen/Qwen-Image"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
+
+
+def _truthy_env(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value.lower() not in ("", "0", "false", "no")
+
+
+def _hf_local_files_only(model_config: Optional[ModelConfig] = None) -> bool:
+    if model_config is not None:
+        model_kwargs = getattr(model_config, "model_kwargs", {}) or {}
+        if "local_files_only" in model_kwargs:
+            return bool(model_kwargs["local_files_only"])
+    return any(
+        _truthy_env(name)
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
+    )
 
 
 _SAFETENSORS_DTYPES = {
@@ -173,7 +191,10 @@ def _resolve_mmdit_checkpoint_path(name_or_path: str, filename: Optional[str]) -
     )
     try:
         path = huggingface_hub.hf_hub_download(
-            repo_id=name_or_path, filename=fname, token=HF_TOKEN
+            repo_id=name_or_path,
+            filename=fname,
+            token=HF_TOKEN,
+            local_files_only=_hf_local_files_only(),
         )
     except EntryNotFoundError as e:
         raise FileNotFoundError(
@@ -291,6 +312,28 @@ def _stream_and_quantize_checkpoint(base_model, transformer, checkpoint_path, dt
     base_model.print_and_status_update("  - finished streaming and quantizing transformer units")
     flush(garbage_collect=False)
 
+
+
+def _compile_cache_key(base_model) -> str:
+    """Identity for the torch.compile mega-cache: resolved checkpoint + quant,
+    not the raw `name_or_path` (which may be an unresolved HF repo id or a
+    local path -- either way, not itself a stable model identity).
+
+    No shape/resolution tag needed: `enable_compiled_sampling()` compiles with
+    `dynamic=None` under the `eager_then_compile` stance, so torch's own guard
+    system (not us) decides whether a given call reuses, upgrades, or misses
+    the cached graph -- that's exactly the "safe miss" property the mega-cache
+    already relies on.
+    """
+    checkpoint_path = getattr(base_model, "_resolved_checkpoint_path", None)
+    if checkpoint_path is None:
+        checkpoint_path = base_model.model_config.name_or_path
+    identity = {
+        "checkpoint_path": os.path.abspath(checkpoint_path) if os.path.exists(checkpoint_path) else checkpoint_path,
+        "qtype": str(base_model.model_config.qtype),
+        "torch_version": torch.__version__,
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
 
 
 def _quantized_transformer_cache_info(base_model, checkpoint_path: str, dtype, config: SingleMMDiTConfig):
@@ -455,6 +498,7 @@ class Krea2Model(BaseModel):
             self.model_config.name_or_path,
             self.model_config.model_kwargs.get("checkpoint_filename", None),
         )
+        self._resolved_checkpoint_path = checkpoint_path
 
         stream_quantized = (
             self.model_config.quantize
@@ -486,13 +530,22 @@ class Krea2Model(BaseModel):
         self.print_and_status_update(f"Loading Qwen3-VL text encoder from {te_path}")
 
         tokenizer = AutoTokenizer.from_pretrained(
-            te_path, max_length=self.max_text_length, token=HF_TOKEN
+            te_path,
+            max_length=self.max_text_length,
+            token=HF_TOKEN,
+            local_files_only=_hf_local_files_only(self.model_config),
         )
         processor = Qwen2TokenizerFast.from_pretrained(
-            te_path, max_length=self.max_text_length, token=HF_TOKEN
+            te_path,
+            max_length=self.max_text_length,
+            token=HF_TOKEN,
+            local_files_only=_hf_local_files_only(self.model_config),
         )
         text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-            te_path, torch_dtype=dtype, token=HF_TOKEN
+            te_path,
+            torch_dtype=dtype,
+            token=HF_TOKEN,
+            local_files_only=_hf_local_files_only(self.model_config),
         )
         # We only ever encode text, so the vision tower is dead weight -- drop it to
         # free VRAM and skip loading its (bf16-slow) Conv3d patch_embed onto the GPU.
@@ -507,7 +560,11 @@ class Krea2Model(BaseModel):
         vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
         self.print_and_status_update(f"Loading Qwen-Image VAE from {vae_path}")
         vae = AutoencoderKLQwenImage.from_pretrained(
-            vae_path, subfolder="vae", torch_dtype=self.vae_torch_dtype, token=HF_TOKEN
+            vae_path,
+            subfolder="vae",
+            torch_dtype=self.vae_torch_dtype,
+            token=HF_TOKEN,
+            local_files_only=_hf_local_files_only(self.model_config),
         )
         vae.eval()
         vae.requires_grad_(False)
@@ -703,10 +760,16 @@ class Krea2Model(BaseModel):
             self.print_and_status_update("Skipping text encoder (skip_te load)")
             te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
             tokenizer = AutoTokenizer.from_pretrained(
-                te_path, max_length=self.max_text_length, token=HF_TOKEN
+                te_path,
+                max_length=self.max_text_length,
+                token=HF_TOKEN,
+                local_files_only=_hf_local_files_only(self.model_config),
             )
             processor = Qwen2TokenizerFast.from_pretrained(
-                te_path, max_length=self.max_text_length, token=HF_TOKEN
+                te_path,
+                max_length=self.max_text_length,
+                token=HF_TOKEN,
+                local_files_only=_hf_local_files_only(self.model_config),
             )
             text_encoder = FakeTextEncoder(device=self.device_torch, dtype=dtype)
         else:
@@ -786,7 +849,59 @@ class Krea2Model(BaseModel):
             except Exception as error:
                 print(f"[MemoryManager] sampling cohabitation guard failed: {error}")
 
-        if self.model_config.compile_sample:
+        compile_cache_dir = getattr(self.model_config, 'compile_cache_dir', None)
+        compile_cache_key = _compile_cache_key(self)
+        if (
+            self.model_config.compile_sample
+            and compile_cache_dir
+            and not getattr(self, '_compile_cache_load_attempted', False)
+        ):
+            self._compile_cache_load_attempted = True
+            if load_compile_cache(compile_cache_dir, compile_cache_key):
+                self.print_and_status_update(
+                    f"Loaded torch.compile cache from {compile_cache_dir}"
+                )
+
+        ingraph_requested = (
+            self.model_config.compile_sample
+            and (
+                getattr(self.model_config, 'layer_offloading_compile_streamed', False)
+                or getattr(self.model_config, 'layer_offloading_ingraph_sampling', False)
+            )
+        )
+        strict_ingraph = bool(getattr(self.model_config, 'layer_offloading_ingraph_sampling', False))
+        if ingraph_requested:
+            self.model._last_ingraph_sampling_compile_state = None
+            try:
+                if getattr(self.model_config, 'layer_offloading_ingraph_stream_all', False):
+                    streamed_blocks = tuple(range(len(self.model.blocks)))
+                else:
+                    streamed_blocks = self.model.ingraph_streamed_block_indices()
+                if strict_ingraph and not streamed_blocks:
+                    raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
+                packed = self.model.enable_ingraph_sampling(
+                    streamed_blocks=streamed_blocks if streamed_blocks else None,
+                    depth=getattr(self.model_config, 'layer_offloading_ingraph_depth', 2),
+                    compile=True,
+                )
+                if not getattr(self, '_ingraph_compile_sample_reported', False):
+                    self.print_and_status_update(
+                        f"Compiling transformer trunk for in-graph sampling: "
+                        f"{packed} streamed block pack(s). First preview will be slow."
+                    )
+                    self._ingraph_compile_sample_reported = True
+            except Exception as error:
+                self.model.disable_ingraph_sampling()
+                if strict_ingraph:
+                    raise RuntimeError(f"strict in-graph sampling failed: {error}") from error
+                if not getattr(self, '_ingraph_compile_sample_reported', False):
+                    self.print_and_status_update(
+                        "In-graph sampling compile unavailable for this layout "
+                        f"({error}); falling back to regional compile."
+                    )
+                    self._ingraph_compile_sample_reported = True
+
+        if self.model_config.compile_sample and self.model._compiled_ingraph_sampling is None and not strict_ingraph:
             # Regional (per-block) compilation. We are inside the sampling
             # context (inference_resident) here, so residency is already
             # decided: blocks the manager made GPU-resident have NO offload
@@ -813,18 +928,57 @@ class Krea2Model(BaseModel):
                     )
                 self._compile_sample_reported = True
 
-        img = pipeline(
-            conditional_embeds=conditional_embeds,
-            unconditional_embeds=unconditional_embeds,
-            height=gen_config.height,
-            width=gen_config.width,
-            num_inference_steps=gen_config.num_inference_steps,
-            guidance_scale=gen_config.guidance_scale,
-            latents=gen_config.latents,
-            generator=generator,
-            batch_cfg=getattr(gen_config, "batch_cfg", False),
-        )[0]
-        return img
+        # enable_compiled_sampling() traces with dynamic=None (torch's
+        # automatic-dynamic-shapes mode): it specializes to the first shape
+        # seen and only pays for a symbolic-shape upgrade if a second,
+        # different shape shows up. Running the call under
+        # eager_then_compile lets that upgrade decision come from real
+        # eager-mode shape history instead of wasting a static compile on the
+        # very first call -- so "did a new compile happen" must be
+        # re-checked on every call, not just the first one this process.
+        frames_before = None
+        if compile_cache_dir and self.model_config.compile_sample:
+            frames_before = torch._dynamo.utils.counters["frames"].get("total", 0)
+
+        try:
+            compile_stance = (
+                torch.compiler.set_stance("eager_then_compile")
+                if self.model_config.compile_sample
+                else contextlib.nullcontext()
+            )
+            with compile_stance:
+                img = pipeline(
+                    conditional_embeds=conditional_embeds,
+                    unconditional_embeds=unconditional_embeds,
+                    height=gen_config.height,
+                    width=gen_config.width,
+                    num_inference_steps=gen_config.num_inference_steps,
+                    guidance_scale=gen_config.guidance_scale,
+                    latents=gen_config.latents,
+                    generator=generator,
+                    batch_cfg=getattr(gen_config, "batch_cfg", False),
+                )[0]
+            if frames_before is not None:
+                frames_after = torch._dynamo.utils.counters["frames"].get("total", 0)
+                if frames_after > frames_before and save_compile_cache(compile_cache_dir, compile_cache_key):
+                    self.print_and_status_update(
+                        f"Saved torch.compile cache to {compile_cache_dir}"
+                    )
+            return img
+        finally:
+            if ingraph_requested:
+                self.model._last_ingraph_sampling_compile_state = {
+                    "ingraph_compiled": self.model._compiled_ingraph_sampling is not None,
+                    "ingraph_packs": len(getattr(self.model, "_ingraph_sampling_packs", {}) or {}),
+                    "regional_compiled_blocks": sum(
+                        1 for block in (getattr(self.model, "_compiled_blocks", None) or [])
+                        if block is not None
+                    ),
+                    "unavailable_reasons": tuple(
+                        getattr(self.model, "_ingraph_unavailable_reasons", ()) or ()
+                    ),
+                }
+                self.model.disable_ingraph_sampling()
 
     # ------------------------------------------------------------------
     # Training hooks

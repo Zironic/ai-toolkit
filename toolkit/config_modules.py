@@ -867,6 +867,15 @@ class ModelConfig:
         self.layer_offloading_compile_streamed = kwargs.get(
             "layer_offloading_compile_streamed", False
         )
+        self.layer_offloading_ingraph_sampling = kwargs.get(
+            "layer_offloading_ingraph_sampling", False
+        )
+        self.layer_offloading_ingraph_depth = kwargs.get(
+            "layer_offloading_ingraph_depth", 2
+        )
+        self.layer_offloading_ingraph_stream_all = kwargs.get(
+            "layer_offloading_ingraph_stream_all", False
+        )
         self.train_compile_blocks = kwargs.get("train_compile_blocks", False)
 
         # can be used to load the extras like text encoder or vae from here
@@ -884,6 +893,11 @@ class ModelConfig:
         # compile the model with torch compile
         self.compile = kwargs.get("compile", False)
         self.compile_sample = kwargs.get("compile_sample", False)
+        # Directory to persist torch.compile's mega-cache (Inductor/AOTAutograd/
+        # Triton artifacts) across process restarts, so a fresh training-job
+        # resume or standalone generate run can skip the cold sampler compile.
+        # None = disabled (no cache read/write).
+        self.compile_cache_dir = kwargs.get("compile_cache_dir", None)
 
         if self.compile and self.quantize:
             print("Quantized model detected - allowing torch.compile (experimental)")

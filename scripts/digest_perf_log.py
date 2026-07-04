@@ -528,6 +528,19 @@ def summarize_record(record: dict, full: bool) -> list[str]:
             )
         )
 
+    ingraph = record.get("ingraph_stream", "")
+    ingraph_fetches = _search(r"fetches=(\d+)", ingraph, int)
+    ingraph_h2d = _search(r"h2d_ms=([\d.]+)", ingraph, float)
+    ingraph_wait = _search(r"wait_ms=([\d.]+)", ingraph, float)
+    if ingraph_fetches:
+        lines.append(
+            "  ingraph: fetches={f} h2d_ms={h} wait_ms={w}".format(
+                f=ingraph_fetches[0],
+                h="-" if ingraph_h2d is None else g(ingraph_h2d[0], 3),
+                w="-" if ingraph_wait is None else g(ingraph_wait[0], 3),
+            )
+        )
+
     profile = record.get("offload_profile", "")
     fetches = _search(r"fetches=(\d+)", profile, int)
     fwd = _search(r"forward=(\d+)", profile, int)

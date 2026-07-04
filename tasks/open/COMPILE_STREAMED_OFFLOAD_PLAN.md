@@ -193,7 +193,11 @@ No streaming involved — isolates compile x checkpoint x LoRA x FP8:
   "no-resize stable band" goal — compile just raises the price of a resize.
 - **Sampler/training transitions** (`_restore_offload`): assert both
   compiled sets rebuild; extend the demotion invalidation to training
-  graphs.
+  graphs. This is also the hook point for persisting the training compile
+  across these rebuilds via the torch.compile mega-cache -- see
+  `COMPILE_MEGA_CACHE_PLAN.md` (sampling side already shipped there; the
+  training half is designed but not yet implemented, and is sequenced to
+  land after this slice's controller-stability work).
 - **Shape policy**: training buckets => accept per-bucket recompile with a
   cap + log line; sampler keeps pad-to-256.
 - **Compile latency budget**: measure cold-start (Inductor/Triton on

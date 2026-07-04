@@ -17,6 +17,7 @@ Differences from the reference (all training-driven, numerically equivalent):
 """
 
 import math
+import time
 from dataclasses import dataclass
 
 import torch
@@ -25,6 +26,16 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
+
+from toolkit.memory_management.ingraph_stream import (
+    CompileRegionError,
+    assert_compile_region_clean,
+    block_linear_views,
+    configure_fetch_runtime,
+
+    pack_block_host,
+    streamed_linear,
+)
 
 
 def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
@@ -206,8 +217,12 @@ class SwiGLU(torch.nn.Module):
         self.up = torch.nn.Linear(features, mlpdim, bias=bias)
         self.down = torch.nn.Linear(mlpdim, features, bias=bias)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+    def forward(self, x: Tensor, leaves: dict | None = None) -> Tensor:
+        if leaves is None:
+            return self.down(F.silu(self.gate(x)) * self.up(x))
+        gate = streamed_linear(x, leaves["gate"])
+        up = streamed_linear(x, leaves["up"])
+        return streamed_linear(F.silu(gate) * up, leaves["down"])
 
 
 class Attention(torch.nn.Module):
@@ -226,9 +241,19 @@ class Attention(torch.nn.Module):
         self.wo = torch.nn.Linear(dim, dim, bias=bias)
 
     def forward(
-        self, qkv: Tensor, freqs: Tensor | None = None, mask: Tensor | None = None
+        self,
+        qkv: Tensor,
+        freqs: Tensor | None = None,
+        mask: Tensor | None = None,
+        leaves: dict | None = None,
     ) -> Tensor:
-        q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
+        if leaves is None:
+            q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
+        else:
+            q = streamed_linear(qkv, leaves["wq"])
+            k = streamed_linear(qkv, leaves["wk"])
+            v = streamed_linear(qkv, leaves["wv"])
+            gate = streamed_linear(qkv, leaves["gate"])
 
         q, k, v = (
             rearrange(q, "B L (H D) -> B H L D", H=self.heads),
@@ -239,7 +264,11 @@ class Attention(torch.nn.Module):
         q, k, v = self.qknorm(q, k, v)
         if freqs is not None:
             q, k = ropeapply(q, k, freqs)
-        out = self.wo(attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate))
+        out = attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate)
+        if leaves is None:
+            out = self.wo(out)
+        else:
+            out = streamed_linear(out, leaves["wo"])
 
         return out
 
@@ -342,13 +371,26 @@ class SingleStreamBlock(nn.Module):
         self.mlp = SwiGLU(features, multiplier, bias)
 
     def forward(
-        self, x: Tensor, vec: Tensor, freqs: Tensor, mask: Tensor | None = None
+        self,
+        x: Tensor,
+        vec: Tensor,
+        freqs: Tensor,
+        mask: Tensor | None = None,
+        leaves: dict | None = None,
     ) -> Tensor:
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
+        attn_leaves = None if leaves is None else leaves["attn"]
+        mlp_leaves = None if leaves is None else leaves["mlp"]
         x = x + pregate * self.attn(
-            (1 + prescale) * self.prenorm(x) + preshift, freqs, mask
+            (1 + prescale) * self.prenorm(x) + preshift,
+            freqs,
+            mask,
+            leaves=attn_leaves,
         )
-        x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
+        x = x + postgate * self.mlp(
+            (1 + postscale) * self.postnorm(x) + postshift,
+            leaves=mlp_leaves,
+        )
 
         return x
 
@@ -375,6 +417,15 @@ class SingleStreamDiT(nn.Module):
         self._compiled_training_fingerprint: tuple | None = None
         self._compiled_training_fp8_restores: list = []
         self._compiled_training_lora_restores: list = []
+        self._ingraph_sampling_packs: dict[int, object] = {}
+        self._ingraph_sampling_restores: list = []
+        self._ingraph_unavailable_reasons: tuple[str, ...] = ()
+        self._ingraph_sampling_depth = 2
+        self._compiled_ingraph_sampling = None
+        self._compiled_ingraph_fingerprint: tuple | None = None
+        self._ingraph_sampling_measure = False
+        self._ingraph_sampling_timing = None
+        self._last_ingraph_sampling_timing = None
 
         headdim = config.features // config.heads
         axes = [
@@ -564,6 +615,14 @@ class SingleStreamDiT(nn.Module):
         replaying stale compiled blocks (which would guard-churn or, worse,
         trace a hook that got re-attached).
 
+        `dynamic=None` (torch's automatic-dynamic-shapes mode) lets Dynamo
+        specialize to the first shape seen and only pay for a symbolic-shape
+        upgrade if a second distinct shape shows up -- the caller is expected
+        to run the actual invocation under
+        `torch.compiler.set_stance("eager_then_compile")` so that upgrade
+        decision is made from real eager-mode shape history instead of
+        wasting a static compile on the very first call.
+
         Returns (compiled_count, eager_count).
         """
         clean = tuple(
@@ -581,7 +640,7 @@ class SingleStreamDiT(nn.Module):
             compiled[i] = torch.compile(
                 self.blocks[i],
                 fullgraph=False,
-                dynamic=False,
+                dynamic=None,
                 mode="default",
             )
         self._compiled_blocks = compiled
@@ -591,6 +650,263 @@ class SingleStreamDiT(nn.Module):
     def disable_compiled_sampling(self):
         self._compiled_blocks = None
         self._compiled_fingerprint = None
+
+    @staticmethod
+    def _block_linear_entries(block):
+        return (
+            ("attn.wq", block.attn.wq),
+            ("attn.wk", block.attn.wk),
+            ("attn.wv", block.attn.wv),
+            ("attn.gate", block.attn.gate),
+            ("attn.wo", block.attn.wo),
+            ("mlp.gate", block.mlp.gate),
+            ("mlp.up", block.mlp.up),
+            ("mlp.down", block.mlp.down),
+        )
+
+    @staticmethod
+    def _nest_block_leaves(flat, pack):
+        views = block_linear_views(flat, pack)
+        return {
+            "attn": {
+                "wq": views["attn.wq"],
+                "wk": views["attn.wk"],
+                "wv": views["attn.wv"],
+                "gate": views["attn.gate"],
+                "wo": views["attn.wo"],
+            },
+            "mlp": {
+                "gate": views["mlp.gate"],
+                "up": views["mlp.up"],
+                "down": views["mlp.down"],
+            },
+        }
+
+    @staticmethod
+    def _clear_module_forward_hooks(module):
+        saved = []
+        for attr in ("_forward_pre_hooks", "_forward_hooks", "_forward_hooks_with_kwargs"):
+            hooks = getattr(module, attr, None)
+            if hooks:
+                saved.append((module, attr, hooks.copy()))
+                hooks.clear()
+        return saved
+
+    @staticmethod
+    def _restore_forward_hooks(saved):
+        for module, attr, hooks in reversed(saved):
+            current = getattr(module, attr, None)
+            if current is not None:
+                current.clear()
+                current.update(hooks)
+
+    def _strip_ingraph_compile_contaminants(self, streamed_blocks):
+        restores = []
+        for index in streamed_blocks:
+            block = self.blocks[index]
+            hook_state = []
+            for child in block.modules():
+                hook_state.extend(self._clear_module_forward_hooks(child))
+                lmm = getattr(child, "_layer_memory_manager", None)
+                if lmm is None:
+                    continue
+                original_forward = getattr(lmm, "_original_forward", None)
+                container = getattr(lmm, "_forward_container", None)
+                attribute = getattr(lmm, "_forward_attribute", None)
+                managed_forward = None
+                if container is not None and attribute is not None:
+                    managed_forward = getattr(container, attribute, None)
+                if original_forward is not None:
+                    if container is child and attribute == "forward" and "forward" in child.__dict__:
+                        del child.__dict__["forward"]
+                    elif container is not None and attribute is not None:
+                        setattr(container, attribute, original_forward)
+                    else:
+                        managed_forward = getattr(child, "forward", None)
+                        child.forward = original_forward
+                if "forward" in child.__dict__:
+                    del child.__dict__["forward"]
+                saved_attrs = {}
+                for attr in (
+                    "_layer_memory_manager",
+                    "_memory_management_device",
+                    "_memory_management_fp8_sampling",
+                    "_memory_management_fp8_training",
+                ):
+                    if hasattr(child, attr):
+                        saved_attrs[attr] = getattr(child, attr)
+                        delattr(child, attr)
+                restores.append((child, lmm, container, attribute, managed_forward, saved_attrs))
+            if hook_state:
+                restores.append(("hooks", hook_state))
+        return restores
+
+    @staticmethod
+    def _restore_ingraph_compile_contaminants(restores):
+        for item in reversed(restores):
+            if item and item[0] == "hooks":
+                SingleStreamDiT._restore_forward_hooks(item[1])
+                continue
+            child, lmm, container, attribute, managed_forward, saved_attrs = item
+            for attr, value in saved_attrs.items():
+                setattr(child, attr, value)
+            if managed_forward is not None:
+                if container is not None and attribute is not None:
+                    setattr(container, attribute, managed_forward)
+                else:
+                    child.forward = managed_forward
+
+    def reset_ingraph_sampling_timing(self):
+        self._ingraph_sampling_timing = {
+            "calls": 0,
+            "cold_wall_s": None,
+            "steady_calls": 0,
+            "steady_wall_total_s": 0.0,
+            "steady_wall_min_s": None,
+            "steady_wall_max_s": None,
+        }
+        self._last_ingraph_sampling_timing = None
+
+    def _record_ingraph_sampling_timing(self, elapsed_s: float):
+        stats = self._ingraph_sampling_timing
+        if stats is None:
+            self.reset_ingraph_sampling_timing()
+            stats = self._ingraph_sampling_timing
+        stats["calls"] += 1
+        if stats["cold_wall_s"] is None:
+            stats["cold_wall_s"] = float(elapsed_s)
+            return
+        stats["steady_calls"] += 1
+        stats["steady_wall_total_s"] += float(elapsed_s)
+        if stats["steady_wall_min_s"] is None or elapsed_s < stats["steady_wall_min_s"]:
+            stats["steady_wall_min_s"] = float(elapsed_s)
+        if stats["steady_wall_max_s"] is None or elapsed_s > stats["steady_wall_max_s"]:
+            stats["steady_wall_max_s"] = float(elapsed_s)
+
+    def ingraph_sampling_timing_snapshot(self):
+        stats = self._ingraph_sampling_timing
+        if not stats:
+            return None
+        steady_calls = int(stats["steady_calls"])
+        steady_avg = (
+            stats["steady_wall_total_s"] / steady_calls
+            if steady_calls
+            else None
+        )
+        estimate_compile = None
+        if stats["cold_wall_s"] is not None and steady_avg is not None:
+            estimate_compile = max(0.0, stats["cold_wall_s"] - steady_avg)
+        return {
+            "calls": int(stats["calls"]),
+            "cold_compile_plus_first_forward_s": stats["cold_wall_s"],
+            "steady_forward_calls": steady_calls,
+            "steady_forward_avg_s": steady_avg,
+            "steady_forward_min_s": stats["steady_wall_min_s"],
+            "steady_forward_max_s": stats["steady_wall_max_s"],
+            "compile_time_estimate_s": estimate_compile,
+        }
+
+    def ingraph_streamed_block_indices(self):
+        indices = []
+        for index, block in enumerate(self.blocks):
+            if any(hasattr(child, "_layer_memory_manager") for child in block.modules()):
+                indices.append(index)
+        return tuple(indices)
+
+    def enable_ingraph_sampling(self, streamed_blocks=None, depth: int = 2, compile: bool = False):
+        """Enable phase-3 in-graph sampling for selected Krea2 blocks."""
+        self.disable_ingraph_sampling()
+        for handle in getattr(self, "_mm_block_stream_handles", []) or []:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._mm_block_stream_handles = []
+        if streamed_blocks is None:
+            streamed_blocks = range(len(self.blocks))
+        streamed_blocks = tuple(int(index) for index in streamed_blocks)
+        self._ingraph_sampling_restores = self._strip_ingraph_compile_contaminants(streamed_blocks)
+        reasons = []
+        details = []
+        for index in streamed_blocks:
+            packed_linears = {id(module) for _, module in self._block_linear_entries(self.blocks[index])}
+            for name, child in self.blocks[index].named_modules():
+                prefix = f"blocks.{index}" + (f".{name}" if name else "")
+                if hasattr(child, "_layer_memory_manager"):
+                    reasons.append("legacy_layer_manager_present")
+                    details.append(f"legacy_layer_manager_present:{prefix}")
+                if bool(getattr(child, "_forward_pre_hooks", None)) or bool(getattr(child, "_forward_hooks", None)) or bool(getattr(child, "_forward_hooks_with_kwargs", None)):
+                    reasons.append("hook_present")
+                    details.append(f"hook_present:{prefix}")
+                if "forward" in getattr(child, "__dict__", {}) and id(child) not in packed_linears:
+                    reasons.append("forward_hijack_present")
+                    details.append(f"forward_hijack_present:{prefix}")
+        if reasons:
+            self._ingraph_unavailable_reasons = tuple(dict.fromkeys(reasons))
+            suffix = ""
+            if details:
+                suffix = " [" + ";".join(details[:16]) + ("]" if len(details) <= 16 else ";...")
+            raise RuntimeError(
+                "in-graph sampling unavailable: " + ",".join(self._ingraph_unavailable_reasons) + suffix
+            )
+        packs = {}
+        for index in streamed_blocks:
+            try:
+                packs[index] = pack_block_host(
+                    f"blocks.{index}",
+                    self._block_linear_entries(self.blocks[index]),
+                    repoint=False,
+                )
+            except ValueError as error:
+                message = str(error)
+                reason = "wrapper_pack_missing" if "wrapper packing" in message else "unsupported_quant_wrapper"
+                self._ingraph_unavailable_reasons = (reason,)
+                raise RuntimeError(
+                    "in-graph sampling unavailable: " + reason + f" ({message})"
+                ) from error
+        if streamed_blocks and len(packs) != len(streamed_blocks):
+            self._ingraph_unavailable_reasons = ("dynamic_streamed_block_set",)
+            raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
+        for pack in packs.values():
+            if not pack.pinned:
+                self._ingraph_unavailable_reasons = ("non_pinned_pack",)
+                raise RuntimeError("in-graph sampling unavailable: non_pinned_pack")
+        self._ingraph_sampling_packs = packs
+        self._ingraph_unavailable_reasons = ()
+        self._ingraph_sampling_depth = max(1, int(depth))
+        if getattr(self, "_ingraph_sampling_measure", False):
+            self.reset_ingraph_sampling_timing()
+        configure_fetch_runtime(depth=self._ingraph_sampling_depth)
+        fingerprint = tuple(sorted(packs))
+        self._compiled_ingraph_fingerprint = fingerprint
+        if compile and packs:
+            self._compiled_ingraph_sampling = torch.compile(
+                lambda combined, tvec, freqs, mask: self._blocks_trunk(
+                    combined,
+                    tvec,
+                    freqs,
+                    mask,
+                    force_ingraph=True,
+                ),
+                fullgraph=True,
+                dynamic=False,
+                mode="default",
+            )
+        return len(packs)
+
+    def disable_ingraph_sampling(self):
+        snapshot = self.ingraph_sampling_timing_snapshot()
+        if snapshot is not None:
+            self._last_ingraph_sampling_timing = snapshot
+        restores = getattr(self, "_ingraph_sampling_restores", [])
+        if restores:
+            self._restore_ingraph_compile_contaminants(restores)
+        self._ingraph_sampling_restores = []
+        self._ingraph_sampling_packs = {}
+        self._ingraph_unavailable_reasons = ()
+        self._ingraph_sampling_depth = 2
+        self._compiled_ingraph_sampling = None
+        self._compiled_ingraph_fingerprint = None
 
     def _enable_lora_compile_fast_path(self):
         restores = []
@@ -683,6 +999,18 @@ class SingleStreamDiT(nn.Module):
         pos: Tensor,
         mask: Tensor | None = None,
     ) -> Tensor:
+        return self._forward_impl(img, context, t, pos, mask)
+
+    def _forward_impl(
+        self,
+        img: Tensor,
+        context: Tensor,
+        t: Tensor,
+        pos: Tensor,
+        mask: Tensor | None = None,
+        *,
+        force_ingraph: bool = False,
+    ) -> Tensor:
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
         tvec = self.tproj(t)
@@ -699,16 +1027,12 @@ class SingleStreamDiT(nn.Module):
             self._compiled_blocks is not None
             and not torch.is_grad_enabled()
         )
+        use_ingraph = bool(self._ingraph_sampling_packs) and not torch.is_grad_enabled()
 
-        # Pad the combined sequence to a multiple of 256 ONLY when the compiled
-        # blocks will actually run. The padding exists purely to quantize the
-        # sequence length so the dynamic=False compiled kernels see few distinct
-        # shapes (and so recompile rarely). In eager training / sampling it buys
-        # nothing and costs up to 255 junk tokens through every attention block,
-        # while also forcing the masked (cutlass) SDPA path. The pad slots are
-        # appended after the image tokens, masked False, and sliced off below,
-        # so gating this is numerically identical.
-        if use_compiled:
+        # Pad the combined sequence to a multiple of 256 when a compiled block
+        # region will run. The pad slots are appended after the image tokens,
+        # masked False, and sliced off below, so this is numerically identical.
+        if use_compiled or use_ingraph:
             fulllen = combined.shape[1]
             _padlen = (-fulllen) % 256
             if _padlen > 0:
@@ -717,12 +1041,49 @@ class SingleStreamDiT(nn.Module):
                 pos = F.pad(pos, (0, 0, 0, _padlen))
 
         mask = _mask(mask)
-
         freqs = self.posemb(pos)
 
-        # Selective checkpointing: checkpoint all but the last `keep_last`
-        # blocks. The trailing blocks keep their activations (no recompute),
-        # which has the shortest residency since their backward runs first.
+        if use_ingraph and self._compiled_ingraph_sampling is not None:
+            if getattr(self, "_ingraph_sampling_measure", False):
+                if combined.device.type == "cuda":
+                    torch.cuda.synchronize(combined.device)
+                started = time.perf_counter()
+                combined = self._compiled_ingraph_sampling(combined, tvec, freqs, mask)
+                if combined.device.type == "cuda":
+                    torch.cuda.synchronize(combined.device)
+                self._record_ingraph_sampling_timing(time.perf_counter() - started)
+            else:
+                combined = self._compiled_ingraph_sampling(combined, tvec, freqs, mask)
+        else:
+            combined = self._blocks_trunk(
+                combined,
+                tvec,
+                freqs,
+                mask,
+                force_ingraph=force_ingraph,
+            )
+
+        final = self.last(combined, t)
+        output = final[:, txtlen : txtlen + imglen, :]
+
+        return output
+
+    def _blocks_trunk(
+        self,
+        combined: Tensor,
+        tvec: Tensor,
+        freqs: Tensor,
+        mask: Tensor | None,
+        *,
+        force_ingraph: bool = False,
+    ) -> Tensor:
+        use_compiled = (
+            self._compiled_blocks is not None
+            and not torch.is_grad_enabled()
+        )
+        use_ingraph = (
+            force_ingraph or bool(self._ingraph_sampling_packs)
+        ) and not torch.is_grad_enabled()
         checkpoint_cutoff = len(self.blocks) - self._checkpoint_keep_last
         use_compiled_training = (
             self._compiled_training_blocks is not None
@@ -749,10 +1110,13 @@ class SingleStreamDiT(nn.Module):
                 # Hook-free block: run its compiled graph. The block that still
                 # streams weights falls through to the eager call below.
                 combined = self._compiled_blocks[i](combined, tvec, freqs, mask)
+            elif use_ingraph and i in self._ingraph_sampling_packs:
+                pack = self._ingraph_sampling_packs[i]
+                token = torch.ops.mm.fetch_start_after(pack.host_flat, combined)
+                flat = torch.ops.mm.fetch_wait(token, int(pack.required_pin_bytes))
+                leaves = self._nest_block_leaves(flat, pack)
+                combined = block_call(combined, tvec, freqs, mask, leaves=leaves)
+                torch.ops.mm.fetch_free_after(token, combined)
             else:
                 combined = block_call(combined, tvec, freqs, mask)
-
-        final = self.last(combined, t)
-        output = final[:, txtlen : txtlen + imglen, :]
-
-        return output
+        return combined

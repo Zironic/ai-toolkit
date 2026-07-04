@@ -49,14 +49,17 @@ class CapAutoPinBudgetTests(unittest.TestCase):
     page-locks already-loaded CPU weights; the crash mode is shared pinned-memory
     commit, not ordinary available-RAM accounting."""
 
-    def _cap(self, budget, total, available, reserve_bytes=0):
+    def _cap(self, budget, total, available, reserve_bytes=0, dxgi_headroom=None):
         with mock.patch.dict(os.environ, _ENV):
             with mock.patch.object(
                 bounce_pool, "_psutil", _FakePsutil(total, available)
             ):
-                return MemoryManager._cap_auto_pin_budget(
-                    budget, reserve_bytes=reserve_bytes
-                )
+                with mock.patch.object(
+                    bounce_pool, "dxgi_pinned_headroom", lambda *_: dxgi_headroom
+                ):
+                    return MemoryManager._cap_auto_pin_budget(
+                        budget, reserve_bytes=reserve_bytes
+                    )
 
     def test_wddm_fraction_binds_on_roomy_box(self):
         # 32 GiB box: total-floor cap 24, WDDM proxy cap 8 -> 8 binds.
@@ -79,6 +82,21 @@ class CapAutoPinBudgetTests(unittest.TestCase):
     def test_small_budget_passes_through(self):
         got = self._cap(1 * GIB, 32 * GIB, 20 * GIB)
         self.assertEqual(got, 1 * GIB)
+
+    def test_dxgi_probe_governs_when_present(self):
+        # With a real DXGI headroom reading, system-RAM proxies must not bind:
+        # neither the WDDM fraction (8 GiB here) nor reported available RAM.
+        got = self._cap(12 * GIB, 32 * GIB, 1 * GIB, dxgi_headroom=10 * GIB)
+        self.assertEqual(got, 10 * GIB)
+        got = self._cap(12 * GIB, 32 * GIB, 1 * GIB, dxgi_headroom=20 * GIB)
+        self.assertEqual(got, 12 * GIB)
+
+    def test_dxgi_probe_subtracts_bounce_reserve(self):
+        got = self._cap(
+            12 * GIB, 32 * GIB, 20 * GIB, reserve_bytes=2 * GIB,
+            dxgi_headroom=10 * GIB,
+        )
+        self.assertEqual(got, 8 * GIB)
 
     def test_no_psutil_returns_budget(self):
         with mock.patch.object(bounce_pool, "_psutil", None):

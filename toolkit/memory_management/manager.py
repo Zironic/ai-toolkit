@@ -10,6 +10,7 @@ from .manager_modules import (
     ConvLayerMemoryManager,
     _DEVICE_STATE,
     _is_quantized_tensor,
+    _profile_is_pinned,
     _unpin_inner_tensors,
     unpin_layer,
     fp8_linear_inference,
@@ -38,6 +39,7 @@ from .manager_modules import (
     block_forward_done,
     reset_block_stream,
 )
+from .ingraph_stream import fetch_report as ingraph_fetch_report
 from . import bounce_pool
 
 
@@ -264,6 +266,30 @@ class MemoryManager:
         to the other's consumption.
         """
         gib = 1024 ** 3
+        reserve_bytes = max(0, int(reserve_bytes or 0))
+        reserve_text = (
+            f" reserve_for_bounce={reserve_bytes / gib:.2f} GiB;"
+            if reserve_bytes
+            else ""
+        )
+        device_index = bounce_pool._cuda_device_index(device)
+        dxgi_headroom = bounce_pool.dxgi_pinned_headroom(device_index)
+        if dxgi_headroom is not None:
+            # The real shared-budget probe is authoritative: system-RAM numbers
+            # ("available" especially) do not measure the resource pinning
+            # spends and must not shrink the budget when DXGI is visible.
+            capped = min(budget, max(0, dxgi_headroom - reserve_bytes))
+            if capped < budget:
+                print(
+                    "[MemoryManager] pinned-weight auto-budget capped: "
+                    f"want={budget / gib:.2f} GiB -> {capped / gib:.2f} GiB "
+                    f"(dxgi_pinned_headroom={dxgi_headroom / gib:.2f} GiB;"
+                    f"{reserve_text} "
+                    "pinned memory commits against the WDDM shared GPU budget -- "
+                    "set layer_offloading_pinned_weight_gb to override)"
+                )
+            return capped
+        # Fallback (no DXGI probe): conservative system-RAM proxies.
         vm = None
         try:
             if bounce_pool._psutil is not None:
@@ -272,13 +298,10 @@ class MemoryManager:
             vm = None
         if vm is None:
             return budget
-        reserve_bytes = max(0, int(reserve_bytes or 0))
         total_floor = int(
             float(_env("AI_TOOLKIT_PINNED_WEIGHT_RAM_FLOOR_GIB", "8.0")) * gib
         )
-        ledger_headroom = bounce_pool.pinned_bytes_headroom(
-            bounce_pool._cuda_device_index(device)
-        )
+        ledger_headroom = bounce_pool.pinned_bytes_headroom(device_index)
         caps = [
             budget,
             max(0, int(vm.total) - total_floor - reserve_bytes),
@@ -287,13 +310,8 @@ class MemoryManager:
             caps.append(max(0, ledger_headroom - reserve_bytes))
         capped = min(caps)
         if capped < budget:
-            reserve_text = (
-                f" reserve_for_bounce={reserve_bytes / gib:.2f} GiB;"
-                if reserve_bytes
-                else ""
-            )
             print(
-                "[MemoryManager] pinned-weight auto-budget capped: "
+                "[MemoryManager] pinned-weight auto-budget capped (RAM proxy, no DXGI probe): "
                 f"want={budget / gib:.2f} GiB -> {capped / gib:.2f} GiB "
                 f"(reported_available={vm.available / gib:.2f} GiB total={vm.total / gib:.2f} GiB;"
                 f"{reserve_text} "
@@ -3733,6 +3751,26 @@ class MemoryManager:
             if key is not None and hasattr(child, "_layer_memory_manager"):
                 sources.append((key, child))
         registered = len(sources)
+        # Fully-pinned streamed set: every streamed layer's H2D runs async
+        # straight from its page-locked weight (the pinned-source bypass in
+        # manager_modules), so a bounce pool would never transfer anything --
+        # it would only pin buffers out of the same finite WDDM shared budget
+        # the weight pins already spent. Don't create one.
+        def _layer_pinned(child):
+            weight = getattr(child, "weight", None)
+            if weight is None or not _profile_is_pinned(weight.data):
+                return False
+            bias = getattr(child, "bias", None)
+            return bias is None or _profile_is_pinned(bias.data)
+
+        if sources and all(_layer_pinned(child) for _, child in sources):
+            print(
+                "[MemoryManager] bounce pool disabled: all "
+                f"{registered} streamed layers are pinned (pinned-source "
+                "bypass makes the pool redundant; its buffers would compete "
+                "for the same WDDM shared pinned budget)"
+            )
+            return
         history = cls._historical_prefetch_defaults(registered)
 
         default_budget_gib, default_target_gib, default_mode = cls._training_bounce_pool_budget_defaults(
@@ -4245,6 +4283,11 @@ class MemoryManager:
     def offload_profile_report(reset: bool = False):
         """Return the slice-1 streamed-step timing report, or None if disabled."""
         return summarize_offload_profile(reset=reset)
+
+    @staticmethod
+    def ingraph_fetch_report(reset: bool = False):
+        """Return in-graph streaming fetch stats, or None if inactive."""
+        return ingraph_fetch_report(reset=reset)
 
     @staticmethod
     def offload_step_begin(shape_key=None):

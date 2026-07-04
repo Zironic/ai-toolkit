@@ -250,23 +250,35 @@ def get_dxgi_meminfo():
     return dxgi_meminfo
 
 
+def dxgi_pinned_headroom(cuda_device_index: Optional[int] = None) -> Optional[int]:
+    """Pinnable headroom from the real DXGI NON_LOCAL budget probe, or None
+    when the probe is unavailable/disabled. This is the authoritative signal;
+    system-RAM proxies exist only for when this returns None."""
+    if _env_bool("AI_TOOLKIT_WDDM_DXGI_CONTROL_DISABLE"):
+        return None
+    dxgi = get_dxgi_meminfo()
+    if dxgi is None:
+        return None
+    info = dxgi.query_non_local_video_memory_info(
+        cuda_device_index=0 if cuda_device_index is None else int(cuda_device_index),
+        min_interval_s=0.0,
+    )
+    if info is None:
+        return None
+    return dxgi.compute_non_local_headroom_bytes(
+        info.budget_bytes,
+        info.current_usage_bytes,
+        dxgi_spill_reserve_bytes(info.budget_bytes),
+    )
+
+
 def pinned_bytes_headroom(cuda_device_index: Optional[int] = None) -> Optional[int]:
     """Bytes still safe to pin process-wide before the WDDM shared-GPU-memory
     budget is likely exhausted. None if psutil is unavailable (check skipped)
     or the proxy is disabled (AI_TOOLKIT_PINNED_WEIGHT_WDDM_FRACTION <= 0)."""
-    if not _env_bool("AI_TOOLKIT_WDDM_DXGI_CONTROL_DISABLE"):
-        dxgi = get_dxgi_meminfo()
-        if dxgi is not None:
-            info = dxgi.query_non_local_video_memory_info(
-                cuda_device_index=0 if cuda_device_index is None else int(cuda_device_index),
-                min_interval_s=0.0,
-            )
-            if info is not None:
-                return dxgi.compute_non_local_headroom_bytes(
-                    info.budget_bytes,
-                    info.current_usage_bytes,
-                    dxgi_spill_reserve_bytes(info.budget_bytes),
-                )
+    headroom = dxgi_pinned_headroom(cuda_device_index)
+    if headroom is not None:
+        return headroom
     if _psutil is None:
         return None
     try:
