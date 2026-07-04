@@ -30,47 +30,53 @@ _FETCH_OPS = (
 
 
 def _wrapped_fetch_op(node):
+    """(op_name, is_auto_functionalized) for fetch-op nodes, else None.
+
+    Matching is string-based on purpose: at the post-grad stage the target is
+    either the auto_functionalized_v2 HOP (whose first arg is the wrapped
+    OpOverload) or a plain OpOverload; identity/__name__ checks on the HOP
+    object proved unreliable across torch builds."""
     if node.op != "call_function":
         return None
-    target = node.target
-    if target is torch.ops.higher_order.auto_functionalized_v2 or (
-        getattr(target, "__name__", "") == "auto_functionalized_v2"
-    ):
-        inner = node.args[0] if node.args else None
-        name = str(getattr(inner, "name", inner))
+    if "auto_functionalized" in str(node.target):
+        name = str(node.args[0]) if node.args else ""
         for op_name in _FETCH_OPS:
             if op_name in name:
-                return op_name
+                return op_name, True
         return None
-    name = str(getattr(target, "name", lambda: target)()) if hasattr(
-        target, "name"
-    ) else str(target)
+    name = str(node.target).replace("::", ".")
     for op_name in _FETCH_OPS:
-        if op_name in name.replace("::", "."):
-            return op_name
+        if op_name in name:
+            return op_name, False
     return None
 
 
 def order_fetch_ops_pass(graph: torch.fx.Graph) -> None:
     """Rewrite fetch_start_after guard bases to chain after the previous
     fetch-op node, enforcing eager fetch/free order via data deps."""
-    prev = None
+    prev_auto = None  # last auto_functionalized fetch node (has tuple output)
+    rewired = 0
     for node in list(graph.nodes):
-        op_name = _wrapped_fetch_op(node)
-        if op_name is None:
+        matched = _wrapped_fetch_op(node)
+        if matched is None:
             continue
+        op_name, is_auto = matched
         if (
             op_name == "mm.fetch_start_after"
-            and prev is not None
+            and is_auto
+            and prev_auto is not None
             and node.kwargs.get("_all_bases")
         ):
-            with graph.inserting_after(prev):
-                gate = graph.call_function(operator.getitem, (prev, 1))
+            with graph.inserting_after(prev_auto):
+                gate = graph.call_function(operator.getitem, (prev_auto, 1))
             new_kwargs = dict(node.kwargs)
             new_kwargs["_all_bases"] = [gate]
             node.kwargs = new_kwargs
-        prev = node
-    graph.lint()
+            rewired += 1
+        if is_auto:
+            prev_auto = node
+    if rewired:
+        graph.lint()
 
 
 def install_ordering_pass() -> None:
