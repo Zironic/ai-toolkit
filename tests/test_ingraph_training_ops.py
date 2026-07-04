@@ -123,18 +123,15 @@ class FreeOnBackwardTests(unittest.TestCase):
         fetches = int(ingraph_stream.fetch_stats()["fetches"]) - stats0
         self.assertEqual(fetches, 2 * self.N_BLOCKS)
 
-    @unittest.expectedFailure
     def test_compiled_checkpoint_fwd_bwd_zero_breaks(self):
-        # KNOWN GAP (Phase 4a S1, 2026-07-04): the AOT backward graph is
-        # CORRECT (refetch -> grads -> free per unit, recomputed token), but
-        # functionalized fetch ops carry no ordering beyond data deps, so
-        # Inductor hoists later units' re-fetches (which depend only on saved
-        # boundary activations) above earlier frees -- exceeding ring depth
-        # and tripping the fail-fast depth guard. Ordered effect tokens
-        # (_register_ordered_effects) are the candidate fix but currently
-        # trip a token-erasure assertion inside the checkpoint HOP lowering
-        # on torch 2.12. Eager training streaming is fully correct (tests
-        # above); revisit on torch upgrade or via a flat-trunk design.
+        # Requires the post-grad ordering pass: without it, Inductor hoists
+        # backward re-fetches (data-dep only on saved boundary activations)
+        # above frees and trips the depth guard. The pass rewrites backward
+        # fetch_start_after nodes to fetch_start_gated, gated on the previous
+        # free's token output -- real dataflow no scheduling stage can drop.
+        from toolkit.memory_management import ingraph_stream_scheduling
+
+        ingraph_stream_scheduling.install_ordering_pass()
         torch._dynamo.reset()
         compiled = torch.compile(
             lambda x: _trunk(x, self.hosts), fullgraph=True, dynamic=False

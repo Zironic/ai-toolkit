@@ -20,12 +20,15 @@ import operator
 
 import torch
 
+# Longest-first: several names are prefixes of others and matching is by
+# substring (e.g. "mm.fetch_start" would shadow "mm.fetch_start_after").
 _FETCH_OPS = (
-    "mm.fetch_start",
+    "mm.fetch_start_gated",
     "mm.fetch_start_after",
+    "mm.fetch_free_after",
+    "mm.fetch_start",
     "mm.fetch_wait",
     "mm.fetch_free",
-    "mm.fetch_free_after",
 )
 
 
@@ -61,19 +64,51 @@ def order_fetch_ops_pass(graph: torch.fx.Graph) -> None:
         if matched is None:
             continue
         op_name, is_auto = matched
-        if (
-            op_name == "mm.fetch_start_after"
-            and is_auto
-            and prev_auto is not None
-            and node.kwargs.get("_all_bases")
-        ):
-            with graph.inserting_after(prev_auto):
-                gate = graph.call_function(operator.getitem, (prev_auto, 1))
-            new_kwargs = dict(node.kwargs)
-            new_kwargs["_all_bases"] = [gate]
-            node.kwargs = new_kwargs
-            rewired += 1
-        if is_auto:
+        if op_name == "mm.fetch_start_after" and is_auto and prev_auto is not None:
+            # Replace the functionalized fetch_start_after with a direct
+            # fetch_start_gated whose gate is the previous fetch-op's updated
+            # base -- a real data input, not mutation bookkeeping.
+            host = node.kwargs.get("host_flat")
+            if host is None and node.args:
+                host = node.args[1] if len(node.args) > 1 else None
+            if host is not None:
+                if prev_auto.target is torch.ops.mm.fetch_start_gated.default:
+                    gate = prev_auto  # token tensor, already a plain output
+                else:
+                    # Gate on the wrapped op's RETURN (tuple element 0, the
+                    # token clone) -- a real extern-kernel output. Element 1+
+                    # are updated-base bookkeeping the reinplacer dissolves
+                    # into the original buffers, which would silently drop
+                    # the ordering edge to the free itself.
+                    with graph.inserting_after(prev_auto):
+                        gate = graph.call_function(
+                            operator.getitem, (prev_auto, 0)
+                        )
+                with graph.inserting_after(node):
+                    gated = graph.call_function(
+                        torch.ops.mm.fetch_start_gated.default, (host, gate)
+                    )
+                # The old node's users are getitems: index 0 is the token,
+                # index >=1 are updated guard bases (pass-through of the
+                # original base).
+                for user in list(node.users):
+                    if (
+                        user.op == "call_function"
+                        and user.target is operator.getitem
+                    ):
+                        if user.args[1] == 0:
+                            user.replace_all_uses_with(gated)
+                            graph.erase_node(user)
+                        else:
+                            base_list = node.kwargs.get("_all_bases") or []
+                            idx = user.args[1] - 1
+                            if 0 <= idx < len(base_list):
+                                user.replace_all_uses_with(base_list[idx])
+                                graph.erase_node(user)
+                graph.erase_node(node)
+                node = gated
+                rewired += 1
+        if is_auto or node.target is torch.ops.mm.fetch_start_gated.default:
             prev_auto = node
     if rewired:
         graph.lint()
