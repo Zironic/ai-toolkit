@@ -176,6 +176,59 @@ def load_captures(path: Path) -> list[tuple[list[Any], list[Any], dict[str, Any]
     return captures
 
 
+def _metadata_number(metadata: dict[str, Any], key: str, default=0):
+    value = metadata.get(key, default)
+    try:
+        return type(default)(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def summarize_captures(captures, per_step, total: ReplayStats) -> dict[str, Any]:
+    confidence = collections.Counter()
+    schedule_entries = 0
+    observed_entries = 0
+    hits = 0
+    soft_misses = 0
+    hard_misses = 0
+    capture_resyncs = 0
+    capture_mismatches = 0
+    duplicate_blocks = 0
+    skips = 0
+    for schedule, observed, metadata in captures:
+        confidence[metadata.get("schedule_confidence") or "unknown"] += 1
+        schedule_entries += len(schedule)
+        observed_entries += len(observed)
+        hits += _metadata_number(metadata, "hits", 0)
+        soft_misses += _metadata_number(metadata, "soft_misses", 0)
+        hard_misses += _metadata_number(metadata, "hard_misses", 0)
+        capture_resyncs += _metadata_number(metadata, "resyncs", 0)
+        capture_mismatches += _metadata_number(metadata, "mismatches", 0)
+        duplicate_blocks += _metadata_number(metadata, "duplicate_key_resync_blocked", 0)
+        skips += _metadata_number(metadata, "skips", 0)
+
+    pool_accesses = hits + soft_misses + hard_misses
+    stats = total.to_dict()
+    stats.update(
+        captures=len(captures),
+        schedule_entries=schedule_entries,
+        observed_entries=observed_entries,
+        avg_schedule_entries=schedule_entries / max(1, len(captures)),
+        avg_observed_entries=observed_entries / max(1, len(captures)),
+        schedule_minus_observed=schedule_entries - observed_entries,
+        pool_hits=hits,
+        pool_soft_misses=soft_misses,
+        pool_hard_misses=hard_misses,
+        pool_hit_rate=(hits / pool_accesses if pool_accesses else None),
+        capture_resyncs=capture_resyncs,
+        capture_mismatches=capture_mismatches,
+        capture_duplicate_key_resync_blocked=duplicate_blocks,
+        capture_skips=skips,
+        confidence=dict(sorted(confidence.items())),
+    )
+    return stats
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("path", type=Path, help="JSON or JSONL capture containing schedule and observed access streams")
@@ -203,15 +256,35 @@ def main() -> int:
         total.duplicate_key_resync_blocked += step_stats.duplicate_key_resync_blocked
         total.schedule_len += step_stats.schedule_len
         total.consume_pos += step_stats.consume_pos
-    stats = total.to_dict()
-    stats["captures"] = len(captures)
+    stats = summarize_captures(captures, per_step, total)
     if args.json:
         print(json.dumps({"summary": stats, "steps": per_step}, indent=2, sort_keys=True))
     else:
         print(
-            "captures={captures} accesses={accesses} aligned={aligned} resyncs={resyncs} "
+            "captures={captures} schedule_entries={schedule_entries} "
+            "observed_entries={observed_entries} avg_schedule={avg_schedule_entries:.1f} "
+            "avg_observed={avg_observed_entries:.1f} delta={schedule_minus_observed}".format(**stats)
+        )
+        print(
+            "replay: accesses={accesses} aligned={aligned} resyncs={resyncs} "
             "mismatches={mismatches} dup_block={duplicate_key_resync_blocked} "
             "resync_rate={resync_rate:.3f} mismatch_rate={mismatch_rate:.3f}".format(**stats)
+        )
+        if (
+            stats["pool_hits"]
+            or stats["pool_soft_misses"]
+            or stats["pool_hard_misses"]
+            or stats["capture_skips"]
+        ):
+            print(
+                "pool: hits={pool_hits} soft_misses={pool_soft_misses} "
+                "hard_misses={pool_hard_misses} hit_rate={pool_hit_rate:.1%} "
+                "captured_resyncs={capture_resyncs} captured_mismatches={capture_mismatches} "
+                "captured_dup_block={capture_duplicate_key_resync_blocked} skips={capture_skips}".format(**stats)
+            )
+        print(
+            "confidence: "
+            + " ".join(f"{key}={value}" for key, value in stats["confidence"].items())
         )
     return 0
 

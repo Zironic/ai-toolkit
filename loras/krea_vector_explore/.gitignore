@@ -1,0 +1,7 @@
+*
+!.gitignore
+!README.md
+!txtfusion_probe/
+!txtfusion_probe/.gitignore
+!txtfusion_probe/README.md
+!txtfusion_probe/prompts.json

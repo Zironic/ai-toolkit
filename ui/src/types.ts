@@ -77,6 +77,7 @@ export interface NetworkConfig {
 export interface SaveConfig {
   dtype: string;
   save_every: number;
+  recovery_every: number;
   max_step_saves_to_keep: number;
   save_format: string;
   push_to_hub: boolean;
@@ -185,8 +186,10 @@ export interface ModelConfig {
   layer_offloading_text_encoder_percent?: number;
   layer_offloading_smart?: boolean;
   layer_offloading_block_stream_only?: boolean;
+  layer_offloading_pinned_weight_gb?: number;
   layer_offloading_smart_working_reserve_gb?: number;
   layer_offloading_smart_wddm_margin_gb?: number;
+  layer_offloading_wddm_spill_reserve_pct?: number;
   layer_offloading_smart_wddm_hard_gb?: number;
   /** @deprecated renamed to layer_offloading_smart_working_reserve_gb; read for back-compat. */
   layer_offloading_smart_headroom_gb?: number;
@@ -202,6 +205,8 @@ export interface ModelConfig {
   layer_offloading_fp8_forward?: boolean;
   layer_offloading_fp8_grad_input?: boolean;
   layer_offloading_checkpoint_keep_last?: number;
+  layer_offloading_compile_streamed?: boolean;
+  train_compile_blocks?: boolean;
   assistant_lora_path?: string;
   unconditional_lora_path?: string;
   compile?: boolean;

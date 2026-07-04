@@ -13,9 +13,11 @@ Flow-matching convention matches ai-toolkit exactly (t=1 noise -> t=0 clean,
 target = noise - clean), so ``get_noise_prediction`` does no time flip / negation.
 """
 
+import hashlib
 import json
 import os
 import struct
+from pathlib import Path
 from typing import List, Optional
 
 import torch
@@ -37,9 +39,6 @@ from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
-from toolkit.samplers.custom_flowmatch_sampler import (
-    CustomFlowMatchEulerDiscreteScheduler,
-)
 from toolkit.accelerator import unwrap_model
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
@@ -51,6 +50,8 @@ from .src.mmdit import (
     SingleMMDiTConfig,
     SingleStreamDiT,
 )
+from .src.noise_band_scheduler import Krea2NoiseBandScheduler
+from .src.skc_injection import install_skc_projector_injection
 from .src.text_encoder import encode_krea_prompt, SELECT_LAYERS
 from .src.pipeline import Krea2Pipeline, pad_text_features, predict_velocity
 
@@ -261,8 +262,6 @@ def _stream_checkpoint(transformer, checkpoint_path: str, dtype) -> None:
 
 def _stream_and_quantize_checkpoint(base_model, transformer, checkpoint_path, dtype) -> None:
     """Materialize, quantize, and release one bounded submodule at a time."""
-    from toolkit.dequantize import patch_dequantization_on_save
-
     header, data_start = _read_safetensors_header(checkpoint_path)
     target_state = transformer.state_dict()
     target_keys = _validate_checkpoint_keys(transformer, header, checkpoint_path)
@@ -271,8 +270,13 @@ def _stream_and_quantize_checkpoint(base_model, transformer, checkpoint_path, dt
         units.setdefault(_quantization_unit_for_key(key), []).append(key)
 
     quantization_type = get_qtype(base_model.model_config.qtype)
+    unit_items = list(units.items())
+    base_model.print_and_status_update(f"  - streaming and quantizing {len(unit_items)} transformer units")
     with open(checkpoint_path, "rb", buffering=0) as handle:
-        for unit_name, keys in tqdm(units.items(), desc="Loading + quantizing Krea 2"):
+        for index, (unit_name, keys) in enumerate(unit_items, start=1):
+            if index == 1 or index == len(unit_items) or index % 5 == 0:
+                base_model.print_and_status_update(f"    quantizing unit {index}/{len(unit_items)}: {unit_name}")
+                flush(garbage_collect=False)
             for key in keys:
                 tensor = _load_checkpoint_tensor(
                     handle, data_start, header, key, target_state[key].shape, dtype
@@ -284,9 +288,71 @@ def _stream_and_quantize_checkpoint(base_model, transformer, checkpoint_path, dt
             quantize(unit, weights=quantization_type)
             freeze(unit)
             unit.to("cpu")
-            flush()
+    base_model.print_and_status_update("  - finished streaming and quantizing transformer units")
+    flush(garbage_collect=False)
 
-    patch_dequantization_on_save(transformer)
+
+
+def _quantized_transformer_cache_info(base_model, checkpoint_path: str, dtype, config: SingleMMDiTConfig):
+    model_kwargs = base_model.model_config.model_kwargs
+    cache_enabled = bool(model_kwargs.get("quantized_transformer_cache", True))
+    if not cache_enabled:
+        return None, None
+    cache_root = Path(
+        model_kwargs.get("quantized_transformer_cache_dir")
+        or os.getenv("AI_TOOLKIT_KREA2_QUANT_CACHE")
+        or "tmp/ai_toolkit_krea2_quantized"
+    )
+    checkpoint_stat = os.stat(checkpoint_path)
+    metadata = {
+        "schema": "krea2_quantized_transformer_cache.v1",
+        "checkpoint_path": os.path.abspath(checkpoint_path),
+        "checkpoint_size": int(checkpoint_stat.st_size),
+        "checkpoint_mtime_ns": int(checkpoint_stat.st_mtime_ns),
+        "dtype": str(dtype).replace("torch.", ""),
+        "qtype": str(base_model.model_config.qtype),
+        "mmdit_config": config.__dict__,
+        "torch_version": torch.__version__,
+    }
+    digest = hashlib.sha256(json.dumps(metadata, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+    return cache_root / f"krea2_transformer_{digest}.pt", metadata
+
+
+def _try_load_quantized_transformer_cache(base_model, transformer, cache_path: Path, metadata: dict) -> bool:
+    if cache_path is None or not cache_path.exists():
+        return False
+    try:
+        base_model.print_and_status_update(f"  - loading cached quantized transformer state from {cache_path}")
+        payload = torch.load(str(cache_path), map_location="cpu", weights_only=False)
+        if payload.get("metadata") != metadata:
+            base_model.print_and_status_update("  - cached quantized transformer metadata mismatch; ignoring")
+            return False
+        missing, unexpected = transformer.load_state_dict(payload["state_dict"], strict=True, assign=True)
+        if missing or unexpected:
+            raise RuntimeError(f"missing={missing[:5]} unexpected={unexpected[:5]}")
+        from toolkit.dequantize import patch_dequantization_on_save
+        patch_dequantization_on_save(transformer)
+        return True
+    except Exception as error:
+        base_model.print_and_status_update(f"  - failed to load cached quantized transformer; rebuilding ({error})")
+        return False
+
+
+def _save_quantized_transformer_cache(base_model, transformer, cache_path: Path, metadata: dict) -> None:
+    if cache_path is None:
+        return
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        base_model.print_and_status_update(f"  - saving cached quantized transformer state to {cache_path}")
+        flush(garbage_collect=False)
+        torch.save({"metadata": metadata, "state_dict": transformer.state_dict()}, str(tmp_path))
+        os.replace(tmp_path, cache_path)
+    except Exception as error:
+        base_model.print_and_status_update(f"  - failed to save cached quantized transformer (ignored): {error}")
+    finally:
+        from toolkit.dequantize import patch_dequantization_on_save
+        patch_dequantization_on_save(transformer)
 
 
 class Krea2Model(BaseModel):
@@ -322,8 +388,52 @@ class Krea2Model(BaseModel):
         self._transformer_quantized_during_load = False
 
     @staticmethod
-    def get_train_scheduler():
-        return CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
+    def get_train_scheduler(model_config: Optional[ModelConfig] = None):
+        model_kwargs = model_config.model_kwargs if model_config is not None else {}
+        # Compresses the training-timestep ladder into a bounded noise-fraction
+        # band, e.g. model.model_kwargs.noise_band_max: 0.9 excludes the top 10%
+        # (near-total-noise) tail from training instead of merely biasing away
+        # from it. Defaults to [0, 1] (disabled / behaviour-preserving). Requires
+        # train.timestep_type: shift when a band is set (see noise_band_scheduler.py).
+        noise_band_min = float(model_kwargs.get("noise_band_min", 0.0))
+        noise_band_max = float(model_kwargs.get("noise_band_max", 1.0))
+        return Krea2NoiseBandScheduler(
+            noise_band_min=noise_band_min,
+            noise_band_max=noise_band_max,
+            **scheduler_config,
+        )
+
+    def _install_skc_injection(self, transformer):
+        """Attach a fixed SKC projector perturbation if configured.
+
+        Reads model.model_kwargs.skc_lora_path / skc_strength. The vector is a
+        frozen teacher-side perturbation on txtfusion.projector, present in every
+        forward (training and sampling) -- distinct from assistant_lora_path,
+        which is merged for training and INVERTED at inference. strength is the
+        raw multiplier on the extracted vector: for skc3vo (scale-1, no alpha)
+        this equals its ComfyUI strength 1:1 (no 2.5x -- that factor is z0-only).
+        """
+        self._skc_injection_handle = None
+        if transformer is None:
+            return
+        mk = self.model_config.model_kwargs
+        skc_lora_path = mk.get("skc_lora_path")
+        if skc_lora_path is None:
+            return
+        skc_strength = float(mk.get("skc_strength", 0.0))
+        if skc_strength == 0.0:
+            self.print_and_status_update(
+                "skc_lora_path set but skc_strength=0; SKC injection disabled"
+            )
+            return
+        source, handle = install_skc_projector_injection(
+            transformer, skc_lora_path, skc_strength
+        )
+        self._skc_injection_handle = handle
+        self.print_and_status_update(
+            f"  - SKC projector injection active (strength={skc_strength}, "
+            f"from {source}); present in training and sampling forwards"
+        )
 
     def get_bucket_divisibility(self):
         # 8 for the VAE downsample, 2 for the patch size.
@@ -340,27 +450,32 @@ class Krea2Model(BaseModel):
         mmdit_kwargs.update(self.model_config.model_kwargs.get("mmdit_config", {}))
         config = SingleMMDiTConfig(**mmdit_kwargs)
 
-        # Build on meta, then materialize straight from the checkpoint.
-        with torch.device("meta"):
-            transformer = SingleStreamDiT(config)
-
         self.print_and_status_update("  - fetching transformer weights")
         checkpoint_path = _resolve_mmdit_checkpoint_path(
             self.model_config.name_or_path,
             self.model_config.model_kwargs.get("checkpoint_filename", None),
         )
 
-        self.print_and_status_update("  - loading transformer through ranged disk reads")
         stream_quantized = (
             self.model_config.quantize
             and self.model_config.accuracy_recovery_adapter is None
             and self.model_config.assistant_lora_path is None
         )
-        if stream_quantized:
-            _stream_and_quantize_checkpoint(self, transformer, checkpoint_path, dtype)
+        cache_path, cache_metadata = _quantized_transformer_cache_info(self, checkpoint_path, dtype, config)
+        # Build on meta, then materialize either from the quantized cache or the checkpoint.
+        with torch.device("meta"):
+            transformer = SingleStreamDiT(config)
+
+        if stream_quantized and _try_load_quantized_transformer_cache(self, transformer, cache_path, cache_metadata):
             self._transformer_quantized_during_load = True
         else:
-            _stream_checkpoint(transformer, checkpoint_path, dtype)
+            self.print_and_status_update("  - loading transformer through ranged disk reads")
+            if stream_quantized:
+                _stream_and_quantize_checkpoint(self, transformer, checkpoint_path, dtype)
+                _save_quantized_transformer_cache(self, transformer, cache_path, cache_metadata)
+                self._transformer_quantized_during_load = True
+            else:
+                _stream_checkpoint(transformer, checkpoint_path, dtype)
 
         flush()
         return transformer
@@ -528,6 +643,8 @@ class Krea2Model(BaseModel):
                         ignore_modules=ignore_modules,
                         pinned_resident_keys=pinned_resident_keys,
                         block_stream_only=self.model_config.layer_offloading_block_stream_only,
+                        pinned_weight_gib=self.model_config.layer_offloading_pinned_weight_gb,
+                        wddm_spill_reserve_pct=self.model_config.layer_offloading_wddm_spill_reserve_pct,
                         fp8_training_forward=(
                             self.model_config.quantize
                             and self.model_config.qtype in ('qfloat8', 'float8')
@@ -624,13 +741,14 @@ class Krea2Model(BaseModel):
             vae = self._load_vae()
             vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
 
-        self.noise_scheduler = Krea2Model.get_train_scheduler()
+        self.noise_scheduler = Krea2Model.get_train_scheduler(self.model_config)
 
         self.vae = vae
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.processor = processor
         self.model = transformer
+        self._install_skc_injection(transformer)
         self.pipeline = Krea2Pipeline(self)
         self.print_and_status_update("Model Loaded")
 

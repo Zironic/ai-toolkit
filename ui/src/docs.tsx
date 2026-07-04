@@ -289,6 +289,19 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.layer_offloading_pinned_weight_gb': {
+    title: 'Pinned Weights (GB)',
+    description: (
+      <>
+        How many GB of offloaded weights to keep page-locked (pinned) in CPU RAM. The model already occupies this RAM
+        while training — pinning just locks it so the OS can&apos;t page it out and fault it back in on every fetch,
+        which is what makes the offload copies slow and the whole machine lag. Costs roughly no extra RAM.{' '}
+        <b>-1 = auto</b>: pins the whole offloaded weight set (capped by free RAM) and lets already-pinned weights skip
+        the copy workers entirely — the recommended default if you have the RAM to hold the model. 0 = pin nothing
+        (workers copy on demand). A positive value pins up to that many GB. Lower it if the system runs short on RAM.
+      </>
+    ),
+  },
   'model.layer_offloading_smart_working_reserve_gb': {
     title: 'Training VRAM Reserve',
     description: (
@@ -303,8 +316,17 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Training WDDM Margin',
     description: (
       <>
-        Driver-level free VRAM to preserve at the training peak. Increase this on Windows if WDDM paging or desktop
-        pressure causes slowdowns; smart offload will stream more layers to keep the margin free.
+        Driver-level free VRAM to preserve at the training peak. Use -1 for auto, which keeps max(10% of physical
+        VRAM, 1 GiB) free. Increase this on Windows if WDDM paging or desktop pressure causes slowdowns.
+      </>
+    ),
+  },
+  'model.layer_offloading_wddm_spill_reserve_pct': {
+    title: 'Shared Spill Reserve',
+    description: (
+      <>
+        Fraction of the DXGI shared GPU memory budget kept free for pinned/shared-memory headroom and sampling
+        transitions. The effective reserve is the larger of this percentage and the resolved Training WDDM Margin.
       </>
     ),
   },
@@ -339,8 +361,8 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Sampling WDDM Margin',
     description: (
       <>
-        Driver-level free VRAM to preserve during sampling. Increase this if validation images trigger WDDM shared-memory
-        paging or compete with desktop/browser memory.
+        Driver-level free VRAM to preserve during sampling. Use -1 for auto, which keeps max(10% of physical VRAM,
+        1 GiB) free. Increase this if validation images trigger WDDM paging or compete with desktop/browser memory.
       </>
     ),
   },
@@ -387,8 +409,8 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Prefetch Trace Capture',
     description: (
       <>
-        Optional JSONL output path for replaying real prefetch schedules and observed access streams with
-        scripts/replay_prefetch_trace.py. Leave empty for normal training.
+        Optional JSONL filename or path for replaying real prefetch schedules and observed access streams with
+        scripts/replay_prefetch_trace.py. Relative paths are written under the job output folder and archived into logs/ on the next run. Leave empty for normal training.
       </>
     ),
   },
@@ -421,6 +443,24 @@ const docs: { [key: string]: ConfigDoc } = {
         Reduces backward compute and memory traffic. Experimental: a one-time
         self-check validates it against the bf16 result on first use and falls
         back automatically if it disagrees, so training stays correct.
+      </>
+    ),
+  },
+  'model.layer_offloading_compile_streamed': {
+    title: 'Compile Streamed Blocks',
+    description: (
+      <>
+        Experimental compile path for offloaded transformer blocks. This flag is reserved for the staged streamed-block
+        compiler and is disabled by default while resident-block training compile lands first.
+      </>
+    ),
+  },
+  'model.train_compile_blocks': {
+    title: 'Compile Training Blocks',
+    description: (
+      <>
+        Compiles permanent-resident Krea 2 transformer blocks during training. Streamed blocks remain eager until the
+        streamed compiler is enabled; readiness details are printed in the MemoryManager plan line.
       </>
     ),
   },

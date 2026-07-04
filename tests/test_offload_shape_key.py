@@ -307,5 +307,57 @@ class OffloadShapeKeyTests(unittest.TestCase):
             manager_modules._OFFLOAD_TRACE.compatible_fallback_blocked_shape_keys.clear()
             manager_modules._OFFLOAD_TRACE.frozen = None
 
+    def test_schedule_cache_evicts_least_recently_used_past_cap(self):
+        """schedule_by_shape_key holds one full per-step access list per shape
+        key ever seen (bucketed aspect-ratio datasets can produce dozens to
+        hundreds of distinct keys over a run) with no natural end -- it must
+        be capped, not grow for the life of the process."""
+        from toolkit.memory_management import manager_modules
+
+        manager_modules.set_offload_trace_enabled(True)
+        old_cap = manager_modules._TRACE_MAX_SHAPE_KEYS
+        try:
+            manager_modules._TRACE_MAX_SHAPE_KEYS = 3
+            trace = manager_modules._OFFLOAD_TRACE
+            trace.schedule_by_shape_key.clear()
+            trace.compatible_fallback_blocked_shape_keys.clear()
+            trace.frozen = None
+
+            keys = [
+                ((("torch.float32", (1, 4, 64 + i, 64)),), (("policy", "same"),))
+                for i in range(3)
+            ]
+            for key in keys:
+                manager_modules.offload_step_begin(shape_key=key)
+                manager_modules.record_weight_access("a", "forward")
+                manager_modules.offload_step_end()
+            self.assertEqual(len(trace.schedule_by_shape_key), 3)
+
+            # Re-touch the oldest key so it is no longer the least-recently-used.
+            manager_modules.offload_step_begin(shape_key=keys[0])
+            manager_modules.record_weight_access("a", "forward")
+            manager_modules.offload_step_end()
+
+            # A 4th distinct key pushes the cache over the cap of 3; the
+            # least-recently-used surviving key (keys[1], never re-touched)
+            # must be the one evicted, not keys[0] (just refreshed).
+            new_key = ((("torch.float32", (1, 4, 999, 64)),), (("policy", "same"),))
+            manager_modules.offload_step_begin(shape_key=new_key)
+            manager_modules.record_weight_access("a", "forward")
+            manager_modules.offload_step_end()
+
+            self.assertEqual(len(trace.schedule_by_shape_key), 3)
+            self.assertIn(keys[0], trace.schedule_by_shape_key)
+            self.assertIn(keys[2], trace.schedule_by_shape_key)
+            self.assertIn(new_key, trace.schedule_by_shape_key)
+            self.assertNotIn(keys[1], trace.schedule_by_shape_key)
+        finally:
+            manager_modules._TRACE_MAX_SHAPE_KEYS = old_cap
+            manager_modules.set_offload_trace_enabled(False)
+            manager_modules._OFFLOAD_TRACE.schedule_by_shape_key.clear()
+            manager_modules._OFFLOAD_TRACE.compatible_fallback_blocked_shape_keys.clear()
+            manager_modules._OFFLOAD_TRACE.frozen = None
+
+
 if __name__ == "__main__":
     unittest.main()

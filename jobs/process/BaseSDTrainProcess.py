@@ -7,6 +7,7 @@ import random
 import shutil
 import sys
 import subprocess
+import threading
 import time
 from collections import OrderedDict
 import os
@@ -173,6 +174,75 @@ def _torch_compile_backend_unavailable_reason() -> Optional[str]:
 
     return None
 
+
+def _detach_to_cpu(obj):
+    """Deep-copy an optimizer state_dict onto CPU, cloning every tensor.
+
+    The result shares no storage with the live (on-device) optimizer state, so
+    it is safe to serialize from a background thread while training continues to
+    mutate the originals at the next optimizer.step().
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _detach_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        seq = [_detach_to_cpu(v) for v in obj]
+        return type(obj)(seq) if not isinstance(obj, tuple) else tuple(seq)
+    return obj
+
+
+class _CudaDriverFreeMonitor:
+    """Best-effort per-step sampler for driver-level CUDA free memory."""
+
+    def __init__(self, device, interval_s=0.02):
+        self.device = device
+        self.interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread = None
+        self.min_free_bytes = None
+        self.total_bytes = None
+        self.samples = 0
+
+    def start(self):
+        if not torch.cuda.is_available():
+            return self
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(self.device)
+        except Exception:
+            return self
+        self.min_free_bytes = int(free_b)
+        self.total_bytes = int(total_b)
+        self.samples = 1
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval_s):
+            try:
+                free_b, total_b = torch.cuda.mem_get_info(self.device)
+            except Exception:
+                continue
+            free_b = int(free_b)
+            self.total_bytes = int(total_b)
+            self.samples += 1
+            if self.min_free_bytes is None or free_b < self.min_free_bytes:
+                self.min_free_bytes = free_b
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.25)
+        if self.min_free_bytes is None or self.total_bytes is None:
+            return None
+        return {
+            "min_free_bytes": int(self.min_free_bytes),
+            "total_bytes": int(self.total_bytes),
+            "samples": int(self.samples),
+        }
+
+
 class BaseSDTrainProcess(BaseTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, custom_pipeline=None):
@@ -193,6 +263,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.start_step = 0
         self.epoch_num = 0
         self.last_save_step = 0
+        # Off-thread, crash-atomic checkpoint writer. Created lazily on first
+        # save so non-training uses of this class never spin up the thread.
+        self._async_saver = None
+        self._save_stager = None
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
         # if true, then we do not do an optimizer step. We are accumulating gradients
@@ -236,8 +310,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.model_config.layer_offloading_trace or prefetch_enabled
         )
         MemoryManager.set_offload_prefetch_enabled(prefetch_enabled)
-        MemoryManager.set_offload_prefetch_trace_capture(
+        prefetch_capture_path = self._resolve_job_jsonl_path(
             self.model_config.layer_offloading_prefetch_trace_capture,
+            'prefetch_trace_capture.jsonl',
+        )
+        if prefetch_capture_path:
+            self._archive_previous_jsonl(prefetch_capture_path, 'prefetch trace capture')
+        MemoryManager.set_offload_prefetch_trace_capture(
+            prefetch_capture_path,
             self.model_config.layer_offloading_prefetch_trace_capture_steps,
         )
         MemoryManager.set_fp8_grad_input_enabled(
@@ -665,10 +745,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def end_step_hook(self):
         pass
 
+    @property
+    def async_saver(self):
+        if self._async_saver is None:
+            from toolkit.async_save import AsyncSaver
+            self._async_saver = AsyncSaver(name=f"save-{self.job.name}")
+        return self._async_saver
+
+    @property
+    def save_stager(self):
+        """Pinned staging buffer for the batched checkpoint snapshot, or None
+        when disabled (snapshot_buffer_mb <= 0 -> per-tensor copy path)."""
+        mb = getattr(self.save_config, 'snapshot_buffer_mb', 64)
+        if not mb or mb <= 0:
+            return None
+        if self._save_stager is None:
+            from toolkit.async_save import PinnedStager
+            self._save_stager = PinnedStager(cap_bytes=int(mb) * 1024 * 1024)
+        return self._save_stager
+
     def save(self, step=None):
         if not self.accelerator.is_main_process:
             return
+        _t_start = time.perf_counter()
+        # Surface a failed background write from a previous save before we do more.
+        if self._async_saver is not None:
+            self._async_saver.wait_idle(timeout=0.0)
         flush()
+        _t_flush1 = time.perf_counter()
         if self.ema is not None:
             # always save params as ema
             self.ema.eval()
@@ -714,7 +818,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     file_path,
                     dtype=get_torch_dtype(self.save_config.dtype),
                     metadata=save_meta,
-                    extra_state_dict=embedding_dict
+                    extra_state_dict=embedding_dict,
+                    writer=self.async_saver,
+                    stager=self.save_stager,
                 )
                 self.network.multiplier = prev_multiplier
                 # if we have an embedding as well, pair it with the network
@@ -861,6 +967,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         
         print_acc(f"Saved checkpoint to {file_path}")
 
+        _t_net = time.perf_counter()
+
         # save optimizer
         if self.optimizer is not None:
             try:
@@ -870,11 +978,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     state_dict = unwrap_model(self.optimizer).state_dict()
                 except Exception as e:
                     state_dict = self.optimizer.state_dict()
-                torch.save(state_dict, file_path)
-                print_acc(f"Saved optimizer to {file_path}")
+                # The optimizer state lives on-device and the next optimizer.step
+                # mutates it, so snapshot to CPU here (synchronous) before the
+                # write is deferred off-thread.
+                cpu_state = _detach_to_cpu(state_dict)
+                from toolkit.async_save import atomic_torch_save
+                self.async_saver.submit(
+                    lambda cs=cpu_state, fp=file_path: atomic_torch_save(cs, fp),
+                    description="optimizer",
+                )
+                print_acc(f"Queued optimizer save to {file_path}")
             except Exception as e:
                 print_acc(e)
                 print_acc("Could not save optimizer")
+
+        _t_optim = time.perf_counter()
 
         self.clean_up_saves()
         self.post_save_hook(file_path)
@@ -882,6 +1000,47 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
         flush()
+        _t_end = time.perf_counter()
+        print_acc(
+            f"[save] snapshot={_t_net - _t_flush1:.2f}s optim_snap={_t_optim - _t_net:.2f}s "
+            f"flush_pre={_t_flush1 - _t_start:.2f}s flush_post={_t_end - _t_optim:.2f}s "
+            f"(disk write async)"
+        )
+
+    def save_recovery_snapshot(self):
+        """Frequent, cheap, latest-wins LoRA snapshot for crash recovery.
+
+        Writes *only* the LoRA (no optimizer / adapter / embedding) to a fixed
+        ``<name>.recovery.safetensors``. The device->host copy is the batched
+        pinned snapshot (~0.1s on the training thread); the disk write is
+        deferred to the async writer and coalesced, so snapshots can't back up.
+
+        The filename deliberately sits outside the ``<name>_*`` glob used by
+        ``clean_up_saves`` (so it is never rotated away) while still matching the
+        ``<name>*`` glob in ``get_latest_save_path`` (so a resume prefers it when
+        it is the newest state on disk). Step lives in the safetensors metadata,
+        so resume picks up exactly where the crash happened.
+        """
+        if not self.accelerator.is_main_process or self.network is None:
+            return
+        try:
+            self.update_training_metadata()
+            save_meta = get_meta_for_safetensors(copy.deepcopy(self.meta), self.job.name)
+            path = os.path.join(self.save_root, f'{self.job.name}.recovery.safetensors')
+            prev_multiplier = self.network.multiplier
+            self.network.multiplier = 1.0
+            self.network.save_weights(
+                path,
+                dtype=get_torch_dtype(self.save_config.dtype),
+                metadata=save_meta,
+                writer=self.async_saver,
+                stager=self.save_stager,
+                coalesce_key='recovery',
+            )
+            self.network.multiplier = prev_multiplier
+        except Exception as e:
+            # Recovery snapshots are best-effort; never let one take down training.
+            print_acc(f"recovery snapshot failed at step {self.step_num}: {e}")
 
     # Called before the model is loaded
     def hook_before_model_load(self):
@@ -919,7 +1078,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"streamed_layers={memory['managed_layers']}/"
                     f"{memory['candidate_layers']} "
                     f"ring_reserve={memory['planned_ring_gb']:.2f} GiB "
-                    f"working_reserve={memory['training_working_reserve_gb']:.2f} GiB "
+                    f"reserve_space={memory['training_working_reserve_gb']:.2f} GiB "
                     f"allocated={memory['torch_allocated_gb']:.2f} GiB "
                     f"reserved={memory['torch_reserved_gb']:.2f} GiB "
                     f"device_free={memory['device_free_gb']:.2f} GiB"
@@ -928,6 +1087,40 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def resolve_performance_timers(self):
         """Resolve model-specific asynchronous timers before logging the rolling window."""
         pass
+
+    def _resolve_job_jsonl_path(self, requested_path, default_filename):
+        """Resolve profiler artifacts under the job output folder by default."""
+        if requested_path is None or requested_path is False:
+            return None
+        if requested_path is True:
+            requested_path = default_filename
+        requested_path = str(requested_path).strip()
+        if not requested_path:
+            return None
+        if requested_path.lower() in ('1', 'true', 'yes', 'on'):
+            requested_path = default_filename
+        if not requested_path.lower().endswith('.jsonl'):
+            requested_path = f'{requested_path}.jsonl'
+        if os.path.isabs(requested_path):
+            return requested_path
+        return os.path.join(self.save_root, requested_path)
+
+    def _archive_previous_jsonl(self, path, label):
+        """Move an existing profiler JSONL aside into this job's logs folder."""
+        if not self.accelerator.is_main_process:
+            return
+        try:
+            if not path or not os.path.exists(path):
+                return
+            logs_folder = os.path.join(self.save_root, 'logs')
+            os.makedirs(logs_folder, exist_ok=True)
+            base = os.path.basename(path)
+            num = 0
+            while os.path.exists(os.path.join(logs_folder, f'{num}_{base}')):
+                num += 1
+            os.replace(path, os.path.join(logs_folder, f'{num}_{base}'))
+        except Exception as error:
+            print_acc(f"Could not archive previous {label}: {error}")
 
     def _archive_previous_performance_log(self):
         """Move an existing performance_log.jsonl aside before a new run.
@@ -1057,31 +1250,46 @@ class BaseSDTrainProcess(BaseTrainProcess):
         }
         try:
             from toolkit.memory_management import MemoryManager
+            driver_free_sample = getattr(self, '_last_driver_free_sample', None) or {}
             smart_memory = MemoryManager.training_runtime_diagnostics(
-                getattr(self.sd, 'unet', None), self.device_torch
+                getattr(self.sd, 'unet', None), self.device_torch,
+                observed_driver_free_min_bytes=driver_free_sample.get('min_free_bytes'),
+                observed_driver_total_bytes=driver_free_sample.get('total_bytes'),
+                observed_driver_free_samples=driver_free_sample.get('samples'),
             )
         except Exception as error:
             smart_memory = {'diagnostic_error': str(error)}
         if smart_memory is not None:
             record['smart_training_offload'] = smart_memory
             if 'diagnostic_error' not in smart_memory:
+                peak_source = smart_memory.get('device_peak_source', 'estimate')
+                peak_samples = smart_memory.get('driver_free_samples')
+                if peak_source == 'observed' and peak_samples:
+                    peak_source_text = f"observed/{peak_samples}"
+                else:
+                    peak_source_text = "estimate"
                 print_acc(
                     "[MemoryManager] smart training runtime: "
                     f"resident={smart_memory['planned_resident_gb']:.2f} GiB "
                     f"offloaded_cpu={smart_memory['offloaded_cpu_gb']:.2f} GiB "
-                    f"ring={smart_memory['live_ring_gb']:.2f}/"
+                    f"ring_peak={smart_memory.get('ring_peak_gb', smart_memory['live_ring_gb']):.2f} GiB "
+                    f"ring_live={smart_memory['live_ring_gb']:.2f}/"
                     f"{smart_memory['planned_ring_gb']:.2f} GiB "
-                    f"working_peak={smart_memory.get('working_reserve_peak_gb', smart_memory['working_reserve_used_gb']):.2f}/"
-                    f"{smart_memory['training_working_reserve_gb']:.2f} GiB "
+                    f"working_peak={smart_memory.get('working_reserve_peak_gb', smart_memory['working_reserve_used_gb']):.2f} GiB "
+                    f"reserve_space={smart_memory['training_working_reserve_gb']:.2f} GiB "
                     f"(residual={smart_memory.get('working_reserve_residual_gb', smart_memory['working_reserve_used_gb']):.2f}) "
                     f"allocated={smart_memory['torch_allocated_gb']:.2f} GiB "
                     f"reserved={smart_memory['torch_reserved_gb']:.2f} GiB "
-                    # Headline the PEAK footprint/free (what the spill cliff sees);
-                    # the step-end trough follows in parens so it can't mislead.
-                    f"device_peak={smart_memory.get('device_used_peak_gb', smart_memory['device_used_gb']):.2f}/"
+                    # Headline the observed driver-level PEAK footprint/free.
+                    # If no sampler data exists, the source is labeled estimate.
+                    f"driver_peak={smart_memory.get('device_used_peak_gb', smart_memory['device_used_gb']):.2f}/"
                     f"{smart_memory['device_total_gb']:.2f} GiB "
                     f"free_peak={smart_memory.get('device_free_peak_gb', smart_memory['device_free_gb']):.2f} GiB "
-                    f"(trough {smart_memory['device_used_gb']:.2f}/"
+                    f"source={peak_source_text} "
+                    f"(est {smart_memory.get('device_used_peak_est_gb', smart_memory.get('device_used_peak_gb', smart_memory['device_used_gb'])):.2f}/"
+                    f"{smart_memory['device_total_gb']:.2f}, "
+                    f"free {smart_memory.get('device_free_peak_est_gb', smart_memory.get('device_free_peak_gb', smart_memory['device_free_gb'])):.2f}; "
+                    f"trough {smart_memory['device_used_gb']:.2f}/"
                     f"{smart_memory['device_total_gb']:.2f}, "
                     f"free {smart_memory['device_free_gb']:.2f})"
                 )
@@ -2641,9 +2849,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ### HOOK ###
         self.hook_before_train_loop()
 
+        wants_torch_compile = bool(
+            self.model_config.compile
+            or getattr(self.model_config, 'train_compile_blocks', False)
+        )
         compile_unavailable_reason = (
             _torch_compile_backend_unavailable_reason()
-            if self.model_config.compile
+            if wants_torch_compile
             else None
         )
         if compile_unavailable_reason is not None:
@@ -2651,6 +2863,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc(compile_unavailable_reason)
             print_acc("Install a working 'triton' package and compiler toolchain to use torch.compile.")
             self.model_config.compile = False
+            self.model_config.train_compile_blocks = False
 
         # ============================================================
         # COMPILE
@@ -2926,6 +3139,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
 
+        if getattr(self.model_config, 'train_compile_blocks', False):
+            try:
+                inner_unet = unwrap_model(self.sd.unet)
+                enable_training_compile = getattr(inner_unet, 'enable_compiled_training', None)
+                if enable_training_compile is None:
+                    print_acc("Training block compile requested, but this model does not expose resident-block compile.")
+                else:
+                    pinned_keys = set()
+                    mm = getattr(inner_unet, '_memory_manager', None)
+                    if mm is not None:
+                        pinned_keys = set(getattr(mm, '_training_pinned_resident_keys', set()))
+                    compiled_count, blocked_count = enable_training_compile(pinned_keys)
+                    print_acc(
+                        f"Compiled {compiled_count} resident training block(s); "
+                        f"{blocked_count} pinned block(s) left eager."
+                    )
+                    if getattr(self.model_config, 'layer_offloading_compile_streamed', False):
+                        print_acc(
+                            "Compile Streamed Blocks is not active yet; streamed blocks remain eager in this slice."
+                        )
+            except Exception as e:
+                print_acc(f"Failed to compile resident training blocks: {e}")
+                print_acc("Continuing without resident training block compile.")
+
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
             self.sample(0, is_first=True)
@@ -3113,11 +3350,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
                 ),
             )
+            try:
+                MemoryManager.prepare_training_memory_for_shape(
+                    getattr(self.sd, 'unet', None),
+                    self.device_torch,
+                    shape_key=offload_shape_key,
+                )
+            except Exception as error:
+                print_acc(
+                    f"[MemoryManager] manual pre-step guard failed: {error}"
+                )
+            driver_free_monitor = None
+            driver_free_sample = None
             if torch.cuda.is_available():
                 try:
                     torch.cuda.reset_peak_memory_stats(self.device_torch)
                 except Exception:
                     pass
+                driver_free_monitor = _CudaDriverFreeMonitor(self.device_torch).start()
             step_started_at = time.perf_counter()
             MemoryManager.offload_step_begin(shape_key=offload_shape_key)
             offload_step_completed = False
@@ -3137,6 +3387,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     MemoryManager.offload_step_end()
                 else:
                     MemoryManager.offload_step_abort()
+                if driver_free_monitor is not None:
+                    driver_free_sample = driver_free_monitor.stop()
+                self._last_driver_free_sample = driver_free_sample
             if did_oom:
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
@@ -3180,6 +3433,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             did_oom=True,
                             peak_allocated_override=peak_alloc_override,
                             peak_reserved_override=peak_reserved_override,
+                            observed_driver_free_min_bytes=(driver_free_sample or {}).get('min_free_bytes'),
+                            observed_driver_total_bytes=(driver_free_sample or {}).get('total_bytes'),
+                            observed_driver_free_samples=(driver_free_sample or {}).get('samples'),
                         )
                     except Exception as error:
                         print_acc(
@@ -3219,6 +3475,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         did_oom=False,
                         peak_allocated_override=peak_alloc_override,
                         peak_reserved_override=peak_reserved_override,
+                        observed_driver_free_min_bytes=(driver_free_sample or {}).get('min_free_bytes'),
+                        observed_driver_total_bytes=(driver_free_sample or {}).get('total_bytes'),
+                        observed_driver_free_samples=(driver_free_sample or {}).get('samples'),
                     )
                 except Exception as error:
                     print_acc(
@@ -3330,6 +3589,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if self.progress_bar is not None:
                             self.progress_bar.unpause()
                             
+                    recovery_every = getattr(self.save_config, 'recovery_every', 0)
+                    if recovery_every and not is_save_step and self.step_num % recovery_every == 0:
+                        self.save_recovery_snapshot()
+
                     if is_sample_step:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
@@ -3438,6 +3701,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sd.pipeline.disable_freeu()
         if self.accelerator.is_main_process:
             self.save()
+            # Block until every deferred checkpoint write has hit disk before we
+            # tear down -- a daemon writer thread would otherwise be killed with
+            # the final save still in flight.
+            if self._async_saver is not None:
+                self._async_saver.wait_idle()
+                self._async_saver.close()
+                self._async_saver = None
         if not self.train_config.disable_sampling:
             self.sample(self.step_num)
             self.logger.commit(step=self.step_num)

@@ -11,9 +11,11 @@ from .manager_modules import (
     _DEVICE_STATE,
     _is_quantized_tensor,
     _unpin_inner_tensors,
+    unpin_layer,
     fp8_linear_inference,
     fp8_sampling_qualifies,
     _fp8_linear_compiled,
+    _fp8_linear_training,
     _FP8_STATS,
     PIPELINE_DEPTH,
     summarize_offload_profile,
@@ -31,9 +33,12 @@ from .manager_modules import (
     set_offload_trace_enabled,
     set_fp8_grad_input_enabled,
     record_weight_access,
+    set_block_stream_enabled,
+    stage_block_forward,
+    block_forward_done,
+    reset_block_stream,
 )
 from . import bounce_pool
-import random
 
 
 # The reserve vocabulary was renamed (headroom -> working_reserve; buffer_hard/
@@ -48,7 +53,6 @@ _ENV_ALIASES = {
     "AI_TOOLKIT_TRAINING_WORKING_RESERVE_PAD_GIB": "AI_TOOLKIT_TRAINING_HEADROOM_PAD_GIB",
     "AI_TOOLKIT_TRAINING_WORKING_RESERVE_STEP_GIB": "AI_TOOLKIT_TRAINING_HEADROOM_STEP_GIB",
     "AI_TOOLKIT_TRAINING_MIN_WORKING_RESERVE_GIB": "AI_TOOLKIT_TRAINING_MIN_HEADROOM_GIB",
-    "AI_TOOLKIT_TRAINING_MAX_WORKING_RESERVE_GIB": "AI_TOOLKIT_TRAINING_MAX_HEADROOM_GIB",
     "AI_TOOLKIT_TRAINING_STABLE_WORKING_RESERVE_STEPS": "AI_TOOLKIT_TRAINING_STABLE_HEADROOM_STEPS",
     "AI_TOOLKIT_TRAINING_WDDM_HARD_GIB": "AI_TOOLKIT_TRAINING_BUFFER_HARD_GIB",
     "AI_TOOLKIT_TRAINING_WDDM_STOP_GIB": "AI_TOOLKIT_TRAINING_BUFFER_STOP_GIB",
@@ -108,23 +112,295 @@ _OFFLOAD_PREFETCH_ENABLED = _env(
 ).lower() not in ("0", "false", "no", "off", "")
 
 
+def _dxgi_telemetry(cuda_device_index: int = 0, min_interval_s: float = 0.5) -> dict:
+    dxgi = bounce_pool.get_dxgi_meminfo()
+    if dxgi is None:
+        return {}
+    non_local = dxgi.query_non_local_video_memory_info(
+        cuda_device_index=cuda_device_index,
+        min_interval_s=min_interval_s,
+    )
+    local = dxgi.query_local_video_memory_info(
+        cuda_device_index=cuda_device_index,
+        min_interval_s=min_interval_s,
+    )
+    adapter = dxgi.selected_adapter_info()
+    fields = {}
+    if non_local is not None:
+        spill_reserve = bounce_pool.dxgi_spill_reserve_bytes(non_local.budget_bytes)
+        headroom = dxgi.compute_non_local_headroom_bytes(
+            non_local.budget_bytes,
+            non_local.current_usage_bytes,
+            spill_reserve,
+        )
+        fields.update({
+            "dxgi_non_local_budget_gb": non_local.budget_bytes / 1024 ** 3,
+            "dxgi_non_local_usage_gb": non_local.current_usage_bytes / 1024 ** 3,
+            "dxgi_non_local_headroom_gb": headroom / 1024 ** 3,
+            "dxgi_spill_reserve_gb": spill_reserve / 1024 ** 3,
+        })
+    if local is not None:
+        fields.update({
+            "dxgi_local_budget_gb": local.budget_bytes / 1024 ** 3,
+            "dxgi_local_usage_gb": local.current_usage_bytes / 1024 ** 3,
+            "dxgi_local_headroom_gb": max(
+                0, local.budget_bytes - local.current_usage_bytes
+            ) / 1024 ** 3,
+            "dxgi_local_available_for_reservation_gb": (
+                local.available_for_reservation_bytes / 1024 ** 3
+            ),
+            "dxgi_local_current_reservation_gb": (
+                local.current_reservation_bytes / 1024 ** 3
+            ),
+        })
+    if adapter is not None:
+        fields.update({
+            "dxgi_adapter_index": adapter.index,
+            "dxgi_adapter_description": adapter.description,
+            "dxgi_adapter_vendor_id": adapter.vendor_id,
+            "dxgi_adapter_device_id": adapter.device_id,
+            "dxgi_adapter_luid": adapter.luid,
+            "dxgi_match_method": adapter.match_method,
+            "dxgi_safe_for_control": adapter.safe_for_control,
+            "dxgi_manual_control": adapter.manual_control,
+        })
+    return fields
+
+def _process_memory_telemetry() -> dict:
+    psutil = bounce_pool._psutil
+    if psutil is None:
+        return {}
+    try:
+        proc = psutil.Process()
+        mi = proc.memory_info()
+    except Exception:
+        return {}
+    fields = {}
+    rss = getattr(mi, "rss", None)
+    private = getattr(mi, "private", None)
+    if rss is not None:
+        fields["proc_working_set_gb"] = int(rss) / 1024 ** 3
+    if private is not None:
+        fields["proc_private_commit_gb"] = int(private) / 1024 ** 3
+    try:
+        uss = getattr(proc.memory_full_info(), "uss", None)
+    except Exception:
+        uss = None
+    if uss is not None:
+        fields["proc_uss_gb"] = int(uss) / 1024 ** 3
+    return fields
+
+
+def _dxgi_attach_log_text(cuda_device_index: int = 0) -> str:
+    fields = _dxgi_telemetry(cuda_device_index, min_interval_s=0.0)
+    if "dxgi_non_local_budget_gb" in fields:
+        dxgi_text = (
+            f"dxgi_non_local_budget={fields['dxgi_non_local_budget_gb']:.2f} GiB "
+            f"dxgi_non_local_usage={fields['dxgi_non_local_usage_gb']:.2f} GiB "
+        )
+    else:
+        dxgi_text = "dxgi_non_local=unavailable "
+    adapter_desc = fields.get("dxgi_adapter_description", "unavailable")
+    return (
+        dxgi_text
+        + f"pinned_ledger_total={bounce_pool._pinned_bytes_total / 1024 ** 3:.2f} GiB "
+        + f"dxgi_adapter_index={fields.get('dxgi_adapter_index')} "
+        + f"dxgi_adapter_description={adapter_desc!r} "
+        + f"dxgi_adapter_vendor_id={fields.get('dxgi_adapter_vendor_id')} "
+        + f"dxgi_adapter_device_id={fields.get('dxgi_adapter_device_id')} "
+        + f"dxgi_adapter_luid={fields.get('dxgi_adapter_luid')} "
+        + f"dxgi_match_method={fields.get('dxgi_match_method')}"
+    )
+
+
 class MemoryManager:
     def __init__(
         self,
         module: torch.nn.Module,
         process_device: torch.device = torch.device("cpu"),
+        pinned_weight_gib: float | None = None,
     ):
         self.module: torch.nn.Module = module
         self.process_device: torch.device = process_device
         self.unmanaged_modules: list[torch.nn.Module] = []
         self.pinned_weight_bytes = 0
-        default_pin_gib = "0.0" if _OFFLOAD_PREFETCH_ENABLED else "1.0"
-        self.pinned_weight_budget_bytes = int(
-            float(_env("AI_TOOLKIT_PINNED_WEIGHT_GIB", default_pin_gib))
-            * 1024 ** 3
-        )
+        # How much offloaded weight to keep page-locked (pinned) in CPU RAM.
+        # Pinning stops weights being paged out and re-faulted on every fetch.
+        # It does not create a second steady-state copy of the already-loaded
+        # CPU weights, but on Windows/WDDM it does count against the GPU's
+        # shared-memory budget --
+        # exhausting either makes the next CUDA call fail with a raw
+        # cudaErrorMemoryAllocation even with VRAM free. Auto budgets are
+        # capped by _cap_auto_pin_budget; a job config value (>= 0) wins;
+        # otherwise fall back to the env/default (0 with prefetch on, since
+        # the pool pins on demand; 1 otherwise).
+        if pinned_weight_gib is not None and float(pinned_weight_gib) >= 0:
+            self.pinned_weight_budget_bytes = int(float(pinned_weight_gib) * 1024 ** 3)
+        else:
+            default_pin_gib = "0.0" if _OFFLOAD_PREFETCH_ENABLED else "1.0"
+            self.pinned_weight_budget_bytes = int(
+                float(_env("AI_TOOLKIT_PINNED_WEIGHT_GIB", default_pin_gib))
+                * 1024 ** 3
+            )
         self._prefetch_pool = None
         self._resident_trace_hooks = {}
+
+    @staticmethod
+    def _cap_auto_pin_budget(
+        budget: int, reserve_bytes: int = 0, device=None
+    ) -> int:
+        """Cap an auto-sized pinned-weight budget by what the host can give.
+
+        Pinned (cudaHostAlloc) memory is page-locked AND, under WDDM, counts
+        against the GPU's shared-memory budget (~RAM/2 shared by every GPU
+        process). Blowing that budget makes the next CUDA call of any size
+        fail with a raw cudaErrorMemoryAllocation while VRAM sits mostly free.
+        The useful cap is the process-wide pinned-bytes ledger's headroom (a fraction of
+        total RAM as a WDDM shared-budget proxy, minus whatever this process
+        has already pinned elsewhere -- e.g. the bounce pool's own buffers, or
+        a prior manager's weight pins; the real DXGI budget is not visible
+        through CUDA). Shared with bounce_pool.py's own allocation checks so
+        neither subsystem can push the combined total past the ceiling blind
+        to the other's consumption.
+        """
+        gib = 1024 ** 3
+        vm = None
+        try:
+            if bounce_pool._psutil is not None:
+                vm = bounce_pool._psutil.virtual_memory()
+        except Exception:
+            vm = None
+        if vm is None:
+            return budget
+        reserve_bytes = max(0, int(reserve_bytes or 0))
+        total_floor = int(
+            float(_env("AI_TOOLKIT_PINNED_WEIGHT_RAM_FLOOR_GIB", "8.0")) * gib
+        )
+        ledger_headroom = bounce_pool.pinned_bytes_headroom(
+            bounce_pool._cuda_device_index(device)
+        )
+        caps = [
+            budget,
+            max(0, int(vm.total) - total_floor - reserve_bytes),
+        ]
+        if ledger_headroom is not None:
+            caps.append(max(0, ledger_headroom - reserve_bytes))
+        capped = min(caps)
+        if capped < budget:
+            reserve_text = (
+                f" reserve_for_bounce={reserve_bytes / gib:.2f} GiB;"
+                if reserve_bytes
+                else ""
+            )
+            print(
+                "[MemoryManager] pinned-weight auto-budget capped: "
+                f"want={budget / gib:.2f} GiB -> {capped / gib:.2f} GiB "
+                f"(reported_available={vm.available / gib:.2f} GiB total={vm.total / gib:.2f} GiB;"
+                f"{reserve_text} "
+                "pinned memory is page-locked and counts against the WDDM shared "
+                "GPU budget -- set layer_offloading_pinned_weight_gb to override)"
+            )
+        return capped
+
+    @classmethod
+    def _training_bounce_pool_budget_defaults(
+        cls,
+        module,
+        offload_ids=None,
+        *,
+        block_stream_only=False,
+        sources=None,
+        history=None,
+    ):
+        """Return default ``(budget_gib, target_ready_gib, mode)`` for training prefetch.
+
+        Bounce memory and permanent pinned weights draw from the same WDDM shared
+        pinned-memory ceiling. The pool is only a temporary staging window, so
+        default it from the current streaming unit instead of replaying old large
+        history budgets. Explicit AI_TOOLKIT_BOUNCE_* env values still win.
+        """
+        gib = 1024 ** 3
+        history = history or {}
+        offload_ids = set(offload_ids or ())
+        rows = []
+        if sources is not None:
+            for key, child in sources:
+                rows.append((str(key), cls._training_stream_bytes(child)))
+        elif module is not None:
+            for name, child in module.named_modules():
+                if offload_ids and id(child) not in offload_ids:
+                    continue
+                if (
+                    child.__class__.__name__ not in LINEAR_MODULES
+                    and child.__class__.__name__ not in CONV_MODULES
+                ):
+                    continue
+                rows.append((name or child.__class__.__name__, cls._training_stream_bytes(child)))
+
+        sizes = [max(0, int(n)) for _key, n in rows if int(n or 0) > 0]
+        if not sizes:
+            budget_gib = float(_env("AI_TOOLKIT_BOUNCE_LAYER_DEFAULT_GIB", "1.0"))
+            target_gib = min(
+                budget_gib,
+                float(_env("AI_TOOLKIT_BOUNCE_LAYER_TARGET_GIB", "0.75")),
+            )
+            return budget_gib, target_gib, "empty"
+
+        slack = max(1.0, float(_env("AI_TOOLKIT_BOUNCE_AUTO_SLACK", "1.20")))
+        if block_stream_only:
+            group_bytes = {}
+            for key, n in rows:
+                gk = cls._offload_group_key(key)
+                group_bytes[gk] = group_bytes.get(gk, 0) + max(0, int(n))
+            block_parents = cls._streaming_block_parents(group_bytes.keys())
+            block_sizes = [
+                n for gk, n in group_bytes.items()
+                if cls._block_parent_of(gk) in block_parents
+            ]
+            unit_bytes = max(block_sizes or sizes)
+            window = max(1, int(_env("AI_TOOLKIT_BOUNCE_BLOCK_WINDOW", "2")))
+            floor_gib = float(_env("AI_TOOLKIT_BOUNCE_BLOCK_MIN_GIB", "0.75"))
+            max_gib = float(_env("AI_TOOLKIT_BOUNCE_BLOCK_MAX_GIB", "1.50"))
+            mode = "block"
+        else:
+            window = max(1, int(_env("AI_TOOLKIT_BOUNCE_LAYER_WINDOW", str(PIPELINE_DEPTH * 4))))
+            unit_bytes = sum(sorted(sizes, reverse=True)[:window])
+            floor_gib = float(_env("AI_TOOLKIT_BOUNCE_LAYER_MIN_GIB", "1.00"))
+            max_gib = float(_env("AI_TOOLKIT_BOUNCE_LAYER_MAX_GIB", "2.00"))
+            mode = "layer"
+
+        raw_gib = (unit_bytes * window * slack) / gib if block_stream_only else (unit_bytes * slack) / gib
+        budget_gib = min(max_gib, max(floor_gib, raw_gib))
+        target_fraction = float(_env("AI_TOOLKIT_BOUNCE_TARGET_FRACTION", "0.60"))
+        target_gib = min(budget_gib, max(floor_gib * 0.5, budget_gib * target_fraction))
+        return budget_gib, target_gib, mode
+
+    @classmethod
+    def _planned_bounce_reserve_bytes(
+        cls,
+        module,
+        offload_ids,
+        device,
+        *,
+        block_stream_only=False,
+    ):
+        if not (_OFFLOAD_PREFETCH_ENABLED and torch.device(device).type == "cuda"):
+            return 0
+        gib = 1024 ** 3
+        env_budget = _env("AI_TOOLKIT_BOUNCE_POOL_GIB", None)
+        if env_budget is not None:
+            bounce_budget_gib = float(env_budget)
+        else:
+            bounce_budget_gib, _target_gib, _mode = cls._training_bounce_pool_budget_defaults(
+                module,
+                offload_ids,
+                block_stream_only=block_stream_only,
+            )
+        bounce_budget_gib = min(
+            float(_env("AI_TOOLKIT_BOUNCE_MAX_POOL_GIB", "6.0")),
+            bounce_budget_gib,
+        )
+        return int(max(0.0, bounce_budget_gib) * gib)
 
     def memory_managed_to(self, *args, **kwargs):
         # check for a dtype argument
@@ -162,16 +438,17 @@ class MemoryManager:
         cls,
         module: torch.nn.Module,
         device: torch.device,
-        offload_percent: float = 1.0,
+        offload_percent: float = 1.0,  # fraction of streamable layers to offload; selected evenly-spaced over execution order (see attach loop)
         ignore_modules: list[torch.nn.Module] = [],
         _offload_module_ids: set[int] | None = None,
         training_strategy: str = "percent",
+        pinned_weight_gib: float | None = None,
     ):
         if hasattr(module, "_memory_manager"):
             # already attached
             return
 
-        module._memory_manager = cls(module, device)
+        module._memory_manager = cls(module, device, pinned_weight_gib=pinned_weight_gib)
         # remember how we were attached so we can re-attach identically after a temporary
         # detach (see inference_resident).
         module._memory_manager._attach_args = {
@@ -179,6 +456,7 @@ class MemoryManager:
             "offload_percent": offload_percent,
             "ignore_modules": list(ignore_modules),
             "training_strategy": training_strategy,
+            "pinned_weight_gib": pinned_weight_gib,
         }
 
         # override the to method to handle memory management
@@ -191,65 +469,100 @@ class MemoryManager:
 
         # count ignore modules as processed
         modules_processed = [x for x in ignore_modules]
-        # attach to all modules
+
+        # Decide which streamable leaf layers to offload (stream from CPU) vs
+        # keep resident. If the caller pinned an explicit id set, honor it.
+        # Otherwise pick an evenly-spaced subset over execution/registration
+        # order sized to `offload_percent`:
+        #   1.0 -> stream everything (default)
+        #   0.5 -> every other layer (resident, streamed, resident, ...)
+        #   0.0 -> keep everything resident
+        # The 0.5 interleave deliberately places a resident layer before each
+        # streamed one: that is the layout a future depth-1 prefetch would use
+        # (kick the next layer's H2D off during the resident layer's compute).
+        # NOTE: this is a count fraction, not a byte/VRAM budget; MLP layers are
+        # larger than attn projections, so bytes-resident ~= count-resident only
+        # approximately. Refine to a byte budget here if that matters later.
+        selected_offload_ids = _offload_module_ids
+        if selected_offload_ids is None:
+            ignore_ids = {id(im) for im in ignore_modules}
+            eligible = [
+                child
+                for _n, child in module.named_modules()
+                if (
+                    child.__class__.__name__ in LINEAR_MODULES
+                    or child.__class__.__name__ in CONV_MODULES
+                )
+                and id(child) not in ignore_ids
+            ]
+            p = max(0.0, min(1.0, offload_percent))
+            selected_offload_ids = set()
+            for i, child in enumerate(eligible):
+                # offload when the running quota crosses an integer boundary;
+                # this spreads the offloaded layers evenly instead of clumping.
+                if int((i + 1) * p) > int(i * p):
+                    selected_offload_ids.add(id(child))
+
+        # Pin budget: pin the offloaded weights, capped by the WDDM shared
+        # pinned-memory proxy after reserving the planned bounce-pool window.
+        # A positive config value is a requested budget, not permission to starve
+        # bounce; set the bounce pool budget to 0 if the pool should get no share.
+        _auto_pin = pinned_weight_gib is None
+        try:
+            _auto_pin = _auto_pin or float(pinned_weight_gib) < 0
+        except (TypeError, ValueError):
+            _auto_pin = True
+        managed_bytes = 0
+        for _n, child in module.named_modules():
+            if id(child) not in selected_offload_ids:
+                continue
+            for _pn in ("weight", "bias"):
+                prm = getattr(child, _pn, None)
+                if isinstance(prm, torch.nn.Parameter):
+                    managed_bytes += prm.numel() * prm.element_size()
+        desired_pin_bytes = (
+            int(managed_bytes * 1.03)
+            if _auto_pin
+            else int(max(0.0, float(pinned_weight_gib)) * (1024 ** 3))
+        )
+        bounce_reserve_bytes = cls._planned_bounce_reserve_bytes(
+            module,
+            selected_offload_ids,
+            device,
+            block_stream_only=False,
+        )
+        budget = cls._cap_auto_pin_budget(
+            desired_pin_bytes,
+            reserve_bytes=bounce_reserve_bytes,
+            device=device,
+        )
+        module._memory_manager.pinned_weight_budget_bytes = budget
+
+        # attach to all modules. The actual per-layer attach (which consumes the
+        # pinned-weight budget greedily) is deferred to `deferred_attach` and run
+        # afterward in an interleaved order -- see below.
+        deferred_attach = []
         for name, sub_module in module.named_modules():
             for child_name, child_module in sub_module.named_modules():
                 if (
                     child_module.__class__.__name__ in LINEAR_MODULES
                     and child_module not in modules_processed
                 ):
-                    if _offload_module_ids is not None:
-                        skip = id(child_module) not in _offload_module_ids
-                    else:
-                        skip = False
-                    if _offload_module_ids is None and offload_percent < 1.0:
-                        # randomly skip some modules
-                        if random.random() > offload_percent:
-                            skip = True
+                    skip = id(child_module) not in selected_offload_ids
                     if skip:
                         module._memory_manager.unmanaged_modules.append(child_module)
                     else:
-                        # linear
-                        LinearLayerMemoryManager.attach(
-                            child_module, module._memory_manager
-                        )
-                        # attach to ARA as well
-                        if hasattr(child_module, "ara_lora_ref"):
-                            ara = child_module.ara_lora_ref()
-                            if ara not in modules_processed:
-                                MemoryManager.attach(
-                                    ara,
-                                    device,
-                                )
+                        deferred_attach.append(("linear", child_module))
                     modules_processed.append(child_module)
                 elif (
                     child_module.__class__.__name__ in CONV_MODULES
                     and child_module not in modules_processed
                 ):
-                    if _offload_module_ids is not None:
-                        skip = id(child_module) not in _offload_module_ids
-                    else:
-                        skip = False
-                    if _offload_module_ids is None and offload_percent < 1.0:
-                        # randomly skip some modules
-                        if random.random() > offload_percent:
-                            skip = True
+                    skip = id(child_module) not in selected_offload_ids
                     if skip:
                         module._memory_manager.unmanaged_modules.append(child_module)
                     else:
-                        # conv
-                        ConvLayerMemoryManager.attach(
-                            child_module, module._memory_manager
-                        )
-                        # attach to ARA as well
-                        if hasattr(child_module, "ara_lora_ref"):
-                            ara = child_module.ara_lora_ref()
-                            if ara not in modules_processed:
-                                MemoryManager.attach(
-                                    ara,
-                                    device,
-                                )
-                            modules_processed.append(ara)
+                        deferred_attach.append(("conv", child_module))
                     modules_processed.append(child_module)
                 elif child_module.__class__.__name__ in UNMANAGED_MODULES or any(
                     inc in child_module.__class__.__name__
@@ -259,6 +572,57 @@ class MemoryManager:
                     module._memory_manager.unmanaged_modules.append(child_module)
                 else:
                     continue
+
+        # Run the deferred attaches in interleaved (not execution) order. Pinning
+        # is consumed greedily as each layer attaches, so processing strictly in
+        # execution order would front-load every pinned layer at one end of the
+        # stream and leave a long unpinned (bounce-only) tail with no resident/
+        # pinned neighbor nearby. Repeated transformer blocks make same-role
+        # layers byte-identical, so which specific layers get pinned first is
+        # free to choose -- spread them evenly instead.
+        gib = 1024 ** 3
+        dxgi_pin_before = cls._dxgi_shared_budget_snapshot_bytes(device)
+        ledger_pin_before = bounce_pool._pinned_bytes_total
+        n_deferred = len(deferred_attach)
+        for i, (kind, child_module) in sorted(
+            enumerate(deferred_attach),
+            key=lambda pair: cls._interleave_priority(pair[0], n_deferred),
+        ):
+            if kind == "linear":
+                LinearLayerMemoryManager.attach(child_module, module._memory_manager)
+                # attach to ARA as well
+                if hasattr(child_module, "ara_lora_ref"):
+                    ara = child_module.ara_lora_ref()
+                    if ara not in modules_processed:
+                        MemoryManager.attach(ara, device)
+            else:
+                ConvLayerMemoryManager.attach(child_module, module._memory_manager)
+                # attach to ARA as well
+                if hasattr(child_module, "ara_lora_ref"):
+                    ara = child_module.ara_lora_ref()
+                    if ara not in modules_processed:
+                        MemoryManager.attach(ara, device)
+                        modules_processed.append(ara)
+        dxgi_pin_after = cls._dxgi_shared_budget_snapshot_bytes(device)
+        if cls._diagnostics_enabled() and dxgi_pin_before is not None and dxgi_pin_after is not None:
+            pinned_layers = sum(
+                1 for _kind, child in deferred_attach
+                if int(getattr(child, "_mm_pinned_bytes", 0) or 0) > 0
+            )
+            pinned_bytes = sum(
+                int(getattr(child, "_mm_pinned_bytes", 0) or 0)
+                for _kind, child in deferred_attach
+            )
+            print(
+                "[MemoryManager] DXGI attach pin delta: "
+                f"usage={dxgi_pin_before['usage_bytes'] / gib:.2f}->{dxgi_pin_after['usage_bytes'] / gib:.2f} GiB "
+                f"headroom={dxgi_pin_before['usable_headroom_bytes'] / gib:.2f}->{dxgi_pin_after['usable_headroom_bytes'] / gib:.2f} GiB "
+                f"pinned_layers={pinned_layers}/{len(deferred_attach)} "
+                f"pinned_bytes={pinned_bytes / gib:.2f} GiB "
+                f"ledger_delta={(bounce_pool._pinned_bytes_total - ledger_pin_before) / gib:.2f} GiB "
+                f"match={dxgi_pin_after.get('match_method')}"
+            )
+
         # Assign each streamable candidate a stable identity from its module path.
         # The trace scheduler keys on this rather than id(weight), which would not
         # survive the Parameter replacement that sampling detach/restore does.
@@ -272,11 +636,13 @@ class MemoryManager:
                 1 for child in module.modules()
                 if hasattr(child, "_layer_memory_manager")
             )
+            dxgi_text = _dxgi_attach_log_text(bounce_pool._cuda_device_index(device))
             print(
                 f"[MemoryManager] training offload attached: "
                 f"managed_layers={managed} "
                 f"pinned_cpu={module._memory_manager.pinned_weight_bytes / gib:.2f} GiB "
-                f"pin_budget={module._memory_manager.pinned_weight_budget_bytes / gib:.2f} GiB"
+                f"pin_budget={module._memory_manager.pinned_weight_budget_bytes / gib:.2f} GiB "
+                f"{dxgi_text}"
             )
 
     @classmethod
@@ -330,6 +696,10 @@ class MemoryManager:
                 else:
                     child.forward = original_forward
 
+            try:
+                unpin_layer(child)
+            except Exception:
+                pass
             for param_name in ("weight", "bias"):
                 param = getattr(child, param_name, None)
                 if param is None or not isinstance(param, torch.nn.Parameter):
@@ -338,6 +708,9 @@ class MemoryManager:
                     if _is_quantized_tensor(param.data):
                         _unpin_inner_tensors(param.data)
                     if param.data.is_pinned():
+                        bounce_pool.release_pinned_bytes(
+                            param.data.numel() * param.data.element_size()
+                        )
                         object.__setattr__(
                             child,
                             param_name,
@@ -348,6 +721,7 @@ class MemoryManager:
                         )
                 except Exception:
                     pass
+            child._mm_pinned_bytes = 0
 
             del child._layer_memory_manager
             if hasattr(child, "_memory_management_device"):
@@ -680,6 +1054,71 @@ class MemoryManager:
             resident_layers += 1
         return restores, resident_layers, streamed_layers
 
+    @classmethod
+    def _enable_fp8_training_compile(cls, module):
+        """Install grad-safe native FP8 forwards for resident training compile."""
+        restores = []
+        resident_layers = 0
+        for child in module.modules():
+            if child.__class__.__name__ not in LINEAR_MODULES:
+                continue
+            weight = getattr(child, "weight", None)
+            if (
+                not isinstance(weight, torch.nn.Parameter)
+                or not hasattr(weight.data, "qdata")
+                or weight.data.qdata.dtype != torch.float8_e4m3fn
+                or weight.requires_grad
+                or hasattr(child, "_layer_memory_manager")
+            ):
+                continue
+            if not fp8_sampling_qualifies(child.weight):
+                continue
+
+            container = child
+            attribute = "forward"
+            if hasattr(child, "ara_lora_ref"):
+                owner = child.ara_lora_ref()
+                if owner is not None and hasattr(owner, "org_forward"):
+                    container, attribute = owner, "org_forward"
+            else:
+                owner = getattr(getattr(child, "forward", None), "__self__", None)
+                if (
+                    owner is not None
+                    and owner is not child
+                    and hasattr(owner, "org_forward")
+                ):
+                    container, attribute = owner, "org_forward"
+
+            original_forward = getattr(container, attribute)
+            qdata_t = child.weight.qdata.t()
+            scale_row = child.weight.scale
+            bias_t = getattr(child, "bias", None)
+
+            def _fp8_forward(
+                x, *args,
+                _qt=qdata_t, _sr=scale_row, _b=bias_t, _original=original_forward,
+                **kwargs,
+            ):
+                if args or kwargs:
+                    return _original(x, *args, **kwargs)
+                return _fp8_linear_training(x, _qt, _sr, _b)
+
+            setattr(container, attribute, _fp8_forward)
+            child._memory_management_training_compile_fp8 = True
+            restores.append((container, attribute, original_forward, child))
+            resident_layers += 1
+        return restores, resident_layers
+
+    @staticmethod
+    def _disable_fp8_training_compile(module, restores):
+        for container, attribute, original_forward, child in reversed(restores):
+            setattr(container, attribute, original_forward)
+            if hasattr(child, "_memory_management_training_compile_fp8"):
+                del child._memory_management_training_compile_fp8
+        for child in module.modules():
+            if hasattr(child, "_memory_management_training_compile_fp8"):
+                del child._memory_management_training_compile_fp8
+
     @staticmethod
     def _disable_fp8_sampling(module, restores):
         for container, attribute, original_forward in reversed(restores):
@@ -756,6 +1195,90 @@ class MemoryManager:
             if parent is not None:
                 children.setdefault(parent, set()).add(gk)
         return {p for p, kids in children.items() if len(kids) >= 2}
+
+    @staticmethod
+    def _make_block_stage_prehook(device, block_key, members):
+        """Forward pre-hook: stage the whole block's streamed weights in one
+        transfer-stream burst before its Linears run. Best-effort — any failure
+        leaves the per-Linear staging path untouched."""
+        def _prehook(_mod, args):
+            try:
+                compute_dtype = torch.bfloat16
+                if args and torch.is_tensor(args[0]):
+                    dt = args[0].dtype
+                    if dt in (torch.bfloat16, torch.float16, torch.float32):
+                        compute_dtype = dt
+                linears = [
+                    (lk, child.weight, getattr(child, "bias", None))
+                    for (lk, child) in members
+                ]
+                stage_block_forward(device, block_key, linears, compute_dtype)
+            except Exception:
+                pass
+            return None
+        return _prehook
+
+    @staticmethod
+    def _make_block_done_hook(device, block_key):
+        """Forward post-hook: mark the block's compute done so its staged buffers
+        can be reclaimed once the matmuls that read them complete."""
+        def _hook(_mod, _args, _output):
+            try:
+                block_forward_done(device, block_key)
+            except Exception:
+                pass
+            return None
+        return _hook
+
+    @classmethod
+    def _wire_block_stream_forward_hooks(cls, module, device):
+        """Register per-block forward pre/post hooks on the streamed transformer
+        blocks so each block's weights are staged together. Returns block count.
+
+        Idempotent: removes any previously registered handles first.
+        """
+        device = torch.device(device)
+        if device.type != "cuda":
+            return 0
+        for handle in getattr(module, "_mm_block_stream_handles", []) or []:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        # Group streamed (managed) Linears by their block group key.
+        blocks: dict = {}
+        for name, child in module.named_modules():
+            if not hasattr(child, "_layer_memory_manager"):
+                continue
+            key = getattr(child, "_mm_layer_key", None) or name
+            blocks.setdefault(cls._offload_group_key(key), []).append((key, child))
+        block_parents = cls._streaming_block_parents(blocks.keys())
+        handles = []
+        wired = 0
+        for gk, linears in blocks.items():
+            if cls._block_parent_of(gk) not in block_parents:
+                continue  # singleton/non-block layer — never block-staged
+            try:
+                block_module = module.get_submodule(gk)
+            except AttributeError:
+                continue
+            # fp8-native forward keeps the per-Linear path; don't block-stage it.
+            members = [
+                (lk, child) for (lk, child) in linears
+                if not getattr(child, "_memory_management_fp8_training", False)
+                and not getattr(child, "_memory_management_fp8_sampling", False)
+            ]
+            if not members:
+                continue
+            handles.append(block_module.register_forward_pre_hook(
+                cls._make_block_stage_prehook(device, gk, members)
+            ))
+            handles.append(block_module.register_forward_hook(
+                cls._make_block_done_hook(device, gk)
+            ))
+            wired += 1
+        module._mm_block_stream_handles = handles
+        return wired
 
     @classmethod
     def _smart_sampling_plan(
@@ -834,6 +1357,59 @@ class MemoryManager:
             "fits": fits,
         }
 
+    @staticmethod
+    def _interleave_priority(index, count):
+        """Bit-reversal (van der Corput) rank of ``index`` among ``count`` slots.
+
+        Sorting a list by this key (as a tie-break under an equal primary key)
+        makes every prefix of the sorted order spread evenly across the original
+        0..count-1 range, whatever the prefix length turns out to be. Used to
+        pick which same-size residency/pin candidates a partial budget covers,
+        so the unselected remainder does not cluster into one contiguous
+        streaming/bounce-only run — see the depth-1 interleave in ``attach``.
+        """
+        if count <= 1:
+            return 0.0
+        bits = (count - 1).bit_length()
+        rev = 0
+        x = index
+        for _ in range(bits):
+            rev = (rev << 1) | (x & 1)
+            x >>= 1
+        return rev / float(1 << bits)
+
+    @staticmethod
+    def _auto_wddm_margin_gib(device, pct=0.10, floor_gib=1.0):
+        try:
+            total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+        except Exception:
+            try:
+                _free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            except Exception:
+                total_bytes = 0
+        total_gib = max(0.0, float(total_bytes) / 1024 ** 3)
+        return max(float(floor_gib), float(pct) * total_gib)
+
+    @classmethod
+    def _resolve_wddm_margin_gib(
+        cls,
+        device,
+        value,
+        *,
+        hard_gib=0.0,
+        env_name="AI_TOOLKIT_TRAINING_WDDM_MARGIN_GIB",
+    ):
+        raw = _env(env_name, "-1.0") if value is None else value
+        try:
+            margin = float(raw)
+            auto = margin < 0
+        except (TypeError, ValueError):
+            auto = str(raw).strip().lower() == "auto"
+            margin = -1.0
+        if auto:
+            margin = cls._auto_wddm_margin_gib(device)
+        return max(float(margin), float(hard_gib or 0.0))
+
     @classmethod
     def smart_training_plan(
         cls,
@@ -843,7 +1419,7 @@ class MemoryManager:
         ignore_modules=None,
         must_resident_keys=("tproj.1",),
         resident_floor_gib=2.0,
-        wddm_margin_gib=1.5,
+        wddm_margin_gib=-1.0,
         wddm_hard_gib=None,
         prefetch_healthy=False,
         pinned_resident_keys=None,
@@ -873,7 +1449,11 @@ class MemoryManager:
             if wddm_hard_gib is None
             else float(wddm_hard_gib)
         )
-        wddm_margin_gib = max(float(wddm_margin_gib), wddm_hard_gib)
+        wddm_margin_gib = cls._resolve_wddm_margin_gib(
+            device,
+            wddm_margin_gib,
+            hard_gib=wddm_hard_gib,
+        )
         wddm_margin_bytes = int(wddm_margin_gib * 1024 ** 3)
         wddm_hard_bytes = int(wddm_hard_gib * 1024 ** 3)
         usable_bytes = max(0, free_bytes - wddm_margin_bytes - working_reserve_bytes)
@@ -930,6 +1510,16 @@ class MemoryManager:
             else:
                 offloaded.append(item)
 
+        # Repeated transformer blocks make most offloaded candidates byte-identical,
+        # so the size-sort below ties constantly; break ties by execution-order
+        # spread instead of leaving them at stable-sort (= list/definition) order,
+        # which would otherwise cluster every fill at one end of the block stack and
+        # leave the other end streaming with no resident/pinned neighbor nearby.
+        offload_priority = {
+            id(item["module"]): cls._interleave_priority(i, len(offloaded))
+            for i, item in enumerate(offloaded)
+        }
+
         pinned_resident_bytes = sum(
             item["resident_bytes"] for item in resident
             if item.get("pinned_resident")
@@ -942,7 +1532,13 @@ class MemoryManager:
         remaining = max(0, usable_bytes - resident_bytes)
 
         if resident_bytes < resident_floor_bytes and remaining > 0:
-            for item in sorted(offloaded, key=lambda row: row["resident_bytes"]):
+            for item in sorted(
+                offloaded,
+                key=lambda row: (
+                    row["resident_bytes"],
+                    offload_priority[id(row["module"])],
+                ),
+            ):
                 need = item["resident_bytes"]
                 if resident_bytes >= resident_floor_bytes or need > remaining:
                     continue
@@ -979,7 +1575,12 @@ class MemoryManager:
         blocked_reason = None
         if resident_growth_allowed:
             for item in sorted(
-                list(offloaded), key=lambda row: row["resident_bytes"], reverse=True
+                list(offloaded),
+                key=lambda row: (
+                    row["resident_bytes"],
+                    -offload_priority[id(row["module"])],
+                ),
+                reverse=True,
             ):
                 need = item["resident_bytes"]
                 if need <= remaining:
@@ -1044,50 +1645,22 @@ class MemoryManager:
         step_gib=0.5,
         retreat_gib=1.0,
     ):
-        """Decide the next training working_reserve reservation (pure, CPU-testable).
+        """Decide the next training working_reserve reservation.
 
-        The static reserve over-holds when it exceeds the real backward peak, so
-        the realised ``device_free`` margin balloons past the stop-line. This
-        walks the reserve down toward ``measured_peak + pad`` one conservative
-        step at a time, but only while a full window has proven there is slack
-        above the stop-line — and never below a level that previously breached.
-
-        Asymmetric on purpose (per AUTOTUNE_PLAN): shrinking is additive and
-        gated; a breach retreats hard and locks out the danger zone for good.
-
-        Returns ``(new_working_reserve_gib, new_danger_gib, action)``.
+        The working reserve is a measurement, not a safety controller. It should
+        track the observed activation/dequant/temporary peak plus a small pad.
+        WDDM free-space cliffs, OOMs, and external pressure are handled by layout
+        demotion/promotion; feeding them back into this number made auto reserve
+        worse than a fixed manual guess by inventing panic reserve.
         """
-        # 1. Breach of the hard floor: give the memory straight back and remember
-        #    this reserve level as unsafe — never shrink to/near it again.
-        if min_device_free_gib < wddm_hard_gib:
-            new_danger = max(danger_gib or 0.0, current_gib)
-            return current_gib + retreat_gib, new_danger, "retreat"
-
-        target_gib = measured_peak_gib + pad_gib
-        # 2. RESPECT the working set: the activation peak is a physical given, not
-        #    something to minimise. If the reserve sits BELOW what the backward
-        #    actually peaked at, climb straight up to meet it — growing the reserve
-        #    only sets aside more FREE VRAM, so it is always safe. This is the
-        #    branch that was missing: the shrink path below only ever walked DOWN
-        #    toward the target, so a reserve seeded under the real peak (auto seeds
-        #    ~2-3 GiB) could never reach it. It then under-reserved the activations,
-        #    which overflowed into the allocator's prefetch/cache every step →
-        #    eviction → bounce misses → prefetch never healthy → resident growth
-        #    locked out. Meeting the measured peak is the root fix.
+        del min_device_free_gib, danger_gib, wddm_hard_gib, wddm_stop_gib, step_gib, retreat_gib
+        target_gib = max(0.0, float(measured_peak_gib)) + max(0.0, float(pad_gib))
+        current_gib = max(0.0, float(current_gib))
+        if abs(current_gib - target_gib) <= 1e-6:
+            return target_gib, None, "hold"
         if current_gib < target_gib:
-            return target_gib, danger_gib, "grow"
-
-        # 3. Shrink only with proven slack: after a step we must still clear the
-        #    stop-line, we must stay at/above the real backward need, and we must
-        #    not approach a known danger level.
-        if min_device_free_gib > wddm_stop_gib + step_gib and current_gib > target_gib:
-            candidate = max(target_gib, current_gib - step_gib)
-            if danger_gib is not None and candidate <= danger_gib + step_gib:
-                return current_gib, danger_gib, "danger_locked"
-            return candidate, danger_gib, "shrink"
-
-        # 4. Settled — at the reserve the measurement and margin both endorse.
-        return current_gib, danger_gib, "hold"
+            return target_gib, None, "grow"
+        return target_gib, None, "shrink"
 
     @staticmethod
     def _prefetch_trace_invalid(
@@ -1232,6 +1805,191 @@ class MemoryManager:
             return "up"
         return "hold"
 
+    @classmethod
+    def _training_layout_move(
+        cls,
+        demote_governing_free_gib,
+        current_free_gib,
+        *,
+        wddm_hard_gib,
+        wddm_hold_high_gib,
+        did_oom,
+    ):
+        """Demote and promote deliberately watch different signals.
+
+        Demote stays conservative across every resolution bucket seen so far
+        (``demote_governing_free_gib``, the worst-case recent free margin): a
+        generous low-res step must never license a layout that later spills at
+        high-res. Promote is gated on the CURRENT bucket's own headroom only
+        (``current_free_gib``) -- requiring every OTHER bucket to also be
+        comfortable meant a chronically tight high-res bucket (activation-bound,
+        not fixable by shedding resident weight bytes) permanently vetoed
+        promotion even during a roomy low-res step, so resident VRAM only ever
+        ratcheted down and never recovered. A promotion that turns out unsafe at
+        another resolution is caught and reversed by the demote check above the
+        very next time that resolution runs.
+        """
+        demote_move = cls._training_layout_action(
+            demote_governing_free_gib,
+            wddm_hard_gib=wddm_hard_gib,
+            wddm_hold_high_gib=wddm_hold_high_gib,
+            did_oom=did_oom,
+        )
+        if demote_move == "down":
+            return "down"
+        promote_move = cls._training_layout_action(
+            current_free_gib,
+            wddm_hard_gib=wddm_hard_gib,
+            wddm_hold_high_gib=wddm_hold_high_gib,
+            did_oom=False,
+        )
+        return "up" if promote_move == "up" else "hold"
+
+    @staticmethod
+    def _shared_cliff_relief_decision(
+        shared_raw_headroom_gib,
+        shared_margin_gib,
+        dedicated_free_gib,
+        dedicated_promote_free_gib,
+    ):
+        """Choose the shared-budget pressure response.
+
+        ``shared_raw_headroom_gib`` is NON_LOCAL Budget - CurrentUsage, before
+        subtracting the reserved spill margin. When it falls below the margin,
+        prefer unpinning a streamed layer back to pageable CPU. Promotion is only
+        allowed when dedicated VRAM is already roomy enough that spending more
+        resident memory will not deepen the dedicated/WDDM spill cliff.
+        """
+        if shared_raw_headroom_gib is None or shared_margin_gib is None:
+            return "hold"
+        try:
+            shared_raw = float(shared_raw_headroom_gib)
+            margin = float(shared_margin_gib)
+        except (TypeError, ValueError):
+            return "hold"
+        if shared_raw >= margin:
+            return "hold"
+        try:
+            dedicated_free = float(dedicated_free_gib)
+            promote_free = float(dedicated_promote_free_gib)
+        except (TypeError, ValueError):
+            return "unpin"
+        return "promote" if dedicated_free >= promote_free else "unpin"
+
+    @staticmethod
+    def _dxgi_shared_budget_snapshot(device):
+        raw = MemoryManager._dxgi_shared_budget_snapshot_bytes(device)
+        if raw is None:
+            return None
+        return {
+            "budget_gib": raw["budget_bytes"] / 1024 ** 3,
+            "usage_gib": raw["usage_bytes"] / 1024 ** 3,
+            "raw_headroom_gib": raw["raw_headroom_bytes"] / 1024 ** 3,
+            "margin_gib": raw["margin_bytes"] / 1024 ** 3,
+            "usable_headroom_gib": raw["usable_headroom_bytes"] / 1024 ** 3,
+            "match_method": raw.get("match_method"),
+            "manual_control": bool(raw.get("manual_control", False)),
+        }
+
+    @staticmethod
+    def _dxgi_shared_budget_snapshot_bytes(device):
+        dxgi = bounce_pool.get_dxgi_meminfo()
+        if dxgi is None:
+            return None
+        adapter = dxgi.selected_adapter_info()
+        if adapter is None or not getattr(adapter, "safe_for_control", False):
+            return None
+        info = dxgi.query_non_local_video_memory_info(
+            cuda_device_index=bounce_pool._cuda_device_index(device),
+            min_interval_s=0.0,
+        )
+        if info is None:
+            return None
+        budget_bytes = int(info.budget_bytes)
+        usage_bytes = int(info.current_usage_bytes)
+        margin_bytes = bounce_pool.dxgi_spill_reserve_bytes(budget_bytes)
+        raw_headroom_bytes = max(0, budget_bytes - usage_bytes)
+        return {
+            "budget_bytes": budget_bytes,
+            "usage_bytes": usage_bytes,
+            "raw_headroom_bytes": raw_headroom_bytes,
+            "margin_bytes": margin_bytes,
+            "usable_headroom_bytes": raw_headroom_bytes - margin_bytes,
+            "match_method": getattr(adapter, "match_method", None),
+            "manual_control": bool(getattr(adapter, "manual_control", False)),
+        }
+
+    @staticmethod
+    def _dxgi_local_budget_snapshot_bytes(device):
+        dxgi = bounce_pool.get_dxgi_meminfo()
+        if dxgi is None:
+            return None
+        adapter = dxgi.selected_adapter_info()
+        if adapter is None or not getattr(adapter, "safe_for_control", False):
+            return None
+        info = dxgi.query_local_video_memory_info(
+            cuda_device_index=bounce_pool._cuda_device_index(device),
+            min_interval_s=0.0,
+        )
+        if info is None:
+            return None
+        budget_bytes = int(info.budget_bytes)
+        usage_bytes = int(info.current_usage_bytes)
+        return {
+            "budget_bytes": budget_bytes,
+            "usage_bytes": usage_bytes,
+            "raw_headroom_bytes": max(0, budget_bytes - usage_bytes),
+            "match_method": getattr(adapter, "match_method", None),
+            "manual_control": bool(getattr(adapter, "manual_control", False)),
+        }
+
+    @staticmethod
+    def _predict_dxgi_local_peak_bytes(
+        snapshot,
+        *,
+        current_reserved_bytes,
+        current_allocated_bytes,
+        peak_reserved_bytes,
+        peak_allocated_bytes,
+    ):
+        if snapshot is None:
+            return None
+        usage = int(snapshot.get("usage_bytes", 0) or 0)
+        reserved_delta = max(0, int(peak_reserved_bytes or 0) - int(current_reserved_bytes or 0))
+        allocated_delta = max(0, int(peak_allocated_bytes or 0) - int(current_allocated_bytes or 0))
+        return usage + max(reserved_delta, allocated_delta)
+
+    @staticmethod
+    def _dxgi_sampling_settle_status(snapshot):
+        if snapshot is None:
+            return "unavailable"
+        return "settled" if snapshot.get("raw_headroom_bytes", 0) >= snapshot.get("margin_bytes", 0) else "pressure"
+
+    @classmethod
+    def _wait_for_sampling_dxgi_settle(cls, device, *, timeout_s=None, poll_s=None):
+        timeout_s = float(
+            _env("AI_TOOLKIT_SAMPLING_DXGI_SETTLE_TIMEOUT_S", "2.0")
+            if timeout_s is None
+            else timeout_s
+        )
+        poll_s = float(
+            _env("AI_TOOLKIT_SAMPLING_DXGI_SETTLE_POLL_S", "0.05")
+            if poll_s is None
+            else poll_s
+        )
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        attempts = 0
+        last = None
+        while True:
+            attempts += 1
+            last = cls._dxgi_shared_budget_snapshot_bytes(device)
+            status = cls._dxgi_sampling_settle_status(last)
+            if status in ("settled", "unavailable"):
+                return {"status": status, "attempts": attempts, "snapshot": last}
+            if time.monotonic() >= deadline:
+                return {"status": "timeout", "attempts": attempts, "snapshot": last}
+            time.sleep(max(0.0, poll_s))
+
     @staticmethod
     def _available_vram_gib(
         total_gib,
@@ -1262,6 +2020,18 @@ class MemoryManager:
         return max(0.0, max_reserved_we_can_hold - peak_reserved_gib)
 
     @staticmethod
+    def _training_governing_free_gib(estimated_free_gib, diagnostics):
+        """Use observed driver-free minima when present; otherwise keep estimate."""
+        result = float(estimated_free_gib)
+        if (diagnostics or {}).get("device_peak_source") != "observed":
+            return result
+        try:
+            observed = max(0.0, float(diagnostics.get("device_free_peak_gb", result)))
+        except (TypeError, ValueError):
+            return result
+        return min(result, observed)
+
+    @staticmethod
     def _training_cliff_guard_action(
         device_free_gib, *, wddm_hard_gib=1.0, did_oom=False
     ):
@@ -1281,6 +2051,85 @@ class MemoryManager:
         if did_oom or device_free_gib < wddm_hard_gib:
             return "reclaim"
         return "ok"
+
+    @staticmethod
+    def _training_shape_state_key(shape_key):
+        if shape_key is None:
+            return ("default",)
+        try:
+            hash(shape_key)
+            return shape_key
+        except TypeError:
+            return repr(shape_key)
+
+    @classmethod
+    def _manual_training_safety_state(cls, mm):
+        state = getattr(mm, "_training_manual_safety_state", None)
+        if not isinstance(state, dict):
+            state = {}
+            mm._training_manual_safety_state = state
+        state.setdefault("shape_peaks", {})
+        return state
+
+    @classmethod
+    def _record_manual_training_shape_peak(
+        cls, mm, shape_key, *, peak_allocated_gib, peak_reserved_gib=0.0
+    ):
+        state = cls._manual_training_safety_state(mm)
+        peaks = state.setdefault("shape_peaks", {})
+        key = cls._training_shape_state_key(shape_key)
+        bucket = peaks.setdefault(key, {"steps": 0})
+        bucket["steps"] = int(bucket.get("steps", 0)) + 1
+        bucket["peak_allocated_gib"] = max(
+            float(bucket.get("peak_allocated_gib", 0.0)), float(peak_allocated_gib or 0.0)
+        )
+        bucket["peak_reserved_gib"] = max(
+            float(bucket.get("peak_reserved_gib", 0.0)), float(peak_reserved_gib or 0.0)
+        )
+        return bucket
+
+    @classmethod
+    def _manual_training_shape_peak(cls, mm, shape_key):
+        state = cls._manual_training_safety_state(mm)
+        bucket = state.get("shape_peaks", {}).get(cls._training_shape_state_key(shape_key))
+        if not bucket:
+            return None
+        peak = float(bucket.get("peak_allocated_gib", 0.0))
+        return peak if peak > 0.0 else None
+
+    @classmethod
+    def _training_shape_peak_bucket(cls, mm, shape_key):
+        state = cls._manual_training_safety_state(mm)
+        return state.get("shape_peaks", {}).get(cls._training_shape_state_key(shape_key))
+
+    @staticmethod
+    def _training_cliff_predicted_peak_free_gib(
+        total_gib,
+        device_free_gib,
+        torch_reserved_gib,
+        peak_allocated_gib,
+    ):
+        """Driver free expected when the next step rebuilds its live peak.
+
+        ``empty_cache`` can make step-end free look healthy by dropping idle
+        cached blocks, but the next forward/backward will recreate the live peak.
+        Keep non-allocator residents (``other``) from the current snapshot and ask
+        whether peak allocated memory itself clears the WDDM hard floor.
+        """
+        device_used_gib = max(0.0, total_gib - device_free_gib)
+        other_gib = max(0.0, device_used_gib - torch_reserved_gib)
+        return total_gib - (max(0.0, peak_allocated_gib) + other_gib)
+
+    @staticmethod
+    def _invalidate_compiled_blocks(module):
+        for name in ("disable_compiled_sampling", "disable_compiled_training"):
+            fn = getattr(module, name, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception:
+                pass
 
     @classmethod
     def promote_layer(cls, child):
@@ -1341,8 +2190,18 @@ class MemoryManager:
         lmm._install_base_forward(lmm._original_forward)
         if hasattr(child, "_memory_management_device"):
             del child._memory_management_device
+        # Return this layer's pinned budget: its CPU copy is now on GPU, so the
+        # pinned bytes it held are free for other (e.g. later-demoted) layers.
+        freed = getattr(child, "_mm_pinned_bytes", 0)
+        if freed:
+            lmm.manager.pinned_weight_bytes = max(
+                0, lmm.manager.pinned_weight_bytes - freed
+            )
+            bounce_pool.release_pinned_bytes(freed)
+            child._mm_pinned_bytes = 0
         del child._layer_memory_manager
         cls._refresh_resident_trace_hooks(lmm.manager.module, lmm.manager)
+        cls._invalidate_compiled_blocks(lmm.manager.module)
         return True
 
     @classmethod
@@ -1365,7 +2224,13 @@ class MemoryManager:
             return False
         child._mm_layer_key = layer_key or getattr(child, "_mm_layer_key", None) or name
         cls._refresh_resident_trace_hooks(manager.module, manager)
+        cls._invalidate_compiled_blocks(manager.module)
         return True
+
+    @staticmethod
+    def _training_auto_seed_working_reserve_gib():
+        """Cold-start reserve-space assumption before the first measured step."""
+        return float(_env("AI_TOOLKIT_TRAINING_AUTO_SEED_WORKING_RESERVE_GIB", "5.0"))
 
     @classmethod
     def attach_smart_training(
@@ -1375,6 +2240,8 @@ class MemoryManager:
         fp8_training_forward=False,
         pinned_resident_keys=None,
         block_stream_only=False,
+        pinned_weight_gib=None,
+        wddm_spill_reserve_pct=None,
     ):
         ignore_modules = list(ignore_modules or [])
         pinned_resident_keys = set(pinned_resident_keys or ())
@@ -1384,35 +2251,61 @@ class MemoryManager:
         except (TypeError, ValueError):
             auto_working_reserve = str(working_reserve_gib).lower() == "auto"
         if auto_working_reserve:
-            gib = 1024 ** 3
-            model_gib = cls._module_bytes(module) / gib
-            # Attention no longer materializes the old oversized workspace, so
-            # seed auto mode closer to the measured working set and let the
-            # live spill guard retreat if a shape proves larger.
-            working_reserve_gib = float(
-                _env(
-                    "AI_TOOLKIT_TRAINING_AUTO_SEED_WORKING_RESERVE_GIB",
-                    str(max(2.0, min(3.0, model_gib * 0.17))),
-                )
-            )
+            # The working set is not controllable; before the first measurement,
+            # reserve enough resident-weight space for the observed Krea/WDDM peak
+            # instead of optimistically starting near 2-3 GiB and spilling step 1.
+            working_reserve_gib = cls._training_auto_seed_working_reserve_gib()
+        resolved_wddm_hard_gib = (
+            float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0"))
+            if wddm_hard_gib is None
+            else float(wddm_hard_gib)
+        )
+        resolved_wddm_margin_gib = cls._resolve_wddm_margin_gib(
+            device,
+            wddm_margin_gib,
+            hard_gib=resolved_wddm_hard_gib,
+        )
+        bounce_pool.set_spill_reserve_policy(
+            floor_gib=resolved_wddm_margin_gib,
+            pct=wddm_spill_reserve_pct,
+        )
         plan = cls.smart_training_plan(
             module, device, working_reserve_gib, ignore_modules,
-            wddm_margin_gib=(
-                float(_env("AI_TOOLKIT_TRAINING_WDDM_MARGIN_GIB", "1.0"))
-                if wddm_margin_gib is None
-                else wddm_margin_gib
-            ),
-            wddm_hard_gib=(
-                float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0"))
-                if wddm_hard_gib is None
-                else wddm_hard_gib
-            ),
+            wddm_margin_gib=resolved_wddm_margin_gib,
+            wddm_hard_gib=resolved_wddm_hard_gib,
             pinned_resident_keys=pinned_resident_keys,
             # Manual working_reserve has no live loop to climb later, so fill the
             # surplus at attach. Auto working_reserve leaves the climb to the live loop.
             cold_growth=not auto_working_reserve,
             block_stream_only=block_stream_only,
         )
+        # Pin budget: size to the whole model in auto mode, or honor a positive
+        # config value as a requested budget, then cap it after reserving the
+        # planned bounce-pool window. This keeps explicit pin budgets from
+        # consuming the pool's share of the same WDDM pinned-memory ceiling.
+        gib = 1024 ** 3
+        auto_pin = pinned_weight_gib is None
+        try:
+            auto_pin = auto_pin or float(pinned_weight_gib) < 0
+        except (TypeError, ValueError):
+            auto_pin = True
+        desired_pin_bytes = (
+            int(int(plan["model_bytes"]) * 1.03)
+            if auto_pin
+            else int(max(0.0, float(pinned_weight_gib)) * gib)
+        )
+        bounce_reserve_bytes = cls._planned_bounce_reserve_bytes(
+            module,
+            plan["offload_ids"],
+            device,
+            block_stream_only=block_stream_only,
+        )
+        pin_bytes = cls._cap_auto_pin_budget(
+            desired_pin_bytes,
+            reserve_bytes=bounce_reserve_bytes,
+            device=device,
+        )
+        resolved_pin_gib = pin_bytes / gib
         cls.attach(
             module,
             device,
@@ -1420,10 +2313,30 @@ class MemoryManager:
             ignore_modules=ignore_modules,
             _offload_module_ids=plan["offload_ids"],
             training_strategy="smart",
+            pinned_weight_gib=resolved_pin_gib,
         )
         module._memory_manager._smart_training_plan = plan
         module._memory_manager._training_pinned_resident_keys = set(pinned_resident_keys)
         module._memory_manager._training_block_stream_only = bool(block_stream_only)
+        # Slice 2 (per-block GPU forward staging) is OFF by default and gated
+        # behind an explicit env flag. The naive forward-pre-hook stages a block
+        # right before it runs and waits on it, which serializes transfer with
+        # compute and measured ~2.4x SLOWER than the depth-4 per-Linear ring
+        # (which overlaps transfer and compute). It needs cross-block prefetch
+        # (stage block i+depth during block i) to be a win — see
+        # BLOCK_STREAM_PLAN.md. block_stream_only itself keeps only the proven
+        # Slice 1 worker-fill batching.
+        gpu_ring = _env("AI_TOOLKIT_BLOCK_STREAM_GPU_RING", "0").lower() not in (
+            "0", "false", "no", "",
+        )
+        if block_stream_only and gpu_ring and torch.device(device).type == "cuda":
+            depth = max(1, int(_env("AI_TOOLKIT_BLOCK_STREAM_DEPTH", "2")))
+            set_block_stream_enabled(device, True, depth=depth)
+            wired = cls._wire_block_stream_forward_hooks(module, device)
+            print(
+                f"[MemoryManager] block-stream forward staging (EXPERIMENTAL, "
+                f"may regress): blocks_hooked={wired} ring_depth={depth}"
+            )
         module._memory_manager._training_autotune_enabled = auto_working_reserve
         module._memory_manager._training_autotune_state = {
             "current_working_reserve_gib": plan["working_reserve_bytes"] / (1024 ** 3),
@@ -1615,6 +2528,8 @@ class MemoryManager:
         for child in module.modules():
             if hasattr(child, "_memory_management_fp8_training"):
                 del child._memory_management_fp8_training
+            if hasattr(child, "_memory_management_training_compile_fp8"):
+                del child._memory_management_training_compile_fp8
             if not enabled or not hasattr(child, "_layer_memory_manager"):
                 continue
             weight = getattr(child, "weight", None)
@@ -1741,6 +2656,60 @@ class MemoryManager:
         return 0, "stop_line"
 
     @classmethod
+    def _unpin_training_layer_for_shared_relief(cls, module, mm):
+        args = getattr(mm, "_attach_args", {}) or {}
+        pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
+        candidates = [
+            item for item in cls._training_layout_candidates(
+                module, args.get("ignore_modules", []), pinned_keys
+            )
+            if item["managed"] and int(getattr(item["module"], "_mm_pinned_bytes", 0) or 0) > 0
+        ]
+        candidates.sort(
+            key=lambda item: int(getattr(item["module"], "_mm_pinned_bytes", 0) or 0),
+            reverse=True,
+        )
+        for item in candidates:
+            released = unpin_layer(item["module"])
+            if released > 0:
+                return 1, "unpin_shared", released
+        return 0, "unpin_unavailable", 0
+
+    @classmethod
+    def _relieve_shared_cliff(
+        cls,
+        module,
+        mm,
+        device,
+        *,
+        shared_snapshot,
+        dedicated_free_gib,
+        dedicated_promote_free_gib,
+        cache_pad_gib,
+        wddm_stop_gib,
+    ):
+        decision = cls._shared_cliff_relief_decision(
+            (shared_snapshot or {}).get("raw_headroom_gib"),
+            (shared_snapshot or {}).get("margin_gib"),
+            dedicated_free_gib,
+            dedicated_promote_free_gib,
+        )
+        if decision == "hold":
+            return 0, "hold", 0
+        if decision == "promote":
+            changed, action = cls._promote_training_layer(
+                module,
+                mm,
+                device,
+                cache_pad_gib=cache_pad_gib,
+                wddm_stop_gib=wddm_stop_gib,
+            )
+            if changed:
+                return changed, "promote_shared", 0
+        changed, action, released = cls._unpin_training_layer_for_shared_relief(module, mm)
+        return changed, action, released
+
+    @classmethod
     def _promote_training_layers(
         cls, module, mm, device, *, cache_pad_gib, wddm_stop_gib, budget_gib, max_count=0
     ):
@@ -1825,6 +2794,145 @@ class MemoryManager:
         return int(free_bytes + max(0, reserved_bytes - allocated_bytes))
 
     @classmethod
+    def prepare_training_memory_for_shape(cls, module, device=None, shape_key=None):
+        """Pre-step guard using learned per-shape peaks and live DXGI LOCAL budget."""
+        while module is not None and not hasattr(module, "_memory_manager"):
+            wrapped = getattr(module, "module", None)
+            if wrapped is None or wrapped is module:
+                return None
+            module = wrapped
+        if module is None or not hasattr(module, "_memory_manager"):
+            return None
+        mm = module._memory_manager
+        plan = getattr(mm, "_smart_training_plan", None)
+        if plan is None:
+            return None
+        try:
+            device = torch.device(device or mm.process_device)
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return None
+
+        bucket = cls._training_shape_peak_bucket(mm, shape_key)
+        if not bucket:
+            return None
+        learned_peak_gib = float(bucket.get("peak_allocated_gib", 0.0) or 0.0)
+        learned_peak_reserved_gib = float(bucket.get("peak_reserved_gib", 0.0) or 0.0)
+        if learned_peak_gib <= 0.0 and learned_peak_reserved_gib <= 0.0:
+            return None
+
+        gib = 1024 ** 3
+        hard_gib = max(
+            float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0")),
+            float(plan.get("wddm_hard_bytes", 0)) / gib,
+        )
+        margin_gib = max(
+            hard_gib,
+            float(plan.get("wddm_margin_bytes", 0)) / gib,
+        )
+        fallback_target_gib = max(
+            hard_gib,
+            float(_env("AI_TOOLKIT_TRAINING_WDDM_STOP_GIB", str(hard_gib + 0.5))),
+        )
+        retreat_layers = max(1, int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "3")))
+        max_demote = int(_env("AI_TOOLKIT_TRAINING_SAFETY_MAX_DEMOTE", "12"))
+
+        def _pressure():
+            local = cls._dxgi_local_budget_snapshot_bytes(device)
+            current_reserved = int(torch.cuda.memory_reserved(device))
+            current_allocated = int(torch.cuda.memory_allocated(device))
+            peak_allocated = int(max(0.0, learned_peak_gib) * gib)
+            peak_reserved = int(max(learned_peak_reserved_gib, learned_peak_gib) * gib)
+            predicted_local = cls._predict_dxgi_local_peak_bytes(
+                local,
+                current_reserved_bytes=current_reserved,
+                current_allocated_bytes=current_allocated,
+                peak_reserved_bytes=peak_reserved,
+                peak_allocated_bytes=peak_allocated,
+            )
+            if local is not None and predicted_local is not None:
+                target_usage = int(local["budget_bytes"] - margin_gib * gib)
+                return {
+                    "source": "dxgi_local",
+                    "pressure": predicted_local > target_usage,
+                    "predicted_local_usage_gib": predicted_local / gib,
+                    "target_local_usage_gib": target_usage / gib,
+                    "local_budget_gib": local["budget_bytes"] / gib,
+                    "local_usage_gib": local["usage_bytes"] / gib,
+                    "predicted_peak_free_gib": (target_usage - predicted_local) / gib,
+                }
+
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            free_gib = free_bytes / gib
+            total_gib = total_bytes / gib
+            reserved_gib = current_reserved / gib
+            predicted_peak_free_gib = cls._training_cliff_predicted_peak_free_gib(
+                total_gib, free_gib, reserved_gib, max(learned_peak_gib, learned_peak_reserved_gib)
+            )
+            return {
+                "source": "cuda_free",
+                "pressure": predicted_peak_free_gib < fallback_target_gib,
+                "predicted_peak_free_gib": predicted_peak_free_gib,
+                "target_free_gib": fallback_target_gib,
+            }
+
+        before = _pressure()
+        if not before.get("pressure"):
+            return None
+
+        demoted = 0
+        pressure = before
+        peak_gib = learned_peak_gib
+        peak_reserved_gib = learned_peak_reserved_gib
+        while pressure.get("pressure") and demoted < max_demote:
+            before_plan = getattr(mm, "_smart_training_plan", plan) or plan
+            before_resident_gib = before_plan.get("resident_bytes", 0) / gib
+            changed = cls._demote_training_layers(
+                module, mm, retreat_layers, largest=True
+            )
+            if not changed:
+                break
+            demoted += changed
+            plan = getattr(mm, "_smart_training_plan", before_plan) or before_plan
+            after_resident_gib = plan.get("resident_bytes", 0) / gib
+            resident_drop_gib = max(0.0, before_resident_gib - after_resident_gib)
+            peak_gib = max(0.0, peak_gib - resident_drop_gib)
+            peak_reserved_gib = max(0.0, peak_reserved_gib - resident_drop_gib)
+            learned_peak_gib = peak_gib
+            learned_peak_reserved_gib = peak_reserved_gib
+            pressure = _pressure()
+
+        if demoted:
+            bucket["peak_allocated_gib"] = peak_gib
+            bucket["peak_reserved_gib"] = peak_reserved_gib
+            if cls._diagnostics_enabled():
+                if before.get("source") == "dxgi_local":
+                    print(
+                        f"[MemoryManager] pre-step DXGI local guard: demoted_layers={demoted} "
+                        f"predicted_local={before.get('predicted_local_usage_gib'):.2f}->{pressure.get('predicted_local_usage_gib', float('nan')):.2f} GiB "
+                        f"budget={before.get('local_budget_gib'):.2f} GiB "
+                        f"target_usage={before.get('target_local_usage_gib'):.2f} GiB "
+                        f"margin={margin_gib:.2f} GiB"
+                    )
+                else:
+                    print(
+                        f"[MemoryManager] pre-step CUDA free guard: demoted_layers={demoted} "
+                        f"peak_free={before.get('predicted_peak_free_gib'):.2f}->{pressure.get('predicted_peak_free_gib'):.2f} GiB "
+                        f"target={fallback_target_gib:.2f} GiB"
+                    )
+        return {
+            "manual_safety": not bool(getattr(mm, "_training_autotune_enabled", False)),
+            "action": "prestep_demote" if demoted else "prestep_unavailable",
+            "demoted_layers": demoted,
+            "source": before.get("source"),
+            "before": before,
+            "after": pressure,
+            "learned_peak_allocated_gib": peak_gib,
+            "learned_peak_reserved_gib": peak_reserved_gib,
+        }
+
+    @classmethod
     def auto_tune_training_memory(
         cls,
         module,
@@ -1835,6 +2943,9 @@ class MemoryManager:
         did_oom=False,
         peak_allocated_override=None,
         peak_reserved_override=None,
+        observed_driver_free_min_bytes=None,
+        observed_driver_total_bytes=None,
+        observed_driver_free_samples=None,
     ):
         """Conservative live tuning for smart training offload.
 
@@ -1855,7 +2966,15 @@ class MemoryManager:
             # chooses the activation reserve; it does not license driving into the
             # WDDM spill and staying there. Reclaim idle allocator cache (and only
             # if that is not enough, demote resident layers) at the step boundary.
-            return cls._training_cliff_safety_net(module, mm, device, did_oom=did_oom)
+            return cls._training_cliff_safety_net(
+                module,
+                mm,
+                device,
+                shape_key=shape_key,
+                did_oom=did_oom,
+                peak_allocated_override=peak_allocated_override,
+                peak_reserved_override=peak_reserved_override,
+            )
         plan = getattr(mm, "_smart_training_plan", None)
         if plan is None:
             return None
@@ -1887,7 +3006,6 @@ class MemoryManager:
         promote_interval = int(_env("AI_TOOLKIT_TRAINING_PROMOTE_INTERVAL", "4"))
         cache_pad_gib = float(_env("AI_TOOLKIT_TRAINING_CACHE_PAD_GIB", "0.25"))
         min_working_reserve_gib = float(_env("AI_TOOLKIT_TRAINING_MIN_WORKING_RESERVE_GIB", "1.5"))
-        max_working_reserve_gib = float(_env("AI_TOOLKIT_TRAINING_MAX_WORKING_RESERVE_GIB", "3.0"))
         stable_windows = int(_env("AI_TOOLKIT_TRAINING_STABLE_WORKING_RESERVE_STEPS", "2"))
         unhealthy_promote_slack_gib = float(
             _env("AI_TOOLKIT_TRAINING_UNHEALTHY_PROMOTE_SLACK_GIB", "1.5")
@@ -1907,9 +3025,18 @@ class MemoryManager:
             device,
             peak_allocated_override=peak_allocated_override,
             peak_reserved_override=peak_reserved_override,
+            observed_driver_free_min_bytes=observed_driver_free_min_bytes,
+            observed_driver_total_bytes=observed_driver_total_bytes,
+            observed_driver_free_samples=observed_driver_free_samples,
         )
         if diagnostics is None:
             return None
+        cls._record_manual_training_shape_peak(
+            mm,
+            shape_key,
+            peak_allocated_gib=diagnostics.get("peak_allocated_gb", 0.0),
+            peak_reserved_gib=diagnostics.get("peak_reserved_gb", 0.0),
+        )
         # Residents on the card that are NOT in our caching allocator: other CUDA
         # processes (browser, compositor, another job) AND our own non-allocator
         # overhead (CUDA context, cuDNN workspaces, compiled-graph constants —
@@ -1923,23 +3050,36 @@ class MemoryManager:
         safety_gib = float(
             _env("AI_TOOLKIT_TRAINING_WDDM_SAFETY_GIB", "0.5")
         )
-        # Margin-to-spill is the "available VRAM" the deadband governs. Computed
-        # by the shared pure helper so the offline simulator measures identically.
-        min_device_free_gib = cls._available_vram_gib(
+        # Margin-to-spill is the "available VRAM" the deadband governs. The
+        # allocator-derived estimate misses resolution-switch WDDM pressure, so
+        # when the trainer sampled an observed driver-free minimum, let that
+        # stricter value govern the bucket and retreat decision.
+        estimated_free_gib = cls._available_vram_gib(
             diagnostics["device_total_gb"],
             diagnostics["device_used_gb"],
             diagnostics["torch_reserved_gb"],
             diagnostics["peak_reserved_gb"],
             safety_gib=safety_gib,
         )
-        working_gib = max(0.0, diagnostics["working_reserve_used_gb"])
+        min_device_free_gib = cls._training_governing_free_gib(
+            estimated_free_gib, diagnostics
+        )
+        working_peak_gib = max(
+            0.0,
+            float(
+                diagnostics.get(
+                    "working_reserve_peak_gb",
+                    diagnostics.get("working_reserve_used_gb", 0.0),
+                )
+            ),
+        )
         allocation_peak_gib = max(
             diagnostics["peak_allocated_gb"]
             - diagnostics["planned_resident_gb"]
-            - diagnostics["planned_ring_gb"],
+            - diagnostics.get("ring_peak_gb", diagnostics["planned_ring_gb"]),
             0.0,
         )
-        measured_peak_gib = max(working_gib, allocation_peak_gib)
+        measured_peak_gib = max(working_peak_gib, allocation_peak_gib)
 
         bucket_key = shape_key if shape_key is not None else ("default",)
         bucket = state["buckets"].setdefault(
@@ -1974,6 +3114,7 @@ class MemoryManager:
         bucket["peak_working_gib"] = max(
             bucket["peak_working_gib"], working_reserve_signal_gib
         )
+        bucket["latest_working_signal_gib"] = working_reserve_signal_gib
         bucket["min_device_free_gib"] = min(
             bucket["min_device_free_gib"], min_device_free_gib
         )
@@ -2020,38 +3161,48 @@ class MemoryManager:
             if plan.get("wddm_margin_bytes", 0) < plan["wddm_hard_bytes"]:
                 plan["wddm_margin_bytes"] = plan["wddm_hard_bytes"]
         current_gib = float(state["current_working_reserve_gib"])
+        # Worst-case recent resolution signal governs the reserve: a quiet low-res
+        # step must not shrink the budget below what the latest high-res bucket
+        # measured. Do not feed WDDM cliffs or OOMs into this number; those are
+        # layout-safety signals handled below by move == "down".
+        governing_reserve_signal_gib = max(
+            [working_reserve_signal_gib]
+            + [
+                b.get("latest_working_signal_gib", b.get("peak_working_gib", 0.0))
+                for b in state["buckets"].values()
+            ]
+        )
         if did_oom:
-            action = "oom_retreat"
-            new_working_reserve = current_gib + retreat_gib
-            state["danger_working_reserve_gib"] = max(
-                state.get("danger_working_reserve_gib") or 0.0, current_gib
-            )
-        else:
-            # Worst-case resolution governs the reserve: a quiet low-res step must
-            # not shrink the budget below what the highest-res bucket peaked at.
             governing_reserve_signal_gib = max(
-                [working_reserve_signal_gib]
-                + [b.get("peak_working_gib", 0.0) for b in state["buckets"].values()]
-            )
-            new_working_reserve, danger, action = cls._training_working_reserve_decision(
-                current_gib,
                 governing_reserve_signal_gib,
-                min(bucket["min_device_free_gib"], min_device_free_gib),
-                state.get("danger_working_reserve_gib"),
-                wddm_hard_gib=wddm_hard_gib,
-                wddm_stop_gib=wddm_stop_gib,
-                pad_gib=pad_gib,
-                step_gib=step_gib,
-                retreat_gib=retreat_gib,
+                max(0.0, current_gib - pad_gib),
             )
-            state["danger_working_reserve_gib"] = danger
+        new_working_reserve, danger, action = cls._training_working_reserve_decision(
+            current_gib,
+            governing_reserve_signal_gib,
+            min(bucket["min_device_free_gib"], min_device_free_gib),
+            state.get("danger_working_reserve_gib"),
+            wddm_hard_gib=wddm_hard_gib,
+            wddm_stop_gib=wddm_stop_gib,
+            pad_gib=pad_gib,
+            step_gib=step_gib,
+            retreat_gib=retreat_gib,
+        )
+        if did_oom and action == "hold":
+            action = "oom_hold"
+        state["danger_working_reserve_gib"] = danger
 
-        new_working_reserve = min(max(new_working_reserve, min_working_reserve_gib), max_working_reserve_gib)
+        # This is not an allocation knob. It is measured working-set demand,
+        # translated into resident-weight space we must leave empty. Do not cap
+        # it with an arbitrary max; under-measuring here drives WDDM spills.
+        new_working_reserve = max(new_working_reserve, min_working_reserve_gib)
 
-        # Govern layout moves off a free-VRAM deadband (user spec). Use the
-        # worst-case *recent* free margin across resolution buckets so high-res
-        # safety binds, but a transient dip does not latch the controller low.
-        governing_free_gib = min(
+        # Govern layout moves off a free-VRAM deadband (user spec). Demote uses
+        # the worst-case *recent* free margin across resolution buckets so
+        # high-res safety binds; promote uses only the CURRENT bucket's margin
+        # -- see _training_layout_move for why they must differ (a chronically
+        # tight bucket must not veto promotion during a roomy one forever).
+        demote_governing_free_gib = min(
             [min_device_free_gib]
             + [
                 b.get("last_free_gib", min_device_free_gib)
@@ -2064,8 +3215,9 @@ class MemoryManager:
             )
         )
         wddm_hold_high_gib = max(wddm_hold_high_gib, wddm_stop_gib + step_gib)
-        move = cls._training_layout_action(
-            governing_free_gib,
+        move = cls._training_layout_move(
+            demote_governing_free_gib,
+            min_device_free_gib,
             wddm_hard_gib=wddm_hard_gib,
             wddm_hold_high_gib=wddm_hold_high_gib,
             did_oom=did_oom,
@@ -2088,14 +3240,45 @@ class MemoryManager:
         grew_prefetch = False
         changed_layers = 0
         layout_action = "hold"
-        # WDDM safety demotion wins over prefetch repair. Otherwise repair a bad
-        # prefetch schedule even while the memory deadband is holding steady.
+        shared_snapshot = cls._dxgi_shared_budget_snapshot(device)
+        shared_relief = cls._shared_cliff_relief_decision(
+            (shared_snapshot or {}).get("raw_headroom_gib"),
+            (shared_snapshot or {}).get("margin_gib"),
+            min_device_free_gib,
+            wddm_hold_high_gib,
+        )
+        # Dedicated-VRAM safety demotion wins. Otherwise, when the measured DXGI
+        # NON_LOCAL headroom is inside the reserved margin, relieve the shared
+        # cliff before ordinary prefetch repair or resident growth. Default relief
+        # is unpin-to-pageable; promotion is allowed only with roomy dedicated VRAM.
         if move == "down":
             changed_layers = cls._demote_training_layers(
                 module, mm, retreat_layers, largest=True
             )
             state["stopped"] = False
             layout_action = "demote" if changed_layers else "demote_unavailable"
+        elif shared_relief != "hold":
+            changed_layers, layout_action, released_bytes = cls._relieve_shared_cliff(
+                module,
+                mm,
+                device,
+                shared_snapshot=shared_snapshot,
+                dedicated_free_gib=min_device_free_gib,
+                dedicated_promote_free_gib=wddm_hold_high_gib,
+                cache_pad_gib=cache_pad_gib,
+                wddm_stop_gib=wddm_stop_gib,
+            )
+            if changed_layers and layout_action == "unpin_shared":
+                cls._register_training_prefetch_sources(module, mm)
+            if cls._diagnostics_enabled() and layout_action != "hold":
+                print(
+                    "[MemoryManager] shared-budget relief: "
+                    f"action={layout_action} changed_layers={changed_layers} "
+                    f"released={released_bytes / gib:.2f} GiB "
+                    f"shared_raw_headroom={(shared_snapshot or {}).get('raw_headroom_gib')} GiB "
+                    f"shared_margin={(shared_snapshot or {}).get('margin_gib')} GiB "
+                    f"dedicated_free={min_device_free_gib:.2f} GiB"
+                )
         elif prefetch_recovery_action is not None:
             if prefetch_invalid:
                 invalidate_offload_trace_for_shape(shape_key)
@@ -2184,6 +3367,12 @@ class MemoryManager:
             "resident_gb": plan["resident_bytes"] / gib,
             "streamed_layers": plan["offloaded_layers"],
             "min_device_free_gb": min_device_free_gib,
+            "estimated_device_free_gb": estimated_free_gib,
+            "observed_device_free_gb": (
+                diagnostics.get("device_free_peak_gb")
+                if diagnostics.get("device_peak_source") == "observed"
+                else None
+            ),
             "measured_peak_gb": measured_peak_gib,
             "danger_working_reserve_gb": state.get("danger_working_reserve_gib"),
             "learned_wddm_hard_gb": state.get("learned_wddm_hard_gib"),
@@ -2196,30 +3385,35 @@ class MemoryManager:
             print(
                 f"[MemoryManager] training autotune: action={action} "
                 f"layout={layout_action} changed_layers={changed_layers} "
-                f"working_reserve={result['working_reserve_gb']:.2f} GiB "
+                f"reserve_space={result['working_reserve_gb']:.2f} GiB "
                 f"resident={result['resident_gb']:.2f} GiB "
                 f"streamed_layers={result['streamed_layers']} "
                 f"min_free={min_device_free_gib:.2f} GiB "
+                f"estimated_free={estimated_free_gib:.2f} GiB "
+                f"observed_free={(result['observed_device_free_gb'] if result['observed_device_free_gb'] is not None else float('nan')):.2f} GiB "
                 f"peak_working={measured_peak_gib:.2f} GiB "
                 f"learned_wddm_hard={state.get('learned_wddm_hard_gib') or 0.0:.2f} GiB"
             )
         return result
 
     @classmethod
-    def _training_cliff_safety_net(cls, module, mm, device=None, *, did_oom=False):
+    def _training_cliff_safety_net(
+        cls,
+        module,
+        mm,
+        device=None,
+        *,
+        shape_key=None,
+        did_oom=False,
+        peak_allocated_override=None,
+        peak_reserved_override=None,
+    ):
         """Keep manual working_reserve runs off the WDDM spill cliff.
 
-        Manual mode (a fixed ``layer_offloading_smart_working_reserve_gb``) does
-        not auto-tune the activation budget, but it must still refuse to fall off
-        the cliff. Allocator fragmentation under multi-resolution training can
-        ratchet ``reserved`` up until driver-free hits 0 and every step then pays
-        the ~5-30x WDDM paging tax for the rest of the run. So at each step
-        boundary, if driver-free is below the hard floor we first hand the
-        allocator's idle cache back to the driver (``empty_cache`` — usually
-        enough on its own, since the idle reserve dwarfs the live tensors), and
-        only if that does not restore the floor do we demote the largest resident
-        layers until it does. The manual budget number is never changed; this is a
-        guard rail, not a tuner.
+        The guard trims idle allocator cache first, but demotion is decided from
+        the next step's expected live peak, not from the artificially healthy
+        post-trim trough. Otherwise a stable run can loop forever:
+        empty_cache -> lots of free -> same peak allocation returns -> cliff.
         """
         plan = getattr(mm, "_smart_training_plan", None)
         if plan is None:
@@ -2238,54 +3432,103 @@ class MemoryManager:
         )
         retreat_layers = max(1, int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "3")))
         max_demote = int(_env("AI_TOOLKIT_TRAINING_SAFETY_MAX_DEMOTE", "12"))
+        target_gib = max(
+            hard_gib,
+            float(_env("AI_TOOLKIT_TRAINING_WDDM_STOP_GIB", str(hard_gib + 0.5))),
+        )
 
-        free_gib = torch.cuda.mem_get_info(device)[0] / gib
-        if cls._training_cliff_guard_action(
-            free_gib, wddm_hard_gib=hard_gib, did_oom=did_oom
-        ) == "ok":
-            return None  # comfortably inside the budget — no work, no overhead
-
-        before_gib = free_gib
-        # 1. Cheapest reclaim first: return idle cached blocks to the driver. Only
-        #    genuinely-unused blocks are freed, so live weights/ring/activations
-        #    are untouched. This alone undoes a fragmentation blowup.
-        try:
-            torch.cuda.synchronize(device)
-        except RuntimeError:
-            pass
-        try:
-            torch.cuda.empty_cache()
-        except RuntimeError:
-            pass
-        free_gib = torch.cuda.mem_get_info(device)[0] / gib
-
-        # 2. Still under the floor => genuinely over-committed for this card.
-        #    Demote the largest resident layers until the floor clears or we run
-        #    out of demotable layers. _demote_training_layers re-syncs and empties
-        #    the cache itself, so the re-measure below is accurate.
-        demoted = 0
-        while (
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        before_gib = free_bytes / gib
+        needs_reclaim = (
             cls._training_cliff_guard_action(
-                free_gib, wddm_hard_gib=hard_gib, did_oom=did_oom
+                before_gib, wddm_hard_gib=hard_gib, did_oom=did_oom
             ) == "reclaim"
-            and demoted < max_demote
-        ):
+        )
+
+        total_gib = total_bytes / gib
+        reserved_before_gib = torch.cuda.memory_reserved(device) / gib
+        allocated_before_gib = torch.cuda.memory_allocated(device) / gib
+        cached_before_gib = max(0.0, reserved_before_gib - allocated_before_gib)
+        peak_allocated_gib = (
+            peak_allocated_override
+            if peak_allocated_override is not None
+            else torch.cuda.max_memory_allocated(device)
+        ) / gib
+        peak_reserved_gib = (
+            peak_reserved_override
+            if peak_reserved_override is not None
+            else torch.cuda.max_memory_reserved(device)
+        ) / gib
+        recorded_peak_bucket = cls._record_manual_training_shape_peak(
+            mm,
+            shape_key,
+            peak_allocated_gib=peak_allocated_gib,
+            peak_reserved_gib=peak_reserved_gib,
+        )
+        predicted_peak_free_gib = cls._training_cliff_predicted_peak_free_gib(
+            total_gib,
+            before_gib,
+            reserved_before_gib,
+            peak_allocated_gib,
+        )
+        peak_pressure = did_oom or predicted_peak_free_gib < target_gib
+        if not needs_reclaim and not peak_pressure:
+            return None
+
+        free_gib = before_gib
+        if needs_reclaim:
+            # Return idle cached blocks to the driver. This fixes pure allocator
+            # hoarding, but demotion is still driven by peak math below.
+            try:
+                torch.cuda.synchronize(device)
+            except RuntimeError:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
+            free_gib = torch.cuda.mem_get_info(device)[0] / gib
+
+        demoted = 0
+        while peak_pressure and demoted < max_demote:
+            before_plan = getattr(mm, "_smart_training_plan", plan) or plan
+            before_resident_gib = before_plan.get("resident_bytes", 0) / gib
             changed = cls._demote_training_layers(
                 module, mm, retreat_layers, largest=True
             )
             if not changed:
                 break
             demoted += changed
-            free_gib = torch.cuda.mem_get_info(device)[0] / gib
-            did_oom = False  # one reclaim round satisfies the OOM trigger
+            plan = getattr(mm, "_smart_training_plan", before_plan) or before_plan
+            after_resident_gib = plan.get("resident_bytes", 0) / gib
+            resident_drop_gib = max(0.0, before_resident_gib - after_resident_gib)
+            peak_allocated_gib = max(0.0, peak_allocated_gib - resident_drop_gib)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            free_gib = free_bytes / gib
+            total_gib = total_bytes / gib
+            current_reserved_gib = torch.cuda.memory_reserved(device) / gib
+            predicted_peak_free_gib = cls._training_cliff_predicted_peak_free_gib(
+                total_gib,
+                free_gib,
+                current_reserved_gib,
+                peak_allocated_gib,
+            )
+            did_oom = False
+            peak_pressure = predicted_peak_free_gib < target_gib
 
-        action = "demote" if demoted else "empty_cache"
+        if demoted and recorded_peak_bucket is not None:
+            recorded_peak_bucket["peak_allocated_gib"] = peak_allocated_gib
+        action = "demote" if demoted else ("empty_cache" if needs_reclaim else "peak_pressure_unavailable")
         if cls._diagnostics_enabled():
             print(
                 f"[MemoryManager] manual cliff guard: action={action} "
                 f"demoted_layers={demoted} "
                 f"free={before_gib:.2f}->{free_gib:.2f} GiB "
-                f"(hard_floor={hard_gib:.2f} GiB)"
+                f"peak_free={predicted_peak_free_gib:.2f} GiB "
+                f"cached_before={cached_before_gib:.2f} GiB "
+                f"peak_allocated={peak_allocated_gib:.2f} GiB "
+                f"peak_reserved={peak_reserved_gib:.2f} GiB "
+                f"(hard_floor={hard_gib:.2f} GiB target={target_gib:.2f} GiB)"
             )
         return {
             "manual_safety": True,
@@ -2293,6 +3536,10 @@ class MemoryManager:
             "demoted_layers": demoted,
             "device_free_gib": free_gib,
             "device_free_before_gib": before_gib,
+            "predicted_peak_free_gib": predicted_peak_free_gib,
+            "allocator_cached_before_gib": cached_before_gib,
+            "peak_allocated_gib": peak_allocated_gib,
+            "peak_reserved_gib": peak_reserved_gib,
         }
 
     @staticmethod
@@ -2488,16 +3735,47 @@ class MemoryManager:
         registered = len(sources)
         history = cls._historical_prefetch_defaults(registered)
 
-        budget_gib = float(_env(
-            "AI_TOOLKIT_BOUNCE_POOL_GIB",
-            str(history.get("budget_gib", 5.0)),
-        ))
+        default_budget_gib, default_target_gib, default_mode = cls._training_bounce_pool_budget_defaults(
+            module,
+            block_stream_only=bool(getattr(getattr(module, "_memory_manager", None), "_training_block_stream_only", False)),
+            sources=sources,
+            history=history,
+        )
+        env_budget = _env("AI_TOOLKIT_BOUNCE_POOL_GIB", None)
+        auto_budget = env_budget is None
+        budget_gib = float(env_budget) if env_budget is not None else default_budget_gib
         max_budget_gib = float(_env("AI_TOOLKIT_BOUNCE_MAX_POOL_GIB", "6.0"))
         budget_gib = min(max_budget_gib, budget_gib)
-        target_ready_gib = float(_env(
-            "AI_TOOLKIT_BOUNCE_TARGET_READY_GIB",
-            str(history.get("target_ready_gib", 3.5)),
-        ))
+        emergency_floor_gib = min(
+            max_budget_gib,
+            max(0.0, float(_env("AI_TOOLKIT_BOUNCE_EMERGENCY_FLOOR_GIB", "0.25"))),
+        ) if auto_budget else 0.0
+        # This pool's buffers pin the SAME finite resource as the pinned-weight
+        # auto-budget (see MemoryManager._cap_auto_pin_budget): cap the initial
+        # size by the shared ledger's headroom too, so it does not spend the
+        # rest of the run repeatedly hitting (and being rejected by) the live
+        # per-allocation check in _take_buffers_locked.
+        ledger_headroom = bounce_pool.pinned_bytes_headroom(
+            bounce_pool._cuda_device_index(device)
+        )
+        if ledger_headroom is not None:
+            capped_gib = ledger_headroom / gib
+            if capped_gib < budget_gib:
+                print(
+                    "[MemoryManager] bounce-pool auto-budget capped: "
+                    f"want={budget_gib:.2f} GiB -> {capped_gib:.2f} GiB "
+                    "(shared pinned-memory headroom already spent by weight "
+                    "pinning -- set AI_TOOLKIT_BOUNCE_POOL_GIB to override)"
+                )
+            budget_gib = min(budget_gib, capped_gib)
+            if auto_budget:
+                # Keep the pool alive for the unpinned tail and for layers that
+                # shared-cliff relief returns to pageable CPU. This is only a
+                # budget floor; live allocation still checks host RAM and fresh
+                # DXGI headroom before pinning any buffer.
+                budget_gib = max(emergency_floor_gib, budget_gib)
+        env_target = _env("AI_TOOLKIT_BOUNCE_TARGET_READY_GIB", None)
+        target_ready_gib = float(env_target) if env_target is not None else default_target_gib
         target_ready_gib = min(budget_gib, target_ready_gib)
         lookahead = int(_env(
             "AI_TOOLKIT_BOUNCE_LOOKAHEAD",
@@ -2566,6 +3844,7 @@ class MemoryManager:
             f"budget={budget / gib:.2f} GiB lookahead={lookahead} "
             f"target_ready={target_ready / gib:.2f} GiB "
             f"workers={workers} fill_group={pool.fill_group_size} sources={registered} "
+            f"default_mode={default_mode} "
             f"cold_start_schedule={len(cold_start_schedule)}{history_text}"
         )
 
@@ -2576,15 +3855,22 @@ class MemoryManager:
         device=None,
         peak_allocated_override=None,
         peak_reserved_override=None,
+        observed_driver_free_min_bytes=None,
+        observed_driver_total_bytes=None,
+        observed_driver_free_samples=None,
     ):
         """Snapshot a smart training layout and its actual runtime memory.
 
         ``peak_allocated_override`` / ``peak_reserved_override`` (bytes) let the
-        caller supply the true within-step peak high-water aggregated across
+        caller supply the true within-step allocator high-water aggregated across
         gradient accumulations. The live CUDA peak counter is reset per
         accumulation by the trainer's resolution sampler, so on multi-accumulation
         steps it under-reports; pass the step-aggregated peak so the controller
         governs on the real high-water.
+
+        ``observed_driver_free_min_bytes`` is a sampled driver-level minimum from
+        the training window. When present, it is the source of the reported
+        device peak; the allocator-derived value is kept separately as *_est.
         """
         while module is not None and not hasattr(module, "_memory_manager"):
             wrapped = getattr(module, "module", None)
@@ -2603,14 +3889,19 @@ class MemoryManager:
             return None
 
         state = _DEVICE_STATE.get(device, {})
-        ring_bytes = 0
-        seen = set()
-        for key in ("w_buffers", "b_buffers", "w_grad_buffers", "b_grad_buffers"):
-            for tensor in state.get(key, ()):
-                if tensor is None or id(tensor) in seen:
-                    continue
-                seen.add(id(tensor))
-                ring_bytes += cls._tensor_storage_bytes(tensor)
+        ring_live_bytes = int(state.get("ring_live_bytes", 0) or 0)
+        if ring_live_bytes <= 0:
+            seen = set()
+            for key in ("w_buffers", "b_buffers", "w_grad_buffers", "b_grad_buffers"):
+                for tensor in state.get(key, ()):
+                    if tensor is None or id(tensor) in seen:
+                        continue
+                    seen.add(id(tensor))
+                    ring_live_bytes += cls._tensor_storage_bytes(tensor)
+        ring_peak_bytes = max(
+            ring_live_bytes,
+            int(state.get("ring_peak_bytes", 0) or 0),
+        )
 
         allocated_bytes = int(memory[0] * 1024 ** 3)
         reserved_bytes = int(memory[1] * 1024 ** 3)
@@ -2629,10 +3920,10 @@ class MemoryManager:
             else torch.cuda.max_memory_allocated(device)
         )
         working_residual_bytes = max(
-            0, allocated_bytes - plan["resident_bytes"] - ring_bytes
+            0, allocated_bytes - plan["resident_bytes"] - ring_live_bytes
         )
         working_peak_bytes = max(
-            0, peak_allocated_bytes - plan["resident_bytes"] - ring_bytes
+            0, peak_allocated_bytes - plan["resident_bytes"] - ring_peak_bytes
         )
         # Kept under the original name for back-compat: the live auto-controller's
         # EMA reads ``working_reserve_used_gb``; changing its meaning would alter
@@ -2748,24 +4039,40 @@ class MemoryManager:
             )
         )
         autotune_state = getattr(mm, "_training_autotune_state", {}) or {}
-        # --- Peak-based device footprint (what actually matters for the cliff) --
-        # device_used_gb / device_free_gb (memory[2]/[3]) are read at step END --
-        # the TROUGH, after the backward graph frees. They overstate free because
-        # the activation peak is already gone. The number that governs spill is the
-        # WITHIN-STEP peak: our allocator high-water (peak_reserved, which already
-        # includes resident weights + ring + activations) plus the non-allocator
-        # overhead (CUDA ctx, cuDNN, WDDM/desktop, other apps). That overhead is
-        # measured at the trough but is ~constant across the step since only our
-        # allocator grows during the forward/backward. resident + ring are inside
-        # peak_reserved, so they are never added again.
+        # --- Device peak reporting ------------------------------------------
+        # memory[2]/[3] are step-end trough values. The allocator-derived peak is
+        # only an estimate because WDDM/driver/other usage may also move during a
+        # step. Prefer the trainer's sampled driver-free minimum when available.
         peak_reserved_gb = (
             peak_reserved_override
             if peak_reserved_override is not None
             else torch.cuda.max_memory_reserved(device)
         ) / 1024 ** 3
         device_other_gb = max(0.0, memory[2] - memory[1])
-        device_used_peak_gb = peak_reserved_gb + device_other_gb
-        device_free_peak_gb = max(0.0, memory[4] - device_used_peak_gb)
+        device_used_peak_est_gb = peak_reserved_gb + device_other_gb
+        device_free_peak_est_gb = max(0.0, memory[4] - device_used_peak_est_gb)
+        device_used_peak_gb = device_used_peak_est_gb
+        device_free_peak_gb = device_free_peak_est_gb
+        device_peak_source = "estimate"
+        driver_free_samples = observed_driver_free_samples
+        if observed_driver_free_min_bytes is not None:
+            try:
+                observed_free_gb = max(0.0, int(observed_driver_free_min_bytes) / 1024 ** 3)
+                observed_total_gb = (
+                    int(observed_driver_total_bytes) / 1024 ** 3
+                    if observed_driver_total_bytes is not None
+                    else memory[4]
+                )
+                device_free_peak_gb = min(observed_free_gb, observed_total_gb)
+                device_used_peak_gb = max(0.0, observed_total_gb - device_free_peak_gb)
+                device_peak_source = "observed"
+            except (TypeError, ValueError, OverflowError):
+                driver_free_samples = None
+        dxgi_fields = _dxgi_telemetry(
+            bounce_pool._cuda_device_index(device),
+            min_interval_s=0.5,
+        )
+        process_fields = _process_memory_telemetry()
         return {
             "strategy": "smart",
             "managed_layers": sum(
@@ -2834,8 +4141,12 @@ class MemoryManager:
             "prefetch_target_ready_gb": target_ready_gb,
             "prefetch_healthy": prefetch_healthy,
             "prefetch_unhealthy": prefetch_unhealthy,
-            "live_ring_gb": ring_bytes / 1024 ** 3,
+            "live_ring_gb": ring_live_bytes / 1024 ** 3,
+            "ring_peak_gb": ring_peak_bytes / 1024 ** 3,
             "pinned_cpu_gb": mm.pinned_weight_bytes / 1024 ** 3,
+            "pinned_ledger_total_gb": bounce_pool._pinned_bytes_total / 1024 ** 3,
+            **dxgi_fields,
+            **process_fields,
             "training_working_reserve_gb": plan["working_reserve_bytes"] / 1024 ** 3,
             # Peak within-step working set — the truthful "how much of the reserve
             # did we actually need" number. Use this when reading logs.
@@ -2858,10 +4169,15 @@ class MemoryManager:
             "device_total_gb": memory[4],
             # Non-allocator residents (CUDA ctx, cuDNN, WDDM/desktop, other apps).
             "device_other_gb": device_other_gb,
-            # PEAK (within-step): the footprint and free margin the spill cliff
-            # actually sees. This is what the auto controller governs on.
+            # PEAK (within-step): observed driver-level peak when sampled;
+            # otherwise the allocator-derived estimate. The estimate is retained
+            # separately so logs do not silently present it as fact.
             "device_used_peak_gb": device_used_peak_gb,
             "device_free_peak_gb": device_free_peak_gb,
+            "device_peak_source": device_peak_source,
+            "driver_free_samples": driver_free_samples,
+            "device_used_peak_est_gb": device_used_peak_est_gb,
+            "device_free_peak_est_gb": device_free_peak_est_gb,
             "peak_allocated_gb": (
                 torch.cuda.max_memory_allocated(device) / 1024 ** 3
             ),
@@ -2955,7 +4271,11 @@ class MemoryManager:
                     pool.schedule_version != version
                     or getattr(pool, "schedule_shape_key", None) != shape_key
                 ):
-                    pool.set_schedule(schedule, confidence=confidence)
+                    pool.set_schedule(
+                        schedule,
+                        confidence=confidence,
+                        filter_to_sources=True,
+                    )
                     pool.schedule_version = version
                     pool.schedule_shape_key = shape_key
                 elif schedule is None and (
@@ -3275,8 +4595,8 @@ class MemoryManager:
         original_smart_training_plan = (
             getattr(mm, "_smart_training_plan", None) if had_manager else None
         )
-        original_fp8_training_layers = (
-            getattr(mm, "_fp8_training_layers", 0) if had_manager else 0
+        original_fp8_training_requested = (
+            getattr(mm, "_fp8_training_requested", False) if had_manager else False
         )
         target = device if device is not None else args.get("device")
         try:
@@ -3292,6 +4612,7 @@ class MemoryManager:
             if hasattr(child, "_layer_memory_manager")
         }
         before = cls._cuda_memory(target)
+        pre_sampling_dxgi = cls._dxgi_shared_budget_snapshot_bytes(target)
         if diagnostics:
             if not had_manager:
                 training_layout = "none"
@@ -3342,9 +4663,11 @@ class MemoryManager:
                     module._memory_manager._smart_training_plan = (
                         original_smart_training_plan
                     )
-                    module._memory_manager._fp8_training_layers = (
-                        original_fp8_training_layers
+                    module._memory_manager._fp8_training_requested = (
+                        original_fp8_training_requested
                     )
+                    cls._refresh_training_fp8_flags(module, module._memory_manager)
+
                     if _OFFLOAD_PREFETCH_ENABLED and args.get("device") is not None:
                         cls._attach_prefetch_pool(module, args["device"])
                     # Sampling detach/restore replaces the streamed layout and
@@ -3370,6 +4693,28 @@ class MemoryManager:
                 f"{cls._format_cuda_memory(after_clear)}"
             )
         gib = 1024 ** 3
+        dxgi_settle = cls._wait_for_sampling_dxgi_settle(target)
+        if dxgi_settle.get("status") == "timeout":
+            snap = dxgi_settle.get("snapshot") or {}
+            _restore_offload()
+            if diagnostics:
+                print(
+                    "[MemoryManager] sampling mode: streamed fallback "
+                    "(DXGI NON_LOCAL did not settle after detach; "
+                    f"raw_headroom={snap.get('raw_headroom_bytes', 0) / gib:.2f} GiB "
+                    f"margin={snap.get('margin_bytes', 0) / gib:.2f} GiB "
+                    f"attempts={dxgi_settle.get('attempts')})"
+                )
+            yield
+            return
+        elif diagnostics and dxgi_settle.get("status") == "settled":
+            snap = dxgi_settle.get("snapshot") or {}
+            print(
+                "[MemoryManager] sampling DXGI settle: "
+                f"raw_headroom={snap.get('raw_headroom_bytes', 0) / gib:.2f} GiB "
+                f"margin={snap.get('margin_bytes', 0) / gib:.2f} GiB "
+                f"attempts={dxgi_settle.get('attempts')}"
+            )
         # Sampling working_reserve is configured INDEPENDENTLY from training (the
         # ``working_reserve_gib`` argument, fed from layer_offloading_smart_sampling_
         # working_reserve_gb). Their VRAM profiles are very different: sampling is
@@ -3404,13 +4749,11 @@ class MemoryManager:
             * gib
         )
         wddm_margin_bytes = int(
-            max(
-                float(
-                    _env("AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB", "1.0")
-                    if wddm_margin_gib is None
-                    else wddm_margin_gib
-                ),
-                wddm_hard_bytes / gib,
+            cls._resolve_wddm_margin_gib(
+                target,
+                wddm_margin_gib,
+                hard_gib=wddm_hard_bytes / gib,
+                env_name="AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB",
             )
             * gib
         )
@@ -3451,6 +4794,7 @@ class MemoryManager:
                     offload_percent=1.0,
                     ignore_modules=args.get("ignore_modules", []),
                     _offload_module_ids=plan["offload_ids"],
+                    pinned_weight_gib=args.get("pinned_weight_gib"),
                 )
                 cls._move_unmanaged_parameters(module, target)
             elif target is not None:
@@ -3599,6 +4943,7 @@ class MemoryManager:
             cls.attach(
                 module, target, offload_percent=1.0,
                 ignore_modules=ignore, _offload_module_ids=all_ids,
+                pinned_weight_gib=args.get("pinned_weight_gib"),
             )
             cls._move_unmanaged_parameters(module, target)
             if cuda_target:
@@ -3814,9 +5159,22 @@ class MemoryManager:
                 del module._mm_sampling_step_trim
             restore_started = time.perf_counter()
             _restore_offload()
+            post_restore_dxgi = cls._dxgi_shared_budget_snapshot_bytes(target)
             if diagnostics:
+                dxgi_restore_text = "dxgi_non_local=unavailable"
+                if pre_sampling_dxgi is not None and post_restore_dxgi is not None:
+                    delta_gib = (
+                        post_restore_dxgi["usage_bytes"] - pre_sampling_dxgi["usage_bytes"]
+                    ) / gib
+                    tolerance_gib = max(0.5, post_restore_dxgi.get("margin_bytes", 0) / gib * 0.25)
+                    status = "ok" if abs(delta_gib) <= tolerance_gib else "changed"
+                    dxgi_restore_text = (
+                        f"dxgi_non_local_usage={pre_sampling_dxgi['usage_bytes'] / gib:.2f}"
+                        f"->{post_restore_dxgi['usage_bytes'] / gib:.2f} GiB "
+                        f"delta={delta_gib:+.2f} GiB status={status}"
+                    )
                 print(
                     f"[MemoryManager] sampling end: current before restore "
                     f"{cls._format_cuda_memory(sample_end)}; restore={time.perf_counter() - restore_started:.2f}s; "
-                    f"{cls._format_cuda_memory(cls._cuda_memory(target))}"
+                    f"{cls._format_cuda_memory(cls._cuda_memory(target))}; {dxgi_restore_text}"
                 )

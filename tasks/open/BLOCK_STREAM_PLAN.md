@@ -1,5 +1,8 @@
 # True Block Streaming Plan
 
+> **git-bug:** `a696018` (open) — decide whether the block GPU ring should stay
+> gated. Status lives in the ticket; this file is the plan.
+
 ## Goal
 
 Make whole-transformer-block streaming a first-class option so the offload path
@@ -56,7 +59,43 @@ lock-cycles/forward into ~28 when `G` = a block's Linear count.
 This is unit-testable without CUDA (the pool degrades to plain tensors), so it
 ships with tests now.
 
-## Slice 2 (next, GPU-verified): per-block GPU ring stage
+## Slice 2 RESULT: ONE H2D per block — implemented, correct, OFF by default
+
+The point of block streaming is to cut the **number of transfers** (CPU submits),
+not just sync. The implementation packs a block's weight/bias leaves (qdata +
+scales for quantized, or the plain tensor for float) into one contiguous pinned
+host buffer, does a **single `cudaMemcpyAsync`** to GPU, then slices the device
+buffer back into per-Linear tensors that view it (`stage_block_forward` /
+`consume_block_resident` / `block_forward_done` / `_flatten_leaves` /
+`_rebuild_from_leaves` in manager_modules.py). Backward is untouched.
+
+Verified on RTX 4070 (`tests/test_block_forward_stage.py`, 6 tests): sliced-back
+weights bitwise-equal direct transfer, **one H2D per 8-Linear block** (224 -> 28
+submits/step measured), 2-block eviction correct, and end-to-end gradient parity
+within GEMM noise.
+
+Submit-count goal MET: `scripts/bench_block_stream_forward.py` shows
+**224 -> 28 H2D submits/step (8x fewer)**. But in that synthetic regime
+(pinned float, cheap submits) wall-time **regressed** (605 -> 836 ms/step):
+cheap submits mean cutting their count doesn't pay, while two costs show up:
+
+1. **Host packing on the critical path** — the pre-hook does N host memcpy into
+   the contiguous buffer on the training thread. Should move to the bounce
+   worker (off-thread), or pack weights contiguously once at attach time so no
+   per-step repack is needed.
+2. **No cross-block prefetch** — the pre-hook stages-then-waits, serializing
+   transfer with compute. Needs to stage block `i+depth` during block `i`.
+
+So it is **gated OFF** behind `AI_TOOLKIT_BLOCK_STREAM_GPU_RING=1`. The synthetic
+bench is the wrong regime to judge it: it has fast pinned transfers, whereas the
+target (Windows, expensive pageable/cudaMemcpy submits) is where 8x fewer submits
+should win. Validate on the real krea2 path via the offload profiler's submit_s.
+
+### Follow-ups to make it a wall-time win
+- Move the contiguous pack off-thread (bounce worker) or pre-pack at attach.
+- Cross-block prefetch (window-stage `i+depth` ahead) to restore pipelining.
+
+### Original Slice 2 sketch (per-block GPU ring stage)
 
 Coalesce the H2D + event management to block granularity:
 

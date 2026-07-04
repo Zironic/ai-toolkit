@@ -1,0 +1,5 @@
+cache/
+*.safetensors
+*.pt
+*.pth
+*.bin

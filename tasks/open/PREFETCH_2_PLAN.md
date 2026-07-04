@@ -1,5 +1,9 @@
 # Prefetch 2.0 Implementation Plan
 
+> **git-bug:** `ee6fa64` (open) — tune thresholds from real trace captures.
+> Core landed under `4bfb44c` (closed) — durable execution trace implemented.
+> Status lives in the tickets; this file is the plan.
+
 ## Goal
 
 Stop treating trace invalidation as the default recovery path. The memory

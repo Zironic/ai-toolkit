@@ -1,6 +1,9 @@
 # Upstream PR strategy for the memory-management work
 
-> **Terminology note.** The reserve vocabulary was renamed; see the glossary at the top of `AUTOTUNE_PLAN.md`. In short: **working_reserve** = our transient working set (the old "headroom"), **system_reserve** = measured uncontrolled VRAM (context/cuDNN/cudagraphs/Windows/other apps), **wddm_margin** = the cushion above the ~500 MB WDDM churn cliff, **usable** = what's left to place resident weights + ring into. "headroom" in the prose below means **working_reserve**.
+> **git-bug:** `db47d2d` (open) — isolate the resident-sampling PR first.
+> Status lives in the ticket; this file is the strategy.
+
+> **Terminology note.** The reserve vocabulary was renamed; see the glossary at the top of `../../tasks/open/AUTOTUNE_PLAN.md`. In short: **working_reserve** = our transient working set (the old "headroom"), **system_reserve** = measured uncontrolled VRAM (context/cuDNN/cudagraphs/Windows/other apps), **wddm_margin** = the cushion above the ~500 MB WDDM churn cliff, **usable** = what's left to place resident weights + ring into. "headroom" in the prose below means **working_reserve**.
 
 This document describes how to turn the local `faster-dop` memory-management work into upstreamable PRs for `ostris/ai-toolkit` without dragging in local-only workflow code.
 
@@ -18,12 +21,25 @@ The important correction from the earlier plan: do not lead with the full traini
 
 Fewer PRs are better here. The earlier 9-10 PR stack was useful for thinking, but it is too much review overhead and some of the ordering was backwards relative to the code's real dependency graph.
 
-| PR | Theme | Independent of training streaming core? | Build now? |
+The committed stack is **A then C**. B stays local (its measurements serve as
+evidence in C's PR description, but the tool is not upstream product surface).
+D is a small, self-contained follow-up once C lands.
+
+| PR | Theme | Depends on | Status |
 | --- | --- | --- | --- |
-| A | Fast resident sampling for quantized/turbo models + native FP8 sampling | Yes | Yes - lead PR |
-| B | Training performance log / lightweight benchmark tooling | Yes | Optional companion or hold locally |
-| C | Bounded training streaming core + bounce pool + safety fixes + automatic memory budget planner + stream attach adapter | This is the core | Later |
-| D | Native FP8 frozen-base training + checkpoint-retention tuning + deeper diagnostics | No, sits on C | Later |
+| A | Fast resident sampling for quantized/turbo models + native FP8 sampling | nothing | Lead PR - build now |
+| P | DXGI shared-budget probe + pinned-memory crash guard (bugfix framing: upstream `attach` pins unboundedly, `manager_modules.py:204`) | nothing | Standalone, parallel with A; minimal clamp only, intelligence stays in C |
+| C | Bounded training streaming core + bounce pool + safety fixes + automatic memory budget planner + stream attach adapter | P (soft: ledger-proxy fallback without it) | After A; gated on validation (see ticket) |
+| D | Native FP8 frozen-base training only | C (hard: lives inside C's streaming autograd fn) | Self-contained diff, stacked follow-up after C |
+| B | Training performance log / benchmark tooling | - | **Local only** - evidence for C, not a PR |
+
+Step-by-step execution plans: `tasks/open/UPSTREAM_PR_{A,P,C,D}_*_PLAN.md`.
+Post-#930 note: upstream `qfloat8` = Quanto once ostris/ai-toolkit PR #930
+merges; A and D must either scope native FP8 to torchao-layout tensors (with
+clean Quanto fallback) or ship dual-layout extraction - decide in A, mirror in D.
+
+Checkpoint-retention autotuning was dropped from D: in practice it did not
+help (local finding, 2026-07-05). The retention knob itself stays local.
 
 ## PR A: Fast resident sampling and native FP8 sampling
 
@@ -179,6 +195,15 @@ Do not include:
 
 ### Automatic memory budget planner
 
+> **Status note (2026-07-04).** This planner has since been built on `faster-dop`
+> and exceeds the spec below (per-bucket measured peaks, cross-bucket worst-case
+> governance, grow-to-measured-peak, measured `system_reserve`, manual-mode cliff
+> safety net), and the generalization items at the end of this PR C section are
+> largely done (no Krea/`.blocks` coupling, device-derived margins, guarded DXGI
+> fallback). What still gates PR C is *validation*, not generality — see the
+> ticket (`db47d2d`) for the current blocker list. The spec below is kept as the
+> design rationale.
+
 The smart training path should not require users to guess a headroom number before it is safe. Manual override is useful for development, but `auto` should be the upstream-friendly default.
 
 The planner should be resolution-aware. A single global headroom number is too crude because activation/workspace pressure scales with pixel count, while model weight size is mostly fixed. The safe plan is a two-stage policy: start conservative from static estimates, then refine per resolution bucket from measured peaks.
@@ -227,9 +252,12 @@ Generalization work before upstream:
 - decide whether the first integration should be Krea or a small synthetic/model-agnostic example;
 - keep heavy profiler local unless requested.
 
-## PR D: Native FP8 frozen-base training and checkpoint-retention tuning
+## PR D: Native FP8 frozen-base training
 
-This PR depends on PR C.
+This PR depends on PR C, but is otherwise very self-contained: the FP8-native
+forward/backward path is a drop-in alternative to the dequant path behind
+existing gates, touching only the streamed-linear forward and its attach-time
+gating. That makes it a small, reviewable follow-up rather than a second big PR.
 
 ### Native FP8 frozen-base training
 
@@ -249,24 +277,12 @@ Fallback:
 - trainable weights are not made FP8-native;
 - no optimizer-state FP8 changes.
 
-### Automatic checkpoint-retention tuning
+### Checkpoint-retention tuning: dropped from D (local only)
 
-This is the feature formerly described as selective checkpointing. Better name: automatic checkpoint-retention tuning.
-
-It is not only an offload feature. It can speed non-offloaded workloads by using spare VRAM to avoid recomputing some checkpointed blocks.
-
-Important design correction from local testing:
-
-- do not tune toward the largest retention value that fits;
-- tune toward the fastest measured step/backward time;
-- use memory spill/OOM risk only as a hard ceiling;
-- back off when step time regresses.
-
-Before upstream:
-
-- remove `.blocks`-only assumptions or make them a model-provided interface;
-- keep defaults conservative;
-- prove clean fallback on unsupported model structures.
+Formerly part of this PR. Dropped 2026-07-05: in practice the autotuned
+checkpoint retention did not deliver a useful speedup, so it is not worth
+upstream review cost or maintenance surface. The `checkpoint_autotuner.py`
+machinery and its config knob stay local-only.
 
 ## Local-only work to keep out of upstream PRs
 

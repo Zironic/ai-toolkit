@@ -62,6 +62,7 @@ export const defaultJobConfig: JobConfig = {
         save: {
           dtype: 'bf16',
           save_every: 250,
+          recovery_every: 0,
           max_step_saves_to_keep: 4,
           save_format: 'diffusers',
           push_to_hub: false,

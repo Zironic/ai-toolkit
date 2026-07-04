@@ -1,5 +1,10 @@
 # Dynamic working-reserve + keep_last autotune — implementation plan
 
+> **git-bug:** `68d3565` (open) — manual WDDM cliff guard: validate proactive
+> demotion across resolutions. This plan spans the broader working-reserve /
+> keep_last autotune; open sub-tickets track individual pieces. Status lives in
+> the tickets; this file is the plan.
+
 > **Terminology (renamed).** The single word "headroom" used to mean two
 > different things; the budget is now split into named buckets:
 >

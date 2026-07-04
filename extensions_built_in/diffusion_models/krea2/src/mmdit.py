@@ -371,6 +371,10 @@ class SingleStreamDiT(nn.Module):
         # we can detect when inference_resident changed the residency layout and
         # rebuild instead of running stale (guard-churning) compiled blocks.
         self._compiled_fingerprint: tuple | None = None
+        self._compiled_training_blocks: list | None = None
+        self._compiled_training_fingerprint: tuple | None = None
+        self._compiled_training_fp8_restores: list = []
+        self._compiled_training_lora_restores: list = []
 
         headdim = config.features // config.heads
         axes = [
@@ -468,6 +472,31 @@ class SingleStreamDiT(nn.Module):
             reasons.append("streaming_hook")
         if training:
             for sub in block.modules():
+                if isinstance(sub, torch.nn.Conv2d):
+                    reasons.append("conv_layer")
+                    break
+            for sub in block.modules():
+                weight = getattr(sub, "weight", None)
+                if (
+                    isinstance(weight, torch.nn.Parameter)
+                    and weight.requires_grad
+                    and getattr(weight, "dtype", None) is not None
+                    and weight.dtype.is_floating_point
+                ):
+                    reasons.append("trainable_base_weight")
+                    break
+            for sub in block.modules():
+                ready = getattr(sub, "_memory_management_compile_fast_lora_ready", None)
+                if ready is None:
+                    continue
+                try:
+                    if not ready():
+                        reasons.append("lora_untraceable")
+                        break
+                except Exception:
+                    reasons.append("lora_untraceable")
+                    break
+            for sub in block.modules():
                 weight = getattr(sub, "weight", None)
                 if (
                     isinstance(weight, torch.nn.Parameter)
@@ -477,7 +506,7 @@ class SingleStreamDiT(nn.Module):
                 ):
                     reasons.append("resident_fp8_tensor_subclass")
                     break
-        return reasons
+        return sorted(set(reasons))
 
     @classmethod
     def _block_compile_safe_for(cls, block, *, training: bool = False) -> bool:
@@ -563,6 +592,89 @@ class SingleStreamDiT(nn.Module):
         self._compiled_blocks = None
         self._compiled_fingerprint = None
 
+    def _enable_lora_compile_fast_path(self):
+        restores = []
+        for module in self.modules():
+            ready = getattr(module, "_memory_management_compile_fast_lora_ready", None)
+            if ready is None:
+                continue
+            try:
+                if not ready():
+                    continue
+            except Exception:
+                continue
+            previous = getattr(module, "_memory_management_compile_lora_fast", None)
+            module._memory_management_compile_lora_fast = True
+            restores.append((module, previous))
+        return restores
+
+    @staticmethod
+    def _disable_lora_compile_fast_path(restores):
+        for module, previous in reversed(restores):
+            if previous is None:
+                if hasattr(module, "_memory_management_compile_lora_fast"):
+                    del module._memory_management_compile_lora_fast
+            else:
+                module._memory_management_compile_lora_fast = previous
+
+    def enable_compiled_training(self, pinned_keys: set[str] | None = None):
+        """Compile permanent-resident blocks for grad-enabled training."""
+        self.disable_compiled_training()
+        mm = getattr(self, "_memory_manager", None)
+        fp8_restores = []
+        if mm is not None:
+            try:
+                fp8_restores, _ = mm.__class__._enable_fp8_training_compile(self)
+            except Exception:
+                fp8_restores = []
+        lora_restores = self._enable_lora_compile_fast_path()
+        try:
+            readiness = self.training_compile_readiness(pinned_keys)
+            clean = tuple(
+                item["index"] for item in readiness["statuses"]
+                if item["ready"]
+            )
+            compiled: list = [None] * len(self.blocks)
+            for i in clean:
+                compiled[i] = torch.compile(
+                    self.blocks[i],
+                    fullgraph=False,
+                    dynamic=False,
+                    mode="default",
+                )
+            self._compiled_training_blocks = compiled
+            self._compiled_training_fingerprint = clean
+            self._compiled_training_fp8_restores = fp8_restores
+            self._compiled_training_lora_restores = lora_restores
+            return len(clean), readiness["blocked_blocks"]
+        except Exception:
+            self._disable_lora_compile_fast_path(lora_restores)
+            if mm is not None:
+                mm.__class__._disable_fp8_training_compile(self, fp8_restores)
+            self._compiled_training_blocks = None
+            self._compiled_training_fingerprint = None
+            self._compiled_training_fp8_restores = []
+            self._compiled_training_lora_restores = []
+            raise
+
+    def disable_compiled_training(self):
+        mm = getattr(self, "_memory_manager", None)
+        if mm is not None:
+            try:
+                mm.__class__._disable_fp8_training_compile(
+                    self,
+                    getattr(self, "_compiled_training_fp8_restores", []),
+                )
+            except Exception:
+                pass
+        self._disable_lora_compile_fast_path(
+            getattr(self, "_compiled_training_lora_restores", [])
+        )
+        self._compiled_training_blocks = None
+        self._compiled_training_fingerprint = None
+        self._compiled_training_fp8_restores = []
+        self._compiled_training_lora_restores = []
+
     def forward(
         self,
         img: Tensor,
@@ -612,14 +724,21 @@ class SingleStreamDiT(nn.Module):
         # blocks. The trailing blocks keep their activations (no recompute),
         # which has the shortest residency since their backward runs first.
         checkpoint_cutoff = len(self.blocks) - self._checkpoint_keep_last
+        use_compiled_training = (
+            self._compiled_training_blocks is not None
+            and torch.is_grad_enabled()
+        )
         for i, block in enumerate(self.blocks):
+            block_call = block
+            if use_compiled_training and self._compiled_training_blocks[i] is not None:
+                block_call = self._compiled_training_blocks[i]
             if (
                 self.gradient_checkpointing
                 and torch.is_grad_enabled()
                 and i < checkpoint_cutoff
             ):
                 combined = checkpoint(
-                    block,
+                    block_call,
                     combined,
                     tvec,
                     freqs,
@@ -631,7 +750,7 @@ class SingleStreamDiT(nn.Module):
                 # streams weights falls through to the eager call below.
                 combined = self._compiled_blocks[i](combined, tvec, freqs, mask)
             else:
-                combined = block(combined, tvec, freqs, mask)
+                combined = block_call(combined, tvec, freqs, mask)
 
         final = self.last(combined, t)
         output = final[:, txtlen : txtlen + imglen, :]

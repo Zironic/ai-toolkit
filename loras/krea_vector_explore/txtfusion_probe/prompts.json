@@ -1,0 +1,303 @@
+{
+  "schema": "krea_txtfusion_probe_prompts.v1",
+  "safety": {
+    "adult_only": true,
+    "required_subject_prefix": "adult woman, age 30",
+    "notes": [
+      "Human-subject prompts must explicitly specify adult age.",
+      "Do not add ambiguous youth terms such as girl, teen, young, school, childlike, or minor."
+    ]
+  },
+  "phrases": [
+    {
+      "id": "blank",
+      "prompt": ""
+    },
+    {
+      "id": "covered_wide",
+      "prompt": "adult woman, age 30, fully covered, wide shot"
+    },
+    {
+      "id": "exposed_wide",
+      "prompt": "adult woman, age 30, fully exposed, wide shot"
+    },
+    {
+      "id": "covered_close",
+      "prompt": "adult woman, age 30, fully covered, close-up portrait"
+    },
+    {
+      "id": "exposed_close",
+      "prompt": "adult woman, age 30, fully exposed, close-up portrait"
+    },
+    {
+      "id": "covered_full_body",
+      "prompt": "adult woman, age 30, fully covered, full body"
+    },
+    {
+      "id": "exposed_full_body",
+      "prompt": "adult woman, age 30, fully exposed, full body"
+    },
+    {
+      "id": "covered_torso",
+      "prompt": "adult woman, age 30, fully covered, torso crop"
+    },
+    {
+      "id": "exposed_torso",
+      "prompt": "adult woman, age 30, fully exposed, torso crop"
+    },
+    {
+      "id": "fashion_wide",
+      "prompt": "adult woman, age 30, fashion editorial, fully covered, wide shot"
+    },
+    {
+      "id": "body_focus_wide",
+      "prompt": "adult woman, age 30, body-focused framing, fully exposed, wide shot"
+    },
+    {
+      "id": "clean_no_injury",
+      "prompt": "adult woman, age 30, clean injury-free scene, wide shot"
+    },
+    {
+      "id": "bloody_injury",
+      "prompt": "adult woman, age 30, visible bloody injury, wide shot"
+    },
+    {
+      "id": "no_weapon",
+      "prompt": "adult woman, age 30, empty hands, no weapon, wide shot"
+    },
+    {
+      "id": "holding_weapon",
+      "prompt": "adult woman, age 30, holding a weapon, wide shot"
+    },
+    {
+      "id": "sfw_wide",
+      "prompt": "adult woman, age 30, modest everyday clothing, wide shot"
+    },
+    {
+      "id": "sfw_close",
+      "prompt": "adult woman, age 30, modest everyday clothing, close-up portrait"
+    },
+    {
+      "id": "sfw_full_body",
+      "prompt": "adult woman, age 30, modest everyday clothing, full body"
+    },
+    {
+      "id": "sfw_torso",
+      "prompt": "adult woman, age 30, modest everyday clothing, torso crop"
+    },
+    {
+      "id": "sfw_fashion_wide",
+      "prompt": "adult woman, age 30, modest fashion editorial, wide shot"
+    },
+    {
+      "id": "anc_blank",
+      "prompt": "adult woman, age 30, full-body wide shot, feet visible, standing in neutral gray studio, camera at chest height, 50mm natural perspective, neutral serious expression, closed mouth, vivid blue eyes, matte natural skin, dry hair, plain gray background, no jewelry, no dramatic makeup, even studio lighting, realistic photograph"
+    },
+    {
+      "id": "anc_sfw",
+      "prompt": "adult woman, age 30, full-body wide shot, feet visible, standing in neutral gray studio, camera at chest height, 50mm natural perspective, neutral serious expression, closed mouth, vivid blue eyes, matte natural skin, dry hair, wearing matte black crop top and loose dark fabric pants, matte cotton no gloss, plain gray background, no jewelry, no latex, no leather, no dramatic makeup, even studio lighting, realistic photograph"
+    },
+    {
+      "id": "anc_exposed",
+      "prompt": "adult woman, age 30, full-body wide shot, feet visible, standing in neutral gray studio, camera at chest height, 50mm natural perspective, neutral serious expression, closed mouth, vivid blue eyes, matte natural skin, dry hair, bare torso exposed, wearing loose dark fabric pants, no latex no leather no gloss, plain gray background, no jewelry, no dramatic makeup, even studio lighting, realistic photograph"
+    },
+    {
+      "id": "anc_emotion",
+      "prompt": "adult woman, age 30, full-body wide shot, feet visible, standing in neutral gray studio, camera at chest height, 50mm natural perspective, crying expression with clear tears and dirt smudges on cheeks, vivid blue eyes, matte natural skin, dry hair, wearing matte black crop top and loose dark fabric pants, matte cotton no gloss, plain gray background, no jewelry, no latex, no leather, even studio lighting, realistic photograph"
+    },
+    {
+      "id": "jinx_blank",
+      "prompt": "Adult actress, age 27, portraying Jinx from Arcane, photographed on an iPhone in a full-length head-to-toe studio catalog shot; the entire figure is fully visible from the top of the head to the soles of both feet, with both feet completely visible, floor visible below the feet, contact shadows visible on the floor, and empty space above the head and on both sides of the body; the subject is centered in frame and occupies only about 50-55% of the image height, with a distant camera and a wide full-body composition, not a portrait crop, not a medium shot, not knees-up, not waist-up; she stands in a simple neutral studio room with a plain wall and clean floor, minimal props, and an uncluttered background, in a relaxed casual stance with one foot slightly forward, shoulders relaxed, one arm resting naturally by her side, the other arm resting naturally, and a calm focused expression; she has pale skin and a slender dancer physique, a narrow ribcage, lean abdomen, tight core, ribcage definition, narrow waist, pronounced lower ribcage, lower-abdominal contour, visible iliac crest, deep lateral subcostal hollow, fuller bust, a clean V-shaped lower-torso shadow below the navel, and a defined hip curve; she has clear vivid electric-blue eyes with medium-large irises, a dark limbal ring, deeper-set eyes, slightly heavier upper lids, clear sclera, a direct steady gaze, and subtle natural shadowing around the eyes; her face is long and narrow with high cheekbones, subtle under-eye hollows, a defined brow bone, straighter darker brows, a slim straight nose, a thinner upper lip with a softly fuller lower lip, and restrained natural asymmetry; her hair is Jinx-inspired on a real person, with salon-dyed intensely saturated electric-blue human hair, slightly darker natural roots, visible scalp at the part, a natural hairline with fine baby hairs, and a heavy asymmetrical fringe sweeping down across one side of the face, with exactly two long thick braids, semi-matte sheen, realistic strand separation, a few flyaways, a few escaped strands, lightly hairspray-set fringe, subtle product-shaped pieceiness, and braids that feel weighty and real and hang naturally with gravity; each braid has simple antique-brass cuffs in the form of snug cylindrical tube-shaped sleeves centered directly around the braid, not side clips or decorative plates, with most cuffs only slightly wider than the braid itself, kept simple, fitted, functional, and repeatable; the hair color is intensely saturated electric blue with deep cobalt-blue mids, sapphire-blue shadows, and bright cyan-blue highlights, reading as rich vivid electric blue rather than muted, pastel, or gray-blue, with the braids staying strongly blue from root to tip and visibly saturated even in shadow; the braids are half as thick as her wrists and long enough to reach her shins, and both braids remain fully visible within the frame; she has Jinx-inspired clean ornamental turquoise-blue cloud tattoos with crisp but healed linework, simplified graphic cloud shapes adapted into real tattoo ink, matte faded blue-green pigment, soft skin integration, no raised edges, and no decal sheen, sparse and asymmetrical and limited to the right shoulder, right upper arm, right ribs, and right abdomen, reading as actual body tattoos rather than body paint, stickers, printed transfers, or costume appliques."
+    },
+    {
+      "id": "jinx_exposed",
+      "prompt": "Adult actress, age 27, portraying Jinx from Arcane, photographed on an iPhone in a full-length head-to-toe studio catalog shot; the entire figure is fully visible from the top of the head to the soles of both feet, with both feet completely visible, floor visible below the feet, contact shadows visible on the floor, and empty space above the head and on both sides of the body; the subject is centered in frame and occupies only about 50-55% of the image height, with a distant camera and a wide full-body composition, not a portrait crop, not a medium shot, not knees-up, not waist-up; she stands in a simple neutral studio room with a plain wall and clean floor, minimal props, and an uncluttered background, in a relaxed casual stance with one foot slightly forward, shoulders relaxed, one arm resting naturally by her side, the other arm resting naturally, and a calm focused expression; she has pale skin and a slender dancer physique, a narrow ribcage, lean abdomen, tight core, ribcage definition, narrow waist, pronounced lower ribcage, lower-abdominal contour, visible iliac crest, deep lateral subcostal hollow, fuller bust, a clean V-shaped lower-torso shadow below the navel, and a defined hip curve; she has clear vivid electric-blue eyes with medium-large irises, a dark limbal ring, deeper-set eyes, slightly heavier upper lids, clear sclera, a direct steady gaze, and subtle natural shadowing around the eyes; her face is long and narrow with high cheekbones, subtle under-eye hollows, a defined brow bone, straighter darker brows, a slim straight nose, a thinner upper lip with a softly fuller lower lip, and restrained natural asymmetry; her hair is Jinx-inspired on a real person, with salon-dyed intensely saturated electric-blue human hair, slightly darker natural roots, visible scalp at the part, a natural hairline with fine baby hairs, and a heavy asymmetrical fringe sweeping down across one side of the face, with exactly two long thick braids, semi-matte sheen, realistic strand separation, a few flyaways, a few escaped strands, lightly hairspray-set fringe, subtle product-shaped pieceiness, and braids that feel weighty and real and hang naturally with gravity; each braid has simple antique-brass cuffs in the form of snug cylindrical tube-shaped sleeves centered directly around the braid, not side clips or decorative plates, with most cuffs only slightly wider than the braid itself, kept simple, fitted, functional, and repeatable; the hair color is intensely saturated electric blue with deep cobalt-blue mids, sapphire-blue shadows, and bright cyan-blue highlights, reading as rich vivid electric blue rather than muted, pastel, or gray-blue, with the braids staying strongly blue from root to tip and visibly saturated even in shadow; the braids are half as thick as her wrists and long enough to reach her shins, and both braids remain fully visible within the frame; she has Jinx-inspired clean ornamental turquoise-blue cloud tattoos with crisp but healed linework, simplified graphic cloud shapes adapted into real tattoo ink, matte faded blue-green pigment, soft skin integration, no raised edges, and no decal sheen, sparse and asymmetrical and limited to the right shoulder, right upper arm, right ribs, and right abdomen, reading as actual body tattoos rather than body paint, stickers, printed transfers, or costume appliques. She is fully exposed."
+    },
+    {
+      "id": "jinx_clothed",
+      "prompt": "Adult actress, age 27, portraying Jinx from Arcane, photographed on an iPhone in a full-length head-to-toe studio catalog shot; the entire figure is fully visible from the top of the head to the soles of both feet, with both feet completely visible, floor visible below the feet, contact shadows visible on the floor, and empty space above the head and on both sides of the body; the subject is centered in frame and occupies only about 50-55% of the image height, with a distant camera and a wide full-body composition, not a portrait crop, not a medium shot, not knees-up, not waist-up; she stands in a simple neutral studio room with a plain wall and clean floor, minimal props, and an uncluttered background, in a relaxed casual stance with one foot slightly forward, shoulders relaxed, one arm resting naturally by her side, the other arm resting naturally, and a calm focused expression; she has pale skin and a slender dancer physique, a narrow ribcage, lean abdomen, tight core, ribcage definition, narrow waist, pronounced lower ribcage, lower-abdominal contour, visible iliac crest, deep lateral subcostal hollow, fuller bust, a clean V-shaped lower-torso shadow below the navel, and a defined hip curve; she has clear vivid electric-blue eyes with medium-large irises, a dark limbal ring, deeper-set eyes, slightly heavier upper lids, clear sclera, a direct steady gaze, and subtle natural shadowing around the eyes; her face is long and narrow with high cheekbones, subtle under-eye hollows, a defined brow bone, straighter darker brows, a slim straight nose, a thinner upper lip with a softly fuller lower lip, and restrained natural asymmetry; her hair is Jinx-inspired on a real person, with salon-dyed intensely saturated electric-blue human hair, slightly darker natural roots, visible scalp at the part, a natural hairline with fine baby hairs, and a heavy asymmetrical fringe sweeping down across one side of the face, with exactly two long thick braids, semi-matte sheen, realistic strand separation, a few flyaways, a few escaped strands, lightly hairspray-set fringe, subtle product-shaped pieceiness, and braids that feel weighty and real and hang naturally with gravity; each braid has simple antique-brass cuffs in the form of snug cylindrical tube-shaped sleeves centered directly around the braid, not side clips or decorative plates, with most cuffs only slightly wider than the braid itself, kept simple, fitted, functional, and repeatable; the hair color is intensely saturated electric blue with deep cobalt-blue mids, sapphire-blue shadows, and bright cyan-blue highlights, reading as rich vivid electric blue rather than muted, pastel, or gray-blue, with the braids staying strongly blue from root to tip and visibly saturated even in shadow; the braids are half as thick as her wrists and long enough to reach her shins, and both braids remain fully visible within the frame; she has Jinx-inspired clean ornamental turquoise-blue cloud tattoos with crisp but healed linework, simplified graphic cloud shapes adapted into real tattoo ink, matte faded blue-green pigment, soft skin integration, no raised edges, and no decal sheen, sparse and asymmetrical and limited to the right shoulder, right upper arm, right ribs, and right abdomen, reading as actual body tattoos rather than body paint, stickers, printed transfers, or costume appliques. She wears a fitted dark asymmetrical-hem crop top, worn dark leather shorts with belt straps and buckles, fingerless gloves, and thigh-high boots, all matte dark fabric and leather with subtle scuffing and wear, reading as real worn clothing rather than a costume."
+    },
+    {
+      "id": "emotion_face_neutral",
+      "prompt": "adult woman, age 30, close-up portrait, face clearly visible, neutral calm expression, relaxed brows, dry eyes, clean cheeks, closed mouth, natural skin texture, even soft studio lighting, realistic photograph"
+    },
+    {
+      "id": "emotion_face_distressed",
+      "prompt": "adult woman, age 30, close-up portrait, face clearly visible, distressed sad expression, tense brows, dry eyes, clean cheeks, closed mouth, natural skin texture, even soft studio lighting, realistic photograph"
+    },
+    {
+      "id": "emotion_face_tears",
+      "prompt": "adult woman, age 30, close-up portrait, face clearly visible, neutral mouth, visible tears on her cheeks, wet lower eyelids, natural skin texture, even soft studio lighting, realistic photograph"
+    },
+    {
+      "id": "emotion_face_crying",
+      "prompt": "adult woman, age 30, close-up portrait, face clearly visible, crying expression, clear tears on her cheeks, wet lower eyelids, tense brows, parted mouth, natural skin texture, even soft studio lighting, realistic photograph"
+    },
+    {
+      "id": "jinx_close_neutral",
+      "prompt": "Adult actress, age 27, portraying Jinx from Arcane, close-up portrait with face clearly visible, vivid electric-blue eyes, pale skin, long narrow face, high cheekbones, dark brows, slim straight nose, asymmetrical electric-blue fringe, two thick electric-blue braids partly visible at frame edges, calm focused expression, relaxed brows, dry eyes, clean cheeks, closed mouth, realistic iPhone photograph, neutral studio lighting"
+    },
+    {
+      "id": "jinx_close_crying",
+      "prompt": "Adult actress, age 27, portraying Jinx from Arcane, close-up portrait with face clearly visible, vivid electric-blue eyes, pale skin, long narrow face, high cheekbones, dark brows, slim straight nose, asymmetrical electric-blue fringe, two thick electric-blue braids partly visible at frame edges, crying expression, clear tears on her cheeks, wet lower eyelids, tense brows, parted mouth, realistic iPhone photograph, neutral studio lighting"
+    }
+  ],
+  "contrast_pairs": [
+    {
+      "id": "covered_to_exposed_wide",
+      "negative": "covered_wide",
+      "positive": "exposed_wide",
+      "label": "covered -> fully exposed, wide shot"
+    },
+    {
+      "id": "covered_to_exposed_full_body",
+      "negative": "covered_full_body",
+      "positive": "exposed_full_body",
+      "label": "covered -> fully exposed, full body"
+    },
+    {
+      "id": "wide_to_close_covered",
+      "negative": "covered_wide",
+      "positive": "covered_close",
+      "label": "wide shot -> close-up portrait, covered"
+    },
+    {
+      "id": "wide_to_close_exposed",
+      "negative": "exposed_wide",
+      "positive": "exposed_close",
+      "label": "wide shot -> close-up portrait, exposed"
+    },
+    {
+      "id": "full_body_to_torso_covered",
+      "negative": "covered_full_body",
+      "positive": "covered_torso",
+      "label": "full body -> torso crop, covered"
+    },
+    {
+      "id": "full_body_to_torso_exposed",
+      "negative": "exposed_full_body",
+      "positive": "exposed_torso",
+      "label": "full body -> torso crop, exposed"
+    },
+    {
+      "id": "fashion_to_body_focus",
+      "negative": "fashion_wide",
+      "positive": "body_focus_wide",
+      "label": "fashion editorial -> body-focused framing"
+    },
+    {
+      "id": "clean_to_bloody",
+      "negative": "clean_no_injury",
+      "positive": "bloody_injury",
+      "label": "clean injury-free -> bloody injury"
+    },
+    {
+      "id": "no_weapon_to_weapon",
+      "negative": "no_weapon",
+      "positive": "holding_weapon",
+      "label": "no weapon -> holding weapon"
+    },
+    {
+      "id": "sfw_to_exposed_wide",
+      "negative": "sfw_wide",
+      "positive": "exposed_wide",
+      "label": "SFW modest -> fully exposed, wide shot"
+    },
+    {
+      "id": "sfw_to_exposed_close",
+      "negative": "sfw_close",
+      "positive": "exposed_close",
+      "label": "SFW modest -> fully exposed, close-up portrait"
+    },
+    {
+      "id": "sfw_to_exposed_full_body",
+      "negative": "sfw_full_body",
+      "positive": "exposed_full_body",
+      "label": "SFW modest -> fully exposed, full body"
+    },
+    {
+      "id": "sfw_to_exposed_torso",
+      "negative": "sfw_torso",
+      "positive": "exposed_torso",
+      "label": "SFW modest -> fully exposed, torso crop"
+    },
+    {
+      "id": "sfw_fashion_to_body_focus",
+      "negative": "sfw_fashion_wide",
+      "positive": "body_focus_wide",
+      "label": "SFW fashion -> body-focused exposed framing"
+    },
+    {
+      "id": "anc_sfw_to_exposed",
+      "negative": "anc_sfw",
+      "positive": "anc_exposed",
+      "label": "anchored SFW -> anchored exposed (clothing only changes)"
+    },
+    {
+      "id": "anc_blank_to_exposed",
+      "negative": "anc_blank",
+      "positive": "anc_exposed",
+      "label": "anchored blank -> anchored exposed"
+    },
+    {
+      "id": "anc_sfw_to_emotion",
+      "negative": "anc_sfw",
+      "positive": "anc_emotion",
+      "label": "anchored SFW -> anchored crying/dirt (expression drift probe)"
+    },
+    {
+      "id": "jinx_clothed_to_exposed",
+      "negative": "jinx_clothed",
+      "positive": "jinx_exposed",
+      "label": "Jinx described outfit -> Jinx fully exposed (clothing only changes)"
+    },
+    {
+      "id": "jinx_blank_to_exposed",
+      "negative": "jinx_blank",
+      "positive": "jinx_exposed",
+      "label": "Jinx no clothing clause -> Jinx fully exposed"
+    },
+    {
+      "id": "jinx_blank_to_clothed",
+      "negative": "jinx_blank",
+      "positive": "jinx_clothed",
+      "label": "Jinx no clothing clause -> Jinx described outfit"
+    },
+    {
+      "id": "emotion_neutral_to_distressed",
+      "negative": "emotion_face_neutral",
+      "positive": "emotion_face_distressed",
+      "label": "neutral expression -> distressed expression without tears"
+    },
+    {
+      "id": "emotion_neutral_to_tears",
+      "negative": "emotion_face_neutral",
+      "positive": "emotion_face_tears",
+      "label": "neutral expression -> visible tears with neutral mouth"
+    },
+    {
+      "id": "emotion_distressed_to_crying",
+      "negative": "emotion_face_distressed",
+      "positive": "emotion_face_crying",
+      "label": "distressed dry face -> crying with tears"
+    },
+    {
+      "id": "emotion_neutral_to_crying",
+      "negative": "emotion_face_neutral",
+      "positive": "emotion_face_crying",
+      "label": "neutral expression -> full crying expression"
+    },
+    {
+      "id": "emotion_tears_to_crying",
+      "negative": "emotion_face_tears",
+      "positive": "emotion_face_crying",
+      "label": "tears only -> full crying expression"
+    },
+    {
+      "id": "jinx_close_neutral_to_crying",
+      "negative": "jinx_close_neutral",
+      "positive": "jinx_close_crying",
+      "label": "Jinx close neutral expression -> Jinx close crying expression"
+    }
+  ]
+}

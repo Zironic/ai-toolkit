@@ -8,8 +8,10 @@ I simply modified it to work with a memory management model and with AI Toolkit'
 
 import atexit
 import collections
+import gc
 import os
 import time
+import threading
 
 import torch
 import torch.nn as nn
@@ -17,7 +19,15 @@ import torch.nn.functional as F
 from typing import TYPE_CHECKING, Optional, Tuple
 from torch.overrides import has_torch_function_unary  # (ADD) torchao detection
 
-from .bounce_pool import get_pool as get_prefetch_pool
+from .bounce_pool import (
+    get_pool as get_prefetch_pool,
+    pinned_bytes_headroom,
+    register_pinned_bytes,
+    release_pinned_bytes,
+    get_dxgi_meminfo,
+    dxgi_spill_reserve_bytes,
+    _cuda_device_index,
+)
 
 if TYPE_CHECKING:
     from .manager import MemoryManager
@@ -125,6 +135,29 @@ def _profile_bytes(t: Optional[torch.Tensor]) -> int:
     except Exception:
         return t.numel() * t.element_size()
     return sum(_profile_bytes(getattr(t, name, None)) for name in names)
+
+
+def _ring_current_bytes(state) -> int:
+    seen = set()
+    total = 0
+    for key in ("w_buffers", "b_buffers", "w_grad_buffers", "b_grad_buffers"):
+        for tensor in state.get(key, ()) or ():
+            if tensor is None or id(tensor) in seen:
+                continue
+            seen.add(id(tensor))
+            total += _profile_bytes(tensor)
+    for entry in state.get("block_ring", ()) or ():
+        try:
+            total += int(entry.get("bytes", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return int(total)
+
+
+def _record_ring_peak(state) -> None:
+    current = _ring_current_bytes(state)
+    state["ring_live_bytes"] = current
+    state["ring_peak_bytes"] = max(int(state.get("ring_peak_bytes", 0)), current)
 
 
 def _profile_is_pinned(t: Optional[torch.Tensor]) -> bool:
@@ -315,6 +348,14 @@ _TRACE_ENABLED = os.environ.get("AI_TOOLKIT_OFFLOAD_TRACE", "0").lower() not in 
 # change in access pattern (e.g. a config switch mid-run) self-heals.
 _TRACE_REDISCOVER_AFTER = int(os.environ.get("AI_TOOLKIT_OFFLOAD_TRACE_REDISCOVER", "3"))
 
+# schedule_by_shape_key holds one full per-step access list (~1700+ entries for
+# a Krea2-sized model) per distinct (resolution, config-flags) shape key ever
+# seen. Bucketed aspect-ratio datasets can produce dozens to hundreds of
+# distinct shape keys over a run with no natural end -- without a cap this
+# dict only ever grows for the life of the process. Evict least-recently-used
+# once the cap is hit.
+_TRACE_MAX_SHAPE_KEYS = int(os.environ.get("AI_TOOLKIT_OFFLOAD_TRACE_MAX_SHAPES", "64"))
+
 _Access = collections.namedtuple(
     "_Access", ("layer_key", "operation", "fp8_bytes", "materialized_bytes")
 )
@@ -328,7 +369,7 @@ class _OffloadTrace:
         self.mode = "idle"            # idle | recording | replaying
         self.recording: list = []
         self.frozen: Optional[list] = None
-        self.schedule_by_shape_key: dict = {}
+        self.schedule_by_shape_key: "collections.OrderedDict" = collections.OrderedDict()
         self.compatible_fallback_blocked_shape_keys = set()
         self.current_shape_key = None
         self.cursor = 0
@@ -347,6 +388,8 @@ class _OffloadTrace:
             return
         self.current_shape_key = shape_key
         self.frozen = self.schedule_by_shape_key.get(shape_key)
+        if self.frozen is not None:
+            self.schedule_by_shape_key.move_to_end(shape_key)
         self.cursor = 0
         self.diverged_this_step = False
         self.first_divergence = None
@@ -394,6 +437,9 @@ class _OffloadTrace:
         if self.mode == "recording":
             self.frozen = self.recording
             self.schedule_by_shape_key[self.current_shape_key] = self.frozen
+            self.schedule_by_shape_key.move_to_end(self.current_shape_key)
+            while len(self.schedule_by_shape_key) > _TRACE_MAX_SHAPE_KEYS:
+                self.schedule_by_shape_key.popitem(last=False)
             self.compatible_fallback_blocked_shape_keys.discard(self.current_shape_key)
             self.recording = []
             self.version += 1
@@ -464,6 +510,11 @@ _OFFLOAD_TRACE = _OffloadTrace()
 
 def offload_step_begin(shape_key=None) -> None:
     _OFFLOAD_TRACE.step_begin(shape_key=shape_key)
+    for state in _DEVICE_STATE.values():
+        if isinstance(state, dict):
+            current = _ring_current_bytes(state)
+            state["ring_live_bytes"] = current
+            state["ring_peak_bytes"] = current
 
 
 def offload_step_end() -> None:
@@ -652,6 +703,17 @@ def _get_device_state(device: torch.device):
                 "b_grad_buffers": [None] * d,
                 "grad_compute_done": [torch.cuda.Event() for _ in range(d)],
                 "grad_xfer_done": [torch.cuda.Event() for _ in range(d)],
+                # block-coalesced forward staging (Slice 2, opt-in; inert until
+                # set_block_stream_enabled). block_resident: layer_key ->
+                # (w_gpu, b_gpu, ready_event); block_ring: FIFO of staged blocks.
+                "block_stream_enabled": False,
+                "block_depth": 2,
+                "block_resident": {},
+                "block_ring": [],
+                "block_h2d_count": 0,
+                "block_layer_count": 0,
+                "ring_live_bytes": 0,
+                "ring_peak_bytes": 0,
             }
     return _DEVICE_STATE[device]
 
@@ -681,7 +743,18 @@ def _stage_forward_weight(
     ticket = None
     src_w, src_b = weight_cpu, bias_cpu
     if pool is not None:
-        src_w, src_b, ticket = pool.acquire(layer_key, weight_cpu, bias_cpu, operation=operation)
+        # Pinned-source bypass: a weight that is already page-locked needs no
+        # bounce copy — the H2D below runs async straight from it. Skip the pool
+        # (no redundant pinned->pinned copy, worker stays idle) but advance its
+        # cursor so prefetch stays aligned for the pageable layers that do need it.
+        if _profile_is_pinned(weight_cpu) and (
+            bias_cpu is None or _profile_is_pinned(bias_cpu)
+        ):
+            pool.consume_without_transfer(layer_key, operation=operation)
+        else:
+            src_w, src_b, ticket = pool.acquire(
+                layer_key, weight_cpu, bias_cpu, operation=operation
+            )
     prof = (
         _begin_layer_profile(src_w, src_b, layer_key, operation)
         if _PROFILE_ENABLED else None
@@ -720,6 +793,7 @@ def _stage_forward_weight(
         state["b_buffers"][idx] = (
             src_b.to(device, non_blocking=True) if src_b is not None else None
         )
+        _record_ring_peak(state)
         if prof is not None:
             # CPU wall inside the enqueue: ~0 for pinned, = staging/pagefile
             # copy time for a pageable source.
@@ -814,6 +888,198 @@ def _stage_backward_weight(
 
 def _release_backward_weight_slot(state, idx):
     _release_forward_slot(state, idx)
+
+
+# ---- block-coalesced forward staging (Slice 2, opt-in) -------------------
+#
+# True block streaming. Instead of one H2D + ring-slot/event pair per Linear, a
+# block forward-pre-hook stages all of a block's streamed weights in ONE
+# transfer-stream burst under a single ready event, into a small ring of
+# whole-block buffers (default 2 blocks: one executing, one prefetching). Each
+# Linear's forward then consumes its already-resident weight via
+# ``consume_block_resident`` instead of issuing its own H2D.
+#
+# Safe by construction: this is forward-only. If nothing staged a layer,
+# ``consume_block_resident`` returns None and the Linear takes the unchanged
+# per-Linear path. Backward staging is never touched, so gradients are computed
+# from the same weight values either way. Quantized weights are dequantized per
+# Linear at stage time (no wrapper repacking); fp8-native forward and conv keep
+# the per-Linear path.
+
+
+def set_block_stream_enabled(device, enabled, depth=2):
+    state = _get_device_state(device)
+    state["block_stream_enabled"] = bool(enabled)
+    state["block_depth"] = max(1, int(depth))
+    if not enabled:
+        reset_block_stream(device)
+
+
+def reset_block_stream(device):
+    state = _DEVICE_STATE.get(torch.device(device))
+    if not state:
+        return
+    state["block_resident"] = {}
+    state["block_ring"] = []
+    state["block_h2d_count"] = 0
+    state["block_layer_count"] = 0
+    state["ring_live_bytes"] = _ring_current_bytes(state)
+
+
+def block_stream_stats(device):
+    """(h2d_count, layer_count): block H2D copies vs layers they covered."""
+    state = _DEVICE_STATE.get(torch.device(device))
+    if not state:
+        return 0, 0
+    return state.get("block_h2d_count", 0), state.get("block_layer_count", 0)
+
+
+def _flatten_leaves(t):
+    """Depth-first list of the physical leaf tensors of a (maybe wrapper) tensor.
+    A plain tensor is its own single leaf; a quantized wrapper yields its qdata,
+    scale, etc. in ``__tensor_flatten__`` order."""
+    try:
+        names, _ = t.__tensor_flatten__()
+    except Exception:
+        return [t]
+    out = []
+    for name in names:
+        inner = getattr(t, name, None)
+        if inner is not None:
+            out.extend(_flatten_leaves(inner))
+    return out
+
+
+def _rebuild_from_leaves(src, leaves_iter):
+    """Rebuild a tensor with ``src``'s type/metadata, backed by the next device
+    leaves from ``leaves_iter`` (already filled by the block H2D) — no copy."""
+    try:
+        names, ctx = src.__tensor_flatten__()
+    except Exception:
+        return next(leaves_iter)
+    moved = {}
+    for name in names:
+        inner = getattr(src, name, None)
+        moved[name] = None if inner is None else _rebuild_from_leaves(inner, leaves_iter)
+    return type(src).__tensor_unflatten__(moved, ctx, src.size(), src.stride())
+
+
+_BLOCK_LEAF_ALIGN = 256  # generous alignment so every leaf's uint8 slice .view()s cleanly
+
+
+def stage_block_forward(device, block_key, linears, compute_dtype=None):
+    """Stage a whole block's streamed weights with a SINGLE H2D copy.
+
+    The block's weight/bias leaves (qdata + scales for quantized, or the plain
+    tensor for float) are packed into one contiguous pinned host buffer, copied
+    to GPU in one ``cudaMemcpyAsync``, then sliced back into per-Linear tensors
+    that view the single device buffer. This is the point of block streaming:
+    one transfer (one CPU submit) per block instead of one per Linear.
+
+    ``linears``: ``(layer_key, weight_cpu, bias_cpu)`` list. Stored in
+    ``block_resident`` as ``(w_gpu, b_gpu, ready_event)`` — still quantized for
+    quantized weights; the Linear forward dequantizes per layer as usual.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return
+    state = _get_device_state(device)
+    if not state.get("block_stream_enabled"):
+        return
+    resident = state["block_resident"]
+    ring = state["block_ring"]
+    depth = state["block_depth"]
+    ts = state["transfer_stream"]
+
+    # 1) Flatten every weight/bias to physical leaves and lay them out in one
+    #    aligned byte buffer.
+    items = []        # (layer_key, weight_cpu, bias_cpu, n_w_leaves, n_b_leaves)
+    src_leaves = []
+    for (layer_key, weight_cpu, bias_cpu) in linears:
+        w_leaves = _flatten_leaves(weight_cpu)
+        b_leaves = _flatten_leaves(bias_cpu) if bias_cpu is not None else []
+        items.append((layer_key, weight_cpu, bias_cpu, len(w_leaves), len(b_leaves)))
+        src_leaves.extend(w_leaves)
+        src_leaves.extend(b_leaves)
+    if not src_leaves:
+        return
+    align = _BLOCK_LEAF_ALIGN
+    offsets = []
+    total = 0
+    for leaf in src_leaves:
+        total = (total + align - 1) // align * align
+        offsets.append(total)
+        total += leaf.numel() * leaf.element_size()
+
+    # 2) Pack the leaves into one pinned host buffer (host memcpy, no CUDA submit).
+    host = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+    for leaf, off in zip(src_leaves, offsets):
+        nb = leaf.numel() * leaf.element_size()
+        host[off:off + nb].view(leaf.dtype).reshape(leaf.shape).copy_(leaf)
+
+    ready_event = torch.cuda.Event()
+    free_event = torch.cuda.Event()
+    staged_keys = []
+    with torch.cuda.stream(ts):
+        while len(ring) >= depth:
+            old = ring.pop(0)
+            if old["free"] is not None:
+                ts.wait_event(old["free"])
+            for k in old["layer_keys"]:
+                resident.pop(k, None)
+        # 3) ONE H2D for the whole block.
+        dev = host.to(device, non_blocking=True)
+        state["block_h2d_count"] = state.get("block_h2d_count", 0) + 1
+        state["block_layer_count"] = state.get("block_layer_count", 0) + len(items)
+        # 4) Slice the device buffer back into per-leaf views, then rebuild each
+        #    weight/bias tensor (sharing the one device buffer's storage).
+        dev_leaves = []
+        for leaf, off in zip(src_leaves, offsets):
+            nb = leaf.numel() * leaf.element_size()
+            dev_leaves.append(
+                dev[off:off + nb].view(leaf.dtype).reshape(leaf.shape)
+            )
+        it = iter(dev_leaves)
+        for (layer_key, weight_cpu, bias_cpu, n_w, n_b) in items:
+            w_gpu = _rebuild_from_leaves(weight_cpu, it)
+            b_gpu = _rebuild_from_leaves(bias_cpu, it) if n_b else None
+            resident[layer_key] = (w_gpu, b_gpu, ready_event)
+            staged_keys.append(layer_key)
+        ready_event.record(ts)
+    ring.append({
+        "key": block_key,
+        "layer_keys": staged_keys,
+        "free": free_event,
+        "bytes": int(total),
+    })
+    _record_ring_peak(state)
+
+
+def block_forward_done(device, block_key):
+    """Record a block's compute-free event (forward post-hook) so its buffers are
+    only reclaimed once the block's matmuls have finished reading them."""
+    state = _DEVICE_STATE.get(torch.device(device))
+    if not state or not state.get("block_stream_enabled"):
+        return
+    cs = torch.cuda.current_stream()
+    for entry in reversed(state.get("block_ring", [])):
+        if entry["key"] == block_key and entry["free"] is not None:
+            entry["free"].record(cs)
+            break
+
+
+def consume_block_resident(device, layer_key):
+    """Return ``(w_gpu, b_gpu)`` for a block-staged layer after making the compute
+    stream wait on the block's H2D, or None if the layer was not block-staged."""
+    state = _DEVICE_STATE.get(torch.device(device))
+    if not state or not state.get("block_stream_enabled"):
+        return None
+    entry = state["block_resident"].get(layer_key)
+    if entry is None:
+        return None
+    w_gpu, b_gpu, ready_event = entry
+    torch.cuda.current_stream().wait_event(ready_event)
+    return w_gpu, b_gpu
 
 
 def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu):
@@ -1234,6 +1500,81 @@ def _fp8_linear_compiled(x, qdata_t, scale_row, bias):
     return out.reshape(*original_shape[:-1], scale_row.shape[0])
 
 
+class _Fp8LinearTrainingFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, qdata_t, scale_row, bias):
+        ctx.save_for_backward(qdata_t, scale_row)
+        ctx.input_dtype = x.dtype
+        return _fp8_linear_compiled(x, qdata_t, scale_row, bias)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        qdata_t, scale_row = ctx.saved_tensors
+        target_dtype = getattr(ctx, "input_dtype", grad_out.dtype)
+        qdata = qdata_t.t()
+        grad_input = _fp8_grad_input_compute(
+            grad_out,
+            qdata,
+            scale_row,
+            target_dtype,
+        )
+        if grad_input is None:
+            weight = qdata.to(torch.float32) * scale_row.reshape(-1, 1).to(torch.float32)
+            grad_input = grad_out.to(target_dtype) @ weight.to(target_dtype)
+        return grad_input.to(dtype=grad_out.dtype), None, None, None
+
+
+def _fp8_linear_training(x, qdata_t, scale_row, bias):
+    """Grad-safe native FP8 Linear for frozen resident training weights."""
+    return _Fp8LinearTrainingFn.apply(x, qdata_t, scale_row, bias)
+
+
+_REGISTERED_HOST_PIN_LOCK = threading.Lock()
+_REGISTERED_HOST_PINS: dict[int, int] = {}
+
+
+def _pin_tensor_in_place(t: torch.Tensor) -> bool:
+    """Pin existing CPU tensor storage via cudaHostRegister when possible.
+
+    ``Tensor.pin_memory()`` allocates through PyTorch's cached pinned-host
+    allocator; in local DXGI probes, releasing that tensor returned the manager
+    ledger to zero but left NON_LOCAL usage committed for the process lifetime.
+    Registering the existing storage is reversible with cudaHostUnregister, so
+    layer-level unpin relief can actually free WDDM shared budget.
+    """
+    if t.device.type != "cpu" or t.is_pinned():
+        return False
+    try:
+        from torch.cuda import _pin_memory_utils as pin_memory_utils
+        ptr = int(t.data_ptr())
+        size = int(t.numel() * t.element_size())
+        if ptr == 0 or size <= 0:
+            return False
+        pin_memory_utils.pin_memory(ptr, size)
+    except Exception:
+        return False
+    with _REGISTERED_HOST_PIN_LOCK:
+        _REGISTERED_HOST_PINS[ptr] = size
+    return True
+
+
+def _unpin_tensor_in_place(t: torch.Tensor) -> bool:
+    ptr = int(t.data_ptr())
+    with _REGISTERED_HOST_PIN_LOCK:
+        size = _REGISTERED_HOST_PINS.pop(ptr, None)
+    if size is None:
+        return False
+    try:
+        from torch.cuda import _pin_memory_utils as pin_memory_utils
+        pin_memory_utils.unpin_memory(ptr)
+        return True
+    except Exception:
+        # Keep the registry conservative if unregister failed.
+        with _REGISTERED_HOST_PIN_LOCK:
+            _REGISTERED_HOST_PINS[ptr] = size
+        return False
+
+
 def _pin_inner_tensors(t: torch.Tensor, budget: int) -> int:
     """Pin the leaf storage of a tensor-subclass (e.g. torchao float8) in place.
 
@@ -1261,12 +1602,38 @@ def _pin_inner_tensors(t: torch.Tensor, budget: int) -> int:
             size = inner.numel() * inner.element_size()
             if size > budget - pinned:
                 continue
-            try:
-                setattr(t, name, inner.pin_memory())
+            # Process-wide ledger: caps against the WDDM shared-memory-budget
+            # proxy, which "budget" alone (a per-call byte cap) cannot see.
+            headroom = pinned_bytes_headroom()
+            if headroom is not None and size > headroom:
+                continue
+            if _pin_tensor_in_place(inner):
                 pinned += size
-            except Exception:
-                pass
+                register_pinned_bytes(size)
+            else:
+                try:
+                    setattr(t, name, inner.pin_memory())
+                    pinned += size
+                    register_pinned_bytes(size)
+                except Exception:
+                    pass
     return pinned
+
+
+def _empty_host_pin_cache() -> None:
+    """Best-effort flush for PyTorch's cached pinned-host allocator."""
+    try:
+        fn = getattr(torch._C, "_host_emptyCache", None)
+        if fn is not None:
+            fn()
+    except Exception:
+        pass
+    try:
+        fn = getattr(torch._C, "_accelerator_emptyHostCache", None)
+        if fn is not None:
+            fn()
+    except Exception:
+        pass
 
 
 def _unpin_inner_tensors(t: torch.Tensor) -> bool:
@@ -1287,9 +1654,106 @@ def _unpin_inner_tensors(t: torch.Tensor) -> bool:
             and inner.device.type == "cpu"
             and inner.is_pinned()
         ):
-            setattr(t, name, inner.clone())
+            size = inner.numel() * inner.element_size()
+            if _unpin_tensor_in_place(inner):
+                release_pinned_bytes(size)
+            else:
+                release_pinned_bytes(size)
+                setattr(t, name, inner.clone())
             changed = True
     return changed
+
+
+def _unpin_module_weights(module: nn.Module, manager) -> int:
+    """Undo the page-locking on a module's weights, in place (pinned -> pageable).
+
+    Shared core of ``unpin_layer`` and the transactional attach rollback.
+    ``_unpin_inner_tensors`` already releases the process-wide bounce ledger for
+    quantized inner tensors; this additionally reconciles the manager-side
+    ``pinned_weight_bytes`` counter and the per-layer ``_mm_pinned_bytes`` tag so
+    later pins can reuse the budget. Returns bytes released (0 if none held).
+    """
+    tracked = int(getattr(module, "_mm_pinned_bytes", 0) or 0)
+    changed = False
+    with torch.no_grad():
+        for name in ("weight", "bias"):
+            param = getattr(module, name, None)
+            if not isinstance(param, nn.Parameter):
+                continue
+            data = param.data
+            if _is_quantized_tensor(data) or hasattr(data, "__tensor_flatten__"):
+                # Releases the bounce ledger per inner tensor internally.
+                changed = _unpin_inner_tensors(data) or changed
+            elif (
+                isinstance(data, torch.Tensor)
+                and data.device.type == "cpu"
+                and data.is_pinned()
+            ):
+                size = data.numel() * data.element_size()
+                if _unpin_tensor_in_place(data):
+                    release_pinned_bytes(size)
+                else:
+                    release_pinned_bytes(size)
+                    param.data = data.clone()
+                changed = True
+    if not changed:
+        return 0
+    # Drop Python references to the old pinned tensors promptly. WDDM NON_LOCAL
+    # reclaim can lag, but holding references here guarantees it cannot happen.
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    _empty_host_pin_cache()
+    # The bounce ledger was already released above (do NOT release it again
+    # here, unlike promote_layer which never calls _unpin_inner_tensors).
+    if manager is not None and tracked:
+        manager.pinned_weight_bytes = max(0, manager.pinned_weight_bytes - tracked)
+    module._mm_pinned_bytes = 0
+    return tracked
+
+
+def unpin_layer(child: nn.Module) -> int:
+    """Unpin a still-streamed layer's weights back to pageable CPU, in place.
+
+    Shared-cliff relief primitive (§4 of the pin-for-speed policy): unlike
+    ``promote_layer`` (pinned -> resident, which spends *dedicated* VRAM), this
+    reverts a pinned layer to bounce-streamed pageable CPU, freeing WDDM shared
+    budget at zero dedicated-VRAM cost. The streaming forward stays installed
+    (the layer remains ``_layer_memory_manager``-attached); only the page-locking
+    is undone, so the very next forward re-streams it through the bounce pool.
+    """
+    lmm = getattr(child, "_layer_memory_manager", None)
+    if lmm is None:
+        return 0
+    return _unpin_module_weights(child, getattr(lmm, "manager", None))
+
+
+def _dxgi_signed_headroom_bytes(device=None) -> Optional[int]:
+    """Fresh NON_LOCAL ``Budget - CurrentUsage - spill_reserve`` (signed), or None.
+
+    Signed (may go negative) unlike ``pinned_bytes_headroom`` which clamps to 0,
+    so the transactional attach can tell "exactly at margin" from "overshot past
+    it" and roll back only in the latter case. Reads DXGI fresh (min_interval_s=0)
+    -- this is an allocation gate, not telemetry.
+    """
+    dxgi = get_dxgi_meminfo()
+    if dxgi is None:
+        return None
+    cuda_index = _cuda_device_index(device)
+    try:
+        if not dxgi.control_is_eligible(cuda_index):
+            return None
+    except Exception:
+        return None
+    info = dxgi.query_non_local_video_memory_info(
+        cuda_device_index=cuda_index,
+        min_interval_s=0.0,
+    )
+    if info is None:
+        return None
+    reserve = dxgi_spill_reserve_bytes(info.budget_bytes)
+    return int(info.budget_bytes) - int(info.current_usage_bytes) - int(reserve)
 
 
 def _ensure_cpu_pinned(
@@ -1302,24 +1766,37 @@ def _ensure_cpu_pinned(
             t = t.to("cpu", copy=True)
         except Exception:
             t = t.to("cpu")
-    # Quantized wrappers can't be pin_memory()'d directly, but pinning their
-    # inner storage gives the same async-transfer benefit.
-    if _is_quantized_tensor(t):
+    # Tensor-subclass wrappers (torchao AQT, quanto QBytesTensor) must have
+    # their inner storage pinned in place: wrapper-level pin_memory() falls
+    # back to a dequantize round-trip that burns ~2x the storage in host RAM
+    # and leaves the real data unpinned. quanto is deliberately not
+    # _is_quantized_tensor (the streaming forward depends on that), so gate
+    # on __tensor_flatten__ as well.
+    if _is_quantized_tensor(t) or hasattr(t, "__tensor_flatten__"):
         if torch.cuda.is_available():
             return t, _pin_inner_tensors(t, budget)
         return t, 0
     size = t.numel() * t.element_size()
     if torch.cuda.is_available() and size <= budget:
-        try:
-            t = t.pin_memory()
-            return t, size
-        except RuntimeError:
-            pass
+        headroom = pinned_bytes_headroom()
+        if headroom is None or size <= headroom:
+            if _pin_tensor_in_place(t):
+                register_pinned_bytes(size)
+                return t, size
+            try:
+                t = t.pin_memory()
+                register_pinned_bytes(size)
+                return t, size
+            except RuntimeError:
+                pass
     return t, 0
+
 
 
 def _move_params_to_cpu_and_pin(module: nn.Module, manager: "MemoryManager"):
     """Force parameters to CPU (+pinned) so we can 'bounce' them per forward/backward."""
+    dxgi_before = _dxgi_signed_headroom_bytes(getattr(manager, "process_device", None))
+    pinned_before = int(getattr(module, "_mm_pinned_bytes", 0) or 0)
     with torch.no_grad():
         for name in ("weight", "bias"):
             param = getattr(module, name, None)
@@ -1329,10 +1806,16 @@ def _move_params_to_cpu_and_pin(module: nn.Module, manager: "MemoryManager"):
                 0,
                 manager.pinned_weight_budget_bytes - manager.pinned_weight_bytes,
             )
+            if dxgi_before is not None:
+                remaining = min(remaining, max(0, int(dxgi_before)))
             cpu_data, pinned = _ensure_cpu_pinned(param.data, remaining)
             manager.pinned_weight_bytes += pinned
+            # Track per-module pinned bytes so promote_layer can give the budget
+            # back when it moves this weight to GPU (otherwise the counter leaks
+            # upward across promote/demote cycles and later demotions can't pin).
+            module._mm_pinned_bytes = getattr(module, "_mm_pinned_bytes", 0) + pinned
             cpu_data = cpu_data.detach()
-            if _is_quantized_tensor(param.data):
+            if _is_quantized_tensor(param.data) or hasattr(param.data, "__tensor_flatten__"):
                 # Tensor-subclass weights (e.g. torchao float8 AffineQuantizedTensor)
                 # ignore `param.data = ...`: the wrapper reports CPU but its inner
                 # storage stays on the GPU, so the weight never actually offloads.
@@ -1344,6 +1827,22 @@ def _move_params_to_cpu_and_pin(module: nn.Module, manager: "MemoryManager"):
                 )
             else:
                 param.data = cpu_data
+    pinned_delta = int(getattr(module, "_mm_pinned_bytes", 0) or 0) - pinned_before
+    if dxgi_before is not None and pinned_delta > 0:
+        dxgi_after = _dxgi_signed_headroom_bytes(getattr(manager, "process_device", None))
+        if dxgi_after is not None and dxgi_after < 0:
+            released = _unpin_module_weights(module, manager)
+            if released:
+                try:
+                    print(
+                        "[MemoryManager] DXGI pin rollback: "
+                        f"layer={getattr(module, '_mm_layer_key', module.__class__.__name__)} "
+                        f"released={released / 1024 ** 3:.2f} GiB "
+                        f"headroom_before={dxgi_before / 1024 ** 3:.2f} GiB "
+                        f"headroom_after={dxgi_after / 1024 ** 3:.2f} GiB"
+                    )
+                except Exception:
+                    pass
 
 
 # ==========================
@@ -1420,6 +1919,30 @@ class _BouncingLinearFn(torch.autograd.Function):
             ctx.save_for_backward(x.to("cpu"), weight_cpu, bias_cpu)
             ctx.device = torch.device("cpu")
             return out.to(x.device)
+
+        # Block streaming (opt-in): if a block pre-hook already staged this
+        # weight to GPU, consume it instead of issuing a per-Linear H2D. Only the
+        # plain dequant/float forward takes this path; fp8-native forward keeps
+        # the per-Linear staging below. Backward is unchanged either way, so the
+        # gradient is computed from the same weight value.
+        if not fp8_sampling:
+            block_resident = consume_block_resident(device, layer_key)
+            if block_resident is not None:
+                w_gpu, b_gpu = block_resident
+                pool = get_prefetch_pool(device)
+                if pool is not None:
+                    pool.consume_without_transfer(layer_key, operation="forward")
+                if _is_quantized_tensor(w_gpu):
+                    w_gpu = _dequantize_to(w_gpu, target_dtype)
+                if w_gpu.dtype != target_dtype:
+                    w_gpu = w_gpu.to(dtype=target_dtype)
+                if b_gpu is not None and b_gpu.dtype != target_dtype:
+                    b_gpu = b_gpu.to(dtype=target_dtype)
+                out = F.linear(x, w_gpu, b_gpu)
+                ctx.save_for_backward(x, weight_cpu, bias_cpu)
+                ctx.device = device
+                ctx.target_dtype = target_dtype
+                return out
 
         state = _get_device_state(device)
         idx, w_gpu, b_gpu = _stage_forward_weight(
@@ -1548,6 +2071,7 @@ class _BouncingLinearFn(torch.autograd.Function):
             if need_b:
                 b_grad_gpu = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
                 state["b_grad_buffers"][idx] = b_grad_gpu
+            _record_ring_peak(state)
             grad_weight, grad_bias = _stage_grads_to_cpu(
                 state, idx, w_grad_gpu, b_grad_gpu
             )
@@ -1784,6 +2308,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
             if need_b:
                 b_grad_gpu = grad_out.sum(dim=(0, 2, 3))
                 state["b_grad_buffers"][idx] = b_grad_gpu
+            _record_ring_peak(state)
             grad_weight, grad_bias = _stage_grads_to_cpu(
                 state, idx, w_grad_gpu, b_grad_gpu
             )

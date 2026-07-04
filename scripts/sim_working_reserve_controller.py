@@ -92,6 +92,7 @@ class SimConfig:
     # GiB / device_free=0 on the 12 GiB Krea run. The guard reclaims it.
     frag_ratchet_gib: float = 0.0     # per-step fragmentation creep toward the hoard ceiling
     retreat_layers_manual: int = 3    # layers the guard demotes per round if empty_cache is not enough
+    manual_residual_gib: Optional[float] = None  # step-end trough after activations free
     # --- Working_reserve SIZING controller (run_reserve_sim) ---
     # This is the *other* auto controller: it sizes the activation budget
     # (working_reserve) via _training_working_reserve_decision / _signal, rather
@@ -113,7 +114,6 @@ class SimConfig:
     retreat_gib: float = 1.0
     stable_windows: int = 2
     min_working_reserve_gib: float = 1.5
-    max_working_reserve_gib: float = 8.0
     # Per-bucket TRUE within-step activation peak (what must fit under the reserve).
     act_peak_gib: dict = field(
         default_factory=lambda: {"res768": 5.2, "res512": 4.46, "res256": 3.3}
@@ -346,6 +346,7 @@ def run_manual_sim(
     resident = int(cfg.start_resident)   # fixed in manual mode (the user's plan)
     reserved_held = 0.0                   # allocator high-water mark (idle-cache hoard)
     history = []
+    shape_peaks = {}
 
     def footprint(res_layers, activations):
         return cfg.always_resident_gib + res_layers * cfg.layer_gib + activations
@@ -360,6 +361,25 @@ def run_manual_sim(
         activations = max(0.0, activations)
 
         allocated_peak = footprint(resident, activations)
+        residual = activations if cfg.manual_residual_gib is None else cfg.manual_residual_gib
+        allocated_residual = footprint(resident, max(0.0, residual))
+        other = max(0.0, cfg.context_gib + float(external_gib(step)))
+        proactive_move = None
+        if guard:
+            known_peak = shape_peaks.get(bucket)
+            if known_peak is not None:
+                target_peak_free = max(cfg.wddm_hard_gib, cfg.wddm_hard_gib + 0.5)
+                predicted_peak_free = cfg.total_gib - (known_peak + other)
+                while predicted_peak_free < target_peak_free and resident > 0:
+                    before_resident = resident
+                    resident = max(0, resident - cfg.retreat_layers_manual)
+                    resident_drop = max(0, before_resident - resident) * cfg.layer_gib
+                    known_peak = max(0.0, known_peak - resident_drop)
+                    shape_peaks[bucket] = known_peak
+                    allocated_peak = footprint(resident, activations)
+                    allocated_residual = footprint(resident, max(0.0, residual))
+                    predicted_peak_free = cfg.total_gib - (known_peak + other)
+                    proactive_move = "pre_down"
         frag = cfg.frag_gib
         if cfg.frag_noise_gib:
             frag += rng.gauss(0.0, cfg.frag_noise_gib)
@@ -368,34 +388,35 @@ def run_manual_sim(
         reserved_held = max(reserved_held, allocated_peak + max(0.0, frag))
         reserved_held += cfg.frag_ratchet_gib
 
-        other = max(0.0, cfg.context_gib + float(external_gib(step)))
         # End-of-step reading, BEFORE the guard acts.
         device_used = reserved_held + other
         spilled = device_used > cfg.total_gib
         device_free = max(0.0, cfg.total_gib - device_used)
 
-        move = "hold"
+        move = proactive_move or "hold"
         if guard:
             action = MemoryManager._training_cliff_guard_action(
                 device_free, wddm_hard_gib=cfg.wddm_hard_gib, did_oom=spilled,
             )
             if action == "reclaim":
-                # 1. empty_cache: hand the idle hoard back, leaving the live peak.
-                reserved_held = allocated_peak
+                # 1. empty_cache: hand the idle hoard back, leaving the step-end trough.
+                reserved_held = allocated_residual
                 device_used = reserved_held + other
                 device_free = max(0.0, cfg.total_gib - device_used)
-                move = "empty_cache"
-                # 2. still under the floor -> genuinely over-committed: demote.
-                while (
-                    MemoryManager._training_cliff_guard_action(
-                        device_free, wddm_hard_gib=cfg.wddm_hard_gib, did_oom=False,
-                    ) == "reclaim"
-                    and resident > 0
-                ):
+                predicted_peak_free = cfg.total_gib - (allocated_peak + other)
+                target_peak_free = max(cfg.wddm_hard_gib, cfg.wddm_hard_gib + 0.5)
+                if move != "pre_down":
+                    move = "empty_cache"
+                # 2. If the next step peak would still breach the stop target,
+                #    demote now rather than trusting the post-trim trough.
+                while predicted_peak_free < target_peak_free and resident > 0:
                     resident = max(0, resident - cfg.retreat_layers_manual)
-                    reserved_held = footprint(resident, activations)
+                    allocated_peak = footprint(resident, activations)
+                    allocated_residual = footprint(resident, max(0.0, residual))
+                    reserved_held = allocated_residual
                     device_used = reserved_held + other
                     device_free = max(0.0, cfg.total_gib - device_used)
+                    predicted_peak_free = cfg.total_gib - (allocated_peak + other)
                     move = "down"
 
         available = MemoryManager._available_vram_gib(
@@ -404,6 +425,7 @@ def run_manual_sim(
         )
         # NOTE: `governing` carries driver `device_free` here (the signal the guard
         # actually reads), not the cross-bucket min used in the auto sim.
+        shape_peaks[bucket] = max(shape_peaks.get(bucket, 0.0), allocated_peak)
         history.append(StepRecord(
             step, bucket, resident, reserved_held, other,
             available, device_free, move, spilled,
@@ -424,7 +446,7 @@ def run_reserve_sim(
     """Drive the REAL working_reserve sizing controller over modelled physics.
 
     Exercises the second auto controller — ``_training_working_reserve_signal``
-    and ``_training_working_reserve_decision`` — which sizes the activation budget
+    and ``_training_working_reserve_decision`` — which measures the activation demand
     (working_reserve), as opposed to :func:`run_sim` which models the layer-layout
     deadband. Because the planner packs resident weights to fill whatever the
     reserve leaves, shrinking the reserve eats the spill margin one-for-one:
@@ -443,7 +465,7 @@ def run_reserve_sim(
     reserve = float(cfg.start_reserve_gib)
     danger = None
     ema: dict = {}
-    peak_seen: dict = {}
+    latest_signal: dict = {}
     last_free: dict = {}
     bsteps: dict = {}
     history = []
@@ -467,8 +489,8 @@ def run_reserve_sim(
             min_working_reserve_gib=cfg.min_working_reserve_gib,
             pad_gib=cfg.pad_gib,
         )
-        peak_seen[bucket] = max(peak_seen.get(bucket, 0.0), signal_b)
-        signal = max(peak_seen.values()) if cross_bucket else signal_b
+        latest_signal[bucket] = signal_b
+        signal = max(latest_signal.values()) if cross_bucket else signal_b
 
         # Physics: free margin at THIS step's activation peak under the current
         # reserve (an external app, if any, eats straight into the margin).
@@ -488,9 +510,7 @@ def run_reserve_sim(
             step_gib=cfg.step_gib,
             retreat_gib=cfg.retreat_gib,
         )
-        reserve = min(
-            max(new_reserve, cfg.min_working_reserve_gib), cfg.max_working_reserve_gib
-        )
+        reserve = max(new_reserve, cfg.min_working_reserve_gib)
 
         # StepRecord reuse: peak_reserved<-reserve, available<-device_free,
         # governing<-signal, move<-decision action.
@@ -529,7 +549,8 @@ def summarize_manual(history, cfg: SimConfig):
         "spills": len(spills),
         "steady_spills": sum(1 for r in spills if r.step >= warmup_end),
         "empty_caches": sum(1 for r in history if r.move == "empty_cache"),
-        "demotes": sum(1 for r in history if r.move == "down"),
+        "demotes": sum(1 for r in history if r.move in ("down", "pre_down")),
+        "pre_demotes": sum(1 for r in history if r.move == "pre_down"),
         "max_reserved": round(max(r.peak_reserved for r in history), 3),
         "min_free": round(min(r.governing for r in history), 3),
         "final_resident": history[-1].resident,
@@ -734,6 +755,19 @@ def scenario_manual_overcommit(cfg=None, *, guard=True):
     )
 
 
+
+def scenario_manual_trough_peak(cfg=None, *, guard=True):
+    """Post-empty_cache trough looks healthy, but next-step peak requires demotion."""
+    cfg = cfg or _manual_cfg(
+        always_resident_gib=2.6,
+        start_resident=40,
+        working_floor_gib={"res768": 5.6, "res512": 5.0, "res256": 4.6},
+        manual_residual_gib=0.2,
+    )
+    return cfg, run_manual_sim(
+        cfg, ["res512", "res256", "res768", "res512"], steps=40, guard=guard
+    )
+
 # --- working_reserve sizing controller (auto) ------------------------------
 def scenario_reserve_peak_fix(cfg=None, *, use_peak=True, cross_bucket=True):
     """Auto reserve sizing on the TRUE peak: climbs down to ~peak+pad and holds."""
@@ -795,6 +829,7 @@ SCENARIOS = {
     "manual_cliff_guard": scenario_manual_cliff_guard,
     "manual_no_guard": scenario_manual_no_guard,
     "manual_overcommit": scenario_manual_overcommit,
+    "manual_trough_peak": scenario_manual_trough_peak,
     "reserve_peak_fix": scenario_reserve_peak_fix,
     "reserve_trough_bug": scenario_reserve_trough_bug,
     "reserve_per_bucket": scenario_reserve_per_bucket,

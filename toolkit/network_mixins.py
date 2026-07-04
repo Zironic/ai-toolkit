@@ -190,6 +190,37 @@ def add_bias(tensor, bias):
     return result
 
 
+def apply_rank_gates(tensor: torch.Tensor, gates: torch.Tensor, module_name: str = ""):
+    gates = gates.to(device=tensor.device, dtype=tensor.dtype)
+    if tensor.shape[-1] == gates.numel():
+        return tensor * gates.view(*([1] * (tensor.ndim - 1)), -1)
+
+    if tensor.ndim == 4 and tensor.shape[1] == gates.numel():
+        return tensor * gates.view(1, -1, 1, 1)
+
+    label = f" for {module_name}" if module_name else ""
+    raise ValueError(f"Cannot apply rank gates{label}: gates={tuple(gates.shape)} tensor={tuple(tensor.shape)}")
+
+
+def _get_rank_gates_for_module(network: Network, module_name: str):
+    vector_gates = getattr(network, "vector_gates", None)
+    if vector_gates is None:
+        return None
+
+    if isinstance(vector_gates, torch.Tensor):
+        return vector_gates
+
+    if isinstance(vector_gates, dict):
+        per_module = vector_gates.get("per_module", {})
+        if module_name in per_module:
+            return per_module[module_name]
+        for pattern, gates in per_module.items():
+            if pattern in module_name:
+                return gates
+        return vector_gates.get("global", None)
+
+    return vector_gates
+
 class ExtractableModuleMixin:
     def extract_weight(
             self: Module,
@@ -281,6 +312,10 @@ class ToolkitModuleMixin:
         elif self.dropout is not None and self.training:
             lx = torch.nn.functional.dropout(lx, p=self.dropout)
 
+        rank_gates = _get_rank_gates_for_module(self.network_ref(), self.lora_name)
+        if rank_gates is not None:
+            lx = apply_rank_gates(lx, rank_gates, self.lora_name)
+
         # rank dropout
         if self.rank_dropout is not None and self.rank_dropout > 0 and self.training:
             mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
@@ -337,7 +372,35 @@ class ToolkitModuleMixin:
             if x.dtype != orig_dtype:
                 x = x.to(orig_dtype)
 
+    def _memory_management_compile_fast_lora_ready(self: Module) -> bool:
+        network: Network = self.network_ref()
+        multiplier = getattr(network, "torch_multiplier", None)
+        return bool(
+            not getattr(network, "is_lorm", False)
+            and getattr(network, "is_active", False)
+            and not getattr(network, "is_merged_in", False)
+            and getattr(network, "_multiplier", None) != 0
+            and multiplier is not None
+            and getattr(multiplier, "numel", lambda: 0)() == 1
+            and self.__class__.__name__ not in ("DoRAModule", "LokrModule")
+            and getattr(self, "module_dropout", None) is None
+            and getattr(self, "rank_dropout", None) in (None, 0)
+            and getattr(network, "vector_gates", None) is None
+            and _assistant_inverse_module_scale(self) == 1.0
+            and (getattr(self, "dropout", None) is None or isinstance(getattr(self, "dropout", None), nn.Identity))
+        )
+
+    def _memory_management_compile_fast_lora_forward(self: Module, x, *args, **kwargs):
+        org_forwarded = self.org_forward(x, *args, **kwargs)
+        lora_input = x.to(self.lora_down.weight.dtype)
+        lora_output = self.lora_up(self.lora_down(lora_input)) * self.scale
+        multiplier = self.network_ref().torch_multiplier.reshape(())
+        return org_forwarded + (lora_output * multiplier).to(org_forwarded.dtype)
+
     def forward(self: Module, x, *args, **kwargs):
+        if getattr(self, "_memory_management_compile_lora_fast", False):
+            return self._memory_management_compile_fast_lora_forward(x, *args, **kwargs)
+
         skip = False
         network: Network = self.network_ref()
         if network.is_lorm:
@@ -572,6 +635,7 @@ class ToolkitNetworkMixin:
         self.can_merge_in = not is_lorm
         # will prevent optimizer from loading as it will have double states
         self.did_change_weights = False
+        self.vector_gates = None
 
     def get_keymap(self: Network, force_weight_mapping=False):
         use_weight_mapping = False
@@ -630,7 +694,7 @@ class ToolkitNetworkMixin:
 
         return keymap
     
-    def get_state_dict(self: Network, extra_state_dict=None, dtype=torch.float16):
+    def get_state_dict(self: Network, extra_state_dict=None, dtype=torch.float16, stager=None):
         keymap = self.get_keymap()
 
         save_keymap = {}
@@ -640,14 +704,25 @@ class ToolkitNetworkMixin:
                 save_keymap[diffusers_key] = ldm_key
 
         state_dict = self.state_dict()
-        save_dict = OrderedDict()
 
-        for key in list(state_dict.keys()):
-            v = state_dict[key]
-            v = v.detach().clone().to("cpu").to(dtype)
-            save_key = save_keymap[key] if key in save_keymap else key
-            save_dict[save_key] = v
-            del state_dict[key]
+        if stager is not None:
+            # Batched device->host copy through a capped pinned buffer: one CUDA
+            # sync per chunk instead of one per tensor. Output is identical to the
+            # per-tensor loop below; only the copy path differs.
+            items = [
+                (save_keymap.get(key, key), state_dict[key])
+                for key in list(state_dict.keys())
+            ]
+            save_dict = stager.snapshot(items, out_dtype=dtype)
+            state_dict.clear()
+        else:
+            save_dict = OrderedDict()
+            for key in list(state_dict.keys()):
+                v = state_dict[key]
+                v = v.detach().clone().to("cpu").to(dtype)
+                save_key = save_keymap[key] if key in save_keymap else key
+                save_dict[save_key] = v
+                del state_dict[key]
 
         if extra_state_dict is not None:
             # add extra items to state dict
@@ -694,28 +769,47 @@ class ToolkitNetworkMixin:
             self: Network,
             file, dtype=torch.float16,
             metadata=None,
-            extra_state_dict: Optional[OrderedDict] = None
+            extra_state_dict: Optional[OrderedDict] = None,
+            writer=None,
+            stager=None,
+            coalesce_key=None,
     ):
-        save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype)
-        
+        # get_state_dict does the device->host copy: it must run here, on the
+        # calling (training) thread, so the snapshot is consistent before the
+        # next optimizer.step mutates the live weights. Only the CPU-side hash +
+        # disk write below can be deferred to ``writer`` (an AsyncSaver).
+        save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype, stager=stager)
+
         if metadata is not None and len(metadata) == 0:
             metadata = None
 
         if metadata is None:
             metadata = OrderedDict()
-        metadata = add_model_hash_to_meta(save_dict, metadata)
+
         # let the model handle the saving
-        
         if self.base_model_ref is not None and hasattr(self.base_model_ref(), 'save_lora'):
-            # call the base model save lora method
+            # call the base model save lora method (kept synchronous: model owns the format)
+            metadata = add_model_hash_to_meta(save_dict, metadata)
             self.base_model_ref().save_lora(save_dict, file, metadata)
             return
-        
-        if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import save_file
-            save_file(save_dict, file, metadata)
+
+        is_safetensors = os.path.splitext(file)[1] == ".safetensors"
+
+        def _write():
+            # Hashing walks the (CPU) tensors -- offload it to the writer thread too.
+            md = add_model_hash_to_meta(save_dict, metadata)
+            if is_safetensors:
+                from toolkit.async_save import atomic_save_file
+                atomic_save_file(save_dict, file, md)
+            else:
+                from toolkit.async_save import atomic_torch_save
+                atomic_torch_save(save_dict, file)
+
+        if writer is not None:
+            writer.submit(_write, coalesce_key=coalesce_key,
+                          description=f"lora:{os.path.basename(file)}")
         else:
-            torch.save(save_dict, file)
+            _write()
 
     def load_weights(self: Network, file, force_weight_mapping=False):
         # allows us to save and load to and from ldm weights
@@ -913,6 +1007,42 @@ class ToolkitNetworkMixin:
             loras += self.text_encoder_loras
         for lora in loras:
             lora.to(device, dtype)
+
+        if self.vector_gates is not None:
+            self.set_vector_gates(self.vector_gates, device=device, dtype=dtype)
+
+    def set_vector_gates(self: Network, gates, device=None, dtype=None):
+        def to_tensor(value):
+            if value is None or isinstance(value, torch.Tensor):
+                tensor = value
+            else:
+                tensor = torch.tensor(value)
+            if tensor is not None and (device is not None or dtype is not None):
+                tensor = tensor.to(
+                    device=device if device is not None else tensor.device,
+                    dtype=dtype if dtype is not None else tensor.dtype,
+                )
+            return tensor
+
+        if gates is None:
+            self.vector_gates = None
+            return
+
+        if isinstance(gates, dict):
+            converted = {}
+            if "global" in gates:
+                converted["global"] = to_tensor(gates["global"])
+            if "per_module" in gates:
+                converted["per_module"] = {
+                    name: to_tensor(value)
+                    for name, value in gates["per_module"].items()
+                }
+            self.vector_gates = converted
+        else:
+            self.vector_gates = to_tensor(gates)
+
+    def clear_vector_gates(self: Network):
+        self.vector_gates = None
 
     def get_all_modules(self: Network) -> List[Module]:
         loras = []

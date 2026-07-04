@@ -101,6 +101,15 @@ class SDTrainer(BaseSDTrainProcess):
         self._checkpoint_tunable = None
         self._checkpoint_autotuner_off = False
         self._checkpoint_timing_start = None
+        # Saved-tensor (autograd) memory probe. Debug-only: a handful of measures
+        # per UNet to see what the within-step activation footprint actually is
+        # (normal vs DOP forward, attention vs MLP via top shapes), so decisions
+        # like FP8-autograd or swapping attention backends are grounded in data.
+        # Set AITK_SAVED_TENSOR_PROBE=<n_steps> to capture; 0/unset = off.
+        self._saved_tensor_probe_steps = self._read_saved_tensor_probe_steps()
+        self._saved_tensor_probe_active = False
+        self._saved_tensor_probe_stats = {}
+        self._saved_tensor_probe_param_ptrs = None
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
         self._dop_cache_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
@@ -1656,19 +1665,24 @@ class SDTrainer(BaseSDTrainProcess):
         guidance_embedding_scale = self.train_config.cfg_scale
         if self.train_config.do_guidance_loss:
             guidance_embedding_scale = self._guidance_loss_target_batch
-        return self.sd.predict_noise(
-            latents=noisy_latents.to(self.device_torch, dtype=dtype),
-            conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
-            unconditional_embeddings=unconditional_embeds,
-            timestep=timesteps,
-            guidance_scale=self.train_config.cfg_scale,
-            guidance_embedding_scale=guidance_embedding_scale,
-            detach_unconditional=False,
-            rescale_cfg=self.train_config.cfg_rescale,
-            bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
-            batch=batch,
-            **kwargs
-        )
+        # Primary training prediction is the "normal" forward; everything else
+        # building a graph here (DOP/blank preservation, guidance/perturbation)
+        # is bucketed separately for the saved-tensor probe.
+        probe_label = 'normal_forward' if is_primary_pred else 'dop_forward'
+        with self._capture_saved_tensors(probe_label):
+            return self.sd.predict_noise(
+                latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
+                unconditional_embeddings=unconditional_embeds,
+                timestep=timesteps,
+                guidance_scale=self.train_config.cfg_scale,
+                guidance_embedding_scale=guidance_embedding_scale,
+                detach_unconditional=False,
+                rescale_cfg=self.train_config.cfg_rescale,
+                bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
+                batch=batch,
+                **kwargs
+            )
     
 
     @contextmanager
@@ -1852,9 +1866,129 @@ class SDTrainer(BaseSDTrainProcess):
         stats['incremental_max'] = max(stats['incremental_max'], incremental)
         self._resolution_memory_baseline = None
 
+    @staticmethod
+    def _read_saved_tensor_probe_steps():
+        raw = os.environ.get('AITK_SAVED_TENSOR_PROBE', '0')
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            # Truthy-but-not-an-int (e.g. "true") → a few measures.
+            return 3 if str(raw).strip().lower() in ('true', 'yes', 'on') else 0
+
+    @staticmethod
+    def _storage_ptr(t):
+        try:
+            return t.untyped_storage().data_ptr()
+        except Exception:
+            return t.storage().data_ptr()
+
+    def _saved_tensor_probe_param_ptr_set(self):
+        """Storage data_ptrs of the transformer's parameters, so saved weight
+        tensors can be told apart from saved activations (the streamed/FP8
+        weights we already account for in resident+ring vs. true activations)."""
+        if self._saved_tensor_probe_param_ptrs is None:
+            ptrs = set()
+            unet = getattr(self.sd, 'unet', None)
+            if unet is not None:
+                for p in unet.parameters():
+                    try:
+                        ptrs.add(self._storage_ptr(p.data))
+                    except Exception:
+                        pass
+            self._saved_tensor_probe_param_ptrs = ptrs
+        return self._saved_tensor_probe_param_ptrs
+
+    @contextmanager
+    def _capture_saved_tensors(self, label):
+        """Tally autograd saved-tensor footprint for the wrapped forward.
+
+        Dedups by storage (saved tensors routinely alias one allocation, so a
+        naive numel*element_size sum over-counts wildly) and splits weight saves
+        from activation saves. Read-only: the unpack hook returns the tensor
+        unchanged, so this does not alter what is kept alive or move any memory.
+        """
+        if not self._saved_tensor_probe_active:
+            yield
+            return
+        bucket = self._saved_tensor_probe_stats.setdefault(label, {
+            'param_bytes': 0, 'param_count': 0,
+            'act_bytes': 0, 'act_count': 0, 'by_shape': {},
+        })
+        seen = set()
+        param_ptrs = self._saved_tensor_probe_param_ptr_set()
+
+        def pack_hook(t):
+            try:
+                if isinstance(t, torch.Tensor) and t.is_cuda:
+                    ptr = self._storage_ptr(t)
+                    if ptr not in seen:
+                        seen.add(ptr)
+                        nbytes = t.numel() * t.element_size()
+                        if ptr in param_ptrs:
+                            bucket['param_bytes'] += nbytes
+                            bucket['param_count'] += 1
+                        else:
+                            bucket['act_bytes'] += nbytes
+                            bucket['act_count'] += 1
+                            key = (str(t.dtype).replace('torch.', ''), tuple(t.shape))
+                            bucket['by_shape'][key] = bucket['by_shape'].get(key, 0) + nbytes
+            except Exception:
+                pass
+            return t
+
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda t: t):
+            yield
+
+    def _emit_saved_tensor_report(self):
+        stats = self._saved_tensor_probe_stats
+        if not stats:
+            return
+        gib = 1024 ** 3
+        peak_alloc = (
+            torch.cuda.max_memory_allocated(self.device_torch) / gib
+            if torch.cuda.is_available() else 0.0
+        )
+        lines = [
+            "",
+            "============== saved-tensor probe (autograd activation footprint) ==============",
+        ]
+        if getattr(self.model_config, 'compile', False):
+            lines.append(
+                "WARNING: model_config.compile is on — compiled blocks bypass these hooks, "
+                "so activation totals UNDERCOUNT. Probe with compile off for true numbers."
+            )
+        total_act = 0
+        for label, b in stats.items():
+            total_act += b['act_bytes']
+            lines.append(
+                f"[{label}] activation_saved={b['act_bytes'] / gib:.3f} GiB "
+                f"({b['act_count']} tensors)   weight_saved={b['param_bytes'] / gib:.3f} GiB "
+                f"({b['param_count']} tensors)"
+            )
+            top = sorted(b['by_shape'].items(), key=lambda kv: kv[1], reverse=True)[:8]
+            for (dt, shape), nb in top:
+                lines.append(f"      {nb / gib:.3f} GiB  {dt} {list(shape)}")
+        lines.append(
+            f"activation_saved_total={total_act / gib:.3f} GiB   "
+            f"peak_allocated={peak_alloc:.3f} GiB   "
+            "(saved ⊂ peak; remainder = attention/GEMM workspace + scratch)"
+        )
+        lines.append(
+            "================================================================================"
+        )
+        print_acc("\n".join(lines))
+
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
         resolution_bucket = self._performance_resolution_bucket(batch)
         self._current_resolution_bucket = resolution_bucket
+        # Arm the saved-tensor probe for this accumulation (a few measures total).
+        self._saved_tensor_probe_active = (
+            self._saved_tensor_probe_steps > 0
+            and torch.cuda.is_available()
+            and self.device_torch.type == 'cuda'
+        )
+        if self._saved_tensor_probe_active:
+            self._saved_tensor_probe_stats = {}
         if self.performance_log_every > 0:
             self._resolution_bucket_counts[resolution_bucket] = (
                 self._resolution_bucket_counts.get(resolution_bucket, 0) + 1
@@ -2887,6 +3021,10 @@ class SDTrainer(BaseSDTrainProcess):
                         self.accelerator.backward(loss)
 
         self._finish_resolution_memory_sample(resolution_bucket)
+        if self._saved_tensor_probe_active:
+            self._emit_saved_tensor_report()
+            self._saved_tensor_probe_steps -= 1
+            self._saved_tensor_probe_active = False
         return loss.detach()
         # flush()
 

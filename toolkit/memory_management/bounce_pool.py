@@ -36,6 +36,8 @@ from typing import Optional
 
 import torch
 
+dxgi_meminfo = None
+
 # device -> PinnedBouncePool. The autograd staging path looks the active pool
 # up here; absent an entry it behaves exactly as before.
 _DEVICE_PREFETCH: dict = {}
@@ -56,15 +58,40 @@ HARD_MISS = "hard_miss"   # not staged at all; fall back to the pageable source
 
 
 def configure_trace_capture(path=None, steps=None):
-    """Configure optional JSONL trace capture for subsequently-created pools."""
+    """Configure optional JSONL trace capture for current and future pools."""
     global _TRACE_CAPTURE_PATH, _TRACE_CAPTURE_STEPS
     _TRACE_CAPTURE_PATH = str(path or "").strip()
     if steps is not None:
         _TRACE_CAPTURE_STEPS = max(0, int(steps))
+    for pool in list(_DEVICE_PREFETCH.values()):
+        try:
+            pool.configure_capture(_TRACE_CAPTURE_PATH, _TRACE_CAPTURE_STEPS)
+        except Exception:
+            pass
 
 
 def _pin_enabled() -> bool:
     return torch.cuda.is_available()
+
+
+def _is_pinned(t) -> bool:
+    """True if a CPU tensor (or every leaf of a tensor-subclass wrapper, e.g.
+    a quantized weight) is already page-locked. Mirrors manager_modules's
+    _profile_is_pinned (False for None -- callers treat an absent bias as "no
+    obstacle" explicitly); duplicated locally to avoid a circular import (that
+    module imports from this one)."""
+    if t is None:
+        return False
+    try:
+        names, _ = t.__tensor_flatten__()
+    except Exception:
+        try:
+            return t.device.type == "cpu" and t.is_pinned()
+        except Exception:
+            return False
+    leaves = [getattr(t, name, None) for name in names]
+    leaves = [leaf for leaf in leaves if leaf is not None]
+    return bool(leaves) and all(_is_pinned(leaf) for leaf in leaves)
 
 
 try:
@@ -81,6 +108,179 @@ def _host_ram_available() -> Optional[int]:
         return _psutil.virtual_memory().available
     except Exception:
         return None
+
+
+# Process-wide ledger of bytes actually page-locked via cudaHostAlloc, shared
+# across every pinning subsystem in this process: this pool's bounce buffers
+# AND MemoryManager's permanent weight pins (training and sampling managers
+# alike). They draw on the SAME finite resource -- on Windows/WDDM, pinned
+# memory commits against the GPU's shared-memory budget (roughly a fraction of
+# total RAM, opaque to psutil: "available RAM" can look fine while this
+# ceiling is already exhausted). Sizing each subsystem's budget independently
+# is what let training crash with a raw cudaErrorMemoryAllocation well after a
+# generous auto-pin budget passed its own isolated checks -- the bounce pool's
+# separate buffer budget pushed the *combined* total past the real ceiling.
+# Any code path that calls .pin_memory() / pin_memory=True must register the
+# bytes here, and release them when the pinning is undone.
+_pinned_bytes_lock = threading.Lock()
+_pinned_bytes_total = 0
+
+
+def register_pinned_bytes(n: int) -> None:
+    global _pinned_bytes_total
+    if n <= 0:
+        return
+    with _pinned_bytes_lock:
+        _pinned_bytes_total += int(n)
+
+
+def release_pinned_bytes(n: int) -> None:
+    global _pinned_bytes_total
+    if n <= 0:
+        return
+    with _pinned_bytes_lock:
+        _pinned_bytes_total = max(0, _pinned_bytes_total - int(n))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _cuda_device_index(device=None) -> int:
+    if device is None:
+        return 0
+    try:
+        dev = torch.device(device)
+    except Exception:
+        return 0
+    if dev.type != "cuda":
+        return 0
+    if dev.index is not None:
+        return int(dev.index)
+    try:
+        return int(torch.cuda.current_device())
+    except Exception:
+        return 0
+
+
+# Shared-budget spill reserve (the WDDM NON_LOCAL margin kept free for cliff-1's
+# overflow valve and the sampling-transition spike). Percentage-based:
+#   margin = max(floor, pct * NON_LOCAL_Budget)
+# so it scales with the OS-assigned budget instead of being a flat guess. The
+# job config drives it at attach via set_spill_reserve_policy(); env vars are the
+# fallback/test override only (see CLAUDE.md Training Configuration Rule).
+_SPILL_RESERVE_FLOOR_GIB_OVERRIDE: Optional[float] = None
+_SPILL_RESERVE_PCT_OVERRIDE: Optional[float] = None
+
+
+def set_spill_reserve_policy(
+    floor_gib: Optional[float] = None, pct: Optional[float] = None
+) -> None:
+    """Set the process-wide shared-budget spill-reserve policy (from job config).
+
+    ``None`` leaves the corresponding term on its env/default value. Passing a
+    value pins it for the process, so a real training run's margin comes from the
+    resolved job config rather than an env var.
+    """
+    global _SPILL_RESERVE_FLOOR_GIB_OVERRIDE, _SPILL_RESERVE_PCT_OVERRIDE
+    if floor_gib is not None:
+        _SPILL_RESERVE_FLOOR_GIB_OVERRIDE = max(0.0, float(floor_gib))
+    if pct is not None:
+        _SPILL_RESERVE_PCT_OVERRIDE = max(0.0, float(pct))
+
+
+def _spill_reserve_floor_gib() -> float:
+    if _SPILL_RESERVE_FLOOR_GIB_OVERRIDE is not None:
+        return _SPILL_RESERVE_FLOOR_GIB_OVERRIDE
+    # Back-compat: the sensor plan's flat AI_TOOLKIT_WDDM_SPILL_RESERVE_GIB, if
+    # set, still acts as the floor. Otherwise the percentage-based default floor.
+    for name, default in (
+        ("AI_TOOLKIT_WDDM_SPILL_RESERVE_FLOOR_GIB", None),
+        ("AI_TOOLKIT_WDDM_SPILL_RESERVE_GIB", "1.0"),
+    ):
+        raw = os.environ.get(name)
+        if raw is None:
+            if default is None:
+                continue
+            raw = default
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            continue
+    return 2.0
+
+
+def _spill_reserve_pct() -> float:
+    if _SPILL_RESERVE_PCT_OVERRIDE is not None:
+        return _SPILL_RESERVE_PCT_OVERRIDE
+    try:
+        return max(0.0, float(os.environ.get("AI_TOOLKIT_WDDM_SPILL_RESERVE_PCT", "0.10")))
+    except (TypeError, ValueError):
+        return 0.20
+
+
+def dxgi_spill_reserve_bytes(budget_bytes: Optional[int] = None) -> int:
+    """Bytes of NON_LOCAL budget to keep free as the cliff-1/sampling spill margin.
+
+    ``margin = max(floor, pct * budget)``. When ``budget_bytes`` is None or
+    non-positive (caller doesn't have the DXGI budget handy) the percentage term
+    drops out and the flat floor is used.
+    """
+    gib = 1024 ** 3
+    floor_bytes = int(_spill_reserve_floor_gib() * gib)
+    if budget_bytes and int(budget_bytes) > 0:
+        pct_bytes = int(_spill_reserve_pct() * float(budget_bytes))
+        return max(floor_bytes, pct_bytes)
+    return floor_bytes
+
+
+def get_dxgi_meminfo():
+    if _env_bool("AI_TOOLKIT_WDDM_DXGI_DISABLE"):
+        return None
+    global dxgi_meminfo
+    if dxgi_meminfo is None:
+        try:
+            from . import dxgi_meminfo as _dxgi_meminfo
+        except Exception:
+            return None
+        dxgi_meminfo = _dxgi_meminfo
+    return dxgi_meminfo
+
+
+def pinned_bytes_headroom(cuda_device_index: Optional[int] = None) -> Optional[int]:
+    """Bytes still safe to pin process-wide before the WDDM shared-GPU-memory
+    budget is likely exhausted. None if psutil is unavailable (check skipped)
+    or the proxy is disabled (AI_TOOLKIT_PINNED_WEIGHT_WDDM_FRACTION <= 0)."""
+    if not _env_bool("AI_TOOLKIT_WDDM_DXGI_CONTROL_DISABLE"):
+        dxgi = get_dxgi_meminfo()
+        if dxgi is not None:
+            info = dxgi.query_non_local_video_memory_info(
+                cuda_device_index=0 if cuda_device_index is None else int(cuda_device_index),
+                min_interval_s=0.0,
+            )
+            if info is not None:
+                return dxgi.compute_non_local_headroom_bytes(
+                    info.budget_bytes,
+                    info.current_usage_bytes,
+                    dxgi_spill_reserve_bytes(info.budget_bytes),
+                )
+    if _psutil is None:
+        return None
+    try:
+        total = _psutil.virtual_memory().total
+    except Exception:
+        return None
+    fraction = float(
+        os.environ.get("AI_TOOLKIT_PINNED_WEIGHT_WDDM_FRACTION", "0.25")
+    )
+    if fraction <= 0:
+        return None
+    ceiling = int(total * fraction)
+    with _pinned_bytes_lock:
+        return max(0, ceiling - _pinned_bytes_total)
 
 
 def _leaf_specs(t) -> list:
@@ -316,6 +516,13 @@ class PinnedBouncePool:
 
     # -- registration & schedule ------------------------------------------
 
+    def configure_capture(self, path=None, steps=None):
+        with self._cv:
+            self._capture_path = str(path or "").strip()
+            if steps is not None:
+                self._capture_limit = max(0, int(steps))
+            self._capture_count = 0
+
     def register_source(self, layer_key, module):
         if layer_key is None:
             return
@@ -331,9 +538,16 @@ class PinnedBouncePool:
             }
             self._cv.notify_all()
 
-    def set_schedule(self, layer_keys, confidence="exact"):
+    def set_schedule(self, layer_keys, confidence="exact", filter_to_sources=False):
         with self._cv:
-            self._scheduled = list(layer_keys)
+            schedule = list(layer_keys)
+            if filter_to_sources:
+                source_keys = set(self._sources)
+                schedule = [
+                    entry for entry in schedule
+                    if _schedule_layer_key(entry) in source_keys
+                ]
+            self._scheduled = schedule
             self._observed_step = []
             self.schedule_confidence = confidence
             self._cv.notify_all()
@@ -513,6 +727,7 @@ class PinnedBouncePool:
                 del self._free_buffers[signature]
                 continue
             buffers.pop()
+            release_pinned_bytes(_spec_bytes(signature))
             if not buffers:
                 del self._free_buffers[signature]
             return True
@@ -712,7 +927,21 @@ class PinnedBouncePool:
             avail = _host_ram_available()
             if avail is not None and avail - nbytes < self.ram_floor_bytes:
                 return None
-            leaves = _alloc_pinned(signature)
+            # Second, independent ceiling: the process-wide pinned-bytes ledger
+            # (shared with MemoryManager's weight pins) approximates the WDDM
+            # shared-GPU-memory budget, which plain "available RAM" cannot see.
+            headroom = pinned_bytes_headroom(_cuda_device_index(self.device))
+            if headroom is not None and nbytes > headroom:
+                return None
+            try:
+                leaves = _alloc_pinned(signature)
+            except Exception:
+                # The proxy above is a heuristic, not a guarantee -- if the
+                # driver still refuses (cudaErrorMemoryAllocation), demand-load
+                # this position from the pageable source instead of taking the
+                # worker thread down.
+                return None
+            register_pinned_bytes(nbytes)
         self._inflight_bytes += nbytes
         return leaves
 
@@ -721,7 +950,8 @@ class PinnedBouncePool:
 
         Returns ``(status, job)`` where status is one of:
           "job"  -> job = (pos, slot, weight, bias, signature); slot registered.
-          "skip" -> position unfillable (no source/weight/too big); advanced.
+          "skip" -> position unfillable (no source/weight/too big/already
+                    pinned -- the consumer bypasses the pool for it); advanced.
           "full" -> budget/buffers exhausted; caller should wait for a reclaim.
           "none" -> no schedulable position right now (target_ready met or end).
         """
@@ -738,6 +968,13 @@ class PinnedBouncePool:
         weight = getattr(module, "weight", None)
         bias = getattr(module, "bias", None)
         if weight is None:
+            self._fill_pos = pos + 1
+            return "skip", None
+        if _is_pinned(weight) and (bias is None or _is_pinned(bias)):
+            # Already page-locked (e.g. under the pinned-weight auto-budget):
+            # the consumer transfers straight from it via consume_without_transfer,
+            # so bouncing a redundant copy into a pool buffer here would only
+            # burn a worker cycle and budget for nothing.
             self._fill_pos = pos + 1
             return "skip", None
         specs = _layer_specs(weight, bias)
@@ -934,6 +1171,7 @@ class PinnedBouncePool:
             # its destination storage until it has left that copy section.
             w.join()
         with self._cv:
+            release_pinned_bytes(self._inflight_bytes + self._free_buffer_bytes_locked())
             self._slots.clear()
             self._free_buffers.clear()
             self._inflight_bytes = 0

@@ -42,5 +42,223 @@ class WddmDeadbandTests(unittest.TestCase):
         self.assertEqual(act(3.5, wddm_hard_gib=0.5, wddm_hold_high_gib=3.0), "up")
 
 
+class LayoutMoveSplitSignalTests(unittest.TestCase):
+    """``_training_layout_move`` deliberately watches two different signals:
+    demote must stay conservative across every resolution bucket (a generous
+    low-res step must never license a layout that spills at high-res), but
+    promote only needs the CURRENT bucket's own headroom. Requiring every
+    bucket to be simultaneously comfortable before promoting meant a
+    chronically tight high-res bucket (activation-bound, not fixable by
+    shedding resident weight bytes) vetoed promotion forever, even during a
+    roomy low-res step -- resident VRAM only ever ratcheted down."""
+
+    def _move(self, demote_free, current_free, **kw):
+        kw.setdefault("wddm_hard_gib", 1.0)
+        kw.setdefault("wddm_hold_high_gib", 2.0)
+        kw.setdefault("did_oom", False)
+        return MemoryManager._training_layout_move(demote_free, current_free, **kw)
+
+    def test_promotes_on_current_bucket_headroom_despite_tight_other_bucket(self):
+        # Cross-bucket worst-case (1.5, from some other bucket sitting in the
+        # hold band -- not low enough to demote, but too low to clear
+        # wddm_hold_high) would veto promotion under the old single-signal
+        # gate; the current bucket's own 5.0 GiB margin must still win "up".
+        self.assertEqual(self._move(demote_free=1.5, current_free=5.0), "up")
+
+    def test_demote_still_wins_and_stays_conservative(self):
+        # A tight OTHER bucket recorded below the hard floor must still force
+        # "down" even though the current bucket looks comfortable right now --
+        # demote's safety is unchanged by this fix.
+        self.assertEqual(self._move(demote_free=0.5, current_free=5.0), "down")
+
+    def test_oom_forces_demote_regardless_of_current_headroom(self):
+        self.assertEqual(
+            self._move(demote_free=9.0, current_free=9.0, did_oom=True), "down"
+        )
+
+    def test_holds_when_neither_threshold_cleared(self):
+        self.assertEqual(self._move(demote_free=1.2, current_free=1.5), "hold")
+
+
+class SharedCliffReliefTests(unittest.TestCase):
+    def test_no_pressure_holds_when_raw_headroom_clears_margin(self):
+        self.assertEqual(
+            MemoryManager._shared_cliff_relief_decision(
+                shared_raw_headroom_gib=4.0,
+                shared_margin_gib=3.0,
+                dedicated_free_gib=1.0,
+                dedicated_promote_free_gib=2.0,
+            ),
+            "hold",
+        )
+
+    def test_shared_pressure_unpins_when_dedicated_is_tight(self):
+        self.assertEqual(
+            MemoryManager._shared_cliff_relief_decision(
+                shared_raw_headroom_gib=2.5,
+                shared_margin_gib=3.0,
+                dedicated_free_gib=1.5,
+                dedicated_promote_free_gib=2.0,
+            ),
+            "unpin",
+        )
+
+    def test_shared_pressure_promotes_only_when_dedicated_is_roomy(self):
+        self.assertEqual(
+            MemoryManager._shared_cliff_relief_decision(
+                shared_raw_headroom_gib=2.5,
+                shared_margin_gib=3.0,
+                dedicated_free_gib=2.5,
+                dedicated_promote_free_gib=2.0,
+            ),
+            "promote",
+        )
+
+    def test_unpin_relief_picks_largest_pinned_streamed_layer(self):
+        import toolkit.memory_management.manager as manager_mod
+
+        class FakeManager:
+            _attach_args = {"ignore_modules": []}
+            _training_pinned_resident_keys = set()
+
+        class FakeLayer:
+            pass
+
+        small = FakeLayer()
+        small._mm_pinned_bytes = 10
+        large = FakeLayer()
+        large._mm_pinned_bytes = 30
+        resident = FakeLayer()
+        resident._mm_pinned_bytes = 100
+        rows = [
+            {"module": small, "managed": True, "resident_bytes": 10},
+            {"module": large, "managed": True, "resident_bytes": 30},
+            {"module": resident, "managed": False, "resident_bytes": 100},
+        ]
+        calls = []
+
+        def fake_candidates(*_args, **_kwargs):
+            return list(rows)
+
+        def fake_unpin(layer):
+            calls.append(layer)
+            return int(getattr(layer, "_mm_pinned_bytes", 0) or 0)
+
+        old_candidates = MemoryManager._training_layout_candidates
+        old_unpin = manager_mod.unpin_layer
+        try:
+            MemoryManager._training_layout_candidates = staticmethod(fake_candidates)
+            manager_mod.unpin_layer = fake_unpin
+            changed, action, released = MemoryManager._unpin_training_layer_for_shared_relief(
+                object(), FakeManager()
+            )
+        finally:
+            MemoryManager._training_layout_candidates = old_candidates
+            manager_mod.unpin_layer = old_unpin
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(action, "unpin_shared")
+        self.assertEqual(released, 30)
+        self.assertEqual(calls, [large])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+class AutoWddmMarginTests(unittest.TestCase):
+    def test_auto_margin_scales_with_device_memory_and_floor(self):
+        import toolkit.memory_management.manager as manager_mod
+
+        class Props:
+            def __init__(self, total_memory):
+                self.total_memory = total_memory
+
+        old_get_props = manager_mod.torch.cuda.get_device_properties
+        try:
+            manager_mod.torch.cuda.get_device_properties = lambda _device: Props(8 * 1024 ** 3)
+            self.assertEqual(MemoryManager._auto_wddm_margin_gib("cuda:0"), 1.0)
+
+            manager_mod.torch.cuda.get_device_properties = lambda _device: Props(12 * 1024 ** 3)
+            self.assertAlmostEqual(MemoryManager._auto_wddm_margin_gib("cuda:0"), 1.2)
+
+            manager_mod.torch.cuda.get_device_properties = lambda _device: Props(24 * 1024 ** 3)
+            self.assertAlmostEqual(MemoryManager._auto_wddm_margin_gib("cuda:0"), 2.4)
+        finally:
+            manager_mod.torch.cuda.get_device_properties = old_get_props
+
+class DxgiLocalPrestepGuardTests(unittest.TestCase):
+    def test_pre_step_guard_demotes_against_local_budget(self):
+        import torch
+        import toolkit.memory_management.manager as manager_mod
+
+        gib = 1024 ** 3
+
+        class FakeManager:
+            process_device = torch.device("cuda:0")
+            _smart_training_plan = {
+                "resident_bytes": 4 * gib,
+                "wddm_margin_bytes": 1 * gib,
+                "wddm_hard_bytes": 1 * gib,
+            }
+            _training_autotune_enabled = True
+
+        class FakeModule:
+            pass
+
+        module = FakeModule()
+        module._memory_manager = FakeManager()
+        MemoryManager._record_manual_training_shape_peak(
+            module._memory_manager,
+            (512, 512),
+            peak_allocated_gib=8.0,
+            peak_reserved_gib=8.0,
+        )
+
+        calls = []
+        old_is_available = manager_mod.torch.cuda.is_available
+        old_reserved = manager_mod.torch.cuda.memory_reserved
+        old_allocated = manager_mod.torch.cuda.memory_allocated
+        old_local = MemoryManager._dxgi_local_budget_snapshot_bytes
+        old_demote = MemoryManager._demote_training_layers
+        try:
+            manager_mod.torch.cuda.is_available = lambda: True
+            manager_mod.torch.cuda.memory_reserved = lambda _device: 4 * gib
+            manager_mod.torch.cuda.memory_allocated = lambda _device: 4 * gib
+            MemoryManager._dxgi_local_budget_snapshot_bytes = staticmethod(
+                lambda _device: {
+                    "budget_bytes": 10 * gib,
+                    "usage_bytes": 8 * gib,
+                    "raw_headroom_bytes": 2 * gib,
+                }
+            )
+
+            def fake_demote(_module, mm, count, largest=True):
+                calls.append((count, largest))
+                before = mm._smart_training_plan["resident_bytes"]
+                mm._smart_training_plan = dict(mm._smart_training_plan)
+                mm._smart_training_plan["resident_bytes"] = max(0, before - 4 * gib)
+                return 1
+
+            MemoryManager._demote_training_layers = classmethod(
+                lambda cls, _module, mm, count, largest=True: fake_demote(
+                    _module, mm, count, largest
+                )
+            )
+
+            result = MemoryManager.prepare_training_memory_for_shape(
+                module, torch.device("cuda:0"), shape_key=(512, 512)
+            )
+        finally:
+            manager_mod.torch.cuda.is_available = old_is_available
+            manager_mod.torch.cuda.memory_reserved = old_reserved
+            manager_mod.torch.cuda.memory_allocated = old_allocated
+            MemoryManager._dxgi_local_budget_snapshot_bytes = old_local
+            MemoryManager._demote_training_layers = old_demote
+
+        self.assertEqual(result["source"], "dxgi_local")
+        self.assertEqual(result["demoted_layers"], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertLessEqual(
+            result["after"]["predicted_local_usage_gib"],
+            result["after"]["target_local_usage_gib"],
+        )

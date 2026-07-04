@@ -146,6 +146,45 @@ class WorkingReserveSimTests(unittest.TestCase):
             f"resident set did not shrink under over-commit: {s}",
         )
 
+    def test_manual_guard_demotes_before_known_shape_under_pressure(self):
+        cfg = sim._manual_cfg(
+            always_resident_gib=2.6,
+            start_resident=30,
+            working_floor_gib={"res512": 5.0},
+            frag_gib=0.0,
+            frag_ratchet_gib=0.0,
+            manual_residual_gib=0.2,
+        )
+
+        def external(step):
+            return 0.8 if step >= 1 else 0.0
+
+        history = sim.run_manual_sim(
+            cfg, ["res512"], steps=3, guard=True, external_gib=external
+        )
+        s = sim.summarize_manual(history, cfg)
+        self.assertEqual(history[0].move, "hold")
+        self.assertEqual(history[1].move, "pre_down")
+        self.assertGreater(s["pre_demotes"], 0, f"known shape did not demote before step: {s}")
+        self.assertEqual(s["spills"], 0, f"pre-step demotion failed to avoid spill: {s}")
+
+    def test_manual_guard_demotes_when_post_trim_trough_hides_peak(self):
+        cfg = sim._manual_cfg(
+            always_resident_gib=2.6,
+            start_resident=40,
+            working_floor_gib={"res768": 5.6, "res512": 5.0, "res256": 4.6},
+            manual_residual_gib=0.2,
+        )
+        history = sim.run_manual_sim(
+            cfg, ["res512", "res256", "res768", "res512"], steps=20, guard=True
+        )
+        s = sim.summarize_manual(history, cfg)
+        self.assertGreater(s["demotes"], 0, f"guard trusted post-trim trough: {s}")
+        self.assertEqual(s["steady_spills"], 0, f"peak-pressure demotion did not stabilize: {s}")
+        first = history[0]
+        self.assertEqual(first.move, "down")
+        self.assertGreater(first.governing, cfg.wddm_hard_gib)
+
     # --- working_reserve SIZING controller (auto) ----------------------------
 
     def test_reserve_peak_fix_converges_and_holds(self):
@@ -192,8 +231,9 @@ class WorkingReserveSimTests(unittest.TestCase):
 
     def test_reserve_trough_bug_is_worse_than_peak_fix(self):
         # The old behaviour: sizing off the step-end residual (trough). It cannot
-        # find the efficient stable point — it gets nearer the cliff, has to retreat,
-        # and ends mis-sized (pinned high / wasting VRAM) versus the peak fix.
+        # find the efficient stable point: it undersizes reserve and rides the
+        # cliff. Reserve no longer reacts to the cliff itself; layout safety owns
+        # that. So the failure is visible as steady spills plus too-low reserve.
         _, hist_bug = sim.scenario_reserve_trough_bug()
         cfg_fix, hist_fix = sim.scenario_reserve_peak_fix()
         bug = sim.summarize_reserve(hist_bug, cfg_fix)
@@ -201,30 +241,116 @@ class WorkingReserveSimTests(unittest.TestCase):
         self.assertLess(bug["min_free"], fix["min_free"], f"bug not nearer cliff: {bug} vs {fix}")
         self.assertLess(bug["min_free"], cfg_fix.wddm_hard_gib,
                         f"bug should breach the danger zone: {bug}")
-        self.assertGreater(bug["retreats"], fix["retreats"],
-                           f"bug should thrash more than the fix: {bug} vs {fix}")
-        self.assertGreater(bug["final_reserve"], fix["final_reserve"],
-                           f"bug should mis-size higher than the fix: {bug} vs {fix}")
+        self.assertGreater(bug["steady_spills"], fix["steady_spills"],
+                           f"bug should keep spilling versus the fix: {bug} vs {fix}")
+        self.assertEqual(bug["retreats"], 0,
+                         f"working reserve should not panic-retreat on cliffs: {bug}")
+        self.assertLess(bug["final_reserve"], fix["final_reserve"],
+                        f"bug should stay undersized versus the peak fix: {bug} vs {fix}")
 
     def test_reserve_cross_bucket_prevents_high_res_starvation(self):
         # Peak signal but per-bucket (no cross-bucket governance): a quiet low-res
-        # step shrinks the reserve below what the next high-res step needs, so it
-        # breaches and retreats. Cross-bucket governance must fix that.
+        # step can shrink the reserve below what the next high-res step needs.
+        # Cross-bucket governance keeps the high-res peak binding even when the
+        # current low-res bucket is quiet.
         _, hist_pb = sim.scenario_reserve_per_bucket()
         cfg, hist_fix = sim.scenario_reserve_peak_fix()
         pb = sim.summarize_reserve(hist_pb, cfg)
         fix = sim.summarize_reserve(hist_fix, cfg)
         self.assertLess(pb["min_free"], fix["min_free"], f"per-bucket not worse: {pb} vs {fix}")
-        self.assertGreater(pb["retreats"], 0, f"per-bucket should have to retreat: {pb}")
+        self.assertLess(pb["final_reserve"], fix["final_reserve"],
+                        f"per-bucket reserve should be lower than the cross-bucket fix: {pb} vs {fix}")
         self.assertEqual(fix["retreats"], 0, f"cross-bucket should not retreat: {fix}")
 
-    def test_reserve_no_steady_spill_under_external_pressure(self):
-        # A transient external app eats the margin; the controller must retreat and
-        # not sit in a steady spill.
+    def test_reserve_ignores_external_pressure(self):
+        # A transient external app eats the free margin, but that is not part of
+        # the activation working set. Layout demotion handles pressure; reserve
+        # should stay sized to the measured peak and must not panic-retreat.
         cfg, history = sim.scenario_reserve_pressure()
         s = sim.summarize_reserve(history, cfg)
-        self.assertGreater(s["retreats"], 0, f"never reacted to pressure: {s}")
-        self.assertEqual(s["steady_spills"], 0, f"steady spill under pressure: {s}")
+        peak = max(cfg.act_peak_gib.values()) + cfg.pad_gib
+        self.assertEqual(s["retreats"], 0, f"reserve reacted to pressure: {s}")
+        self.assertAlmostEqual(s["final_reserve"], peak, places=6)
+
+    def test_auto_seed_defaults_to_five_gib(self):
+        from toolkit.memory_management import MemoryManager
+
+        self.assertAlmostEqual(
+            MemoryManager._training_auto_seed_working_reserve_gib(),
+            5.0,
+            places=6,
+        )
+
+    def test_panic_reserve_snaps_to_measured_target(self):
+        from toolkit.memory_management import MemoryManager
+
+        new_reserve, danger, action = MemoryManager._training_working_reserve_decision(
+            current_gib=17.0,
+            measured_peak_gib=4.38,
+            min_device_free_gib=3.86,
+            danger_gib=16.0,
+            wddm_hard_gib=1.0,
+            wddm_stop_gib=2.0,
+            pad_gib=0.5,
+            step_gib=0.5,
+            retreat_gib=1.0,
+        )
+        self.assertEqual(action, "shrink")
+        self.assertAlmostEqual(new_reserve, 4.88, places=6)
+        self.assertIsNone(danger)
+
+    def test_cliff_does_not_change_measured_reserve_target(self):
+        from toolkit.memory_management import MemoryManager
+
+        new_reserve, danger, action = MemoryManager._training_working_reserve_decision(
+            current_gib=17.0,
+            measured_peak_gib=4.38,
+            min_device_free_gib=0.0,
+            danger_gib=16.0,
+            wddm_hard_gib=1.0,
+            wddm_stop_gib=2.0,
+            pad_gib=0.5,
+            step_gib=0.5,
+            retreat_gib=1.0,
+        )
+        self.assertEqual(action, "shrink")
+        self.assertAlmostEqual(new_reserve, 4.88, places=6)
+        self.assertIsNone(danger)
+
+    def test_observed_driver_free_overrides_optimistic_estimate(self):
+        from toolkit.memory_management import MemoryManager
+
+        self.assertAlmostEqual(
+            MemoryManager._training_governing_free_gib(
+                3.4, {"device_peak_source": "observed", "device_free_peak_gb": 0.0}
+            ),
+            0.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            MemoryManager._training_governing_free_gib(
+                3.4, {"device_peak_source": "estimate", "device_free_peak_gb": 0.0}
+            ),
+            3.4,
+            places=6,
+        )
+
+    def test_underreserved_peak_grows_before_hard_floor(self):
+        from toolkit.memory_management import MemoryManager
+
+        new_reserve, danger, action = MemoryManager._training_working_reserve_decision(
+            current_gib=2.03,
+            measured_peak_gib=3.39,
+            min_device_free_gib=1.20,
+            danger_gib=None,
+            wddm_hard_gib=1.0,
+            wddm_stop_gib=1.5,
+            pad_gib=0.5,
+            step_gib=0.5,
+        )
+        self.assertEqual(action, "grow")
+        self.assertIsNone(danger)
+        self.assertAlmostEqual(new_reserve, 3.89, places=6)
 
     def test_working_reserve_signal_tracks_peak_not_floor(self):
         from toolkit.memory_management import MemoryManager
@@ -314,6 +440,24 @@ class WorkingReserveSimTests(unittest.TestCase):
             pad_gib=0.25,
         )
         self.assertIsNone(floor)
+    def test_cliff_guard_predicts_next_peak_not_post_trim_trough(self):
+        from toolkit.memory_management import MemoryManager
+
+        pred = MemoryManager._training_cliff_predicted_peak_free_gib(
+            total_gib=12.0,
+            device_free_gib=0.0,
+            torch_reserved_gib=11.5,
+            peak_allocated_gib=11.2,
+        )
+        self.assertAlmostEqual(pred, 0.3, places=6)
+        healthy = MemoryManager._training_cliff_predicted_peak_free_gib(
+            total_gib=12.0,
+            device_free_gib=0.0,
+            torch_reserved_gib=11.5,
+            peak_allocated_gib=5.2,
+        )
+        self.assertAlmostEqual(healthy, 6.3, places=6)
+
     def test_cliff_guard_action_predicate(self):
         from toolkit.memory_management import MemoryManager
         act = MemoryManager._training_cliff_guard_action

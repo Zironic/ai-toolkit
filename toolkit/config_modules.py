@@ -31,6 +31,15 @@ class SaveConfig:
         self.push_to_hub: bool = kwargs.get("push_to_hub", False)
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
+        # Pinned staging buffer (MB) for the batched device->host checkpoint
+        # snapshot. Larger -> fewer CUDA syncs -> faster save, but more pinned
+        # (WDDM shared-budget) memory held for the run's lifetime. 0 disables the
+        # batched path (falls back to the per-tensor copy loop).
+        self.snapshot_buffer_mb: int = kwargs.get('snapshot_buffer_mb', 64)
+        # Frequent crash-recovery snapshot: write a latest-wins LoRA to
+        # <name>_recovery.safetensors every N steps (cheap: ~0.1s, off-thread
+        # disk write). 0 disables. This is separate from save_every checkpoints.
+        self.recovery_every: int = kwargs.get('recovery_every', 0)
 
 class LoggingConfig:
     def __init__(self, **kwargs):
@@ -770,6 +779,17 @@ class ModelConfig:
         self.layer_offloading_block_stream_only = kwargs.get(
             "layer_offloading_block_stream_only", False
         )
+        # How many GiB of offloaded weights to keep page-locked (pinned) in CPU
+        # RAM. The model already occupies this RAM; pinning just locks it so it
+        # is not paged out and faulted back in on every fetch (the cause of slow
+        # bounce-pool copies and whole-system lag during training). -1 = auto:
+        # pin the whole offloaded (streamed) weight set, capped by free host RAM.
+        # 0 = pin nothing (prefetch pool pins on demand). A positive value pins
+        # up to that many GiB. Auto is the sensible default when the machine has
+        # the RAM to hold the model (it already does); lower it if RAM is tight.
+        self.layer_offloading_pinned_weight_gb = kwargs.get(
+            "layer_offloading_pinned_weight_gb", -1.0
+        )
         # "working_reserve" = the VRAM we reserve for our own transient working
         # set (activations / dequant / temporary workspace) during a step. -1 =
         # auto (live controller tunes it). The pre-rename key was
@@ -780,7 +800,10 @@ class ModelConfig:
         )
         self.layer_offloading_smart_wddm_margin_gb = kwargs.get(
             "layer_offloading_smart_wddm_margin_gb",
-            kwargs.get("layer_offloading_smart_buffer_gb", 1.0),
+            kwargs.get("layer_offloading_smart_buffer_gb", -1.0),
+        )
+        self.layer_offloading_wddm_spill_reserve_pct = kwargs.get(
+            "layer_offloading_wddm_spill_reserve_pct", 0.10
         )
         self.layer_offloading_smart_wddm_hard_gb = kwargs.get(
             "layer_offloading_smart_wddm_hard_gb",
@@ -804,7 +827,7 @@ class ModelConfig:
         )
         self.layer_offloading_smart_sampling_wddm_margin_gb = kwargs.get(
             "layer_offloading_smart_sampling_wddm_margin_gb",
-            kwargs.get("layer_offloading_smart_sampling_buffer_gb", 1.0),
+            kwargs.get("layer_offloading_smart_sampling_buffer_gb", -1.0),
         )
         self.layer_offloading_smart_sampling_wddm_hard_gb = kwargs.get(
             "layer_offloading_smart_sampling_wddm_hard_gb",
@@ -841,6 +864,10 @@ class ModelConfig:
         self.layer_offloading_checkpoint_keep_last = kwargs.get(
             "layer_offloading_checkpoint_keep_last", 0
         )
+        self.layer_offloading_compile_streamed = kwargs.get(
+            "layer_offloading_compile_streamed", False
+        )
+        self.train_compile_blocks = kwargs.get("train_compile_blocks", False)
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for

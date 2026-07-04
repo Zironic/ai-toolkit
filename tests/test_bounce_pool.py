@@ -319,6 +319,41 @@ class BouncePoolTests(unittest.TestCase):
             manager_modules._OFFLOAD_TRACE.schedule_by_shape_key.clear()
             manager_modules._OFFLOAD_TRACE.frozen = None
 
+    def test_transfer_schedule_filters_to_registered_sources(self):
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=4, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            module_b = torch.nn.Linear(8, 8)
+            weight = torch.empty(4)
+            pool.register_source("b", module_b)
+            pool.set_schedule(
+                [
+                    ("a", "forward", 0),
+                    ("b", "forward", 0),
+                    ("c", "forward", 0),
+                    ("b", "backward", 1),
+                    ("a", "backward", 1),
+                ],
+                filter_to_sources=True,
+            )
+
+            pool.acquire("b", weight, None, operation="forward")
+            pool.acquire("b", weight, None, operation="backward")
+
+            with pool._cv:
+                self.assertEqual(
+                    pool._scheduled,
+                    [("b", "forward", 0), ("b", "backward", 1)],
+                )
+            stats = pool.stats()
+            self.assertEqual(stats["mismatches"], 0)
+            self.assertEqual(stats["duplicate_key_resync_blocked"], 0)
+            self.assertEqual(stats["consume_pos"], 2)
+        finally:
+            pool.shutdown()
+
     def test_sync_sources_replaces_sources_without_clearing_schedule(self):
         pool = bounce_pool.PinnedBouncePool(
             "cpu", budget_bytes=1 << 20, lookahead=2, num_workers=1,
@@ -373,6 +408,33 @@ class BouncePoolTests(unittest.TestCase):
             finally:
                 if pool is not None:
                     pool.shutdown()
+                bounce_pool.configure_trace_capture(old_path, old_limit)
+
+    def test_trace_capture_configuration_updates_existing_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_path = os.path.join(tmp, "capture.jsonl")
+            old_path = bounce_pool._TRACE_CAPTURE_PATH
+            old_limit = bounce_pool._TRACE_CAPTURE_STEPS
+            pool = None
+            try:
+                bounce_pool.configure_trace_capture(None, 256)
+                pool = bounce_pool.create_pool(
+                    "cpu", budget_bytes=1 << 20, lookahead=2, num_workers=1,
+                    ram_floor_bytes=0,
+                )
+                bounce_pool.configure_trace_capture(capture_path, 1)
+                pool.set_schedule([("a", "forward", 0)])
+                pool.acquire("a", torch.empty(4), None, operation="forward")
+
+                pool.step_begin(warmup_bytes=0, warmup_timeout_s=0.0)
+
+                with open(capture_path, "r", encoding="utf-8") as handle:
+                    records = [json.loads(line) for line in handle if line.strip()]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["observed"], [["a", "forward", 0]])
+            finally:
+                if pool is not None:
+                    bounce_pool.destroy_pool("cpu")
                 bounce_pool.configure_trace_capture(old_path, old_limit)
 
     def test_ready_slot_wrong_layer_or_shape_is_hard_miss(self):
@@ -568,6 +630,75 @@ class BounceFillGroupTests(unittest.TestCase):
             time.sleep(0.05)
             with pool._cv:
                 self.assertLessEqual(pool._inflight_bytes, pool.budget_bytes)
+        finally:
+            pool.shutdown()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "pin_memory requires CUDA")
+class PinnedSourceFillSkipTests(unittest.TestCase):
+    """A layer that is already pinned (e.g. under the pinned-weight auto-budget)
+    must not be re-bounced: the consumer transfers straight from it, so a worker
+    fill would just burn a copy that gets discarded. _claim_one_fill_locked must
+    skip it (like the existing no-source/too-big skips) without ever creating a
+    slot for that position."""
+
+    def test_claim_skips_pinned_weight_without_creating_slot(self):
+        pinned_module = torch.nn.Linear(8, 8, bias=False)
+        pinned_module.weight.data = pinned_module.weight.data.pin_memory()
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=4, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            pool.register_source("pinned", pinned_module)
+            pool.set_schedule(["pinned"])
+            with pool._cv:
+                status, job = pool._claim_one_fill_locked()
+                self.assertEqual(status, "skip")
+                self.assertIsNone(job)
+                self.assertEqual(pool._slots, {})
+                self.assertEqual(pool._fill_pos, 1)
+        finally:
+            pool.shutdown()
+
+    def test_claim_still_fills_pageable_weight(self):
+        pageable_module = torch.nn.Linear(8, 8, bias=False)
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=4, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            pool.register_source("pageable", pageable_module)
+            pool.set_schedule(["pageable"])
+            with pool._cv:
+                status, job = pool._claim_one_fill_locked()
+                self.assertEqual(status, "job")
+                self.assertIsNotNone(job)
+                self.assertIn(0, pool._slots)
+        finally:
+            pool.shutdown()
+
+    def test_worker_never_copies_an_already_pinned_layer(self):
+        """End-to-end: let the real worker thread run against a mixed pinned
+        + pageable schedule and confirm no fill was ever recorded for the
+        pinned position (not just that the synchronous claim skips it)."""
+        pinned_module = torch.nn.Linear(8, 8, bias=False)
+        pinned_module.weight.data = pinned_module.weight.data.pin_memory()
+        pageable_module = torch.nn.Linear(8, 8, bias=False)
+        pool = bounce_pool.PinnedBouncePool(
+            "cpu", budget_bytes=1 << 20, lookahead=4, num_workers=1,
+            ram_floor_bytes=0,
+        )
+        try:
+            pool.register_source("pinned", pinned_module)
+            pool.register_source("pageable", pageable_module)
+            pool.set_schedule(["pinned", "pageable"])
+            _wait_until(lambda: pool.stats()["fills"] >= 1, timeout=2.0)
+            time.sleep(0.05)
+            with pool._cv:
+                self.assertNotIn(0, pool._slots, "pinned position must never get a slot")
+                pageable_slot = pool._slots.get(1)
+                self.assertIsNotNone(pageable_slot)
         finally:
             pool.shutdown()
 
