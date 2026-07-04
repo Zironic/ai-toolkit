@@ -9,6 +9,7 @@ block.
 from __future__ import annotations
 
 import collections
+import contextlib
 import itertools
 import threading
 import time
@@ -514,4 +515,167 @@ def fetch_free_after(token: torch.Tensor, guard: torch.Tensor) -> torch.Tensor:
 @fetch_free_after.register_fake
 def _(token, guard):
     return token.clone()
+
+
+def _register_ordered_effects():
+    """Pin the fetch ops to program order inside compiled graphs.
+
+    Functionalized custom ops only carry data deps through their args; in the
+    AOT backward graph each checkpoint unit's re-fetch depends only on the
+    saved boundary activation (an immediately-available input), so Inductor
+    may hoist all re-fetches above the frees -- exceeding the ring depth and
+    deadlocking the host-side depth guard. Ordered effect tokens thread a
+    dependency chain through every fetch op, enforcing eager program order in
+    forward AND backward graphs (kernel-launch order only; stream overlap is
+    unaffected)."""
+    try:
+        from torch._higher_order_ops.effects import (
+            _EffectType,
+            _register_effectful_op,
+        )
+
+        for op in (
+            torch.ops.mm.fetch_start.default,
+            torch.ops.mm.fetch_start_after.default,
+            torch.ops.mm.fetch_wait.default,
+            torch.ops.mm.fetch_free.default,
+            torch.ops.mm.fetch_free_after.default,
+        ):
+            _register_effectful_op(op, _EffectType.ORDERED)
+    except Exception as error:  # pragma: no cover - torch-version dependent
+        raise RuntimeError(
+            "in-graph streaming requires ordered-effect registration for its "
+            f"fetch ops (torch internal API changed?): {error!r}"
+        ) from error
+
+
+# NOT registered at import time: in torch 2.12 ordered-effect tokens trip an
+# internal token-erasure assertion inside the checkpoint HOP lowering
+# (see tests/test_ingraph_training_ops.py, compiled xfail). Phase 4a S1 keeps
+# this as the candidate ordering mechanism for the compiled trunk; call it
+# explicitly once the HOP interaction is resolved (torch upgrade or flat-trunk
+# design without the checkpoint HOP).
+
+
+class _FreeOnBackwardFn(torch.autograd.Function):
+    """Anchor a ticket's free event to the consuming block's BACKWARD.
+
+    Training-mode counterpart of `fetch_free_after`: under checkpoint
+    recompute, the block's backward (grad-input from the fetched weight
+    views) is the true last reader of the ticket's device buffer, so a
+    forward-side free lets the depth-K ring recycle the buffer under
+    backward kernels that are still reading it (silent corruption).
+
+    Wrap the block INPUT, not its output: this node's backward runs last
+    in the block's backward (input side), i.e. after every weight-view
+    read, and `fetch_free_after`'s declared guard mutation on the incoming
+    grad keeps the free ordered after the kernels that produced it.
+    """
+
+    @staticmethod
+    def forward(ctx, x, token):
+        ctx.save_for_backward(token)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_x):
+        (token,) = ctx.saved_tensors
+        if torch.compiler.is_compiling():
+            # Declared guard mutation orders the free after the kernels that
+            # produced grad_x; functionalization makes it version-safe.
+            torch.ops.mm.fetch_free_after(token, grad_x)
+        else:
+            # Eager executes in program order -- and the guarded variant's
+            # version bump on grad_x would trip autograd's version checks.
+            torch.ops.mm.fetch_free(token)
+        return grad_x, None
+
+
+def free_on_backward(x: torch.Tensor, token: torch.Tensor) -> torch.Tensor:
+    """Defer a ticket's free to the consuming block's backward (training).
+
+    Two fetch generations exist under non-reentrant checkpoint: the
+    first-pass fetch (its views are dropped by the checkpoint hooks, so it
+    is safe to free after the block's forward) and the recompute fetch
+    (its views feed the real backward, so it must be freed after the
+    block's backward). The token passed here is saved via
+    ``save_for_backward`` -- checkpoint's saved-tensor machinery therefore
+    swaps it for the RECOMPUTE generation's token automatically, and this
+    node's backward frees exactly the ticket backward actually read.
+
+    Canonical training block shape (see checkpoint_recompute_context):
+
+        token = fetch_start_after(host, x)
+        flat = fetch_wait(token, nbytes)
+        ...views...
+        x = free_on_backward(x, token)
+        out = <block math>(x, views)
+        if not in_recompute():
+            torch.ops.mm.fetch_free_after(token, out)  # first-pass gen only
+        return out
+    """
+    return _FreeOnBackwardFn.apply(x, token)
+
+
+_IN_RECOMPUTE = threading.local()
+
+
+def in_recompute() -> bool:
+    """True while a checkpoint recompute pass (via checkpoint_recompute_context)
+    is re-running the block fn."""
+    return bool(getattr(_IN_RECOMPUTE, "value", False))
+
+
+class _RecomputeMarker:
+    def __enter__(self):
+        self._prev = getattr(_IN_RECOMPUTE, "value", False)
+        _IN_RECOMPUTE.value = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _IN_RECOMPUTE.value = self._prev
+        return False
+
+
+def checkpoint_recompute_context():
+    """``context_fn`` for torch.utils.checkpoint: null forward context, and a
+    recompute context that flips in_recompute() so the block fn suppresses the
+    first-pass forward free during recompute (the recompute ticket is freed by
+    free_on_backward instead). EAGER ONLY -- compiled checkpoint requires
+    TorchDispatchMode contexts; use compiled_checkpoint_context there."""
+    return contextlib.nullcontext(), _RecomputeMarker()
+
+
+def _compiled_free_policy(ctx, op, *args, **kwargs):
+    from torch.utils.checkpoint import CheckpointPolicy
+
+    if op in (
+        torch.ops.mm.fetch_free_after.default,
+        torch.ops.mm.fetch_free.default,
+    ):
+        # Keep the forward-side free OUT of the backward replay: replayed, it
+        # would free the backward re-fetch's buffer before the grad kernels
+        # read it. free_on_backward's op is the backward-side free.
+        return CheckpointPolicy.MUST_SAVE
+    # Everything else replays in backward (full-checkpoint mode) -- including
+    # fetch_start/fetch_wait, which is precisely the backward re-fetch, and
+    # hands the backward-side free the recompute generation's token.
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def compiled_checkpoint_context():
+    """``context_fn`` for torch.utils.checkpoint under torch.compile."""
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts
+
+    return create_selective_checkpoint_contexts(_compiled_free_policy)
+
+
+def training_checkpoint_context():
+    """Grad-mode checkpoint context for streamed ingraph blocks: dispatch-mode
+    (SAC) contexts under compile, the in_recompute marker in eager. Both make
+    the first-pass forward free stay out of the backward path so the ring is
+    freed by free_on_backward at the true last read."""
+    if torch.compiler.is_compiling():
+        return compiled_checkpoint_context()
+    return checkpoint_recompute_context()
 
