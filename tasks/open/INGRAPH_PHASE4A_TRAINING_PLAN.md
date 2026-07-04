@@ -103,6 +103,35 @@ block fn selects at trace time:
   beat it — the sampler's compiled forward already runs 3.56 s/pass on
   the same transfers).
 
+## S1 findings (2026-07-04) — compiled-trunk ordering, the full map
+
+Eager is DONE (d47bd45). For the compiled trunk, three mechanisms were
+tried; the constraint set is now fully mapped:
+
+1. **Plain HOP checkpoint**: AOT backward graph is CORRECT (re-fetch ->
+   grads -> free per unit, recomputed token via SAC MUST_SAVE on frees),
+   but functionalized fetch ops carry only data deps, and backward
+   re-fetches depend just on saved boundary activations -> Inductor
+   hoists them above frees -> depth-guard fail-fast (by design).
+2. **Ordered effect tokens** (`_register_ordered_effects`, kept opt-in):
+   give exactly the needed program order, but trip a token-erasure
+   assertion inside the checkpoint HOP lowering on torch 2.12.
+3. **Flat trunk (no HOP) + effects**: registers and orders fine (probe:
+   forward 6 fetches, ordered, zero breaks) — but effectful ops are not
+   recomputed by the partitioner (correctly: side effects must not
+   replay), so backward gets no re-fetch at all; and without recompute
+   the saved views read freed ring buffers. Effects-for-ordering and
+   partitioner-recompute are mutually exclusive.
+
+**Chosen direction: Inductor post-grad ordering pass** (the parent
+plan's Tier-2 machinery, pulled forward): keep the HOP + SAC design from
+(1) — whose graphs are already correct — and add a
+`post_grad_custom_post_pass` that threads explicit dependencies between
+consecutive auto_functionalized fetch/free nodes in the backward graph
+(free_N -> fetch_{N-1}), restoring eager order without effect tokens.
+Local, no torch patch; also re-test (2) on the next torch upgrade — if
+effects x HOP is fixed upstream, the pass becomes dead code.
+
 ## Risks
 
 | Risk | Mitigation |
