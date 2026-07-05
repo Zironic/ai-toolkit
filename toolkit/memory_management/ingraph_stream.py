@@ -20,7 +20,10 @@ import torch
 import torch.nn.functional as F
 from toolkit.memory_management import pin_manager
 
-from toolkit.memory_management.manager_modules import _fp8_linear_compiled
+from toolkit.memory_management.manager_modules import (
+    _fp8_linear_compiled,
+    _fp8_linear_training,
+)
 
 
 
@@ -282,12 +285,48 @@ def functional_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor 
     return F.linear(x, weight, bias)
 
 
-def streamed_linear(x: torch.Tensor, view: LinearView):
+@dataclass(frozen=True)
+class LoraEntry:
+    """Trainable LoRA leaves for one streamed Linear.
+
+    NOT part of the host pack: A/B are small trainable fp32 Parameters that
+    must stay ordinary graph inputs (GPU-resident, grad-carrying). ``scale``
+    folds alpha/rank and the network multiplier -- both must be trace-time
+    scalars (non-scalar multipliers fail closed as lora_untraceable at
+    enable time, before any entry is built)."""
+
+    a: torch.Tensor  # lora_down weight, (rank, in_features)
+    b: torch.Tensor  # lora_up weight, (out_features, rank)
+    scale: float
+
+
+def streamed_linear(
+    x: torch.Tensor,
+    view: LinearView,
+    *,
+    training: bool = False,
+    lora: LoraEntry | None = None,
+):
+    """Pure traced Linear math from pack views.
+
+    ``training`` and ``lora`` presence are trace-time constants selected at
+    enable time (not data-dependent branches). The training fp8 path uses the
+    grad-safe autograd.Function (no weight grad, grad-input via scale
+    folding); the frozen base views never require grad, so nothing here saves
+    a weight for backward."""
     if view.spec.kind == "fp8_rowwise" and view.spec.fp8_qualifies:
         if view.scale is None:
             raise RuntimeError(f"missing scale for {view.spec.name}")
-        return _fp8_linear_compiled(x, view.weight.t(), view.scale.reshape(-1), view.bias)
-    return functional_linear(x, view.materialized_weight(), view.bias)
+        fp8_linear = _fp8_linear_training if training else _fp8_linear_compiled
+        base = fp8_linear(x, view.weight.t(), view.scale.reshape(-1), view.bias)
+    else:
+        base = functional_linear(x, view.materialized_weight(), view.bias)
+    if lora is not None:
+        # Same math as the compile-fast LoRA path: adapter computed in its
+        # own dtype (fp32), scaled, cast back to the base dtype.
+        lora_out = (x.to(lora.a.dtype) @ lora.a.t() @ lora.b.t()) * lora.scale
+        base = base + lora_out.to(base.dtype)
+    return base
 
 
 class CompileRegionError(RuntimeError):
