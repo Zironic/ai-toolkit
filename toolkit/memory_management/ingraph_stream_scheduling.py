@@ -17,6 +17,7 @@ ingraph trunk.
 from __future__ import annotations
 
 import operator
+import sys
 
 import torch
 
@@ -114,16 +115,42 @@ def order_fetch_ops_pass(graph: torch.fx.Graph) -> None:
         graph.lint()
 
 
+class _OrderingGraphPass:
+    """CustomGraphPass-shaped wrapper with a STABLE uuid.
+
+    Inductor hashes post_grad_custom_post_pass into every fxgraph cache key;
+    a bare closure is unpicklable, so torch salts the key per process and
+    every run cache-misses (observed as 'different pass paths each run').
+    The uuid is a content hash of this module's source: same code -> same
+    key -> warm caches; editing the pass correctly invalidates them."""
+
+    _ingraph_ordering_pass = True
+
+    def __init__(self, existing=None):
+        self._existing = existing
+
+    def __call__(self, graph):
+        if self._existing is not None:
+            self._existing(graph)
+        order_fetch_ops_pass(graph)
+
+    def uuid(self):
+        import hashlib
+        import inspect
+
+        source = inspect.getsource(sys.modules[__name__])
+        salt = b""
+        existing_uuid = getattr(self._existing, "uuid", None)
+        if callable(existing_uuid):
+            salt = bytes(str(existing_uuid()), "utf-8")
+        elif self._existing is not None:
+            salt = bytes(repr(self._existing), "utf-8")
+        return hashlib.sha256(source.encode("utf-8") + salt).digest()
+
+
 def install_ordering_pass() -> None:
     """Idempotently chain onto torch._inductor.config.post_grad_custom_post_pass."""
     existing = torch._inductor.config.post_grad_custom_post_pass
     if getattr(existing, "_ingraph_ordering_pass", False):
         return
-
-    def _pass(graph):
-        if existing is not None:
-            existing(graph)
-        order_fetch_ops_pass(graph)
-
-    _pass._ingraph_ordering_pass = True
-    torch._inductor.config.post_grad_custom_post_pass = _pass
+    torch._inductor.config.post_grad_custom_post_pass = _OrderingGraphPass(existing)

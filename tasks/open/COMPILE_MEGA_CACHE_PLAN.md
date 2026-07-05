@@ -43,6 +43,44 @@ it's the compliant path.
   no resolution/shape tag needed, since guards (not us) discriminate shapes
   within one cumulative blob. One blob per (checkpoint, quant) is enough.
 
+## MEASURED 2026-07-05: what the mega-cache can and cannot buy
+
+Two findings from wiring the blob into the Phase 4a ingraph training smoke
+(`smoke_krea2_train_cuda.py --compile-cache-dir`); they reshape this plan's
+value calculus:
+
+1. **Custom-pass cache poisoning (fixed, applies to SAMPLING too).**
+   Inductor hashes `post_grad_custom_post_pass` into every fxgraph cache
+   key. A bare closure is unpicklable, so torch salts the key PER PROCESS:
+   with the ingraph ordering pass installed, every run looked like a
+   different compiler and every cache tier missed -- including the shipped
+   sampling mega-cache in any process that also enabled ingraph
+   training/sampling ordering. Fixed in `ingraph_stream_scheduling.py`:
+   the pass is a CustomGraphPass-shaped object whose `uuid()` is a content
+   hash of the module source. **Standing rule: any custom Inductor pass in
+   this repo must be a stable-uuid object, never a closure.**
+2. **The ingraph TRAINING trunk's cold compile is not cacheable by this
+   mechanism.** A/B with the stable uuid: cold step-0 151 s, warm step-0
+   188 s (blob loaded successfully; warm being marginally slower is
+   run-to-run variance in the tracing-bound regime, NOT the cache adding
+   cost -- the signal is the absence of any drop). The cost is Dynamo
+   tracing + AOTAutograd partitioning of 28 checkpoint-HOP units -- work
+   upstream of every cache tier the blob stores (fxgraph/Triton/AOT
+   artifacts).
+   Implications:
+   - Training mega-cache wiring stays (smoke has load/save; costs nothing)
+     but its expected payoff at Krea2 scale is ~zero until torch caches
+     tracing, so its priority drops accordingly.
+   - The real cold-compile lever is trace-once via
+     `torch.compiler.nested_compile_region` (identical blocks), which
+     torch 2.12 REJECTS for training with mutating ops (our guarded
+     `_after` fetch ops). The unlock is a mutation-free gated op set
+     (`fetch_free_gated(token, gate) -> token` chained functionally) --
+     parked in `INGRAPH_PHASE4A_TRAINING_PLAN.md`.
+   - Multi-bucket training multiplies the ~150 s per shape bucket; the
+     freeze-after-warmup / bucket-count policy in
+     `INGRAPH_STREAM_PLAN.md` Phase 5 must budget with this number.
+
 ## Not yet done: training compile (`train_compile_blocks`, `enable_compiled_training`)
 
 Training is a harder target than sampling for three compounding reasons, the

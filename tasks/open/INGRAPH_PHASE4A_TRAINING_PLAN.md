@@ -132,6 +132,30 @@ consecutive auto_functionalized fetch/free nodes in the backward graph
 Local, no torch patch; also re-test (2) on the next torch upgrade — if
 effects x HOP is fixed upstream, the pass becomes dead code.
 
+## S4 RESULT (2026-07-05) + compile-latency findings
+
+Krea2 scale, 28 blocks streamed, keep_last=0, 512px batch 1 (9cdf8f4):
+**steady 2.10 s/step vs 3.97 eager (1.9x)**, 512/512 LoRA grads, losses
+track eager within fp8 tolerance, fetches = 28 fwd + 28 bwd per step
+(exactly the design), VRAM 5.8-7.7 GiB (~3-5 GiB headroom vs legacy =
+the Phase 5 partial-residency budget). Traps fixed en route: LoRA entry
+collection must run BEFORE the contaminant strip; pack-source ownership
+class (`_mm_ingraph_pack_source`, `tests/test_residency_ownership.py`);
+fetch ops MUST_RECOMPUTE (PREFER let the partitioner save 12.25 GiB of
+flats); WDDM hard allocator cap makes overshoot loud.
+
+Cold compile is ~150 s per (model, shape bucket) and is **tracing/AOT
+dominated**: the mega-cache blob loads but buys nothing (A/B: cold 151 s,
+warm 188 s -- see `COMPILE_MEGA_CACHE_PLAN.md` measured section, incl.
+the custom-pass stable-uuid rule that fix produced).
+`nested_compile_region` (trace the identical block once) is the real
+lever but torch 2.12 rejects invoke_subgraph training with input
+mutations -- our guarded `_after` ops. PARKED UNLOCK: mutation-free op
+set -- `fetch_free_gated(token, gate) -> token` threaded functionally
+through the trunk (forward chain in traced code; backward side needs
+design) so no fetch op declares mutations; then re-try nested regions
+AND drop the post-grad rewrite pass entirely (gating becomes source-level).
+
 ## Risks
 
 | Risk | Mitigation |

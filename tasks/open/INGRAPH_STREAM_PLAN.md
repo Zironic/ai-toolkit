@@ -370,10 +370,15 @@ checkpoint x compile at Krea2 scale.
   cache (`torch._dynamo.config.cache_size_limit` sized to bucket count) +
   a log line; sampler resolution set is small. Revisit `dynamic=True` on
   the seq dim only if bucket-count recompiles hurt in practice.
-- Compile-latency budget: cold compile of the trunk (fwd+bwd, per bucket)
-  measured and recorded; enable Inductor caching
-  (`TORCHINDUCTOR_CACHE_DIR` is a test-harness/env concern only —
-  persistent cache location must work out of the box on Windows).
+- Compile-latency budget: MEASURED 2026-07-05 -- training trunk cold
+  compile is ~150 s per (model, shape bucket), tracing/AOT dominated;
+  the mega-cache blob does NOT reduce it (see COMPILE_MEGA_CACHE_PLAN
+  measured section) and per-bucket recompiles multiply the full cost.
+  Bucket-count policy must budget ~150 s x buckets at warmup; the
+  trace-once unlock (nested_compile_region) requires the mutation-free
+  fetch-op redesign parked in INGRAPH_PHASE4A_TRAINING_PLAN.
+  Standing rule from the same investigation: custom Inductor passes must
+  be stable-uuid objects or they poison every compile cache per process.
 - Tier-2 Inductor pass: separate opt-in module
   (`ingraph_stream_scheduling.py`), only if Phase 4 measurement demands
   it. Scope: hoist recomputed fetch_starts across block boundaries in the
