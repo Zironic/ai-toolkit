@@ -297,12 +297,28 @@ class LoraEntry:
 
     a: torch.Tensor  # lora_down weight, (rank, in_features)
     b: torch.Tensor  # lora_up weight, (out_features, rank)
-    scale: float
+    # float (folded at enable time) or a scalar tensor (live network
+    # multiplier as an ordinary graph input -- tracks with-network toggling
+    # without recompiles).
+    scale: "float | torch.Tensor"
+
+
+@dataclass(frozen=True)
+class TrainLeaf:
+    """LinearView plus optional LoRA entry for the training leaves path.
+
+    Lets the block forward keep its single `streamed_linear(x, leaf)` call
+    shape for both modes: a bare LinearView selects the no-grad sampling
+    path, a TrainLeaf the grad-safe training path (dispatch is on dataclass
+    type -- a trace-time constant)."""
+
+    view: LinearView
+    lora: LoraEntry | None = None
 
 
 def streamed_linear(
     x: torch.Tensor,
-    view: LinearView,
+    view: LinearView | "TrainLeaf",
     *,
     training: bool = False,
     lora: LoraEntry | None = None,
@@ -314,6 +330,10 @@ def streamed_linear(
     grad-safe autograd.Function (no weight grad, grad-input via scale
     folding); the frozen base views never require grad, so nothing here saves
     a weight for backward."""
+    if isinstance(view, TrainLeaf):
+        lora = view.lora
+        training = True
+        view = view.view
     if view.spec.kind == "fp8_rowwise" and view.spec.fp8_qualifies:
         if view.scale is None:
             raise RuntimeError(f"missing scale for {view.spec.name}")
@@ -714,9 +734,16 @@ def _compiled_free_policy(ctx, op, *args, **kwargs):
         # would free the backward re-fetch's buffer before the grad kernels
         # read it. free_on_backward's op is the backward-side free.
         return CheckpointPolicy.MUST_SAVE
-    # Everything else replays in backward (full-checkpoint mode) -- including
-    # fetch_start/fetch_wait, which is precisely the backward re-fetch, and
-    # hands the backward-side free the recompute generation's token.
+    if op in (
+        torch.ops.mm.fetch_start.default,
+        torch.ops.mm.fetch_start_after.default,
+        torch.ops.mm.fetch_wait.default,
+    ):
+        # The design's core invariant: fetched weights are NEVER saved for
+        # backward. PREFER_RECOMPUTE is advisory -- at Krea2 scale the
+        # partitioner chose to save all 28 fetched flats (12.25 GiB -> OOM).
+        return CheckpointPolicy.MUST_RECOMPUTE
+    # Everything else replays in backward (full-checkpoint mode).
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 

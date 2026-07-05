@@ -3174,6 +3174,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(f"Failed to compile resident training blocks: {e}")
                 print_acc("Continuing without resident training block compile.")
 
+        if getattr(self.model_config, 'layer_offloading_ingraph_training', False):
+            inner_unet = unwrap_model(self.sd.unet)
+            enable_ingraph_training = getattr(inner_unet, 'enable_ingraph_training', None)
+            if enable_ingraph_training is None:
+                raise RuntimeError(
+                    "layer_offloading_ingraph_training requested, but this model "
+                    "does not expose enable_ingraph_training."
+                )
+            # Fail closed and loud (no try/except fallback): silently training
+            # eager would make every perf/parity number mean the wrong thing.
+            depth = int(getattr(self.model_config, 'layer_offloading_ingraph_depth', 2))
+            pack_count = enable_ingraph_training(depth=depth, compile=True)
+            print_acc(
+                f"In-graph streamed training enabled: {pack_count} block pack(s), "
+                f"depth={depth}. First training step will compile."
+            )
+
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
             self.sample(0, is_first=True)

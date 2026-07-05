@@ -29,10 +29,15 @@ from torch.utils.checkpoint import checkpoint
 
 from toolkit.memory_management.ingraph_stream import (
     CompileRegionError,
+    LoraEntry,
+    TrainLeaf,
     assert_compile_region_clean,
     block_linear_views,
+    checkpoint_recompute_context,
+    compiled_checkpoint_context,
     configure_fetch_runtime,
-
+    free_on_backward,
+    in_recompute,
     pack_block_host,
     streamed_linear,
 )
@@ -424,6 +429,11 @@ class SingleStreamDiT(nn.Module):
         self._compiled_ingraph_sampling = None
         self._compiled_ingraph_fingerprint: tuple | None = None
         self._ingraph_sampling_measure = False
+        self._ingraph_training_packs: dict[int, object] = {}
+        self._ingraph_training_loras: dict[int, dict] = {}
+        self._ingraph_training_restores: list = []
+        self._ingraph_training_block_fns: list = []
+        self._compiled_ingraph_training = None
         self._ingraph_sampling_timing = None
         self._last_ingraph_sampling_timing = None
 
@@ -908,6 +918,207 @@ class SingleStreamDiT(nn.Module):
         self._compiled_ingraph_sampling = None
         self._compiled_ingraph_fingerprint = None
 
+    @staticmethod
+    def _collect_lora_entry(child):
+        """LoraEntry from a Linear's LoRA hijack, None if no LoRA, raise if
+        a LoRA is present but not expressible as pure traced math."""
+        fwd = getattr(child, "__dict__", {}).get("forward")
+        owner = getattr(fwd, "__self__", None)
+        if owner is None or not hasattr(owner, "lora_down"):
+            return None
+        network_ref = getattr(owner, "network_ref", None)
+        network = network_ref() if network_ref is not None else None
+        multiplier = getattr(network, "torch_multiplier", None)
+        dropout = getattr(owner, "dropout", None)
+        if (
+            network is None
+            or multiplier is None
+            or getattr(multiplier, "numel", lambda: 0)() != 1
+            or owner.__class__.__name__ in ("DoRAModule", "LokrModule")
+            or getattr(owner, "module_dropout", None) is not None
+            or getattr(owner, "rank_dropout", None) not in (None, 0)
+            or (dropout is not None and not isinstance(dropout, torch.nn.Identity))
+        ):
+            raise CompileRegionError(["lora_untraceable"])
+        m = float(multiplier.reshape(()).item())
+        if m == 0.0:
+            # A zero multiplier at enable time would silently bake LoRA out
+            # of the trunk for the whole session.
+            raise CompileRegionError(["lora_untraceable"])
+        return LoraEntry(
+            a=owner.lora_down.weight,
+            b=owner.lora_up.weight,
+            scale=float(owner.scale) * m,
+        )
+
+    @staticmethod
+    def _nest_block_train_leaves(views, loras):
+        def leaf(name):
+            return TrainLeaf(view=views[name], lora=loras.get(name))
+
+        return {
+            "attn": {
+                "wq": leaf("attn.wq"),
+                "wk": leaf("attn.wk"),
+                "wv": leaf("attn.wv"),
+                "gate": leaf("attn.gate"),
+                "wo": leaf("attn.wo"),
+            },
+            "mlp": {
+                "gate": leaf("mlp.gate"),
+                "up": leaf("mlp.up"),
+                "down": leaf("mlp.down"),
+            },
+        }
+
+    def _make_ingraph_train_block_fn(self, index):
+        block = self.blocks[index]
+        pack = self._ingraph_training_packs[index]
+        loras = self._ingraph_training_loras.get(index, {})
+        host = pack.host_flat
+        nbytes = int(pack.required_pin_bytes)
+
+        def fn(x, tvec, freqs, mask):
+            compiling = torch.compiler.is_compiling()
+            if compiling:
+                token = torch.ops.mm.fetch_start_after(host, x)
+            else:
+                token = torch.ops.mm.fetch_start(host)
+            flat = torch.ops.mm.fetch_wait(token, nbytes)
+            leaves = self._nest_block_train_leaves(
+                block_linear_views(flat, pack), loras
+            )
+            if torch.is_grad_enabled():
+                # Saved-token swap: backward frees the recompute generation.
+                x = free_on_backward(x, token)
+            out = block(x, tvec, freqs, mask, leaves=leaves)
+            if not in_recompute():
+                if compiling:
+                    torch.ops.mm.fetch_free_after(token, out)
+                else:
+                    torch.ops.mm.fetch_free(token)
+            return out
+
+        return fn
+
+    def _ingraph_training_trunk(self, combined, tvec, freqs, mask):
+        context_fn = (
+            compiled_checkpoint_context
+            if torch.compiler.is_compiling()
+            else checkpoint_recompute_context
+        )
+        for fn in self._ingraph_training_block_fns:
+            combined = checkpoint(
+                fn,
+                combined,
+                tvec,
+                freqs,
+                mask,
+                use_reentrant=False,
+                context_fn=context_fn,
+            )
+        return combined
+
+    def enable_ingraph_training(self, depth: int = 2, compile: bool = True):
+        """Phase 4a: compiled fully-streamed TRAINING trunk (all blocks).
+
+        Each block is checkpoint(fetch + leaves-passing block call); backward
+        re-fetch falls out of checkpoint recompute; LoRA A/B enter as
+        ordinary trainable graph inputs. Fail-closed like the sampler enable.
+        Call AFTER the LoRA network is applied and configured (multiplier
+        must be a nonzero scalar at enable time)."""
+        self.disable_ingraph_training()
+        streamed_blocks = tuple(range(len(self.blocks)))
+        self._ingraph_training_restores = self._strip_ingraph_compile_contaminants(
+            streamed_blocks
+        )
+        reasons = []
+        for index in streamed_blocks:
+            packed = {id(m) for _, m in self._block_linear_entries(self.blocks[index])}
+            for name, child in self.blocks[index].named_modules():
+                if hasattr(child, "_layer_memory_manager"):
+                    reasons.append("legacy_layer_manager_present")
+                if (
+                    bool(getattr(child, "_forward_pre_hooks", None))
+                    or bool(getattr(child, "_forward_hooks", None))
+                    or bool(getattr(child, "_forward_hooks_with_kwargs", None))
+                ):
+                    reasons.append("hook_present")
+                if "forward" in getattr(child, "__dict__", {}) and id(child) not in packed:
+                    reasons.append("forward_hijack_present")
+        if reasons:
+            self._ingraph_unavailable_reasons = tuple(dict.fromkeys(reasons))
+            raise RuntimeError(
+                "in-graph training unavailable: "
+                + ",".join(self._ingraph_unavailable_reasons)
+            )
+        try:
+            packs = {}
+            loras = {}
+            for index in streamed_blocks:
+                entries = self._block_linear_entries(self.blocks[index])
+                packs[index] = pack_block_host(
+                    f"blocks.{index}", entries, repoint=False
+                )
+                block_loras = {}
+                for name, child in entries:
+                    entry = self._collect_lora_entry(child)
+                    if entry is not None:
+                        block_loras[name] = entry
+                if block_loras:
+                    loras[index] = block_loras
+        except CompileRegionError as error:
+            self._ingraph_unavailable_reasons = error.reasons
+            raise RuntimeError(
+                "in-graph training unavailable: " + ",".join(error.reasons)
+            ) from error
+        except ValueError as error:
+            reason = (
+                "wrapper_pack_missing"
+                if "wrapper packing" in str(error)
+                else "unsupported_quant_wrapper"
+            )
+            self._ingraph_unavailable_reasons = (reason,)
+            raise RuntimeError(
+                f"in-graph training unavailable: {reason} ({error})"
+            ) from error
+        for pack in packs.values():
+            if not pack.pinned:
+                self._ingraph_unavailable_reasons = ("non_pinned_pack",)
+                raise RuntimeError("in-graph training unavailable: non_pinned_pack")
+        self._ingraph_training_packs = packs
+        self._ingraph_training_loras = loras
+        self._ingraph_unavailable_reasons = ()
+        self._ingraph_training_block_fns = [
+            self._make_ingraph_train_block_fn(i) for i in streamed_blocks
+        ]
+        configure_fetch_runtime(depth=max(1, int(depth)))
+        if compile:
+            from toolkit.memory_management.ingraph_stream_scheduling import (
+                install_ordering_pass,
+            )
+
+            install_ordering_pass()
+            self._compiled_ingraph_training = torch.compile(
+                self._ingraph_training_trunk,
+                fullgraph=True,
+                dynamic=False,
+                mode="default",
+            )
+        else:
+            self._compiled_ingraph_training = self._ingraph_training_trunk
+        return len(packs)
+
+    def disable_ingraph_training(self):
+        restores = getattr(self, "_ingraph_training_restores", [])
+        if restores:
+            self._restore_ingraph_compile_contaminants(restores)
+        self._ingraph_training_restores = []
+        self._ingraph_training_packs = {}
+        self._ingraph_training_loras = {}
+        self._ingraph_training_block_fns = []
+        self._compiled_ingraph_training = None
+
     def _enable_lora_compile_fast_path(self):
         restores = []
         for module in self.modules():
@@ -1028,11 +1239,14 @@ class SingleStreamDiT(nn.Module):
             and not torch.is_grad_enabled()
         )
         use_ingraph = bool(self._ingraph_sampling_packs) and not torch.is_grad_enabled()
+        use_ingraph_train = (
+            self._compiled_ingraph_training is not None and torch.is_grad_enabled()
+        )
 
         # Pad the combined sequence to a multiple of 256 when a compiled block
         # region will run. The pad slots are appended after the image tokens,
         # masked False, and sliced off below, so this is numerically identical.
-        if use_compiled or use_ingraph:
+        if use_compiled or use_ingraph or use_ingraph_train:
             fulllen = combined.shape[1]
             _padlen = (-fulllen) % 256
             if _padlen > 0:
@@ -1043,7 +1257,9 @@ class SingleStreamDiT(nn.Module):
         mask = _mask(mask)
         freqs = self.posemb(pos)
 
-        if use_ingraph and self._compiled_ingraph_sampling is not None:
+        if use_ingraph_train:
+            combined = self._compiled_ingraph_training(combined, tvec, freqs, mask)
+        elif use_ingraph and self._compiled_ingraph_sampling is not None:
             if getattr(self, "_ingraph_sampling_measure", False):
                 if combined.device.type == "cuda":
                     torch.cuda.synchronize(combined.device)

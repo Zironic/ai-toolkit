@@ -157,8 +157,12 @@ def _build_model_config(args):
     )
 
 
-def _attach_training_memory(transformer, model_config, device):
+def _attach_training_memory(transformer, model_config, device, *, ingraph_training=False):
     # Mirror Krea2Model.load_model()'s smart-offload attach exactly.
+    # Ingraph training pins its own packs; attach pins would double-commit.
+    pinned_weight_gib = (
+        0.0 if ingraph_training else model_config.layer_offloading_pinned_weight_gb
+    )
     ignore_modules = [
         module
         for module in transformer.modules()
@@ -177,7 +181,7 @@ def _attach_training_memory(transformer, model_config, device):
         ignore_modules=ignore_modules,
         pinned_resident_keys=pinned_resident_keys,
         block_stream_only=model_config.layer_offloading_block_stream_only,
-        pinned_weight_gib=model_config.layer_offloading_pinned_weight_gb,
+        pinned_weight_gib=pinned_weight_gib,
         wddm_spill_reserve_pct=model_config.layer_offloading_wddm_spill_reserve_pct,
         fp8_training_forward=bool(model_config.layer_offloading_fp8_forward),
     )
@@ -255,6 +259,18 @@ def _parse_args():
     parser.add_argument("--block-stream-only", action="store_true")
     parser.add_argument("--fp8-training-forward", action="store_true")
     parser.add_argument(
+        "--ingraph-training",
+        action="store_true",
+        help="call enable_ingraph_training() after LoRA apply (Phase 4a): "
+        "compiled fully-streamed training trunk, all blocks checkpointed",
+    )
+    parser.add_argument("--ingraph-depth", type=int, default=2)
+    parser.add_argument(
+        "--no-ingraph-compile",
+        action="store_true",
+        help="with --ingraph-training: run the eager ingraph trunk (no torch.compile)",
+    )
+    parser.add_argument(
         "--train-compile-blocks",
         action="store_true",
         help="call enable_compiled_training() after LoRA apply, mirroring the "
@@ -320,7 +336,9 @@ def main():
 
     print("[smoke] attaching smart training memory manager")
     t0 = time.perf_counter()
-    _attach_training_memory(transformer, config, device)
+    _attach_training_memory(
+        transformer, config, device, ingraph_training=bool(args.ingraph_training)
+    )
     model.model = transformer
     rows.append(
         {
@@ -352,6 +370,28 @@ def main():
         }
     )
     _print_json(rows[-1])
+
+    if args.ingraph_training:
+        # Mirror BaseSDTrainProcess's layer_offloading_ingraph_training hook:
+        # enable after LoRA apply so entries see the final module state.
+        print("[smoke] enabling in-graph streamed training trunk")
+        t0 = time.perf_counter()
+        pack_count = transformer.enable_ingraph_training(
+            depth=args.ingraph_depth, compile=not args.no_ingraph_compile
+        )
+        rows.append(
+            {
+                "event": "ingraph_training_enabled",
+                "seconds": time.perf_counter() - t0,
+                "packs": pack_count,
+                "depth": args.ingraph_depth,
+                "compiled": not args.no_ingraph_compile,
+                "lora_blocks": len(getattr(transformer, "_ingraph_training_loras", {})),
+                "cuda": _cuda_snapshot("ingraph_training_enabled", device),
+                "dxgi": _dxgi_snapshot("ingraph_training_enabled"),
+            }
+        )
+        _print_json(rows[-1])
 
     if args.train_compile_blocks:
         # Mirror BaseSDTrainProcess's train_compile_blocks wiring: compile the

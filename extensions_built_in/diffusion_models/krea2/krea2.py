@@ -700,7 +700,15 @@ class Krea2Model(BaseModel):
                         ignore_modules=ignore_modules,
                         pinned_resident_keys=pinned_resident_keys,
                         block_stream_only=self.model_config.layer_offloading_block_stream_only,
-                        pinned_weight_gib=self.model_config.layer_offloading_pinned_weight_gb,
+                        # Ingraph training pins its own block packs
+                        # (repoint=False duplicates); per-tensor attach pins
+                        # for the same weights would double-commit the shared
+                        # WDDM pinned budget.
+                        pinned_weight_gib=(
+                            0.0
+                            if self.model_config.layer_offloading_ingraph_training
+                            else self.model_config.layer_offloading_pinned_weight_gb
+                        ),
                         wddm_spill_reserve_pct=self.model_config.layer_offloading_wddm_spill_reserve_pct,
                         fp8_training_forward=(
                             self.model_config.quantize

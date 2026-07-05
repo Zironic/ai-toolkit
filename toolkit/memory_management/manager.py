@@ -1,5 +1,6 @@
 import contextlib
 import json
+import sys
 import pathlib
 import re
 import os
@@ -2257,6 +2258,44 @@ class MemoryManager:
         """Cold-start reserve-space assumption before the first measured step."""
         return float(_env("AI_TOOLKIT_TRAINING_AUTO_SEED_WORKING_RESERVE_GIB", "5.0"))
 
+    _wddm_hard_cap_applied: dict = {}
+
+    @classmethod
+    def _apply_wddm_hard_allocator_cap(cls, device, wddm_hard_gib=None):
+        """Hard-cap torch's allocator below the WDDM dedicated ceiling.
+
+        Crossing the dedicated-VRAM ceiling on Windows does not OOM -- WDDM
+        silently pages GPU memory to system RAM (catastrophic slowdown, no
+        error; we have observed torch_allocated=12.23 GiB on an 11.99 GiB
+        card). set_per_process_memory_fraction makes the caching allocator
+        raise a real OOM at (total - wddm_hard_gib) instead, so the failure
+        is loud, attributable, and never a silent 30x slowdown."""
+        if sys.platform != "win32" or not torch.cuda.is_available():
+            return
+        dev = torch.device(device if device is not None else "cuda")
+        if dev.type != "cuda":
+            return
+        index = dev.index if dev.index is not None else torch.cuda.current_device()
+        try:
+            hard_gib = float(wddm_hard_gib) if wddm_hard_gib is not None else 1.0
+        except (TypeError, ValueError):
+            hard_gib = 1.0
+        if hard_gib <= 0:
+            hard_gib = 1.0
+        total = torch.cuda.get_device_properties(index).total_memory
+        fraction = max(0.1, min(1.0, 1.0 - (hard_gib * 1024 ** 3) / float(total)))
+        previous = cls._wddm_hard_cap_applied.get(index)
+        if previous is not None and abs(previous - fraction) < 1e-6:
+            return
+        torch.cuda.set_per_process_memory_fraction(fraction, index)
+        cls._wddm_hard_cap_applied[index] = fraction
+        print(
+            "[MemoryManager] WDDM hard allocator cap: "
+            f"{fraction * total / 1024 ** 3:.2f}/{total / 1024 ** 3:.2f} GiB "
+            f"(margin {hard_gib:.2f} GiB; allocation beyond this raises OOM "
+            "instead of silently paging)"
+        )
+
     @classmethod
     def attach_smart_training(
         cls, module, device, working_reserve_gib=2.0, ignore_modules=None,
@@ -2268,6 +2307,7 @@ class MemoryManager:
         pinned_weight_gib=None,
         wddm_spill_reserve_pct=None,
     ):
+        cls._apply_wddm_hard_allocator_cap(device, wddm_hard_gib)
         ignore_modules = list(ignore_modules or [])
         pinned_resident_keys = set(pinned_resident_keys or ())
         auto_working_reserve = False
@@ -4633,6 +4673,7 @@ class MemoryManager:
         original offload configuration afterward. If there is no manager it is a no-op; if the
         module does not fit resident (OOM) it restores offload and yields the streamed path.
         """
+        cls._apply_wddm_hard_allocator_cap(device, wddm_hard_gib)
         diagnostics = cls._diagnostics_enabled()
         if module is None:
             yield

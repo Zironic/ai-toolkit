@@ -876,6 +876,11 @@ class ModelConfig:
         self.layer_offloading_ingraph_stream_all = kwargs.get(
             "layer_offloading_ingraph_stream_all", False
         )
+        # Phase 4a: compiled in-graph streamed TRAINING (checkpointed blocks
+        # trunk, grad-safe fp8 base, LoRA as graph inputs). Off by default.
+        self.layer_offloading_ingraph_training = kwargs.get(
+            "layer_offloading_ingraph_training", False
+        )
         self.train_compile_blocks = kwargs.get("train_compile_blocks", False)
 
         # can be used to load the extras like text encoder or vae from here
