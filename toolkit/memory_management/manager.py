@@ -824,6 +824,13 @@ class MemoryManager:
         for child in module.modules():
             if hasattr(child, "_layer_memory_manager"):
                 continue
+            if getattr(child, "_mm_ingraph_pack_source", False):
+                # Ingraph-streamed linear: its manager hijack was stripped for
+                # the compile region, but its weights are pack sources that
+                # must stay on CPU -- the trunk streams them from the pinned
+                # pack. Moving them here silently hauls the whole model onto
+                # the card (observed: 12.23 GiB and a WDDM spill).
+                continue
             for name, param in list(child._parameters.items()):
                 if param is None:
                     continue

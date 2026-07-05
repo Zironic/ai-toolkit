@@ -1029,6 +1029,24 @@ class SingleStreamDiT(nn.Module):
         must be a nonzero scalar at enable time)."""
         self.disable_ingraph_training()
         streamed_blocks = tuple(range(len(self.blocks)))
+        # Collect LoRA entries BEFORE stripping compile contaminants: the
+        # strip deletes instance forwards, including the LoRA hijacks the
+        # entries are read from (learned the hard way: 232/512 LoRA grads).
+        try:
+            loras = {}
+            for index in streamed_blocks:
+                block_loras = {}
+                for name, child in self._block_linear_entries(self.blocks[index]):
+                    entry = self._collect_lora_entry(child)
+                    if entry is not None:
+                        block_loras[name] = entry
+                if block_loras:
+                    loras[index] = block_loras
+        except CompileRegionError as error:
+            self._ingraph_unavailable_reasons = error.reasons
+            raise RuntimeError(
+                "in-graph training unavailable: " + ",".join(error.reasons)
+            ) from error
         self._ingraph_training_restores = self._strip_ingraph_compile_contaminants(
             streamed_blocks
         )
@@ -1054,24 +1072,12 @@ class SingleStreamDiT(nn.Module):
             )
         try:
             packs = {}
-            loras = {}
             for index in streamed_blocks:
-                entries = self._block_linear_entries(self.blocks[index])
                 packs[index] = pack_block_host(
-                    f"blocks.{index}", entries, repoint=False
+                    f"blocks.{index}",
+                    self._block_linear_entries(self.blocks[index]),
+                    repoint=False,
                 )
-                block_loras = {}
-                for name, child in entries:
-                    entry = self._collect_lora_entry(child)
-                    if entry is not None:
-                        block_loras[name] = entry
-                if block_loras:
-                    loras[index] = block_loras
-        except CompileRegionError as error:
-            self._ingraph_unavailable_reasons = error.reasons
-            raise RuntimeError(
-                "in-graph training unavailable: " + ",".join(error.reasons)
-            ) from error
         except ValueError as error:
             reason = (
                 "wrapper_pack_missing"
@@ -1086,6 +1092,12 @@ class SingleStreamDiT(nn.Module):
             if not pack.pinned:
                 self._ingraph_unavailable_reasons = ("non_pinned_pack",)
                 raise RuntimeError("in-graph training unavailable: non_pinned_pack")
+        for index in streamed_blocks:
+            for _, child in self._block_linear_entries(self.blocks[index]):
+                # Keep unmanaged-parameter moves (model.to) off the pack
+                # sources: their CPU residency is the design, the trunk
+                # streams them from the pinned pack.
+                child._mm_ingraph_pack_source = True
         self._ingraph_training_packs = packs
         self._ingraph_training_loras = loras
         self._ingraph_unavailable_reasons = ()
@@ -1110,6 +1122,10 @@ class SingleStreamDiT(nn.Module):
         return len(packs)
 
     def disable_ingraph_training(self):
+        for block in self.blocks:
+            for _, child in self._block_linear_entries(block):
+                if hasattr(child, "_mm_ingraph_pack_source"):
+                    del child._mm_ingraph_pack_source
         restores = getattr(self, "_ingraph_training_restores", [])
         if restores:
             self._restore_ingraph_compile_contaminants(restores)

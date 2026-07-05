@@ -266,6 +266,12 @@ def _parse_args():
     )
     parser.add_argument("--ingraph-depth", type=int, default=2)
     parser.add_argument(
+        "--compile-cache-dir",
+        default="tmp/torch_compile_cache",
+        help="mega-cache dir for torch.compile artifacts (warm start turns "
+        "the ~2.5 min cold trunk compile into seconds); empty string disables",
+    )
+    parser.add_argument(
         "--no-ingraph-compile",
         action="store_true",
         help="with --ingraph-training: run the eager ingraph trunk (no torch.compile)",
@@ -370,6 +376,15 @@ def main():
         }
     )
     _print_json(rows[-1])
+
+    compile_cache_key = None
+    if args.ingraph_training and args.compile_cache_dir:
+        from extensions_built_in.diffusion_models.krea2.krea2 import _compile_cache_key
+        from toolkit.compile_cache import load_compile_cache
+
+        compile_cache_key = _compile_cache_key(model) + "_ingraph_train"
+        if load_compile_cache(args.compile_cache_dir, compile_cache_key):
+            print(f"[smoke] loaded torch.compile mega-cache ({compile_cache_key})")
 
     if args.ingraph_training:
         # Mirror BaseSDTrainProcess's layer_offloading_ingraph_training hook:
@@ -482,6 +497,11 @@ def main():
             f"[smoke] step {step}: {elapsed:.2f}s loss={row['loss']:.4f} "
             f"grad_norm={grad_norm:.4e} grads={row['grad_tensors']}"
         )
+        if step == 0 and compile_cache_key is not None:
+            from toolkit.compile_cache import save_compile_cache
+
+            if save_compile_cache(args.compile_cache_dir, compile_cache_key):
+                print(f"[smoke] saved torch.compile mega-cache ({compile_cache_key})")
         if grads_present == 0:
             raise SystemExit("no LoRA gradients produced -- training path is broken")
 
