@@ -25,6 +25,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 import huggingface_hub
+from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.errors import EntryNotFoundError
 from diffusers import AutoencoderKLQwenImage
 from transformers import (
@@ -344,7 +345,7 @@ def _quantized_transformer_cache_info(base_model, checkpoint_path: str, dtype, c
     cache_root = Path(
         model_kwargs.get("quantized_transformer_cache_dir")
         or os.getenv("AI_TOOLKIT_KREA2_QUANT_CACHE")
-        or "tmp/ai_toolkit_krea2_quantized"
+        or (Path(HF_HUB_CACHE) / "ai-toolkit" / "krea2_quantized_transformers")
     )
     checkpoint_stat = os.stat(checkpoint_path)
     metadata = {
