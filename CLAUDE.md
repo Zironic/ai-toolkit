@@ -151,6 +151,26 @@ overrides that are not required for normal training.
     budget, which is *also* the dedicated cliff's overflow valve — so over-pinning
     converts a would-be slowdown into a crash. Sizing pinned memory must respect
     both cliffs independently.
+    - **Hard-cap the allocator so the dedicated cliff becomes a loud OOM.**
+      `torch.cuda.set_per_process_memory_fraction(1 - hard_gib/total)` makes the
+      caching allocator raise a real OOM at ~(total − 1 GiB) instead of letting
+      WDDM silently page past the ceiling (we observed `torch_allocated=12.23 GiB`
+      on an 11.99 GiB card, then a crash in an unrelated bystander op). Applied at
+      `attach_smart_training` / `inference_resident` via
+      `MemoryManager._apply_wddm_hard_allocator_cap` (Windows-only, idempotent,
+      keyed on the existing `wddm_hard_gib`). Debugging value: a capped allocator
+      OOMs at the *true culprit's* allocation line — it found a stray
+      `model.to(cuda)` hauling the whole quantized model onto the card in one run,
+      where the uncapped version had crashed somewhere downstream.
+    - **Pinned host memory grows/shrinks slowly, and torch never gives it back.**
+      Page-locking is per-page kernel work (~0.6–2 GB/s on consumer Windows), so
+      large pin/unpin is seconds, not free. Worse, anything pinned through torch's
+      caching host allocator (`pin_memory=True`, every `non_blocking=True` D2H
+      staging buffer) is retained page-locked for the process lifetime on free —
+      it commits against the DXGI budget until `torch._C._host_emptyCache()`.
+      `cudaHostRegister` (used for weight pins) is the one variant whose unpin
+      actually returns budget; that is why the pin manager's eviction rung empties
+      the host cache first, then unpins weights.
 - **Fail-fast, deterministic, few silent fallbacks** in training/inference code —
   prefer explicit config flags and informative errors. Add a focused test under
   `tests/` for new memory-manager behaviour; the controllers have CPU/sim

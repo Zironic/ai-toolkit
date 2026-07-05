@@ -166,6 +166,33 @@ opt in:
   makes compiled-vs-eager non-bitwise by construction (Phase 0 finding);
   bitwise assertions compare against a compiled resident reference,
   end-to-end comparisons use documented tolerances.
+- **Four weight ownership classes; moves must respect them** (added Phase
+  4a, `tests/test_residency_ownership.py`). A weight is exactly one of:
+  *managed* (has `_layer_memory_manager`; the streaming manager owns its
+  device residency), *unmanaged* (plain; `model.to`/`_move_unmanaged_
+  parameters` moves it freely), *resident-pinned* (kept GPU-resident by
+  the plan), or *ingraph pack-source* (`_mm_ingraph_pack_source`; CPU
+  residency IS the design — the trunk streams it from the pinned pack).
+  Both Krea2-scale training OOMs were logic bugs in this layer, not typos:
+  a `model.to(cuda)` hauling 11 GiB of pack sources onto the card because
+  the pack-source class postdated the move rule. Any new move/residency
+  code must branch on all four; the mark is set at
+  `enable_ingraph_training` and cleared at disable.
+- **Grad-mode guarded ops break eager autograd.** The `_after` fetch-op
+  variants (declared guard mutation) are compile-only: the version bump on
+  the guarded tensor trips autograd's saved-tensor version check in eager.
+  Grad-mode eager must use the plain (`fetch_start`/`fetch_free`) ops;
+  select on `torch.compiler.is_compiling()`.
+- **LoRA entries must be collected BEFORE stripping compile contaminants.**
+  The strip deletes instance-`forward` hijacks — which is exactly where the
+  LoRA A/B live. Collect first, strip second (symptom of getting it
+  backwards: 232/512 LoRA grads instead of 512/512).
+- **Custom Inductor passes must be stable-uuid objects, never closures.**
+  Inductor folds `post_grad_custom_post_pass` into every fxgraph cache key
+  and salts unpicklable passes per-process — a closure pass misses ALL
+  compile caches every launch (and poisons the sampling mega-cache in the
+  same process). Wrap as a `CustomGraphPass`-shaped object whose `uuid()`
+  is a content hash of the pass source.
 
 ## Phases
 
