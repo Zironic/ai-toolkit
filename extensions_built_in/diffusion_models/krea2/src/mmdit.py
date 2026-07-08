@@ -17,6 +17,7 @@ Differences from the reference (all training-driven, numerically equivalent):
 """
 
 import math
+import os
 import time
 from dataclasses import dataclass
 
@@ -33,13 +34,16 @@ from toolkit.memory_management.ingraph_stream import (
     TrainLeaf,
     assert_compile_region_clean,
     block_linear_views,
+    block_tensor_views,
     checkpoint_recompute_context,
     compiled_checkpoint_context,
     configure_fetch_runtime,
     free_on_backward,
     in_recompute,
     pack_block_host,
+    release_pack,
     streamed_linear,
+    streamed_linear_tensors,
 )
 
 
@@ -63,6 +67,78 @@ def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
     return xq_.reshape(*xq.shape).to(xq.dtype), xk_.reshape(*xk.shape).to(xk.dtype)
 
 
+def _split_heads(x: Tensor, heads: int) -> Tensor:
+    b, length, width = x.shape
+    return x.reshape(b, length, heads, width // heads).permute(0, 2, 1, 3)
+
+
+def _merge_heads(x: Tensor) -> Tensor:
+    b, heads, length, dim = x.shape
+    return x.permute(0, 2, 1, 3).reshape(b, length, heads * dim)
+
+
+# Debug printout of which SDPA backend the dispatcher will run for each
+# distinct attention signature (shape/dtype/mask/gqa/grad). Off by default;
+# enable with AI_TOOLKIT_SDPA_DEBUG=1 (diagnostic only -- never wire runtime
+# behavior to it). SDPA picks its backend inside the C++ dispatcher, so this
+# replays the same decision: walk the priority order, take the first backend
+# that is both enabled and eligible for these exact tensors.
+_SDPA_DEBUG = os.environ.get("AI_TOOLKIT_SDPA_DEBUG", "0") not in ("", "0")
+_SDPA_DEBUG_SEEN: set = set()
+
+# Build-level fact, safe to freeze at import: Windows torch wheels ship
+# without the Flash SDPA kernel. attention() uses this to decide whether
+# unmasked GQA can stay on Flash's native GQA path or must expand KV heads
+# for the memory-efficient backend (a trace-time constant under compile).
+try:
+    _FLASH_SDP_AVAILABLE = bool(torch.backends.cuda.is_flash_attention_available())
+except Exception:
+    _FLASH_SDP_AVAILABLE = False
+
+
+def _sdpa_debug_report(q, k, v, mask, gqa) -> None:
+    if q.device.type != "cuda":
+        return
+    key = (
+        tuple(q.shape), tuple(k.shape), str(q.dtype),
+        mask is not None, bool(gqa), torch.is_grad_enabled(),
+    )
+    if key in _SDPA_DEBUG_SEEN:
+        return
+    _SDPA_DEBUG_SEEN.add(key)
+    bc = torch.backends.cuda
+    try:
+        params = bc.SDPAParams(q, k, v, mask, 0.0, False, bool(gqa))
+        eligible = {
+            "FLASH_ATTENTION": bc.flash_sdp_enabled()
+            and bc.can_use_flash_attention(params, False),
+            "EFFICIENT_ATTENTION": bc.mem_efficient_sdp_enabled()
+            and bc.can_use_efficient_attention(params, False),
+            "CUDNN_ATTENTION": bc.cudnn_sdp_enabled()
+            and bc.can_use_cudnn_attention(params, False),
+            "MATH": bc.math_sdp_enabled(),
+        }
+        value_to_name = {
+            int(member.value): name
+            for name, member in torch.nn.attention.SDPBackend.__members__.items()
+        }
+        order = [
+            value_to_name.get(int(value), str(value))
+            for value in torch._C._get_sdp_priority_order()
+        ]
+        selected = next((name for name in order if eligible.get(name)), "NONE")
+    except Exception as error:  # never let diagnostics break a forward
+        print(f"[SDPA] backend probe failed: {error}")
+        return
+    print(
+        f"[SDPA] q={tuple(q.shape)} kv={tuple(k.shape)} dtype={q.dtype} "
+        f"mask={mask is not None} gqa={bool(gqa)} grad={torch.is_grad_enabled()} "
+        f"-> {selected} (eligible: "
+        f"{', '.join(n for n in order if eligible.get(n)) or 'none'}; "
+        f"priority: {' > '.join(order)})"
+    )
+
+
 def attention(
     q: Tensor,
     k: Tensor,
@@ -76,28 +152,98 @@ def attention(
     # allocation spike on a 12 GiB Ada card). Automatic SDPA dispatch can use
     # Flash or another memory-efficient backend and retains the math fallback.
     #
-    # But enable_gqa=True AND an explicit attn_mask disqualify *both* fast
-    # backends at once — Flash rejects arbitrary masks, the memory-efficient
-    # (cutlass) backend rejects enable_gqa — so dispatch silently falls to the
-    # math backend, which materializes the full (B, heads, L, L) score tensor
-    # (multiple GiB at sampling resolutions). When we have a mask, expand the KV
-    # heads to match Q here and drop enable_gqa, so the memory-efficient backend
-    # (which does accept masks) becomes eligible. This is numerically identical
-    # to enable_gqa=True: it repeats each KV head across its query-head group.
-    if gqa and mask is not None and k.shape[1] != q.shape[1]:
+    # But enable_gqa=True disqualifies every fast backend this box has: the
+    # memory-efficient (cutlass) backend rejects enable_gqa outright, Flash
+    # (which would accept unmasked GQA) is not compiled into Windows torch
+    # builds, and torch 2.12's default priority order puts MATH above CUDNN —
+    # so dispatch silently falls to the math backend, which materializes the
+    # full (B, heads, L, L) score tensor (multiple GiB at sampling
+    # resolutions). Expand the KV heads to match Q and drop enable_gqa, so
+    # the memory-efficient backend becomes eligible. This is numerically
+    # identical to enable_gqa=True: it repeats each KV head across its
+    # query-head group. Two cases need it:
+    #   * an explicit mask (Flash rejects arbitrary masks everywhere), and
+    #   * no Flash in the build (the unmasked GQA path would fall to MATH —
+    #     this regressed once when the expansion was gated on mask-only).
+    # On builds WITH Flash, unmasked GQA stays on Flash's native GQA path.
+    if gqa and k.shape[1] != q.shape[1] and (
+        mask is not None or not _FLASH_SDP_AVAILABLE
+    ):
         groups = q.shape[1] // k.shape[1]
         k = k.repeat_interleave(groups, dim=1)
         v = v.repeat_interleave(groups, dim=1)
         gqa = False
+    # Constant-folds away under dynamo (both operands are trace-time
+    # constants), so compiled graphs stay print-free and break-free.
+    if _SDPA_DEBUG and not torch.compiler.is_compiling():
+        _sdpa_debug_report(q, k, v, mask, gqa)
     x = F.scaled_dot_product_attention(
         q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
     )
-    return rearrange(x, "B H L D -> B L (H D)")
+    return _merge_heads(x)
 
 
-def _mask(mask: Tensor) -> Tensor:
-    """Expand a (B, L) key-padding mask into a (B, 1, L, L) attention mask."""
-    return mask.unsqueeze(1).unsqueeze(2) * mask.unsqueeze(1).unsqueeze(3)
+def _mask(mask: Tensor) -> Tensor | None:
+    """Expand a (B, L) key-padding mask into a broadcast (B, 1, 1, L) attention
+    mask, or None when nothing is masked.
+
+    Key-only masking is equivalent to the dense (B, 1, L, L) outer product for
+    every output that is actually consumed: pad tokens are excluded as *keys*,
+    so they never contribute to real tokens, and the pad tokens' own outputs
+    are either masked again downstream or sliced off before use. Dropping the
+    query side keeps SDPA's additive-bias materialization at O(L) per sample
+    instead of O(L^2) (~85 MB/sample at 1024px), and returning None for an
+    all-True mask keeps Flash + enable_gqa dispatch eligible in attention().
+    """
+    if bool(mask.all()):
+        return None
+    return mask[:, None, None, :]
+
+
+def _streamed_arg_linear_sample(
+    x: Tensor,
+    arg,
+    fp8_qualifies: bool,
+) -> Tensor:
+    weight, bias, scale = arg
+    return streamed_linear_tensors(
+        x,
+        weight,
+        bias,
+        scale,
+        fp8_qualifies=fp8_qualifies,
+        training=False,
+    )
+
+
+def _streamed_arg_linear_train(
+    x: Tensor,
+    arg,
+    fp8_qualifies: bool,
+    lora=None,
+) -> Tensor:
+    weight, bias, scale = arg
+    if lora is None:
+        return streamed_linear_tensors(
+            x,
+            weight,
+            bias,
+            scale,
+            fp8_qualifies=fp8_qualifies,
+            training=True,
+        )
+    lora_a, lora_b, lora_scale = lora
+    return streamed_linear_tensors(
+        x,
+        weight,
+        bias,
+        scale,
+        fp8_qualifies=fp8_qualifies,
+        training=True,
+        lora_a=lora_a,
+        lora_b=lora_b,
+        lora_scale=lora_scale,
+    )
 
 
 def temb(
@@ -229,6 +375,31 @@ class SwiGLU(torch.nn.Module):
         up = streamed_linear(x, leaves["up"])
         return streamed_linear(F.silu(gate) * up, leaves["down"])
 
+    def forward_streamed(
+        self,
+        x: Tensor,
+        gate_arg,
+        up_arg,
+        down_arg,
+        fp8_flags,
+        *,
+        training: bool = False,
+        loras=None,
+    ) -> Tensor:
+        if training:
+            loras = (None, None, None) if loras is None else loras
+            gate = _streamed_arg_linear_train(x, gate_arg, fp8_flags[0], loras[0])
+            up = _streamed_arg_linear_train(x, up_arg, fp8_flags[1], loras[1])
+            return _streamed_arg_linear_train(
+                F.silu(gate) * up,
+                down_arg,
+                fp8_flags[2],
+                loras[2],
+            )
+        gate = _streamed_arg_linear_sample(x, gate_arg, fp8_flags[0])
+        up = _streamed_arg_linear_sample(x, up_arg, fp8_flags[1])
+        return _streamed_arg_linear_sample(F.silu(gate) * up, down_arg, fp8_flags[2])
+
 
 class Attention(torch.nn.Module):
     def __init__(self, dim: int, heads: int, kvheads: int = None, bias: bool = False):
@@ -261,9 +432,9 @@ class Attention(torch.nn.Module):
             gate = streamed_linear(qkv, leaves["gate"])
 
         q, k, v = (
-            rearrange(q, "B L (H D) -> B H L D", H=self.heads),
-            rearrange(k, "B L (H D) -> B H L D", H=self.kvheads),
-            rearrange(v, "B L (H D) -> B H L D", H=self.kvheads),
+            _split_heads(q, self.heads),
+            _split_heads(k, self.kvheads),
+            _split_heads(v, self.kvheads),
         )
 
         q, k, v = self.qknorm(q, k, v)
@@ -276,6 +447,47 @@ class Attention(torch.nn.Module):
             out = streamed_linear(out, leaves["wo"])
 
         return out
+
+    def forward_streamed(
+        self,
+        qkv: Tensor,
+        freqs: Tensor | None,
+        mask: Tensor | None,
+        wq_arg,
+        wk_arg,
+        wv_arg,
+        gate_arg,
+        wo_arg,
+        fp8_flags,
+        *,
+        training: bool = False,
+        loras=None,
+    ) -> Tensor:
+        if training:
+            loras = (None, None, None, None, None) if loras is None else loras
+            q = _streamed_arg_linear_train(qkv, wq_arg, fp8_flags[0], loras[0])
+            k = _streamed_arg_linear_train(qkv, wk_arg, fp8_flags[1], loras[1])
+            v = _streamed_arg_linear_train(qkv, wv_arg, fp8_flags[2], loras[2])
+            gate = _streamed_arg_linear_train(qkv, gate_arg, fp8_flags[3], loras[3])
+        else:
+            q = _streamed_arg_linear_sample(qkv, wq_arg, fp8_flags[0])
+            k = _streamed_arg_linear_sample(qkv, wk_arg, fp8_flags[1])
+            v = _streamed_arg_linear_sample(qkv, wv_arg, fp8_flags[2])
+            gate = _streamed_arg_linear_sample(qkv, gate_arg, fp8_flags[3])
+
+        q, k, v = (
+            _split_heads(q, self.heads),
+            _split_heads(k, self.kvheads),
+            _split_heads(v, self.kvheads),
+        )
+
+        q, k, v = self.qknorm(q, k, v)
+        if freqs is not None:
+            q, k = ropeapply(q, k, freqs)
+        out = attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate)
+        if training:
+            return _streamed_arg_linear_train(out, wo_arg, fp8_flags[4], loras[4])
+        return _streamed_arg_linear_sample(out, wo_arg, fp8_flags[4])
 
 
 class LastLayer(torch.nn.Module):
@@ -399,6 +611,45 @@ class SingleStreamBlock(nn.Module):
 
         return x
 
+    def forward_streamed(
+        self,
+        x: Tensor,
+        vec: Tensor,
+        freqs: Tensor,
+        mask: Tensor | None,
+        leaf_args,
+        fp8_flags,
+        *,
+        training: bool = False,
+        loras=None,
+    ) -> Tensor:
+        prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
+        loras = (None,) * 8 if loras is None else loras
+        x = x + pregate * self.attn.forward_streamed(
+            (1 + prescale) * self.prenorm(x) + preshift,
+            freqs,
+            mask,
+            leaf_args[0],
+            leaf_args[1],
+            leaf_args[2],
+            leaf_args[3],
+            leaf_args[4],
+            fp8_flags[:5],
+            training=training,
+            loras=loras[:5],
+        )
+        x = x + postgate * self.mlp.forward_streamed(
+            (1 + postscale) * self.postnorm(x) + postshift,
+            leaf_args[5],
+            leaf_args[6],
+            leaf_args[7],
+            fp8_flags[5:],
+            training=training,
+            loras=loras[5:],
+        )
+
+        return x
+
 
 class SingleStreamDiT(nn.Module):
     def __init__(self, config: SingleMMDiTConfig):
@@ -427,6 +678,7 @@ class SingleStreamDiT(nn.Module):
         self._ingraph_unavailable_reasons: tuple[str, ...] = ()
         self._ingraph_sampling_depth = 2
         self._compiled_ingraph_sampling = None
+        self._compiled_ingraph_sampling_blocks: dict[int, object] = {}
         self._compiled_ingraph_fingerprint: tuple | None = None
         self._ingraph_sampling_measure = False
         self._ingraph_training_packs: dict[int, object] = {}
@@ -529,8 +781,17 @@ class SingleStreamDiT(nn.Module):
         remain a blocker until a grad-safe lowering is installed.
         """
         reasons: list[str] = []
-        if any(hasattr(sub, "_layer_memory_manager") for sub in block.modules()):
-            reasons.append("streaming_hook")
+        for sub in block.modules():
+            if hasattr(sub, "_layer_memory_manager"):
+                reasons.append("streaming_hook")
+            if (
+                bool(getattr(sub, "_forward_pre_hooks", None))
+                or bool(getattr(sub, "_forward_hooks", None))
+                or bool(getattr(sub, "_forward_hooks_with_kwargs", None))
+            ):
+                reasons.append("hook_present")
+            if hasattr(sub, "_memory_management_device"):
+                reasons.append("memory_management_marker")
         if training:
             for sub in block.modules():
                 if isinstance(sub, torch.nn.Conv2d):
@@ -625,19 +886,24 @@ class SingleStreamDiT(nn.Module):
         replaying stale compiled blocks (which would guard-churn or, worse,
         trace a hook that got re-attached).
 
-        `dynamic=None` (torch's automatic-dynamic-shapes mode) lets Dynamo
-        specialize to the first shape seen and only pay for a symbolic-shape
-        upgrade if a second distinct shape shows up -- the caller is expected
-        to run the actual invocation under
-        `torch.compiler.set_stance("eager_then_compile")` so that upgrade
-        decision is made from real eager-mode shape history instead of
-        wasting a static compile on the very first call.
+        `dynamic=False` matches every other compile family here (in-graph
+        sampling blocks, training blocks/trunk). Dynamo pins each cache entry
+        to its backend via a BACKEND_MATCH guard that compares backends by
+        (mode, options, dynamic) equality, so a mismatched `dynamic` makes
+        shared code objects traced under both families (RMSNorm.forward,
+        _split_heads) duplicate their compiled entries instead of reusing
+        them. Static shapes are cheap because the trunk pads sequences to a
+        multiple of 256; a genuinely new sample resolution recompiles, same
+        as the in-graph blocks. The caller runs the invocation under
+        `torch.compiler.set_stance("eager_then_compile")` so the very first
+        call is not a wasted compile.
 
         Returns (compiled_count, eager_count).
         """
+        streamed = set(getattr(self, "_ingraph_sampling_packs", {}) or {})
         clean = tuple(
             i for i, block in enumerate(self.blocks)
-            if self._block_compile_safe(block)
+            if i not in streamed and self._block_compile_safe(block)
         )
         if (
             self._compiled_blocks is not None
@@ -650,7 +916,7 @@ class SingleStreamDiT(nn.Module):
             compiled[i] = torch.compile(
                 self.blocks[i],
                 fullgraph=False,
-                dynamic=None,
+                dynamic=False,
                 mode="default",
             )
         self._compiled_blocks = compiled
@@ -860,27 +1126,46 @@ class SingleStreamDiT(nn.Module):
                 "in-graph sampling unavailable: " + ",".join(self._ingraph_unavailable_reasons) + suffix
             )
         packs = {}
-        for index in streamed_blocks:
-            try:
-                packs[index] = pack_block_host(
-                    f"blocks.{index}",
-                    self._block_linear_entries(self.blocks[index]),
-                    repoint=False,
+        arena = getattr(self, "_mm_weight_arena", None)
+        try:
+            for index in streamed_blocks:
+                entries = list(self._block_linear_entries(self.blocks[index]))
+                borrowed = (
+                    arena.try_borrow_pack(f"blocks.{index}", entries)
+                    if arena is not None
+                    else None
                 )
-            except ValueError as error:
-                message = str(error)
-                reason = "wrapper_pack_missing" if "wrapper packing" in message else "unsupported_quant_wrapper"
-                self._ingraph_unavailable_reasons = (reason,)
-                raise RuntimeError(
-                    "in-graph sampling unavailable: " + reason + f" ({message})"
-                ) from error
-        if streamed_blocks and len(packs) != len(streamed_blocks):
-            self._ingraph_unavailable_reasons = ("dynamic_streamed_block_set",)
-            raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
-        for pack in packs.values():
-            if not pack.pinned:
-                self._ingraph_unavailable_reasons = ("non_pinned_pack",)
-                raise RuntimeError("in-graph sampling unavailable: non_pinned_pack")
+                if borrowed is not None:
+                    # Ticket 534ea49/763bb75: this block's weights are already
+                    # pinned by the persistent arena -- reuse that flat
+                    # instead of allocating (and separately pinning) a fresh
+                    # ingraph pack over the same bytes.
+                    packs[index] = borrowed
+                    continue
+                try:
+                    packs[index] = pack_block_host(
+                        f"blocks.{index}",
+                        entries,
+                        repoint=False,
+                    )
+                except ValueError as error:
+                    message = str(error)
+                    reason = "wrapper_pack_missing" if "wrapper packing" in message else "unsupported_quant_wrapper"
+                    self._ingraph_unavailable_reasons = (reason,)
+                    raise RuntimeError(
+                        "in-graph sampling unavailable: " + reason + f" ({message})"
+                    ) from error
+            if streamed_blocks and len(packs) != len(streamed_blocks):
+                self._ingraph_unavailable_reasons = ("dynamic_streamed_block_set",)
+                raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
+            for pack in packs.values():
+                if not pack.pinned:
+                    self._ingraph_unavailable_reasons = ("non_pinned_pack",)
+                    raise RuntimeError("in-graph sampling unavailable: non_pinned_pack")
+        except Exception:
+            for pack in packs.values():
+                release_pack(pack)
+            raise
         self._ingraph_sampling_packs = packs
         self._ingraph_unavailable_reasons = ()
         self._ingraph_sampling_depth = max(1, int(depth))
@@ -890,6 +1175,17 @@ class SingleStreamDiT(nn.Module):
         fingerprint = tuple(sorted(packs))
         self._compiled_ingraph_fingerprint = fingerprint
         if compile and packs:
+            if len(packs) != len(self.blocks):
+                self._compiled_ingraph_sampling_blocks = {
+                    index: torch.compile(
+                        self._make_ingraph_sample_block_fn(index),
+                        fullgraph=True,
+                        dynamic=False,
+                        mode="default",
+                    )
+                    for index in packs
+                }
+                return len(packs)
             self._compiled_ingraph_sampling = torch.compile(
                 lambda combined, tvec, freqs, mask: self._blocks_trunk(
                     combined,
@@ -912,10 +1208,13 @@ class SingleStreamDiT(nn.Module):
         if restores:
             self._restore_ingraph_compile_contaminants(restores)
         self._ingraph_sampling_restores = []
+        for pack in getattr(self, "_ingraph_sampling_packs", {}).values():
+            release_pack(pack)
         self._ingraph_sampling_packs = {}
         self._ingraph_unavailable_reasons = ()
         self._ingraph_sampling_depth = 2
         self._compiled_ingraph_sampling = None
+        self._compiled_ingraph_sampling_blocks = {}
         self._compiled_ingraph_fingerprint = None
 
     @staticmethod
@@ -971,12 +1270,62 @@ class SingleStreamDiT(nn.Module):
             },
         }
 
+    def _make_ingraph_sample_block_fn(self, index):
+        block = self.blocks[index]
+        pack = self._ingraph_sampling_packs[index]
+        host = pack.host_flat
+        nbytes = int(pack.required_pin_bytes)
+        fp8_flags = pack.fp8_flags
+
+        def fn(x, tvec, freqs, mask):
+            token = torch.ops.mm.fetch_start_after(host, x)
+            flat = torch.ops.mm.fetch_wait(token, nbytes)
+            leaf_args = block_tensor_views(flat, pack)
+            out = block.forward_streamed(
+                x,
+                tvec,
+                freqs,
+                mask,
+                leaf_args,
+                fp8_flags,
+            )
+            torch.ops.mm.fetch_free_after(token, out)
+            return out
+
+        return fn
+
+    @staticmethod
+    def _block_lora_tuple(loras):
+        out = []
+        for name, _ in SingleStreamDiT._block_linear_entries_for_lora_order():
+            entry = loras.get(name)
+            if entry is None:
+                out.append(None)
+            else:
+                out.append((entry.a, entry.b, entry.scale))
+        return tuple(out)
+
+    @staticmethod
+    def _block_linear_entries_for_lora_order():
+        return (
+            ("attn.wq", None),
+            ("attn.wk", None),
+            ("attn.wv", None),
+            ("attn.gate", None),
+            ("attn.wo", None),
+            ("mlp.gate", None),
+            ("mlp.up", None),
+            ("mlp.down", None),
+        )
+
     def _make_ingraph_train_block_fn(self, index):
         block = self.blocks[index]
         pack = self._ingraph_training_packs[index]
         loras = self._ingraph_training_loras.get(index, {})
         host = pack.host_flat
         nbytes = int(pack.required_pin_bytes)
+        fp8_flags = pack.fp8_flags
+        lora_args = self._block_lora_tuple(loras)
 
         def fn(x, tvec, freqs, mask):
             compiling = torch.compiler.is_compiling()
@@ -985,13 +1334,20 @@ class SingleStreamDiT(nn.Module):
             else:
                 token = torch.ops.mm.fetch_start(host)
             flat = torch.ops.mm.fetch_wait(token, nbytes)
-            leaves = self._nest_block_train_leaves(
-                block_linear_views(flat, pack), loras
-            )
+            leaf_args = block_tensor_views(flat, pack)
             if torch.is_grad_enabled():
                 # Saved-token swap: backward frees the recompute generation.
                 x = free_on_backward(x, token)
-            out = block(x, tvec, freqs, mask, leaves=leaves)
+            out = block.forward_streamed(
+                x,
+                tvec,
+                freqs,
+                mask,
+                leaf_args,
+                fp8_flags,
+                training=True,
+                loras=lora_args,
+            )
             if not in_recompute():
                 if compiling:
                     torch.ops.mm.fetch_free_after(token, out)
@@ -1070,14 +1426,18 @@ class SingleStreamDiT(nn.Module):
                 "in-graph training unavailable: "
                 + ",".join(self._ingraph_unavailable_reasons)
             )
+        packs = {}
         try:
-            packs = {}
             for index in streamed_blocks:
                 packs[index] = pack_block_host(
                     f"blocks.{index}",
                     self._block_linear_entries(self.blocks[index]),
                     repoint=False,
                 )
+            for pack in packs.values():
+                if not pack.pinned:
+                    self._ingraph_unavailable_reasons = ("non_pinned_pack",)
+                    raise RuntimeError("in-graph training unavailable: non_pinned_pack")
         except ValueError as error:
             reason = (
                 "wrapper_pack_missing"
@@ -1085,13 +1445,15 @@ class SingleStreamDiT(nn.Module):
                 else "unsupported_quant_wrapper"
             )
             self._ingraph_unavailable_reasons = (reason,)
+            for pack in packs.values():
+                release_pack(pack)
             raise RuntimeError(
                 f"in-graph training unavailable: {reason} ({error})"
             ) from error
-        for pack in packs.values():
-            if not pack.pinned:
-                self._ingraph_unavailable_reasons = ("non_pinned_pack",)
-                raise RuntimeError("in-graph training unavailable: non_pinned_pack")
+        except Exception:
+            for pack in packs.values():
+                release_pack(pack)
+            raise
         for index in streamed_blocks:
             for _, child in self._block_linear_entries(self.blocks[index]):
                 # Keep unmanaged-parameter moves (model.to) off the pack
@@ -1130,6 +1492,8 @@ class SingleStreamDiT(nn.Module):
         if restores:
             self._restore_ingraph_compile_contaminants(restores)
         self._ingraph_training_restores = []
+        for pack in getattr(self, "_ingraph_training_packs", {}).values():
+            release_pack(pack)
         self._ingraph_training_packs = {}
         self._ingraph_training_loras = {}
         self._ingraph_training_block_fns = []
@@ -1343,12 +1707,23 @@ class SingleStreamDiT(nn.Module):
                 # streams weights falls through to the eager call below.
                 combined = self._compiled_blocks[i](combined, tvec, freqs, mask)
             elif use_ingraph and i in self._ingraph_sampling_packs:
-                pack = self._ingraph_sampling_packs[i]
-                token = torch.ops.mm.fetch_start_after(pack.host_flat, combined)
-                flat = torch.ops.mm.fetch_wait(token, int(pack.required_pin_bytes))
-                leaves = self._nest_block_leaves(flat, pack)
-                combined = block_call(combined, tvec, freqs, mask, leaves=leaves)
-                torch.ops.mm.fetch_free_after(token, combined)
+                compiled_ingraph = self._compiled_ingraph_sampling_blocks.get(i)
+                if compiled_ingraph is not None and not force_ingraph:
+                    combined = compiled_ingraph(combined, tvec, freqs, mask)
+                else:
+                    pack = self._ingraph_sampling_packs[i]
+                    token = torch.ops.mm.fetch_start_after(pack.host_flat, combined)
+                    flat = torch.ops.mm.fetch_wait(token, int(pack.required_pin_bytes))
+                    leaf_args = block_tensor_views(flat, pack)
+                    combined = block.forward_streamed(
+                        combined,
+                        tvec,
+                        freqs,
+                        mask,
+                        leaf_args,
+                        pack.fp8_flags,
+                    )
+                    torch.ops.mm.fetch_free_after(token, combined)
             else:
                 combined = block_call(combined, tvec, freqs, mask)
         return combined

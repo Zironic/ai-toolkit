@@ -105,6 +105,7 @@ class PinConformanceTests(unittest.TestCase):
         "toolkit/memory_management/manager.py",
         "toolkit/memory_management/manager_modules.py",
         "toolkit/memory_management/checkpoint_autotuner.py",
+        "toolkit/memory_management/pinned_arena.py",
     )
     PATTERN = re.compile(r"pin_memory\s*=\s*True|\.pin_memory\(\)")
 

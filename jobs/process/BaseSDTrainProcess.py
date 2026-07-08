@@ -585,6 +585,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # Sampling layout mutation is opt-in and separate from native FP8
         # sampling. With it disabled, preserve the model's existing behavior.
         transformer = getattr(self.sd, 'unet', None)
+        # Shape-aware cold-start reserve: models that can size their sampling
+        # working set from the pending gen configs (resolution, CFG mode) hint
+        # the residency planner so the first high-res sample streams enough
+        # blocks up front instead of demoting mid-denoise. Optional per model;
+        # a learned measured reserve replaces it after the first sample.
+        estimate_fn = getattr(
+            self.sd, 'estimate_sampling_working_reserve_bytes', None
+        )
+        cold_start_hint = (
+            estimate_fn(gen_img_config_list) if estimate_fn is not None else None
+        )
         sampling_context = (
             MemoryManager.inference_resident(
                 transformer,
@@ -593,6 +604,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self._memory_manager_fp8_weights_configured
                     and self.model_config.layer_offloading_fp8_sampling
                 ),
+                cold_start_hint_bytes=cold_start_hint,
                 working_reserve_gib=(
                     self.model_config.layer_offloading_smart_sampling_working_reserve_gb
                 ),

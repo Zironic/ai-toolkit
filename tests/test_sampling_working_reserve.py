@@ -1,6 +1,7 @@
 import unittest
 
 import pathlib
+import types
 
 import torch
 
@@ -90,6 +91,23 @@ class SamplingWorkingReserveTests(unittest.TestCase):
         self.assertEqual(plan["wddm_hard_bytes"], 2 * GIB)
         self.assertEqual(plan["wddm_margin_bytes"], 2 * GIB)
         self.assertEqual(plan["usable_bytes"], 6 * GIB)
+
+    def test_sampling_trace_hook_suppression_clears_resident_hooks(self):
+        module = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+        mm = types.SimpleNamespace(
+            _attach_args={"ignore_modules": []},
+            _training_pinned_resident_keys=set(),
+        )
+
+        MemoryManager._refresh_resident_trace_hooks(module, mm)
+        self.assertTrue(getattr(mm, "_resident_trace_hooks", None))
+        self.assertTrue(module[0]._forward_pre_hooks)
+
+        module._mm_sampling_disable_resident_trace_hooks = True
+        MemoryManager._refresh_resident_trace_hooks(module, mm)
+
+        self.assertEqual({}, getattr(mm, "_resident_trace_hooks", {}))
+        self.assertFalse(module[0]._forward_pre_hooks)
 
     def test_job_config_wires_training_and_sampling_wddm_margins(self):
         source = pathlib.Path("toolkit/config_modules.py").read_text()

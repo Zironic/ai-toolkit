@@ -58,6 +58,16 @@ class BlockPack:
     linears: tuple[LinearSpec, ...]
     required_pin_bytes: int
     pinned: bool
+    fp8_flags: tuple[bool, ...] = ()
+    view_maker: object | None = None
+    # Ownership of ``host_flat``'s pin grant. ``pin_handle`` is the PinHandle
+    # returned by pin_manager.pin_alloc for this pack's OWN flat allocation
+    # (None when the pack didn't allocate -- e.g. it borrows another owner's
+    # storage). ``owns_flat`` gates release_pack: a borrowed pack (arena-backed,
+    # borrowed_from_arena=True) must never release someone else's handle.
+    pin_handle: object | None = None
+    owns_flat: bool = True
+    borrowed_from_arena: bool = False
 
 
 @dataclass(frozen=True)
@@ -127,24 +137,43 @@ def _fp8_rowwise_qualifies(qdata: torch.Tensor, scale: torch.Tensor) -> bool:
     )
 
 
-def _empty_host_flat(nbytes: int, *, pin: bool = True) -> tuple[torch.Tensor, bool]:
+def _empty_host_flat(
+    nbytes: int, *, pin: bool = True, kind: str = "ingraph_pack"
+) -> tuple[torch.Tensor, bool, object | None]:
     if not pin:
-        return torch.empty(nbytes, dtype=torch.uint8), False
+        return torch.empty(nbytes, dtype=torch.uint8), False, None
     handle = pin_manager.pin_alloc(
         nbytes,
-        "ingraph_pack",
+        kind,
         required=False,
         mode="sampling",
     )
-    return handle.tensor, bool(handle.pinned)
+    return handle.tensor, bool(handle.pinned), handle
 
 
-def pack_block_host(block_key: str, linears, *, repoint: bool = True, pin: bool = True) -> BlockPack:
+def release_pack(pack: "BlockPack | None") -> None:
+    """Release a pack's own pin grant.
+
+    A borrowed pack (``owns_flat=False``, e.g. arena-backed) must never
+    release someone else's handle -- the owner (the arena) is responsible for
+    its own flat's lifetime."""
+    if pack is None or not pack.owns_flat:
+        return
+    pin_manager.release(pack.pin_handle)
+    pack.pin_handle = None
+
+
+def pack_block_host(
+    block_key: str, linears, *, repoint: bool = True, pin: bool = True, kind: str = "ingraph_pack"
+) -> BlockPack:
     """Pack a block's Linear weights/biases into one aligned host byte buffer.
 
     ``linears`` is an iterable of ``(name, module)`` or
     ``(name, weight, bias)`` entries. When ``repoint`` is true the modules'
-    Parameters are replaced by views into the flat host buffer.
+    Parameters are replaced by views into the flat host buffer. ``kind`` is
+    the pin_manager ledger kind for this pack's own allocation (callers that
+    build a persistent weight arena pass ``kind="weights"`` so the bytes are
+    accounted under the same tier as ordinary offload pins).
     """
     normalized = []
     leaves = []
@@ -164,20 +193,156 @@ def pack_block_host(block_key: str, linears, *, repoint: bool = True, pin: bool 
         leaves.extend(b_leaves)
 
     offsets, total = _aligned_offsets(leaves)
-    host, pinned = _empty_host_flat(total, pin=pin)
-    for leaf, offset in zip(leaves, offsets):
-        nbytes = leaf.numel() * leaf.element_size()
-        host[offset:offset + nbytes].view(leaf.dtype).reshape(leaf.shape).copy_(leaf)
-
-    cursor = 0
-    specs = []
-    for name, module, weight, bias, w_leaves, b_leaves in normalized:
-        rebuilt = []
-        for leaf in itertools.chain(w_leaves, b_leaves):
-            offset = offsets[cursor]
+    host, pinned, pin_handle = _empty_host_flat(total, pin=pin, kind=kind)
+    try:
+        for leaf, offset in zip(leaves, offsets):
             nbytes = leaf.numel() * leaf.element_size()
-            rebuilt.append(host[offset:offset + nbytes].view(leaf.dtype).reshape(leaf.shape))
-            cursor += 1
+            host[offset:offset + nbytes].view(leaf.dtype).reshape(leaf.shape).copy_(leaf)
+
+        cursor = 0
+        specs = []
+        for name, module, weight, bias, w_leaves, b_leaves in normalized:
+            rebuilt = []
+            for leaf in itertools.chain(w_leaves, b_leaves):
+                offset = offsets[cursor]
+                nbytes = leaf.numel() * leaf.element_size()
+                rebuilt.append(host[offset:offset + nbytes].view(leaf.dtype).reshape(leaf.shape))
+                cursor += 1
+            leaf_kind = "float"
+            weight_scale_spec = None
+            fp8_qualifies = False
+            if len(w_leaves) == 1:
+                weight_role = "float_weight"
+            elif (
+                len(w_leaves) == 2
+                and w_leaves[0].dtype == torch.float8_e4m3fn
+                and w_leaves[1].is_floating_point()
+            ):
+                leaf_kind = "fp8_rowwise"
+                weight_role = "qdata"
+                scale_leaf = w_leaves[1]
+                fp8_qualifies = _fp8_rowwise_qualifies(w_leaves[0], scale_leaf)
+                scale_offset = offsets[cursor - len(w_leaves) - len(b_leaves) + 1]
+                weight_scale_spec = LeafSpec(
+                    offset=scale_offset,
+                    nbytes=scale_leaf.numel() * scale_leaf.element_size(),
+                    dtype=scale_leaf.dtype,
+                    shape=tuple(scale_leaf.shape),
+                    role="scale",
+                )
+            else:
+                raise ValueError("unsupported_quant_wrapper")
+            w_spec = LeafSpec(
+                offset=offsets[cursor - len(w_leaves) - len(b_leaves)],
+                nbytes=w_leaves[0].numel() * w_leaves[0].element_size(),
+                dtype=w_leaves[0].dtype,
+                shape=tuple(w_leaves[0].shape),
+                role=weight_role,
+            )
+            b_spec = None
+            if b_leaves:
+                b_leaf = b_leaves[0]
+                b_offset = offsets[cursor - len(b_leaves)]
+                b_spec = LeafSpec(
+                    offset=b_offset,
+                    nbytes=b_leaf.numel() * b_leaf.element_size(),
+                    dtype=b_leaf.dtype,
+                    shape=tuple(b_leaf.shape),
+                    role="bias",
+                )
+            if repoint and module is not None:
+                if leaf_kind == "float":
+                    w_view = rebuilt[0]
+                else:
+                    w_view = _rebuild_from_leaves(
+                        weight.data if isinstance(weight, torch.nn.Parameter) else weight,
+                        iter(rebuilt[:len(w_leaves)]),
+                    )
+                module.weight = torch.nn.Parameter(
+                    w_view,
+                    requires_grad=getattr(weight, "requires_grad", False),
+                )
+                if bias is not None and b_spec is not None:
+                    b_view = rebuilt[len(w_leaves)]
+                    module.bias = torch.nn.Parameter(
+                        b_view,
+                        requires_grad=getattr(bias, "requires_grad", False),
+                    )
+            specs.append(
+                LinearSpec(
+                    name=name,
+                    weight=w_spec,
+                    bias=b_spec,
+                    weight_requires_grad=getattr(weight, "requires_grad", False),
+                    bias_requires_grad=getattr(bias, "requires_grad", False) if bias is not None else False,
+                    kind=leaf_kind,
+                    weight_scale=weight_scale_spec,
+                    fp8_qualifies=fp8_qualifies,
+                )
+            )
+    except Exception:
+        pin_manager.release(pin_handle)
+        raise
+    linears_tuple = tuple(specs)
+    pack = BlockPack(
+        block_key=block_key,
+        host_flat=host,
+        linears=linears_tuple,
+        required_pin_bytes=int(total),
+        pinned=bool(pinned),
+        fp8_flags=tuple(spec.fp8_qualifies for spec in linears_tuple),
+        pin_handle=pin_handle,
+        owns_flat=True,
+        borrowed_from_arena=False,
+    )
+    pack.view_maker = make_block_view_maker(pack)
+    return pack
+
+
+class ArenaBorrowError(ValueError):
+    """A block's live params don't actually live in the flat they were
+    expected to borrow from -- caller must fall back to an owned pack."""
+
+
+def pack_block_host_from_flat(block_key: str, linears, flat: torch.Tensor) -> "BlockPack":
+    """Build a BORROWED BlockPack over an already-pinned flat someone else
+    owns (the pinned-arena, ticket 534ea49's Slice 4): no allocation, no copy,
+    no new pin grant. Offsets are derived from each leaf's REAL data_ptr
+    relative to ``flat`` -- never trusted from a caller-supplied layout --
+    so a leaf that turns out not to live in ``flat`` (stale/rebuilt block,
+    a sibling Linear whose Parameter was replaced) fails closed with
+    ArenaBorrowError instead of silently packing mixed storage.
+
+    ``linears`` entries may use whatever naming convention the caller likes
+    (e.g. ingraph's short per-block names, distinct from the arena's own
+    full module-path names) -- only real storage identity is checked.
+    """
+    flat_storage = flat.untyped_storage()
+    flat_ptr = flat.data_ptr()
+    flat_end = flat_ptr + flat.numel() * flat.element_size()
+
+    def _offset_of(leaf: torch.Tensor) -> int:
+        if leaf.untyped_storage().data_ptr() != flat_storage.data_ptr():
+            raise ArenaBorrowError(f"arena_layout_mismatch:{block_key}:not_in_flat")
+        offset = leaf.data_ptr() - flat_ptr
+        nbytes = leaf.numel() * leaf.element_size()
+        if offset < 0 or offset + nbytes > flat_end - flat_ptr:
+            raise ArenaBorrowError(f"arena_layout_mismatch:{block_key}:out_of_range")
+        return offset
+
+    specs = []
+    for entry in linears:
+        if len(entry) == 2:
+            name, module = entry
+            weight = module.weight
+            bias = getattr(module, "bias", None)
+        else:
+            name, weight, bias = entry
+        w_data = weight.data if isinstance(weight, torch.nn.Parameter) else weight
+        b_data = bias.data if isinstance(bias, torch.nn.Parameter) else bias
+        w_leaves = _flatten_leaves(w_data)
+        b_leaves = _flatten_leaves(b_data) if b_data is not None else []
+
         kind = "float"
         weight_scale_spec = None
         fp8_qualifies = False
@@ -192,52 +357,33 @@ def pack_block_host(block_key: str, linears, *, repoint: bool = True, pin: bool 
             weight_role = "qdata"
             scale_leaf = w_leaves[1]
             fp8_qualifies = _fp8_rowwise_qualifies(w_leaves[0], scale_leaf)
-            scale_offset = offsets[cursor - len(w_leaves) - len(b_leaves) + 1]
             weight_scale_spec = LeafSpec(
-                offset=scale_offset,
+                offset=_offset_of(scale_leaf),
                 nbytes=scale_leaf.numel() * scale_leaf.element_size(),
                 dtype=scale_leaf.dtype,
                 shape=tuple(scale_leaf.shape),
                 role="scale",
             )
         else:
-            raise ValueError("unsupported_quant_wrapper")
+            raise ArenaBorrowError(f"arena_layout_mismatch:{block_key}:unsupported_quant_wrapper")
+        w_leaf = w_leaves[0]
         w_spec = LeafSpec(
-            offset=offsets[cursor - len(w_leaves) - len(b_leaves)],
-            nbytes=w_leaves[0].numel() * w_leaves[0].element_size(),
-            dtype=w_leaves[0].dtype,
-            shape=tuple(w_leaves[0].shape),
+            offset=_offset_of(w_leaf),
+            nbytes=w_leaf.numel() * w_leaf.element_size(),
+            dtype=w_leaf.dtype,
+            shape=tuple(w_leaf.shape),
             role=weight_role,
         )
         b_spec = None
         if b_leaves:
             b_leaf = b_leaves[0]
-            b_offset = offsets[cursor - len(b_leaves)]
             b_spec = LeafSpec(
-                offset=b_offset,
+                offset=_offset_of(b_leaf),
                 nbytes=b_leaf.numel() * b_leaf.element_size(),
                 dtype=b_leaf.dtype,
                 shape=tuple(b_leaf.shape),
                 role="bias",
             )
-        if repoint and module is not None:
-            if kind == "float":
-                w_view = rebuilt[0]
-            else:
-                w_view = _rebuild_from_leaves(
-                    weight.data if isinstance(weight, torch.nn.Parameter) else weight,
-                    iter(rebuilt[:len(w_leaves)]),
-                )
-            module.weight = torch.nn.Parameter(
-                w_view,
-                requires_grad=getattr(weight, "requires_grad", False),
-            )
-            if bias is not None and b_spec is not None:
-                b_view = rebuilt[len(w_leaves)]
-                module.bias = torch.nn.Parameter(
-                    b_view,
-                    requires_grad=getattr(bias, "requires_grad", False),
-                )
         specs.append(
             LinearSpec(
                 name=name,
@@ -250,17 +396,43 @@ def pack_block_host(block_key: str, linears, *, repoint: bool = True, pin: bool 
                 fp8_qualifies=fp8_qualifies,
             )
         )
-    return BlockPack(
+    linears_tuple = tuple(specs)
+    pack = BlockPack(
         block_key=block_key,
-        host_flat=host,
-        linears=tuple(specs),
-        required_pin_bytes=int(total),
-        pinned=bool(pinned),
+        host_flat=flat,
+        linears=linears_tuple,
+        required_pin_bytes=int(flat.numel() * flat.element_size()),
+        pinned=bool(flat.is_pinned()),
+        fp8_flags=tuple(spec.fp8_qualifies for spec in linears_tuple),
+        pin_handle=None,
+        owns_flat=False,
+        borrowed_from_arena=True,
     )
+    pack.view_maker = make_block_view_maker(pack)
+    return pack
 
+
+def _flat_view(
+    flat: torch.Tensor,
+    offset: int,
+    nbytes: int,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    return flat[offset:offset + nbytes].view(dtype).reshape(shape)
+
+
+def _flat_clone_view(
+    flat: torch.Tensor,
+    offset: int,
+    nbytes: int,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    return flat[offset:offset + nbytes].clone().view(dtype).reshape(shape)
 
 def leaf_view(flat: torch.Tensor, spec: LeafSpec) -> torch.Tensor:
-    return flat[spec.offset:spec.offset + spec.nbytes].view(spec.dtype).reshape(spec.shape)
+    return _flat_view(flat, spec.offset, spec.nbytes, spec.dtype, spec.shape)
 
 
 def block_linear_views(flat: torch.Tensor, pack: BlockPack) -> dict[str, LinearView]:
@@ -277,12 +449,95 @@ def block_linear_views(flat: torch.Tensor, pack: BlockPack) -> dict[str, LinearV
     return out
 
 
+def make_block_view_maker(pack: BlockPack):
+    """Return a flat-buffer view maker that yields only tensor tuples."""
+    entries = []
+    for spec in pack.linears:
+        scale_spec = spec.weight_scale
+        entries.append(
+            (
+                (
+                    spec.weight.offset,
+                    spec.weight.nbytes,
+                    spec.weight.dtype,
+                    spec.weight.shape,
+                ),
+                None if spec.bias is None else (
+                    spec.bias.offset,
+                    spec.bias.nbytes,
+                    spec.bias.dtype,
+                    spec.bias.shape,
+                ),
+                None if scale_spec is None else (
+                    scale_spec.offset,
+                    scale_spec.nbytes,
+                    scale_spec.dtype,
+                    scale_spec.shape,
+                ),
+            )
+        )
+    entries = tuple(entries)
+
+    def view_maker(flat: torch.Tensor, _entries=entries):
+        out = []
+        for weight, bias, scale in _entries:
+            w = _flat_view(flat, weight[0], weight[1], weight[2], weight[3])
+            b = None if bias is None else _flat_clone_view(flat, bias[0], bias[1], bias[2], bias[3])
+            s = None if scale is None else _flat_clone_view(flat, scale[0], scale[1], scale[2], scale[3])
+            out.append((w, b, s))
+        return tuple(out)
+
+    return view_maker
+
+
+def block_tensor_views(flat: torch.Tensor, pack: BlockPack) -> tuple:
+    maker = pack.view_maker
+    if maker is None:
+        maker = make_block_view_maker(pack)
+        pack.view_maker = maker
+    return maker(flat)
+
+
 def functional_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None):
     if weight.dtype != x.dtype and weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
         weight = weight.to(dtype=x.dtype)
     if bias is not None and bias.dtype != x.dtype:
         bias = bias.to(dtype=x.dtype)
     return F.linear(x, weight, bias)
+
+
+def materialized_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor | None,
+) -> torch.Tensor:
+    if scale is None:
+        return weight
+    view_shape = [weight.shape[0]] + [1] * (weight.ndim - 1)
+    return weight.to(torch.bfloat16) * scale.reshape(view_shape).to(torch.bfloat16)
+
+
+def streamed_linear_tensors(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    *,
+    fp8_qualifies: bool,
+    training: bool = False,
+    lora_a: torch.Tensor | None = None,
+    lora_b: torch.Tensor | None = None,
+    lora_scale: "float | torch.Tensor | None" = None,
+):
+    """Pure traced Linear math from tensor views only."""
+    if scale is not None and fp8_qualifies:
+        fp8_linear = _fp8_linear_training if training else _fp8_linear_compiled
+        base = fp8_linear(x, weight.t(), scale.reshape(-1), bias)
+    else:
+        base = functional_linear(x, materialized_weight(weight, scale), bias)
+    if lora_a is not None:
+        lora_out = (x.to(lora_a.dtype) @ lora_a.t() @ lora_b.t()) * lora_scale
+        base = base + lora_out.to(base.dtype)
+    return base
 
 
 @dataclass(frozen=True)
@@ -462,6 +717,26 @@ def _reap_locked(block: bool = False):
             _STATS["wait_ms"] += (time.perf_counter() - start) * 1000.0
         _TICKETS.pop(ticket.tid, None)
         _LIVE.popleft()
+
+
+def drain_fetch_runtime() -> int:
+    """Abandon every outstanding fetch ticket (OOM-recovery path only).
+
+    An OOM unwinds a forward between fetch_start and fetch_free, leaving
+    tickets whose free_event never records; the next fetch_start then blocks
+    on the depth limit and raises 'depth exceeded before fetch_free'. The
+    recovery path (mid-denoise demote / full streamed transition) calls this
+    AFTER the failed forward has fully unwound: nothing will consume the
+    in-flight device buffers anymore, so waiting out the transfer streams and
+    dropping the tickets is safe. Returns the number of tickets abandoned.
+    """
+    with _STATE_LOCK:
+        for stream in _TRANSFER_STREAMS.values():
+            stream.synchronize()
+        abandoned = len(_LIVE)
+        _LIVE.clear()
+        _TICKETS.clear()
+    return abandoned
 
 
 def _fetch_start_impl(host_flat: torch.Tensor) -> torch.Tensor:

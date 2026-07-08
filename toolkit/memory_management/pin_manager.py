@@ -404,6 +404,11 @@ def pin_alloc(
         )
         if available is not None and nbytes > available:
             if not required:
+                print(
+                    f"[PinManager] pin refused ({kind}): {nbytes / GIB:.2f} GiB "
+                    f"> {available / GIB:.2f} GiB available (ledger/DXGI budget); "
+                    "returning pageable"
+                )
                 tensor = torch.empty(nbytes, dtype=torch.uint8)
                 return PinHandle(tensor=tensor, nbytes=nbytes, kind=kind, pinned=False)
             raise PinBudgetExceeded(_budget_message(kind, nbytes, available, device=device))
@@ -415,6 +420,12 @@ def pin_alloc(
             tensor = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         except RuntimeError as error:
             if not required:
+                print(
+                    f"[PinManager] pin failed at OS level ({kind}): "
+                    f"{nbytes / GIB:.2f} GiB cudaHostAlloc/pin raised "
+                    f"'{error}' (ledger said {'' if available is None else f'{available / GIB:.2f} GiB '}"
+                    "available -- likely system RAM pressure); returning pageable"
+                )
                 tensor = torch.empty(nbytes, dtype=torch.uint8)
                 return PinHandle(tensor=tensor, nbytes=nbytes, kind=kind, pinned=False)
             raise PinBudgetExceeded(_budget_message(kind, nbytes, available, device=device)) from error

@@ -245,6 +245,12 @@ class Krea2Pipeline:
         # do not contribute), but reads each weight once. Built once — invariant
         # across timesteps. do_batch_cfg may be cleared on OOM to fall back.
         do_batch_cfg = do_cfg and bool(batch_cfg)
+        print(
+            f"[Krea2Pipeline] CFG mode: "
+            f"{'batched' if do_batch_cfg else ('sequential' if do_cfg else 'off')} "
+            f"(cfg={do_cfg}, batch_cfg={bool(batch_cfg)}, "
+            f"guidance_scale={guidance_scale})"
+        )
         cfg_feats = cfg_mask = None
         if do_batch_cfg:
             cfg_feats, cfg_mask = pad_text_features(
@@ -291,24 +297,86 @@ class Krea2Pipeline:
                         transformer.disable_compiled_sampling()
                 except Exception as error:  # never let the guard break sampling
                     print(f"[MemoryManager] step trim failed (ignored): {error}")
-            try:
-                v = _step(t)
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                demote = getattr(transformer, "_mm_sampling_demote", None)
-                if demote is not None and demote():
-                    transformer.disable_compiled_sampling()
+            # Retry until the step fits: each OOM streams a couple more resident
+            # blocks (incremental demote), so one step may need several rounds
+            # when the shortfall exceeds what one demote frees. Bounded: demote()
+            # returns False once fully streamed, then one trim-only retry (the
+            # empty_cache alone can defragment enough for a large contiguous
+            # allocation under the WDDM cap), then batch-CFG is dropped once,
+            # then the OOM propagates.
+            trim_retry_used = False
+            while True:
+                try:
                     v = _step(t)
-                elif do_batch_cfg:
-                    # Batched CFG doubles the activation peak; drop to sequential
-                    # CFG (half the peak) for the rest of the run and retry.
-                    do_batch_cfg = False
-                    v = _step(t)
-                else:
-                    raise
+                    break
+                except torch.cuda.OutOfMemoryError as oom:
+                    # Synchronize BEFORE trimming: blocks freed on side streams
+                    # (ingraph transfer-stream fetch buffers, ~0.4 GiB each)
+                    # stay stream-bound and unreleasable until their events
+                    # complete -- an unsynced empty_cache leaves exactly the
+                    # fragmented reserved-but-unallocated GiB that blocks a
+                    # contiguous activation under the WDDM cap.
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    demote = getattr(transformer, "_mm_sampling_demote", None)
+                    if not trim_retry_used:
+                        # Transients are ALLOWED to spend the reserve buffer:
+                        # first give the freed cache one retry before paying
+                        # for relief with residency (demotion invalidates
+                        # compiled state and mutates the ingraph pack set).
+                        trim_retry_used = True
+                    elif demote is not None and demote(reason=oom):
+                        transformer.disable_compiled_sampling()
+                    elif do_batch_cfg:
+                        # Batched CFG doubles the activation peak; drop to
+                        # sequential CFG (half the peak) for the rest of the run.
+                        do_batch_cfg = False
+                    else:
+                        raise
             latents = latents + (tprev - tcurr) * v.to(torch.float32)
 
-        images = model.decode_latents(latents, device=device, dtype=dtype)
+        # VAE decode cohabits with the resident transformer and is NOT covered
+        # by the per-step retry above. At high resolutions its fp32 upsample
+        # transients are GiB-scale (observed 1.43 GiB contiguous at 2000px),
+        # so an OOM here gets the same relief: stream transformer blocks back
+        # to CPU and retry. Bounded like the step loop: demote() returns False
+        # once fully streamed, then the OOM propagates.
+        trim_retry_used = False
+        while True:
+            try:
+                images = model.decode_latents(latents, device=device, dtype=dtype)
+                break
+            except torch.cuda.OutOfMemoryError as oom:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                vae = getattr(model, "vae", None)
+                if vae is not None and hasattr(vae, "enable_tiling") and not getattr(
+                    vae, "use_tiling", False
+                ):
+                    # First relief: tiled decode caps the fp32 upsample
+                    # transients at tile size (observed 2.86 GiB contiguous for
+                    # a full-frame 2000px decode -- unfittable next to a
+                    # resident transformer under the WDDM cap). Tiling keeps
+                    # the transformer layout and compiled state untouched, so
+                    # it beats demoting weights for a decode-phase OOM.
+                    vae.enable_tiling()
+                    print(
+                        "[MemoryManager] VAE decode OOM: enabled tiled decode "
+                        "and retrying."
+                    )
+                elif not trim_retry_used:
+                    # Second relief, still free: empty_cache alone can clear
+                    # the fragmentation (reserved-but-unallocated) blocking a
+                    # contiguous request under the WDDM cap.
+                    trim_retry_used = True
+                elif (
+                    (demote := getattr(transformer, "_mm_sampling_demote", None))
+                    is not None
+                    and demote(reason=oom)
+                ):
+                    transformer.disable_compiled_sampling()
+                else:
+                    raise
         images = images.float().clamp(-1.0, 1.0)
         images = ((images + 1.0) * 127.5).round().to(torch.uint8)
         images = images.permute(0, 2, 3, 1).cpu().numpy()

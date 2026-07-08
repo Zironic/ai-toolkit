@@ -1,5 +1,6 @@
 import io
 import unittest
+from unittest import mock
 
 import pytest
 import torch
@@ -7,9 +8,11 @@ import torch.nn as nn
 from optimum.quanto import freeze
 
 from toolkit.util.quantize import get_qtype, quantize
+from toolkit.memory_management import pin_manager
 from toolkit.memory_management.ingraph_stream import (
     block_linear_views,
     pack_block_host,
+    release_pack,
 )
 
 
@@ -115,6 +118,57 @@ class InGraphPackTests(unittest.TestCase):
         self.assertEqual(set(expected), set(after))
         for key, value in expected.items():
             self.assertTrue(torch.equal(value, after[key]), key)
+
+
+class PackHandleOwnershipTests(unittest.TestCase):
+    """Slice 0: pack_block_host must carry its own pin grant so callers can
+    release it, and never release a grant it doesn't own (borrowed_from_arena
+    packs in a later slice). Regression coverage for the 0.40 GiB leak
+    (ticket 763bb75): pack_block_host used to allocate via pin_manager.pin_alloc
+    but discard the returned PinHandle entirely."""
+
+    def test_pack_carries_pin_handle_and_owns_flat_by_default(self):
+        layer = torch.nn.Linear(8, 4, bias=True)
+        pack = pack_block_host("blocks.0", [("proj", layer)], repoint=False, pin=True)
+        self.assertIsNotNone(pack.pin_handle)
+        self.assertTrue(pack.owns_flat)
+        self.assertFalse(pack.borrowed_from_arena)
+
+    def test_release_pack_releases_owned_handle(self):
+        layer = torch.nn.Linear(8, 4, bias=True)
+        pack = pack_block_host("blocks.0", [("proj", layer)], repoint=False, pin=True)
+        handle = pack.pin_handle
+        with mock.patch.object(pin_manager, "release") as released:
+            release_pack(pack)
+        released.assert_called_once_with(handle)
+        self.assertIsNone(pack.pin_handle)
+
+    def test_release_pack_is_noop_for_borrowed_flat(self):
+        layer = torch.nn.Linear(8, 4, bias=True)
+        pack = pack_block_host("blocks.0", [("proj", layer)], repoint=False, pin=False)
+        pack.owns_flat = False
+        pack.borrowed_from_arena = True
+        sentinel = object()
+        pack.pin_handle = sentinel
+        with mock.patch.object(pin_manager, "release") as released:
+            release_pack(pack)
+        released.assert_not_called()
+        self.assertIs(pack.pin_handle, sentinel)
+
+    def test_release_pack_handles_none(self):
+        release_pack(None)
+
+    def test_build_failure_after_flat_alloc_releases_handle(self):
+        from toolkit.memory_management import ingraph_stream
+
+        layer = torch.nn.Linear(8, 4, bias=True)
+        with mock.patch.object(pin_manager, "release") as released:
+            with mock.patch.object(
+                ingraph_stream, "LinearSpec", side_effect=RuntimeError("boom")
+            ):
+                with self.assertRaises(RuntimeError):
+                    pack_block_host("blocks.0", [("proj", layer)], repoint=False, pin=True)
+        released.assert_called_once()
 
 
 if __name__ == "__main__":

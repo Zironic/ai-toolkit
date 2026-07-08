@@ -21,4 +21,14 @@ def force_hf_hub_progress_bars():
     hf_tqdm.is_tqdm_disabled = is_tqdm_disabled
 
 
+def _apply_sdpa_gqa_patch():
+    # Late import: sdpa_patch pulls in torch, and this package init runs for
+    # every toolkit consumer. See toolkit/sdpa_patch.py for the rationale
+    # (enable_gqa silently dispatching to the MATH SDPA backend on builds
+    # without Flash, e.g. all Windows torch wheels).
+    from toolkit.sdpa_patch import apply_sdpa_gqa_patch
+    apply_sdpa_gqa_patch()
+
+
 force_hf_hub_progress_bars()
+_apply_sdpa_gqa_patch()

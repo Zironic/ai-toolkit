@@ -1146,13 +1146,28 @@ def _is_quantized_tensor(t: Optional[torch.Tensor]) -> bool:
     return not t.dtype.is_floating_point
 
 
-def _dequantize_to(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize directly to the compute dtype when the backend supports it."""
+def _reference_dequantize_to(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """The backend's own dequant. TorchAO transits fp32 internally, so the
+    transient is ~5x the output bytes even when output_dtype is honored."""
     try:
         return tensor.dequantize(output_dtype=dtype)
     except TypeError:
         value = tensor.dequantize()
         return value if value.dtype == dtype else value.to(dtype=dtype)
+
+
+def _dequantize_to(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Dequantize directly to the compute dtype when the backend supports it.
+
+    For the rowwise / per-tensor float8 weights Krea uses, prefer the direct
+    fp8 -> dtype cast + row-scale multiply: it allocates only the output
+    (~0.19 GiB for a 16384x6144 linear) where TorchAO's dequantize transits
+    fp32 (~0.94 GiB transient for the same weight -- the OOM-spiral trigger
+    under the WDDM hard allocator cap, git-bug 1895607)."""
+    fast = _fast_fp8_dequant(tensor, dtype)
+    if fast is not None:
+        return fast
+    return _reference_dequantize_to(tensor, dtype)
 
 
 _FP8_GRAD_INPUT = os.environ.get("AI_TOOLKIT_FP8_GRAD_INPUT", "0").lower() not in (
@@ -1330,6 +1345,38 @@ def _fast_fp8_dequant_into(qweight, dest):
     return None
 
 
+def _fast_fp8_dequant(qweight, dtype):
+    """Rowwise/per-tensor fp8 dequant allocating only the output, or None.
+
+    Same math and one-time verification as _dequantize_into, without a
+    preallocated destination -- for callers outside the staging slots
+    (block-resident consume, backward, CPU fallback)."""
+    global _REUSE_VERIFIED
+    if not _REUSE_DEQUANT or _REUSE_VERIFIED is False:
+        return None
+    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return None
+    qdata = getattr(qweight, "qdata", None)
+    if qdata is None:
+        return None
+    dest = torch.empty(qdata.shape, dtype=dtype, device=qdata.device)
+    fast = _fast_fp8_dequant_into(qweight, dest)
+    if fast is None:
+        return None
+    if _REUSE_VERIFIED is None:
+        try:
+            reference = _reference_dequantize_to(qweight, dtype)
+            ok = reference.shape == fast.shape and torch.allclose(
+                fast, reference, rtol=1e-2, atol=1e-2
+            )
+        except Exception:
+            ok = False
+        _REUSE_VERIFIED = bool(ok)
+        if not ok:
+            return None
+    return fast
+
+
 def _dequantize_into(qweight, dest):
     """Dequant qweight into the preallocated dest buffer, or None to fall back."""
     global _REUSE_VERIFIED
@@ -1342,7 +1389,7 @@ def _dequantize_into(qweight, dest):
         # Pay one allocation to confirm the elementwise path matches TorchAO's
         # own dequant before we trust it for the rest of the run.
         try:
-            reference = _dequantize_to(qweight, dest.dtype)
+            reference = _reference_dequantize_to(qweight, dest.dtype)
             ok = reference.shape == fast.shape and torch.allclose(
                 fast, reference, rtol=1e-2, atol=1e-2
             )
@@ -1644,7 +1691,18 @@ def _unpin_module_weights(module: nn.Module, manager) -> int:
     quantized inner tensors; this additionally reconciles the manager-side
     ``pinned_weight_bytes`` counter and the per-layer ``_mm_pinned_bytes`` tag so
     later pins can reuse the budget. Returns bytes released (0 if none held).
+
+    Arena-backed modules (``_mm_arena_block`` tagged, ticket 534ea49) are a
+    no-op here: their weight is a view into a persistent per-block flat pinned
+    via ``pin_manager.pin_alloc``, not a per-tensor ``cudaHostRegister``. The
+    unregister branch below would find no registration, fall through to
+    ``release_pinned_bytes`` + ``.clone()``, and incorrectly drain the
+    ``"weights"`` ledger for bytes the arena still holds while detaching the
+    param from the arena's storage -- exactly the churn this arena exists to
+    eliminate.
     """
+    if getattr(module, "_mm_arena_block", None) is not None:
+        return 0
     tracked = int(getattr(module, "_mm_pinned_bytes", 0) or 0)
     changed = False
     with torch.no_grad():
@@ -1763,6 +1821,28 @@ def _ensure_cpu_pinned(
 
 def _move_params_to_cpu_and_pin(module: nn.Module, manager: "MemoryManager"):
     """Force parameters to CPU (+pinned) so we can 'bounce' them per forward/backward."""
+    if getattr(module, "_mm_arena_block", None) is not None:
+        # Arena-backed (ticket 534ea49): the weight/bias are meant to be views
+        # into the arena's persistent pinned flat. Re-registering them with
+        # cudaHostRegister here would be the register/alloc collision behind
+        # ticket 763bb75; pin_alloc-ing a fresh standalone buffer would
+        # double-pin the same bytes -- the arena already owns this weight's
+        # host pin, so no NEW pinning happens here either way.
+        #
+        # But the param may have been detached from that storage since the
+        # arena was built: a sampling pass can go fully GPU-resident (see
+        # inference_resident's non-streaming branch), moving param.data to
+        # CUDA and back via ordinary .to() calls that know nothing about the
+        # arena. restore_view copies whatever data is CURRENTLY there back
+        # into the arena's flat and repoints -- a no-op copy if the param is
+        # still the arena's own view, a real D2H if it drifted away. Either
+        # way the arena remains the sole owner of the pin.
+        arena = getattr(getattr(manager, "module", None), "_mm_weight_arena", None)
+        if arena is not None:
+            for name in ("weight", "bias"):
+                if isinstance(getattr(module, name, None), nn.Parameter):
+                    arena.restore_view(module, name)
+        return
     dxgi_before = _dxgi_signed_headroom_bytes(getattr(manager, "process_device", None))
     pinned_before = int(getattr(module, "_mm_pinned_bytes", 0) or 0)
     with torch.no_grad():

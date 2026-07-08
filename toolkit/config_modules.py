@@ -882,6 +882,13 @@ class ModelConfig:
             "layer_offloading_ingraph_training", False
         )
         self.train_compile_blocks = kwargs.get("train_compile_blocks", False)
+        # Ticket 534ea49: pin offloaded weights ONCE into persistent per-block
+        # flat host buffers instead of cudaHostRegister-ing/unregistering them
+        # at every sampling boundary. Off by default -- flip after GPU
+        # validation (see docs/decisions or tasks/open/PIN_MANAGER_PLAN.md).
+        self.layer_offloading_pinned_arena = kwargs.get(
+            "layer_offloading_pinned_arena", False
+        )
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for

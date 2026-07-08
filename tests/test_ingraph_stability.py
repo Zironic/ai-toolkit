@@ -37,6 +37,70 @@ def _streamed_matmul_chain(x, hosts, n, k):
     return y
 
 
+def _heterogeneous_pack():
+    torch.manual_seed(2)
+    entries = (
+        ("attn.wq", torch.randn(32, 32) * 0.05, None),
+        ("attn.wk", torch.randn(16, 32) * 0.05, None),
+        ("attn.wv", torch.randn(16, 32) * 0.05, None),
+        ("attn.gate", torch.randn(32, 32) * 0.05, None),
+        ("attn.wo", torch.randn(32, 32) * 0.05, None),
+        ("mlp.gate", torch.randn(64, 32) * 0.05, None),
+        ("mlp.up", torch.randn(64, 32) * 0.05, None),
+        ("mlp.down", torch.randn(32, 64) * 0.05, None),
+    )
+    return ingraph_stream.pack_block_host("heterogeneous", entries, repoint=False, pin=True)
+
+
+def _heterogeneous_streamed_block(x, host, nbytes, pack):
+    token = torch.ops.mm.fetch_start_after(host, x)
+    flat = torch.ops.mm.fetch_wait(token, nbytes)
+    views = ingraph_stream.block_tensor_views(flat, pack)
+    q = ingraph_stream.streamed_linear_tensors(
+        x, views[0][0], views[0][1], views[0][2], fp8_qualifies=pack.fp8_flags[0]
+    )
+    gate = ingraph_stream.streamed_linear_tensors(
+        x, views[5][0], views[5][1], views[5][2], fp8_qualifies=pack.fp8_flags[5]
+    )
+    up = ingraph_stream.streamed_linear_tensors(
+        x, views[6][0], views[6][1], views[6][2], fp8_qualifies=pack.fp8_flags[6]
+    )
+    down = ingraph_stream.streamed_linear_tensors(
+        torch.nn.functional.silu(gate) * up,
+        views[7][0],
+        views[7][1],
+        views[7][2],
+        fp8_qualifies=pack.fp8_flags[7],
+    )
+    y = q + down
+    torch.ops.mm.fetch_free_after(token, y)
+    return y
+
+
+def test_heterogeneous_pack_views_cause_zero_recompiles():
+    _reset(depth=2)
+    pack = _heterogeneous_pack()
+    compiled = torch.compile(_heterogeneous_streamed_block, fullgraph=True, dynamic=False)
+    x = torch.randn(4, 32, device="cuda")
+
+    first = compiled(x, pack.host_flat, int(pack.required_pin_bytes), pack)
+    torch.cuda.synchronize()
+    graphs = _unique_graphs()
+    assert graphs >= 1
+    assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+
+    again = compiled(x, pack.host_flat, int(pack.required_pin_bytes), pack)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(again, first)
+    assert _unique_graphs() == graphs
+
+    repacked_host = pack.host_flat.clone().pin_memory()
+    third = compiled(x, repacked_host, int(pack.required_pin_bytes), pack)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(third, first)
+    assert _unique_graphs() == graphs
+    assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+
 def test_repack_and_repeat_cause_zero_recompiles():
     _reset(depth=2)
     k = 32

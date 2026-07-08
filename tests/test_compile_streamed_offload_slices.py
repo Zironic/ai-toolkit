@@ -66,6 +66,26 @@ class CompileStreamedOffloadSliceTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertIn("streaming_hook", status["reasons"])
 
+    def test_sampling_readiness_reports_forward_hook(self):
+        model = self._model()
+        handle = model.blocks[0].attn.wq.register_forward_pre_hook(
+            lambda _module, args: None
+        )
+        try:
+            reasons = SingleStreamDiT._block_compile_reject_reasons(model.blocks[0])
+        finally:
+            handle.remove()
+        self.assertIn("hook_present", reasons)
+
+    def test_regional_sampling_compile_skips_ingraph_streamed_blocks(self):
+        model = self._model()
+        model._ingraph_sampling_packs = {0: object()}
+        compiled_count, eager_count = model.enable_compiled_sampling()
+        self.assertEqual(0, compiled_count)
+        self.assertEqual(1, eager_count)
+        self.assertIsNotNone(model._compiled_blocks)
+        self.assertIsNone(model._compiled_blocks[0])
+
 
 if __name__ == "__main__":
     unittest.main()

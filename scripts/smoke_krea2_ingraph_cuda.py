@@ -140,6 +140,139 @@ def _dynamo_counters():
         return {"error": repr(error)}
 
 
+def _compile_path_snapshot(transformer):
+    state = getattr(transformer, "_last_ingraph_sampling_compile_state", None)
+    if state is None:
+        state = {
+            "ingraph_compiled": getattr(transformer, "_compiled_ingraph_sampling", None)
+            is not None,
+            "ingraph_compiled_blocks": len(
+                getattr(transformer, "_compiled_ingraph_sampling_blocks", {}) or {}
+            ),
+            "regional_compiled_blocks": sum(
+                1 for block in (getattr(transformer, "_compiled_blocks", None) or [])
+                if block is not None
+            ),
+            "ingraph_packs": len(getattr(transformer, "_ingraph_sampling_packs", {}) or {}),
+            "unavailable_reasons": tuple(
+                getattr(transformer, "_ingraph_unavailable_reasons", ()) or ()
+            ),
+        }
+    state = dict(state)
+    state["unavailable_reasons"] = list(state.get("unavailable_reasons") or ())
+    total_blocks = len(getattr(transformer, "blocks", []) or [])
+    state["total_blocks"] = total_blocks
+    ingraph_packs = int(state.get("ingraph_packs", 0) or 0)
+    ingraph_compiled_blocks = int(state.get("ingraph_compiled_blocks", 0) or 0)
+    regional_compiled_blocks = int(state.get("regional_compiled_blocks", 0) or 0)
+    stream_expected_blocks = ingraph_packs
+    resident_expected_blocks = max(0, total_blocks - ingraph_packs)
+    stream_compile_complete = bool(state.get("ingraph_compiled")) or (
+        stream_expected_blocks > 0
+        and ingraph_compiled_blocks == stream_expected_blocks
+    )
+    resident_compile_complete = regional_compiled_blocks == resident_expected_blocks
+    mixed_compile_complete = bool(
+        stream_expected_blocks > 0
+        and stream_compile_complete
+        and resident_compile_complete
+    )
+    state["stream_expected_blocks"] = stream_expected_blocks
+    state["resident_expected_blocks"] = resident_expected_blocks
+    state["stream_compile_complete"] = stream_compile_complete
+    state["resident_compile_complete"] = resident_compile_complete
+    state["mixed_compile_complete"] = mixed_compile_complete
+    if state.get("ingraph_compiled"):
+        if total_blocks and ingraph_packs == total_blocks:
+            path = "ingraph_fullgraph_all"
+        else:
+            path = "ingraph_fullgraph_partial"
+    elif mixed_compile_complete:
+        path = "mixed_resident_ingraph_compile"
+    elif ingraph_compiled_blocks:
+        path = "ingraph_block_compile"
+    elif regional_compiled_blocks:
+        path = "regional_compile"
+    elif "partial_ingraph_compile" in state["unavailable_reasons"] and ingraph_packs:
+        path = "ingraph_partial_eager"
+    elif state["unavailable_reasons"]:
+        path = "ingraph_unavailable"
+    else:
+        path = "eager_or_not_compiled"
+    state["path"] = path
+    return state
+
+
+def _ingraph_fetch_count(report):
+    if not report:
+        return None
+    marker = "fetches="
+    start = str(report).find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = start
+    text = str(report)
+    while end < len(text) and text[end].isdigit():
+        end += 1
+    try:
+        return int(text[start:end])
+    except Exception:
+        return None
+
+
+def _compile_diagnostics(compile_state, dynamo, fetch_report, ingraph_timing):
+    stats = (dynamo or {}).get("stats", {}) if isinstance(dynamo, dict) else {}
+    graph_breaks = (dynamo or {}).get("graph_breaks") if isinstance(dynamo, dict) else None
+    unique_graphs = stats.get("unique_graphs")
+    packs = int((compile_state or {}).get("ingraph_packs", 0) or 0)
+    calls = None
+    if isinstance(ingraph_timing, dict):
+        calls = ingraph_timing.get("calls")
+    fetches = _ingraph_fetch_count(fetch_report)
+    compile_path = (compile_state or {}).get("path")
+    ingraph_compiled = bool((compile_state or {}).get("ingraph_compiled"))
+    ingraph_compiled_blocks = int((compile_state or {}).get("ingraph_compiled_blocks", 0) or 0)
+    regional_compiled_blocks = int((compile_state or {}).get("regional_compiled_blocks", 0) or 0)
+    stream_compile_complete = bool((compile_state or {}).get("stream_compile_complete"))
+    resident_compile_complete = bool((compile_state or {}).get("resident_compile_complete"))
+    mixed_compile_complete = bool((compile_state or {}).get("mixed_compile_complete"))
+    expected_fetches = None
+    if ingraph_compiled and packs and calls is not None and int(calls) > 0:
+        expected_fetches = packs * int(calls)
+    fetches_match = None
+    if fetches is not None and expected_fetches is not None:
+        fetches_match = fetches == expected_fetches
+    graph_break_clean = graph_breaks == 0 if graph_breaks is not None else None
+    cache_clean = None
+    if unique_graphs is not None:
+        cache_clean = int(unique_graphs) <= 1
+    warning = None
+    if not stream_compile_complete and packs:
+        warning = "streamed blocks did not compile"
+    elif not resident_compile_complete:
+        warning = "resident blocks did not compile"
+    elif ingraph_compiled and unique_graphs and int(unique_graphs) > 1:
+        warning = "ingraph compiled with multiple unique graphs"
+    elif compile_path == "ingraph_partial_eager":
+        warning = "partial ingraph ran eager"
+    return {
+        "compile_path": compile_path,
+        "graph_break_clean": graph_break_clean,
+        "compile_cache_clean": cache_clean,
+        "unique_graphs": unique_graphs,
+        "calls_captured": stats.get("calls_captured"),
+        "ingraph_compiled_blocks": ingraph_compiled_blocks,
+        "regional_compiled_blocks": regional_compiled_blocks,
+        "stream_compile_complete": stream_compile_complete,
+        "resident_compile_complete": resident_compile_complete,
+        "mixed_compile_complete": mixed_compile_complete,
+        "expected_fetches": expected_fetches,
+        "actual_fetches": fetches,
+        "fetches_match_packs": fetches_match,
+        "warning": warning,
+    }
+
 def _managed_summary(transformer):
     managed = pinned_layers = 0
     pinned_bytes = 0
@@ -243,6 +376,7 @@ def _build_model_config(args):
         qtype=args.qtype,
         compile_sample=not args.no_compile_sample,
         compile_debug=not args.no_compile_debug,
+        compile_cache_dir=args.compile_cache_dir,
         layer_offloading=True,
         layer_offloading_smart=True,
         layer_offloading_smart_sampling=True,
@@ -318,7 +452,10 @@ def _parse_args():
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--guidance-scale", type=float, default=None)
-    parser.add_argument("--batch-cfg", action="store_true")
+    parser.add_argument(
+        "--batch-cfg", action=argparse.BooleanOptionalAction, default=False,
+        help="Batched CFG (cond+uncond in one forward). --no-batch-cfg forces sequential.",
+    )
     parser.add_argument("--output", default=".codex/krea2_ingraph_cuda_smoke.png")
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--working-reserve-gib", default="-1")
@@ -335,6 +472,24 @@ def _parse_args():
     parser.add_argument("--sampling-wddm-hard-gib", type=float, default=1.0)
     parser.add_argument("--disable-compile-streamed", action="store_true")
     parser.add_argument("--no-compile-sample", action="store_true")
+    parser.add_argument(
+        "--ab-eager",
+        action="store_true",
+        help=(
+            "Run an eager (compile disabled) baseline sample of --steps steps "
+            "before the compile warmup, for an A/B per-forward comparison in "
+            "the same process/layout."
+        ),
+    )
+    parser.add_argument(
+        "--compile-cache-dir",
+        default=None,
+        help=(
+            "torch.compile mega-cache directory. Loaded before the first "
+            "compiled sample, saved after new frames compile (same path the "
+            "trainer uses via ModelConfig.compile_cache_dir)."
+        ),
+    )
     parser.add_argument("--strict-ingraph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ingraph-depth", type=int, default=2)
     parser.add_argument("--ingraph-stream-all", action="store_true")
@@ -375,12 +530,16 @@ def main():
     config = _build_model_config(args)
     rows = []
 
+    model_setup_started = time.perf_counter()
     print("[smoke] constructing Krea2Model without text encoder")
+    t0 = time.perf_counter()
     model = Krea2Model(device=args.device, model_config=config, dtype=args.dtype)
+    model_construct_seconds = time.perf_counter() - t0
     model.skip_te = True
     rows.append(
         {
             "event": "start",
+            "model_construct_seconds": model_construct_seconds,
             "compile_debug": compile_debug_state,
             "cuda": _cuda_snapshot("start", device),
             "dxgi": _dxgi_snapshot("start"),
@@ -448,73 +607,298 @@ def main():
     )
     _print_json(rows[-1])
 
-    gen_config = GenerateImageConfig(
-        prompt="cached TE prompt",
-        width=args.width,
-        height=args.height,
-        seed=args.seed,
-        guidance_scale=guidance_scale,
-        num_inference_steps=args.steps,
-        output_path=args.output,
-        batch_cfg=bool(args.batch_cfg),
+    model_setup_seconds = time.perf_counter() - model_setup_started
+    rows.append(
+        {
+            "event": "model_ready",
+            "seconds": model_setup_seconds,
+            "cuda": _cuda_snapshot("model_ready", device),
+            "dxgi": _dxgi_snapshot("model_ready"),
+        }
     )
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    _print_json(rows[-1])
 
-    compile_label = "compile_sample" if config.compile_sample else "compile disabled"
-    print(f"[smoke] sampling with MemoryManager.inference_resident and {compile_label}")
-    transformer._ingraph_sampling_measure = bool(config.compile_sample)
-    t0 = time.perf_counter()
-    with MemoryManager.inference_resident(
-        transformer,
-        device=device,
-        fp8_sampling=bool(config.layer_offloading_fp8_sampling),
-        working_reserve_gib=config.layer_offloading_smart_sampling_working_reserve_gb,
-        wddm_margin_gib=config.layer_offloading_smart_sampling_wddm_margin_gb,
-        wddm_hard_gib=config.layer_offloading_smart_sampling_wddm_hard_gb,
-        reserve_pin_for_ingraph=bool(
-            config.layer_offloading_compile_streamed
-            or config.layer_offloading_ingraph_sampling
-        ),
+    def _make_gen_config(num_steps: int, output_path: str):
+        return GenerateImageConfig(
+            prompt="cached TE prompt",
+            width=args.width,
+            height=args.height,
+            seed=args.seed,
+            guidance_scale=guidance_scale,
+            num_inference_steps=int(num_steps),
+            output_path=output_path,
+            batch_cfg=bool(args.batch_cfg),
+        )
+
+    def _forward_count_from_fetches(fetch_report, compile_state):
+        fetches = _ingraph_fetch_count(fetch_report)
+        packs = int((compile_state or {}).get("ingraph_packs", 0) or 0)
+        if fetches is None or packs <= 0:
+            return None
+        return fetches // packs if fetches % packs == 0 else fetches / packs
+
+    def _run_sample(
+        label: str,
+        num_steps: int,
+        output_path: str,
+        *,
+        keep_ingraph: bool,
+        expected_forwards=None,
     ):
+        gen_config = _make_gen_config(num_steps, output_path)
+        generator = torch.Generator(device=device).manual_seed(args.seed)
+        started = time.perf_counter()
         image = model.generate_single_image(
             model.pipeline,
             gen_config,
             conditional_embeds=conditional_embeds,
             unconditional_embeds=unconditional_embeds,
             generator=generator,
-            extra={},
+            extra={
+                "keep_ingraph_sampling": keep_ingraph,
+                "skip_sampling_guard": True,
+            },
         )
-        compile_state = getattr(transformer, "_last_ingraph_sampling_compile_state", None)
-        if compile_state is None:
-            compile_state = {
-                "ingraph_compiled": getattr(transformer, "_compiled_ingraph_sampling", None)
-                is not None,
-                "regional_compiled_blocks": sum(
-                    1 for block in (getattr(transformer, "_compiled_blocks", None) or [])
-                    if block is not None
-                ),
-                "ingraph_packs": len(getattr(transformer, "_ingraph_sampling_packs", {}) or {}),
-                "unavailable_reasons": tuple(
-                    getattr(transformer, "_ingraph_unavailable_reasons", ()) or ()
-                ),
-            }
+        seconds = time.perf_counter() - started
+        compile_state = _compile_path_snapshot(transformer)
         ingraph_timing = getattr(transformer, "_last_ingraph_sampling_timing", None)
         fetch_report = MemoryManager.ingraph_fetch_report(reset=True)
         profile_report = MemoryManager.offload_profile_report(reset=True)
+        dynamo = _dynamo_counters()
+        compile_diagnostics = _compile_diagnostics(
+            compile_state,
+            dynamo,
+            fetch_report,
+            ingraph_timing,
+        )
+        forward_calls = _forward_count_from_fetches(fetch_report, compile_state)
+        if forward_calls is None and expected_forwards:
+            # Eager pass has no in-graph fetches to count; the forward count
+            # is known analytically from steps and CFG mode.
+            forward_calls = int(expected_forwards)
+        seconds_per_forward = (
+            seconds / float(forward_calls)
+            if forward_calls not in (None, 0)
+            else None
+        )
+        result = {
+            "label": label,
+            "steps": int(num_steps),
+            "seconds": seconds,
+            "transformer_forward_calls": forward_calls,
+            "seconds_per_transformer_forward": seconds_per_forward,
+            "compile": compile_state,
+            "compile_path": compile_state.get("path"),
+            "compile_diagnostics": compile_diagnostics,
+            "dynamo": dynamo,
+            "ingraph_fetch_report": fetch_report,
+            "ingraph_timing": ingraph_timing,
+            "offload_profile_report": profile_report,
+        }
+        return image, result
+
+    compile_label = "compile_sample" if config.compile_sample else "compile disabled"
+    print(f"[smoke] sampling with MemoryManager.inference_resident and {compile_label}")
+    transformer._ingraph_sampling_measure = False
+
+    # Mirrors pipeline.py's CFG decision so the eager pass (no fetch counter)
+    # can report a per-forward time.
+    do_cfg = bool(guidance_scale and guidance_scale > 0 and unconditional_embeds is not None)
+    forwards_per_step = 2 if do_cfg and not args.batch_cfg else 1
+
+    def _run_eager_baseline():
+        # Same layout, same process, compile fully off: flip the model-config
+        # flags generate_single_image() gates on, restore afterwards.
+        model_config = model.model_config
+        saved = (
+            model_config.compile_sample,
+            model_config.layer_offloading_compile_streamed,
+            model_config.layer_offloading_ingraph_sampling,
+        )
+        model_config.compile_sample = False
+        model_config.layer_offloading_compile_streamed = False
+        model_config.layer_offloading_ingraph_sampling = False
+        try:
+            return _run_sample(
+                "eager_baseline",
+                args.steps,
+                ".codex/krea2_ingraph_cuda_eager.png",
+                keep_ingraph=False,
+                expected_forwards=args.steps * forwards_per_step,
+            )
+        finally:
+            (
+                model_config.compile_sample,
+                model_config.layer_offloading_compile_streamed,
+                model_config.layer_offloading_ingraph_sampling,
+            ) = saved
+
+    def _compile_cache_snapshot():
+        if not args.compile_cache_dir:
+            return None
+        cache_dir = Path(args.compile_cache_dir)
+        blobs = (
+            sorted(p.name for p in cache_dir.glob("*.torchcompile_cache"))
+            if cache_dir.is_dir()
+            else []
+        )
+        return {"dir": str(cache_dir), "blobs": blobs}
+
+    compile_cache_before = _compile_cache_snapshot()
+    sampling_context_started = time.perf_counter()
+    eager_result = None
+    warmup_result = None
+    measured_result = None
+    try:
+        cold_start_hint = model.estimate_sampling_working_reserve_bytes(
+            [_make_gen_config(args.steps, args.output)]
+        )
+        if cold_start_hint:
+            print(
+                f"[smoke] sampling cold-start estimate: "
+                f"{cold_start_hint / 1024 ** 3:.2f} GiB "
+                f"({args.width}x{args.height}, batch_cfg={bool(args.batch_cfg)}, "
+                f"fp8={bool(config.layer_offloading_fp8_sampling)})"
+            )
+        with MemoryManager.inference_resident(
+            transformer,
+            device=device,
+            fp8_sampling=bool(config.layer_offloading_fp8_sampling),
+            working_reserve_gib=config.layer_offloading_smart_sampling_working_reserve_gb,
+            wddm_margin_gib=config.layer_offloading_smart_sampling_wddm_margin_gb,
+            wddm_hard_gib=config.layer_offloading_smart_sampling_wddm_hard_gb,
+            reserve_pin_for_ingraph=bool(
+                config.layer_offloading_compile_streamed
+                or config.layer_offloading_ingraph_sampling
+            ),
+            cold_start_hint_bytes=cold_start_hint,
+        ):
+            if args.ab_eager and config.compile_sample:
+                print(f"[smoke] eager baseline sample ({args.steps} steps, compile disabled)")
+                _eager_image, eager_result = _run_eager_baseline()
+            print("[smoke] warmup compile sample (1 step)")
+            _warmup_image, warmup_result = _run_sample(
+                "compile_warmup",
+                1,
+                ".codex/krea2_ingraph_cuda_warmup.png",
+                keep_ingraph=True,
+            )
+            torch.cuda.empty_cache()
+            print(f"[smoke] measured post-compile sample ({args.steps} steps)")
+            image, measured_result = _run_sample(
+                "post_compile_sample",
+                args.steps,
+                args.output,
+                keep_ingraph=False,
+            )
+        sampling_context_seconds = time.perf_counter() - sampling_context_started
+        compile_state = measured_result["compile"]
+        ingraph_timing = measured_result["ingraph_timing"]
+        fetch_report = measured_result["ingraph_fetch_report"]
+        profile_report = measured_result["offload_profile_report"]
+        dynamo = measured_result["dynamo"]
+        compile_diagnostics = measured_result["compile_diagnostics"]
+    except Exception as error:
+        sampling_context_seconds = time.perf_counter() - sampling_context_started
+        compile_state = _compile_path_snapshot(transformer)
+        ingraph_timing = getattr(transformer, "_last_ingraph_sampling_timing", None)
+        fetch_report = MemoryManager.ingraph_fetch_report(reset=True)
+        profile_report = MemoryManager.offload_profile_report(reset=True)
+        dynamo = _dynamo_counters()
+        compile_diagnostics = _compile_diagnostics(
+            compile_state,
+            dynamo,
+            fetch_report,
+            ingraph_timing,
+        )
+        phase_timing = {
+            "model_setup_s": model_setup_seconds,
+            "model_construct_s": model_construct_seconds,
+            "sampling_context_s": sampling_context_seconds,
+        }
+        rows.append(
+            {
+                "event": "sample_failed",
+                "seconds": sampling_context_seconds,
+                "phase_timing": phase_timing,
+                "compile_cache": {
+                    "before": compile_cache_before,
+                    "after": _compile_cache_snapshot(),
+                },
+                "eager_sample": eager_result,
+                "warmup_sample": warmup_result,
+                "measured_sample": measured_result,
+                "error": repr(error),
+                "cond_cache": str(cond_path),
+                "uncond_cache": None if uncond_path is None else str(uncond_path),
+                "guidance_scale": guidance_scale,
+                "compile": compile_state,
+                "compile_path": compile_state.get("path"),
+                "compile_diagnostics": compile_diagnostics,
+                "dynamo": dynamo,
+                "ingraph_fetch_report": fetch_report,
+                "ingraph_timing": ingraph_timing,
+                "offload_profile_report": profile_report,
+                "cuda": _cuda_snapshot("sample_failed", device),
+                "dxgi": _dxgi_snapshot("sample_failed"),
+            }
+        )
+        _print_json(rows[-1])
+        if args.output_json:
+            json_path = Path(args.output_json)
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+            print(f"[smoke] wrote {json_path}")
+        raise
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
+    image_save_started = time.perf_counter()
     image.save(out)
+    image_save_seconds = time.perf_counter() - image_save_started
+    phase_timing = {
+        "model_setup_s": model_setup_seconds,
+        "model_construct_s": model_construct_seconds,
+        "sampling_context_s": sampling_context_seconds,
+        "compile_warmup_sample_s": warmup_result["seconds"],
+        "post_compile_sample_s": measured_result["seconds"],
+        "post_compile_seconds_per_transformer_forward": measured_result[
+            "seconds_per_transformer_forward"
+        ],
+        "post_compile_transformer_forward_calls": measured_result[
+            "transformer_forward_calls"
+        ],
+        "image_save_s": image_save_seconds,
+    }
+    if eager_result is not None:
+        phase_timing["eager_sample_s"] = eager_result["seconds"]
+        phase_timing["eager_seconds_per_transformer_forward"] = eager_result[
+            "seconds_per_transformer_forward"
+        ]
+        eager_spf = eager_result["seconds_per_transformer_forward"]
+        compiled_spf = measured_result["seconds_per_transformer_forward"]
+        if eager_spf and compiled_spf:
+            phase_timing["compiled_vs_eager_forward_speedup"] = eager_spf / compiled_spf
     rows.append(
         {
             "event": "sampled",
-            "seconds": time.perf_counter() - t0,
+            "seconds": sampling_context_seconds,
+            "phase_timing": phase_timing,
+            "compile_cache": {
+                "before": compile_cache_before,
+                "after": _compile_cache_snapshot(),
+            },
+            "eager_sample": eager_result,
+            "warmup_sample": warmup_result,
+            "measured_sample": measured_result,
             "output": str(out),
             "cond_cache": str(cond_path),
             "uncond_cache": None if uncond_path is None else str(uncond_path),
             "guidance_scale": guidance_scale,
             "compile": compile_state,
-            "dynamo": _dynamo_counters(),
+            "compile_path": compile_state.get("path"),
+            "compile_diagnostics": compile_diagnostics,
+            "dynamo": dynamo,
             "ingraph_fetch_report": fetch_report,
             "ingraph_timing": ingraph_timing,
             "offload_profile_report": profile_report,

@@ -45,6 +45,7 @@ from toolkit.accelerator import unwrap_model
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
 from toolkit.memory_management import MemoryManager
+from toolkit.memory_management import vram_budget
 from toolkit.compile_cache import load_compile_cache, save_compile_cache
 
 from .src.mmdit import (
@@ -320,10 +321,10 @@ def _compile_cache_key(base_model) -> str:
     not the raw `name_or_path` (which may be an unresolved HF repo id or a
     local path -- either way, not itself a stable model identity).
 
-    No shape/resolution tag needed: `enable_compiled_sampling()` compiles with
-    `dynamic=None` under the `eager_then_compile` stance, so torch's own guard
-    system (not us) decides whether a given call reuses, upgrades, or misses
-    the cached graph -- that's exactly the "safe miss" property the mega-cache
+    No shape/resolution tag needed: sampling compiles are static-shape
+    (`dynamic=False`) under the `eager_then_compile` stance, so torch's own
+    guard system (not us) decides whether a given call reuses or misses the
+    cached graph -- that's exactly the "safe miss" property the mega-cache
     already relies on.
     """
     checkpoint_path = getattr(base_model, "_resolved_checkpoint_path", None)
@@ -482,6 +483,36 @@ class Krea2Model(BaseModel):
     def get_bucket_divisibility(self):
         # 8 for the VAE downsample, 2 for the patch size.
         return self.vae_scale_factor * self.patch_size
+
+    def estimate_sampling_working_reserve_bytes(self, gen_configs):
+        """Shape-aware cold-start hint for MemoryManager.inference_resident.
+
+        Sized from the LARGEST pending sample so the residency plan streams
+        enough blocks up front -- a mid-denoise OOM demote invalidates
+        compiled state and (under strict ingraph) changes the pack set, so
+        planning for the worst sample beats reacting per image. Returns None
+        when there is nothing to estimate; the manager then keeps its flat
+        cold-start default. A learned measured reserve replaces the estimate
+        after the first sample either way.
+        """
+        gen_configs = [cfg for cfg in (gen_configs or []) if cfg is not None]
+        if not gen_configs:
+            return None
+        token_div = self.vae_scale_factor * self.patch_size
+        image_tokens = max(
+            (max(1, int(cfg.width)) // token_div)
+            * (max(1, int(cfg.height)) // token_div)
+            for cfg in gen_configs
+        )
+        batch_cfg = any(getattr(cfg, "batch_cfg", False) for cfg in gen_configs)
+        return vram_budget.estimate_sampling_working_reserve_bytes(
+            image_tokens,
+            self.max_text_length,
+            batch_cfg=batch_cfg,
+            fp8_native=bool(
+                getattr(self.model_config, "layer_offloading_fp8_sampling", False)
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Loading
@@ -716,6 +747,16 @@ class Krea2Model(BaseModel):
                             and self.model_config.qtype in ('qfloat8', 'float8')
                             and self.model_config.layer_offloading_fp8_forward
                         ),
+                        # Ingraph training builds its own pinned block packs
+                        # (see the pinned_weight_gib=0.0 comment above); the
+                        # arena and ingraph packs are two independent pinning
+                        # mechanisms for the same weights until they're merged
+                        # (see PIN_MANAGER_PLAN's borrowed-pack slice), so only
+                        # one may be active at a time.
+                        use_pinned_arena=(
+                            self.model_config.layer_offloading_pinned_arena
+                            and not self.model_config.layer_offloading_ingraph_training
+                        ),
                     )
                     # Smart offload budgets weights, but an uncheckpointed Krea
                     # graph retains every block's activations (~16 GiB at the
@@ -839,6 +880,10 @@ class Krea2Model(BaseModel):
         generator: torch.Generator,
         extra: dict,
     ):
+        extra = extra or {}
+        keep_ingraph_sampling = bool(extra.get("keep_ingraph_sampling", False))
+        skip_sampling_guard = bool(extra.get("skip_sampling_guard", False))
+        sample_ok = False
         if self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
 
@@ -852,7 +897,7 @@ class Krea2Model(BaseModel):
         # Runs before compile so enable_compiled_sampling() rebuilds for the new
         # resident set. Paging is silent (not an OOM), so this must be proactive.
         guard = getattr(self.model, "_mm_sampling_guard", None)
-        if guard is not None:
+        if guard is not None and not skip_sampling_guard:
             try:
                 guard()
             except Exception as error:
@@ -885,14 +930,40 @@ class Krea2Model(BaseModel):
                 if getattr(self.model_config, 'layer_offloading_ingraph_stream_all', False):
                     streamed_blocks = tuple(range(len(self.model.blocks)))
                 else:
-                    streamed_blocks = self.model.ingraph_streamed_block_indices()
+                    # enable_ingraph_sampling() strips the legacy streaming
+                    # markers that ingraph_streamed_block_indices() detects, so
+                    # on a layout retained across calls (keep_ingraph_sampling)
+                    # the live packs are the source of truth for the streamed
+                    # set; markers only reappear if the layout changed since.
+                    retained_packs = getattr(self.model, "_ingraph_sampling_packs", {}) or {}
+                    streamed_blocks = tuple(sorted(
+                        {int(i) for i in self.model.ingraph_streamed_block_indices()}
+                        | {int(i) for i in retained_packs}
+                    ))
                 if strict_ingraph and not streamed_blocks:
                     raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
-                packed = self.model.enable_ingraph_sampling(
-                    streamed_blocks=streamed_blocks if streamed_blocks else None,
-                    depth=getattr(self.model_config, 'layer_offloading_ingraph_depth', 2),
-                    compile=True,
+                requested_streamed = tuple(sorted(int(index) for index in streamed_blocks))
+                current_packs = getattr(self.model, "_ingraph_sampling_packs", {}) or {}
+                current_streamed = tuple(sorted(int(index) for index in current_packs))
+                compiled_ingraph_blocks = getattr(
+                    self.model, "_compiled_ingraph_sampling_blocks", {}
+                ) or {}
+                reuse_ingraph = bool(
+                    current_streamed
+                    and current_streamed == requested_streamed
+                    and (
+                        self.model._compiled_ingraph_sampling is not None
+                        or len(compiled_ingraph_blocks) == len(current_streamed)
+                    )
                 )
+                if reuse_ingraph:
+                    packed = len(current_streamed)
+                else:
+                    packed = self.model.enable_ingraph_sampling(
+                        streamed_blocks=streamed_blocks if streamed_blocks else None,
+                        depth=getattr(self.model_config, 'layer_offloading_ingraph_depth', 2),
+                        compile=True,
+                    )
                 if not getattr(self, '_ingraph_compile_sample_reported', False):
                     self.print_and_status_update(
                         f"Compiling transformer trunk for in-graph sampling: "
@@ -900,7 +971,8 @@ class Krea2Model(BaseModel):
                     )
                     self._ingraph_compile_sample_reported = True
             except Exception as error:
-                self.model.disable_ingraph_sampling()
+                if not (keep_ingraph_sampling and sample_ok):
+                    self.model.disable_ingraph_sampling()
                 if strict_ingraph:
                     raise RuntimeError(f"strict in-graph sampling failed: {error}") from error
                 if not getattr(self, '_ingraph_compile_sample_reported', False):
@@ -910,7 +982,7 @@ class Krea2Model(BaseModel):
                     )
                     self._ingraph_compile_sample_reported = True
 
-        if self.model_config.compile_sample and self.model._compiled_ingraph_sampling is None and not strict_ingraph:
+        if self.model_config.compile_sample and self.model._compiled_ingraph_sampling is None:
             # Regional (per-block) compilation. We are inside the sampling
             # context (inference_resident) here, so residency is already
             # decided: blocks the manager made GPU-resident have NO offload
@@ -937,14 +1009,11 @@ class Krea2Model(BaseModel):
                     )
                 self._compile_sample_reported = True
 
-        # enable_compiled_sampling() traces with dynamic=None (torch's
-        # automatic-dynamic-shapes mode): it specializes to the first shape
-        # seen and only pays for a symbolic-shape upgrade if a second,
-        # different shape shows up. Running the call under
-        # eager_then_compile lets that upgrade decision come from real
-        # eager-mode shape history instead of wasting a static compile on the
-        # very first call -- so "did a new compile happen" must be
-        # re-checked on every call, not just the first one this process.
+        # Sampling compiles are static-shape (dynamic=False); running the
+        # call under eager_then_compile defers each compile to the second
+        # call with a given shape instead of wasting one on the very first
+        # -- so "did a new compile happen" must be re-checked on every
+        # call, not just the first one this process.
         frames_before = None
         if compile_cache_dir and self.model_config.compile_sample:
             frames_before = torch._dynamo.utils.counters["frames"].get("total", 0)
@@ -973,11 +1042,15 @@ class Krea2Model(BaseModel):
                     self.print_and_status_update(
                         f"Saved torch.compile cache to {compile_cache_dir}"
                     )
+            sample_ok = True
             return img
         finally:
             if ingraph_requested:
                 self.model._last_ingraph_sampling_compile_state = {
                     "ingraph_compiled": self.model._compiled_ingraph_sampling is not None,
+                    "ingraph_compiled_blocks": len(
+                        getattr(self.model, "_compiled_ingraph_sampling_blocks", {}) or {}
+                    ),
                     "ingraph_packs": len(getattr(self.model, "_ingraph_sampling_packs", {}) or {}),
                     "regional_compiled_blocks": sum(
                         1 for block in (getattr(self.model, "_compiled_blocks", None) or [])
@@ -987,7 +1060,8 @@ class Krea2Model(BaseModel):
                         getattr(self.model, "_ingraph_unavailable_reasons", ()) or ()
                     ),
                 }
-                self.model.disable_ingraph_sampling()
+                if not (keep_ingraph_sampling and sample_ok):
+                    self.model.disable_ingraph_sampling()
 
     # ------------------------------------------------------------------
     # Training hooks
