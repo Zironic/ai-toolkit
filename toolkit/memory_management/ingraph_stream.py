@@ -138,16 +138,28 @@ def _fp8_rowwise_qualifies(qdata: torch.Tensor, scale: torch.Tensor) -> bool:
 
 
 def _empty_host_flat(
-    nbytes: int, *, pin: bool = True, kind: str = "ingraph_pack"
+    nbytes: int,
+    *,
+    pin: bool = True,
+    kind: str = "ingraph_pack",
+    pin_mechanism: str = "alloc",
 ) -> tuple[torch.Tensor, bool, object | None]:
     if not pin:
         return torch.empty(nbytes, dtype=torch.uint8), False, None
-    handle = pin_manager.pin_alloc(
-        nbytes,
-        kind,
-        required=False,
-        mode="sampling",
-    )
+    if pin_mechanism == "register":
+        # Exact DXGI cost: cudaHostRegister on an exact-size tensor, no
+        # caching-allocator power-of-two bucket rounding. The pinned weight
+        # arena's flats are large and long-lived, where the rounding
+        # overhead compounds to gigabytes (observed live: 8.86 GiB of
+        # pin_alloc flats committed 12.70 GiB of DXGI usage).
+        handle = pin_manager.pin_register(nbytes, kind, required=False)
+    else:
+        handle = pin_manager.pin_alloc(
+            nbytes,
+            kind,
+            required=False,
+            mode="sampling",
+        )
     return handle.tensor, bool(handle.pinned), handle
 
 
@@ -164,7 +176,13 @@ def release_pack(pack: "BlockPack | None") -> None:
 
 
 def pack_block_host(
-    block_key: str, linears, *, repoint: bool = True, pin: bool = True, kind: str = "ingraph_pack"
+    block_key: str,
+    linears,
+    *,
+    repoint: bool = True,
+    pin: bool = True,
+    kind: str = "ingraph_pack",
+    pin_mechanism: str = "alloc",
 ) -> BlockPack:
     """Pack a block's Linear weights/biases into one aligned host byte buffer.
 
@@ -193,7 +211,9 @@ def pack_block_host(
         leaves.extend(b_leaves)
 
     offsets, total = _aligned_offsets(leaves)
-    host, pinned, pin_handle = _empty_host_flat(total, pin=pin, kind=kind)
+    host, pinned, pin_handle = _empty_host_flat(
+        total, pin=pin, kind=kind, pin_mechanism=pin_mechanism
+    )
     try:
         for leaf, offset in zip(leaves, offsets):
             nbytes = leaf.numel() * leaf.element_size()
@@ -402,7 +422,10 @@ def pack_block_host_from_flat(block_key: str, linears, flat: torch.Tensor) -> "B
         host_flat=flat,
         linears=linears_tuple,
         required_pin_bytes=int(flat.numel() * flat.element_size()),
-        pinned=bool(flat.is_pinned()),
+        # cudaHostRegister'd arena flats report is_pinned()==False (torch only
+        # tracks its own caching-allocator pins); consult the registration
+        # table too or every register-mechanism borrow falsely reads pageable.
+        pinned=bool(pin_manager.is_host_pinned(flat)),
         fp8_flags=tuple(spec.fp8_qualifies for spec in linears_tuple),
         pin_handle=None,
         owns_flat=False,
@@ -742,7 +765,10 @@ def drain_fetch_runtime() -> int:
 def _fetch_start_impl(host_flat: torch.Tensor) -> torch.Tensor:
     if host_flat.device.type != "cpu":
         raise RuntimeError("mm.fetch_start expected a CPU host_flat tensor")
-    if torch.cuda.is_available() and not host_flat.is_pinned():
+    if torch.cuda.is_available() and not pin_manager.is_host_pinned(host_flat):
+        # is_host_pinned, not host_flat.is_pinned(): arena flats are pinned
+        # in place with cudaHostRegister, which torch's is_pinned() does not
+        # recognize (it only tracks its own caching-allocator pins).
         raise RuntimeError("mm.fetch_start expected a pinned host_flat tensor")
     device = torch.device("cuda")
     stream = _transfer_stream(device)

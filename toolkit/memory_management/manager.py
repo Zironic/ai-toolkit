@@ -42,6 +42,7 @@ from .manager_modules import (
 )
 from .ingraph_stream import fetch_report as ingraph_fetch_report
 from .ingraph_stream import drain_fetch_runtime as ingraph_drain_fetch_runtime
+from .ingraph_stream import _flatten_leaves, _rebuild_from_leaves
 from . import bounce_pool
 from . import pin_manager
 from . import vram_budget
@@ -400,6 +401,43 @@ class MemoryManager:
         return budget_gib, target_gib, mode
 
     @classmethod
+    def _desired_pin_bytes_for_offload_ids(cls, module, offload_ids, pinned_weight_gib):
+        """Requested pin-budget bytes, scoped to the layers ACTUALLY selected
+        for streaming (``offload_ids``) -- never the whole model.
+
+        Single source of truth for the auto/explicit pin-sizing math: sum
+        weight+bias bytes over only the selected offload ids (auto mode,
+        ``*1.03`` slack) or honor an explicit ``pinned_weight_gib`` config
+        value. ``attach_smart_training`` previously sized auto-pin from
+        ``plan["model_bytes"]`` (the WHOLE model), over-requesting whenever a
+        smart-training plan keeps some blocks resident -- this is the fix
+        (ticket 534ea49 Phase 2 Slice A). ``attach`` uses this too, so the two
+        entry points can never drift apart again.
+
+        Bytes are PHYSICAL storage bytes (``_tensor_storage_bytes`` walks
+        wrapper leaves): a quanto/torchao FP8 weight reports the LOGICAL
+        dtype through ``numel()*element_size()`` (bf16, 2 bytes/elem) --
+        exactly 2x its real 1-byte qdata -- which produced a nonsense
+        want=20.42 GiB request for a ~9.9 GiB model on a live run.
+        """
+        auto_pin = pinned_weight_gib is None
+        try:
+            auto_pin = auto_pin or float(pinned_weight_gib) < 0
+        except (TypeError, ValueError):
+            auto_pin = True
+        if not auto_pin:
+            return int(max(0.0, float(pinned_weight_gib)) * (1024 ** 3))
+        managed_bytes = 0
+        for _name, child in module.named_modules():
+            if id(child) not in offload_ids:
+                continue
+            for param_name in ("weight", "bias"):
+                param = getattr(child, param_name, None)
+                if isinstance(param, torch.nn.Parameter):
+                    managed_bytes += cls._tensor_storage_bytes(param.data)
+        return int(managed_bytes * 1.03)
+
+    @classmethod
     def _planned_bounce_reserve_bytes(
         cls,
         module,
@@ -533,38 +571,95 @@ class MemoryManager:
         # pinned-memory proxy after reserving the planned bounce-pool window.
         # A positive config value is a requested budget, not permission to starve
         # bounce; set the bounce pool budget to 0 if the pool should get no share.
-        _auto_pin = pinned_weight_gib is None
-        try:
-            _auto_pin = _auto_pin or float(pinned_weight_gib) < 0
-        except (TypeError, ValueError):
-            _auto_pin = True
-        managed_bytes = 0
-        for _n, child in module.named_modules():
-            if id(child) not in selected_offload_ids:
-                continue
-            for _pn in ("weight", "bias"):
-                prm = getattr(child, _pn, None)
-                if isinstance(prm, torch.nn.Parameter):
-                    managed_bytes += prm.numel() * prm.element_size()
-        desired_pin_bytes = (
-            int(managed_bytes * 1.03)
-            if _auto_pin
-            else int(max(0.0, float(pinned_weight_gib)) * (1024 ** 3))
+        desired_pin_bytes = cls._desired_pin_bytes_for_offload_ids(
+            module, selected_offload_ids, pinned_weight_gib
         )
-        bounce_reserve_bytes = cls._planned_bounce_reserve_bytes(
-            module,
-            selected_offload_ids,
-            device,
-            block_stream_only=False,
-        )
+        # Re-attach with a live arena: request the FULL desired, not a
+        # `desired - committed` delta. plan_budgets' headroom is already net
+        # of the arena's committed bytes (they sit in DXGI usage), so
+        # weight_budget = min(desired, usable_headroom) is exactly the room
+        # available for NEW pins -- and the arena's build() only ever rebuilds
+        # stale/pageable groups (current-pinned blocks are skipped), so a
+        # larger-than-needed grant can never over-pin: build()'s own
+        # budget_left caps each rebuild. The delta form UNDERSHOOTS: when the
+        # streamed set grows a couple of blocks (142->144 layers at the
+        # training->sampling boundary), `desired - committed` is a small
+        # estimate that caps the grant below the actual bytes those blocks
+        # need, forcing them pageable despite ~1.9 GiB of real free headroom
+        # (observed live, 768px fp8). Do NOT reintroduce a committed
+        # subtraction here OR in _build_pinned_arena -- subtracting on BOTH
+        # sides is the original double-count that zeroed the budget.
+        requested_pin_bytes = desired_pin_bytes
+        if use_pinned_arena and requested_pin_bytes > 0:
+            # The DXGI headroom plan_budgets measures still contains torch's
+            # retained host-pin cache (every non_blocking staging buffer stays
+            # page-locked for the process lifetime once freed). pin_alloc
+            # reconciles on refusal, but the arena's per-block pin decision is
+            # made from THIS grant -- without reclaiming the cache first the
+            # grant undersizes and blocks flip pageable without ever
+            # attempting a pin (observed live: 12.70 GiB DXGI usage against
+            # an 8.86 GiB ledger -> free=0 -> 3 pageable blocks ->
+            # non_pinned_pack under strict ingraph). allow_shrink=False:
+            # weights are the lowest pin tier and must not evict bounce.
+            pin_manager.reconcile(
+                requested_pin_bytes, device=device, allow_shrink=False
+            )
+        if use_pinned_arena:
+            # Ticket 534ea49: the arena pins the whole streamed set once, and
+            # a pinned weight bypasses bounce staging entirely (the
+            # profile_is_pinned fast path). Reserving a bounce window for the
+            # SAME offloaded weights the arena is about to pin double-counts
+            # the host-pin budget: plan_budgets hands the arena
+            # `usable - bounce_reserve`, so the reservation clips the arena's
+            # grant below the streamed set even when real headroom exists
+            # (observed live: 1.73 GiB free ledger, yet 2 streamed blocks
+            # forced pageable for want of ~0.8 GiB -> non_pinned_pack under
+            # strict ingraph). The arena gets first claim on the headroom;
+            # bounce still grows dynamically at runtime for the genuinely
+            # pageable remainder (unmanaged params, any block the arena could
+            # not fit), just without a pre-subtracted reservation.
+            bounce_reserve_bytes = 0
+        else:
+            bounce_reserve_bytes = cls._planned_bounce_reserve_bytes(
+                module,
+                selected_offload_ids,
+                device,
+                block_stream_only=False,
+            )
         pin_plan = pin_manager.plan_budgets(
-            offloaded_weight_bytes=desired_pin_bytes,
+            offloaded_weight_bytes=requested_pin_bytes,
             requested_bounce_bytes=bounce_reserve_bytes,
             device=device,
             mode="training",
         )
         budget = int(pin_plan["weight_budget_bytes"])
-        module._memory_manager.pinned_weight_budget_bytes = budget
+        if use_pinned_arena and pin_plan.get("headroom_bytes") is not None:
+            # The arena is the SOLE pinner (bounce_reserve=0 above), so it
+            # should pin every offloaded block that fits the REAL usable pin
+            # headroom, not min(desired, usable): `desired` is a physical
+            # estimate (bytes x 1.03) that undercounts each flat's per-leaf
+            # 256B alignment AND the register mechanism's 4096B page-padding.
+            # On production's large blocks that overhead is noise, but capping
+            # build() at the undercounting desired forces marginal blocks
+            # pageable -> non_pinned_pack. pin_register enforces the true
+            # per-block DXGI limit and the host-cache reserve itself, so
+            # handing build() the full usable headroom is safe: build() only
+            # (re)builds stale/pageable groups, and a per-block pin that would
+            # cross the reserve is refused into a pageable fallback exactly as
+            # a tight budget_bytes would have.
+            usable_weight_headroom = (
+                int(pin_plan["headroom_bytes"])
+                - int(pin_plan["reserve_bytes"])
+                - int(pin_plan["bounce_budget_bytes"])
+            )
+            budget = max(budget, usable_weight_headroom)
+        # Ticket 534ea49 Phase 2 Slice B2: when the arena is active it is the
+        # SOLE pinner. Give the per-layer deferred attach below a budget of 0
+        # so it never cudaHostRegisters anything; _build_pinned_arena spends
+        # the real `budget` itself afterward, once, per block -- otherwise
+        # first attach would pin per-tensor, then unpin, then re-pin as flats
+        # (the exact churn this arena exists to remove).
+        module._memory_manager.pinned_weight_budget_bytes = 0 if use_pinned_arena else budget
         module._memory_manager._pin_plan = pin_plan
 
         # attach to all modules. The actual per-layer attach (which consumes the
@@ -660,7 +755,9 @@ class MemoryManager:
                 child._mm_layer_key = name or child.__class__.__name__
         arena_stats = None
         if use_pinned_arena:
-            arena_stats = cls._build_pinned_arena(module)
+            arena_stats = cls._build_pinned_arena(
+                module, budget_bytes=budget, priority_ids=selected_offload_ids,
+            )
         cls._refresh_resident_trace_hooks(module, module._memory_manager)
         if arena_stats is not None and cls._diagnostics_enabled():
             gib = 1024 ** 3
@@ -687,42 +784,145 @@ class MemoryManager:
             )
 
     @classmethod
-    def _build_pinned_arena(cls, module: torch.nn.Module):
+    def _build_pinned_arena(
+        cls, module: torch.nn.Module, budget_bytes: int = 0, priority_ids=None,
+    ):
         """Fold newly-offloaded weights into module._mm_weight_arena (ticket
         534ea49): pin once into persistent per-block flat host buffers instead
-        of the per-tensor cudaHostRegister pins the ordinary per-layer attach
-        just applied. Idempotent AND non-churning across re-attach: a child
-        already arena-current (``arena.is_current``, i.e. built by an earlier
-        attach and untouched since -- detach() leaves arena params alone) is
-        skipped entirely, so re-attaching after a detach costs zero pin/repin
-        work, only ever building blocks that are genuinely new or were
-        invalidated. (Assumes a block's children move in and out of currency
-        together, which holds as long as the whole block is built in one
-        ``arena.build()`` call, as here.)"""
+        of per-tensor cudaHostRegister. Idempotent AND non-churning across
+        re-attach: a child already arena-current (``arena.is_current``, i.e.
+        built by an earlier attach and untouched since -- detach() leaves
+        arena params alone) is skipped entirely, so re-attaching after a
+        detach costs zero pin/repin work, only ever building blocks that are
+        genuinely new or were invalidated. (Assumes a block's children move
+        in and out of currency together, which holds as long as the whole
+        block is built in one ``arena.build()`` call, as here.)
+
+        ``budget_bytes`` is the ``plan_budgets`` weight grant: the room
+        available for NEW pins right now (plan_budgets' headroom is already
+        net of the arena's committed bytes, which sit in DXGI usage, so this
+        is min(desired, usable_headroom) -- NOT a delta, and not to be
+        reduced by committed again here; subtracting on both sides is the
+        original double-count that zeroed the budget). build() only rebuilds
+        stale/pageable groups, so a grant larger than the rebuild need can
+        never over-pin -- its own budget_left caps each block. The arena is
+        the SOLE pinner when active (Slice B2: the per-layer deferred attach
+        above ran with a budget of 0), so no unpin pre-pass is needed here.
+
+        ``priority_ids`` (the current attach's selected_offload_ids) are the
+        blocks that will actually be STREAMED this phase and therefore
+        borrowed by strict ingraph -- build() spends the budget in iteration
+        order, so those groups go first. Strict ingraph is all-or-nothing on
+        the streamed set: one pageable streamed block fails the whole
+        compile, so under a tight budget the pageable fallback must land on
+        resident-during-this-phase blocks (harmless -- they are not borrowed)
+        rather than on a streamed one.
+        """
         from .pinned_arena import PinnedWeightArena
 
         arena = getattr(module, "_mm_weight_arena", None)
         if arena is None:
             arena = PinnedWeightArena()
             module._mm_weight_arena = arena
-        entries_by_block: dict = {}
+        # Group ALL managed children by block key first, then rebuild any
+        # group with at least one non-current member as a WHOLE. Rebuilding
+        # with only the missing children (the original approach) bumps the
+        # block's generation and strands its previously-built siblings as
+        # stale -- observed live as `borrow refused: stale_modules=5/8` on
+        # every block, because the smart-training plan splits blocks
+        # per-layer (its resident-growth loops append individual linears),
+        # so training built each block from a subset and the sampling
+        # attach then "completed" it destructively.
+        priority_ids = set(priority_ids or ())
+        groups: dict = {}
+        group_has_stale: dict = {}
+        group_is_streamed: dict = {}
         for name, child in module.named_modules():
             if not hasattr(child, "_layer_memory_manager"):
                 continue
-            if arena.is_current(child):
-                continue
-            # The arena becomes the sole owner of this weight's host pin;
-            # undo the per-tensor cudaHostRegister pin the per-layer attach
-            # just applied so the "weights" ledger isn't double-booked.
-            unpin_layer(child)
             key = getattr(child, "_mm_layer_key", None) or name
-            entries_by_block.setdefault(cls._offload_group_key(key), []).append(
-                (key, child)
-            )
+            group_key = cls._offload_group_key(key)
+            groups.setdefault(group_key, []).append((key, child))
+            if id(child) in priority_ids:
+                group_is_streamed[group_key] = True
+            if not arena.is_current(child):
+                group_has_stale[group_key] = True
+            elif budget_bytes and budget_bytes > 0:
+                # Self-healing retry: a block that fell back to a PAGEABLE
+                # flat in an earlier tight-budget build stays current (its
+                # params are valid views), so the stale check alone would
+                # never revisit it -- strict ingraph then fails on it
+                # forever even after headroom recovers. Rebuild pageable
+                # groups whenever this attach actually has new budget.
+                pack_key = arena.arena_block_of(child)
+                if pack_key is not None:
+                    pack = arena.block_pack(pack_key)
+                    if pack is not None and not pack.pinned:
+                        group_has_stale[group_key] = True
+        # Streamed (to-be-borrowed) groups first so a tight budget spends its
+        # pins where strict ingraph requires them; resident-this-phase groups
+        # take any pageable fallback.
+        rebuild_keys = [k for k in groups if group_has_stale.get(k)]
+        rebuild_keys.sort(key=lambda k: 0 if group_is_streamed.get(k) else 1)
+        entries_by_block = {k: groups[k] for k in rebuild_keys}
         if entries_by_block:
-            arena.build(entries_by_block)
+            # ``budget_bytes`` is ALREADY the new-bytes delta: attach()
+            # subtracts the arena's committed bytes from the plan_budgets
+            # request (they are already in DXGI usage, so the measured
+            # headroom is net of them). Do NOT subtract committed again
+            # here -- that double-count zeroed the budget on every sampling
+            # re-attach and forced all block rebuilds pageable. Blocks being
+            # rebuilt release their old flat, which build() credits back
+            # internally.
+            arena.build(entries_by_block, budget_bytes=int(budget_bytes))
+        module._memory_manager.pinned_weight_budget_bytes = arena.committed_pinned_bytes()
         module._memory_manager.pinned_weight_bytes = arena.committed_pinned_bytes()
         return arena.stats()
+
+    @classmethod
+    def _destroy_pinned_arena(cls, module: torch.nn.Module) -> None:
+        """Explicitly tear down ``module._mm_weight_arena`` (ticket 534ea49
+        Phase 2 Slice D).
+
+        NOT called from ``detach``/sampling boundaries -- the whole point of
+        the arena is that it persists across those (see pinned_arena.py's
+        module docstring); tearing it down there would reintroduce the
+        unpin/repin churn this ticket removes. Only for genuine model
+        unload or test teardown.
+
+        Order matters: every arena-backed param is first detached onto
+        standalone (non-arena) storage via a clone, THEN the arena's packs
+        are released. Releasing pinned bytes while live params still view
+        that storage would decrement the ledger for memory that is still
+        page-locked and referenced -- a real leak dressed up as a clean
+        teardown.
+        """
+        arena = getattr(module, "_mm_weight_arena", None)
+        if arena is None:
+            return
+        for child in module.modules():
+            if getattr(child, "_mm_arena_block", None) is None:
+                continue
+            for name in ("weight", "bias"):
+                param = getattr(child, name, None)
+                if not isinstance(param, torch.nn.Parameter):
+                    continue
+                data = param.data
+                if _is_quantized_tensor(data) or hasattr(data, "__tensor_flatten__"):
+                    cloned = _rebuild_from_leaves(
+                        data, (leaf.clone() for leaf in _flatten_leaves(data))
+                    )
+                else:
+                    cloned = data.clone()
+                setattr(
+                    child, name,
+                    torch.nn.Parameter(cloned, requires_grad=param.requires_grad),
+                )
+            del child._mm_arena_block
+            if hasattr(child, "_mm_arena_generation"):
+                del child._mm_arena_generation
+        arena.release()
+        del module._mm_weight_arena
 
     @classmethod
     def detach(cls, module: torch.nn.Module):
@@ -2441,27 +2641,43 @@ class MemoryManager:
             cold_growth=not auto_working_reserve,
             block_stream_only=block_stream_only,
         )
-        # Pin budget: size to the whole model in auto mode, or honor a positive
-        # config value as a requested budget, then cap it after reserving the
-        # planned bounce-pool window. This keeps explicit pin budgets from
-        # consuming the pool's share of the same WDDM pinned-memory ceiling.
+        # Pin budget: size to the layers ACTUALLY selected for streaming (auto
+        # mode), or honor a positive config value as a requested budget, then
+        # cap it after reserving the planned bounce-pool window. This keeps
+        # explicit pin budgets from consuming the pool's share of the same
+        # WDDM pinned-memory ceiling. Uses the same scoped helper `attach`
+        # itself uses (ticket 534ea49 Phase 2 Slice A) -- sizing auto-pin from
+        # plan["model_bytes"] (the WHOLE model) over-requested whenever a
+        # smart-training plan keeps some blocks resident.
         gib = 1024 ** 3
-        auto_pin = pinned_weight_gib is None
-        try:
-            auto_pin = auto_pin or float(pinned_weight_gib) < 0
-        except (TypeError, ValueError):
-            auto_pin = True
-        desired_pin_bytes = (
-            int(int(plan["model_bytes"]) * 1.03)
-            if auto_pin
-            else int(max(0.0, float(pinned_weight_gib)) * gib)
+        desired_pin_bytes = cls._desired_pin_bytes_for_offload_ids(
+            module, plan["offload_ids"], pinned_weight_gib
         )
-        bounce_reserve_bytes = cls._planned_bounce_reserve_bytes(
-            module,
-            plan["offload_ids"],
-            device,
-            block_stream_only=block_stream_only,
-        )
+        if use_pinned_arena:
+            # See the matching rationale in attach(): the arena pins the
+            # streamed set and pinned weights bypass bounce staging, so
+            # reserving a bounce window for the same weights double-counts
+            # the host-pin budget and clips the arena's cap below the
+            # streamed set. resolved_pin_gib below is recorded in
+            # _attach_args and becomes every later re-attach's explicit
+            # budget, so the reservation must be dropped here too or the
+            # whole run inherits the undersized cap.
+            bounce_reserve_bytes = 0
+        else:
+            bounce_reserve_bytes = cls._planned_bounce_reserve_bytes(
+                module,
+                plan["offload_ids"],
+                device,
+                block_stream_only=block_stream_only,
+            )
+        if use_pinned_arena and desired_pin_bytes > 0:
+            # Reclaim the retained torch host-pin cache before measuring the
+            # cap: the resolved gib below is recorded in _attach_args and
+            # becomes the EXPLICIT desired budget of every later sampling
+            # re-attach -- capping it against cache-clogged headroom
+            # undersizes the arena for the whole run (see the matching
+            # reconcile in attach()).
+            pin_manager.reconcile(desired_pin_bytes, device=device, allow_shrink=False)
         pin_bytes = cls._cap_auto_pin_budget(
             desired_pin_bytes,
             reserve_bytes=bounce_reserve_bytes,
@@ -5062,23 +5278,33 @@ class MemoryManager:
                     offload_percent=1.0,
                     ignore_modules=args.get("ignore_modules", []),
                     _offload_module_ids=plan["offload_ids"],
+                    # 0.0 starves the per-tensor path on purpose (ingraph used
+                    # to pin its OWN packs, so per-tensor pinning the same
+                    # weights would double-commit). But `pinned_weight_gib`
+                    # also sizes the ARENA's own budget (Slice B) when the
+                    # arena is active -- zeroing it here would starve any
+                    # block newly added to the arena this attach (e.g. one
+                    # resident during training but streamed for sampling),
+                    # forcing it pageable and making ingraph's borrow
+                    # attempt fail closed to an owned pack with no headroom
+                    # left (ticket 534ea49 Phase 2 bug: this exact path
+                    # produced "non_pinned_pack" after "pin refused
+                    # (ingraph_pack)"). Only zero it for the non-arena path.
                     pinned_weight_gib=(
-                        0.0 if reserve_pin_for_ingraph else args.get("pinned_weight_gib")
+                        0.0
+                        if reserve_pin_for_ingraph and not args.get("use_pinned_arena", False)
+                        else args.get("pinned_weight_gib")
                     ),
                     # Ticket 534ea49: if training already folded these weights
                     # into a persistent pinned arena, reuse it here rather than
                     # falling back to pageable streaming -- _build_pinned_arena
                     # skips children already arena-current, so this costs
-                    # nothing when the arena is already built. NOT when ingraph
-                    # sampling packs will also be built over the same weights
-                    # (reserve_pin_for_ingraph): the arena and ingraph packs are
-                    # two independent pin_alloc grants until they're merged
-                    # (PIN_MANAGER_PLAN's borrowed-pack slice), so combining
-                    # them here would double-commit the same bytes.
-                    use_pinned_arena=(
-                        args.get("use_pinned_arena", False)
-                        and not reserve_pin_for_ingraph
-                    ),
+                    # nothing when the arena is already built. Ingraph sampling
+                    # packs now BORROW arena flats (Slice 4's try_borrow_pack)
+                    # rather than pinning a second copy, so arena+ingraph is
+                    # the intended pairing, not a double-commit -- do not gate
+                    # this on reserve_pin_for_ingraph.
+                    use_pinned_arena=bool(args.get("use_pinned_arena", False)),
                 )
                 cls._move_unmanaged_parameters(module, target)
             elif target is not None:
@@ -5364,13 +5590,19 @@ class MemoryManager:
             cls.attach(
                 module, target, offload_percent=1.0,
                 ignore_modules=ignore, _offload_module_ids=all_ids,
+                # See the comment at the sibling attach() call above: zeroing
+                # this would starve the arena's own budget for any block newly
+                # added here, not just the (irrelevant, arena-bypassed)
+                # per-tensor path.
                 pinned_weight_gib=(
-                    0.0 if reserve_pin_for_ingraph else args.get("pinned_weight_gib")
+                    0.0
+                    if reserve_pin_for_ingraph and not args.get("use_pinned_arena", False)
+                    else args.get("pinned_weight_gib")
                 ),
-                use_pinned_arena=(
-                    args.get("use_pinned_arena", False)
-                    and not reserve_pin_for_ingraph
-                ),
+                # See the comment at the sibling attach() call above: ingraph
+                # sampling packs borrow arena flats now, so this is no longer
+                # gated on reserve_pin_for_ingraph.
+                use_pinned_arena=bool(args.get("use_pinned_arena", False)),
             )
             cls._move_unmanaged_parameters(module, target)
             if cuda_target:

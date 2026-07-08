@@ -34,7 +34,7 @@ from extensions_built_in.diffusion_models.krea2.krea2 import (  # noqa: E402
 )
 from toolkit.basic import flush  # noqa: E402
 from toolkit.config_modules import GenerateImageConfig, ModelConfig  # noqa: E402
-from toolkit.memory_management import MemoryManager, bounce_pool, dxgi_meminfo  # noqa: E402
+from toolkit.memory_management import MemoryManager, bounce_pool, dxgi_meminfo, pin_manager  # noqa: E402
 from toolkit.prompt_utils import PromptEmbeds  # noqa: E402
 from toolkit.util.quantize import quantize_model  # noqa: E402
 
@@ -304,6 +304,27 @@ def _managed_summary(transformer):
     }
 
 
+def _arena_summary(transformer):
+    """Ticket 534ea49 Phase 2 Slice E: arena presence/size + ingraph
+    borrowed-vs-owned pack counts, for the full train->sample->train cycle
+    instrumentation."""
+    arena = getattr(transformer, "_mm_weight_arena", None)
+    if arena is None:
+        return {"present": False}
+    stats = arena.stats()
+    return {
+        "present": True,
+        "id": id(arena),
+        "blocks": stats.blocks,
+        "pinned_gib": _gib(stats.pinned_bytes),
+        "pageable_blocks": stats.pageable_blocks,
+        "pageable_gib": _gib(stats.pageable_bytes),
+        "ledger_weights_gib": _gib(pin_manager.pinned_bytes_by_kind().get("weights", 0)),
+        "ingraph_borrowed_packs": getattr(transformer, "_ingraph_sampling_borrowed_count", 0),
+        "ingraph_owned_packs": getattr(transformer, "_ingraph_sampling_owned_count", 0),
+    }
+
+
 def _pool_summary(transformer):
     manager = getattr(transformer, "_memory_manager", None)
     pool = getattr(manager, "_prefetch_pool", None) if manager is not None else None
@@ -396,6 +417,7 @@ def _build_model_config(args):
         layer_offloading_smart_sampling_working_reserve_gb=args.sampling_working_reserve_gib,
         layer_offloading_smart_sampling_wddm_margin_gb=args.sampling_wddm_margin_gib,
         layer_offloading_smart_sampling_wddm_hard_gb=args.sampling_wddm_hard_gib,
+        layer_offloading_pinned_arena=args.pinned_arena,
         model_kwargs=model_kwargs,
     )
 
@@ -422,6 +444,11 @@ def _attach_training_memory(transformer, model_config, device):
         pinned_weight_gib=model_config.layer_offloading_pinned_weight_gb,
         wddm_spill_reserve_pct=model_config.layer_offloading_wddm_spill_reserve_pct,
         fp8_training_forward=bool(model_config.layer_offloading_fp8_forward),
+        # Ticket 534ea49/763bb75: pin the offloaded weights once into a
+        # persistent per-block arena; enable_ingraph_sampling's pack build
+        # (below, via --strict-ingraph) borrows this same flat instead of
+        # allocating its own pinned pack over the same bytes (Slice 4).
+        use_pinned_arena=bool(model_config.layer_offloading_pinned_arena),
     )
     transformer.enable_gradient_checkpointing(keep_last=max(0, keep_last))
     if getattr(transformer, "_memory_manager", None) is not None:
@@ -461,9 +488,19 @@ def _parse_args():
     parser.add_argument("--working-reserve-gib", default="-1")
     parser.add_argument("--wddm-margin-gib", type=float, default=1.0)
     parser.add_argument("--wddm-hard-gib", type=float, default=1.0)
-    parser.add_argument("--spill-reserve-pct", type=float, default=0.20)
+    parser.add_argument("--spill-reserve-pct", type=float, default=0.15)
     parser.add_argument("--pinned-weight-gib", type=float, default=-1.0)
-    parser.add_argument("--checkpoint-keep-last", type=int, default=-1)
+    parser.add_argument(
+        "--pinned-arena", action="store_true",
+        help=(
+            "Ticket 534ea49: pin offloaded weights once into a persistent "
+            "per-block flat arena instead of re-pinning them at every "
+            "sampling boundary. With --strict-ingraph, ingraph sampling "
+            "packs borrow this same flat (Slice 4) instead of pinning a "
+            "second copy of the same weights."
+        ),
+    )
+    parser.add_argument("--checkpoint-keep-last", type=int, default=0)
     parser.add_argument("--block-stream-only", action="store_true")
     parser.add_argument("--fp8-training-forward", action="store_true")
     parser.add_argument("--fp8-sampling", action="store_true")
@@ -576,6 +613,12 @@ def main():
         )
         _print_json(rows[-1])
 
+    # Mirror BaseSDTrainProcess's model-load ordering (unet.requires_grad_(False)
+    # before offload attach): this smoke never trains, so the transformer is
+    # always frozen. Needed for --pinned-arena, whose arena covers frozen
+    # offloaded weights only -- a still-trainable leaf fails attach closed.
+    transformer.requires_grad_(False)
+
     print("[smoke] attaching smart training memory manager")
     t0 = time.perf_counter()
     _attach_training_memory(transformer, config, device)
@@ -586,6 +629,7 @@ def main():
             "seconds": time.perf_counter() - t0,
             "summary": _managed_summary(transformer),
             "pool": _pool_summary(transformer),
+            "arena": _arena_summary(transformer),
             "cuda": _cuda_snapshot("attached_training_memory", device),
             "dxgi": _dxgi_snapshot("attached_training_memory"),
         }
@@ -745,6 +789,11 @@ def main():
         return {"dir": str(cache_dir), "blobs": blobs}
 
     compile_cache_before = _compile_cache_snapshot()
+    # Ticket 534ea49 Phase 2 Slice E: the arena must survive the sampling
+    # boundary untouched -- same object, same committed bytes, no unpin/
+    # repin churn. Snapshotted here (before) and compared after the
+    # `with MemoryManager.inference_resident(...)` block exits below.
+    arena_before = _arena_summary(transformer)
     sampling_context_started = time.perf_counter()
     eager_result = None
     warmup_result = None
@@ -798,6 +847,26 @@ def main():
         profile_report = measured_result["offload_profile_report"]
         dynamo = measured_result["dynamo"]
         compile_diagnostics = measured_result["compile_diagnostics"]
+
+        arena_after = _arena_summary(transformer)
+        rows.append(
+            {
+                "event": "pinned_arena_sampling_boundary",
+                "before": arena_before,
+                "after": arena_after,
+                # Same object, same committed bytes: the boundary must be
+                # pure accounting, never an unpin/repin round trip.
+                "arena_identity_unchanged": (
+                    arena_before.get("present") == arena_after.get("present")
+                    and arena_before.get("id") == arena_after.get("id")
+                ),
+                "ledger_weights_unchanged": (
+                    arena_before.get("ledger_weights_gib")
+                    == arena_after.get("ledger_weights_gib")
+                ),
+            }
+        )
+        _print_json(rows[-1])
     except Exception as error:
         sampling_context_seconds = time.perf_counter() - sampling_context_started
         compile_state = _compile_path_snapshot(transformer)
@@ -907,6 +976,26 @@ def main():
         }
     )
     _print_json(rows[-1])
+
+    if args.pinned_arena:
+        # Ticket 534ea49 Phase 2 Slice E: explicit teardown at the very end
+        # (model unload, not a sampling boundary -- see _destroy_pinned_arena's
+        # docstring). The "weights" ledger must return to its pre-arena
+        # baseline; a nonzero remainder means something is still pinned that
+        # should have been released.
+        ledger_before_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+        MemoryManager._destroy_pinned_arena(transformer)
+        ledger_after_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+        rows.append(
+            {
+                "event": "pinned_arena_destroyed",
+                "ledger_weights_gib_before": _gib(ledger_before_destroy),
+                "ledger_weights_gib_after": _gib(ledger_after_destroy),
+                "arena_present_after": getattr(transformer, "_mm_weight_arena", None)
+                is not None,
+            }
+        )
+        _print_json(rows[-1])
 
     if args.output_json:
         json_path = Path(args.output_json)

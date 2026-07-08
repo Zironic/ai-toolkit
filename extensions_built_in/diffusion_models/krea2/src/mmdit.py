@@ -1162,6 +1162,15 @@ class SingleStreamDiT(nn.Module):
                 if not pack.pinned:
                     self._ingraph_unavailable_reasons = ("non_pinned_pack",)
                     raise RuntimeError("in-graph sampling unavailable: non_pinned_pack")
+            # Ticket 534ea49 Phase 2 Slice E: diagnostics only, not a gate --
+            # every STREAMED pack must be pinned (checked above); it need not
+            # be arena-borrowed (a block outside the arena, or one that fell
+            # back to an owned pack, is equally valid). Exposed for the smoke
+            # harness / tests to assert borrowed-vs-owned counts.
+            self._ingraph_sampling_borrowed_count = sum(
+                1 for pack in packs.values() if pack.borrowed_from_arena
+            )
+            self._ingraph_sampling_owned_count = len(packs) - self._ingraph_sampling_borrowed_count
         except Exception:
             for pack in packs.values():
                 release_pack(pack)
@@ -1211,6 +1220,8 @@ class SingleStreamDiT(nn.Module):
         for pack in getattr(self, "_ingraph_sampling_packs", {}).values():
             release_pack(pack)
         self._ingraph_sampling_packs = {}
+        self._ingraph_sampling_borrowed_count = 0
+        self._ingraph_sampling_owned_count = 0
         self._ingraph_unavailable_reasons = ()
         self._ingraph_sampling_depth = 2
         self._compiled_ingraph_sampling = None

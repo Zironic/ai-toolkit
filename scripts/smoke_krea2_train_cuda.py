@@ -40,7 +40,7 @@ from extensions_built_in.diffusion_models.krea2.krea2 import (  # noqa: E402
 from toolkit.basic import flush  # noqa: E402
 from toolkit.config_modules import ModelConfig, NetworkConfig  # noqa: E402
 from toolkit.lora_special import LoRASpecialNetwork  # noqa: E402
-from toolkit.memory_management import MemoryManager, bounce_pool, dxgi_meminfo  # noqa: E402
+from toolkit.memory_management import MemoryManager, bounce_pool, dxgi_meminfo, pin_manager  # noqa: E402
 from toolkit.prompt_utils import PromptEmbeds  # noqa: E402
 from toolkit.util.quantize import quantize_model  # noqa: E402
 
@@ -72,6 +72,23 @@ def _cuda_snapshot(label, device):
         }
     )
     return row
+
+
+def _arena_summary(transformer):
+    """Ticket 534ea49 Phase 2 Slice E: arena presence/size instrumentation."""
+    arena = getattr(transformer, "_mm_weight_arena", None)
+    if arena is None:
+        return {"present": False}
+    stats = arena.stats()
+    return {
+        "present": True,
+        "id": id(arena),
+        "blocks": stats.blocks,
+        "pinned_gib": _gib(stats.pinned_bytes),
+        "pageable_blocks": stats.pageable_blocks,
+        "pageable_gib": _gib(stats.pageable_bytes),
+        "ledger_weights_gib": _gib(pin_manager.pinned_bytes_by_kind().get("weights", 0)),
+    }
 
 
 def _dxgi_snapshot(label, device_index=0):
@@ -153,6 +170,7 @@ def _build_model_config(args):
         layer_offloading_checkpoint_keep_last=args.checkpoint_keep_last,
         layer_offloading_block_stream_only=args.block_stream_only,
         layer_offloading_fp8_forward=args.fp8_training_forward,
+        layer_offloading_pinned_arena=args.pinned_arena,
         model_kwargs=model_kwargs,
     )
 
@@ -184,6 +202,11 @@ def _attach_training_memory(transformer, model_config, device, *, ingraph_traini
         pinned_weight_gib=pinned_weight_gib,
         wddm_spill_reserve_pct=model_config.layer_offloading_wddm_spill_reserve_pct,
         fp8_training_forward=bool(model_config.layer_offloading_fp8_forward),
+        # Mirror krea2.py: the arena and ingraph packs are two independent
+        # pin grants until they're merged, so only one may be active.
+        use_pinned_arena=(
+            bool(model_config.layer_offloading_pinned_arena) and not ingraph_training
+        ),
     )
     transformer.enable_gradient_checkpointing(keep_last=max(0, keep_last))
     if getattr(transformer, "_memory_manager", None) is not None:
@@ -255,6 +278,15 @@ def _parse_args():
     parser.add_argument("--wddm-hard-gib", type=float, default=1.0)
     parser.add_argument("--spill-reserve-pct", type=float, default=0.20)
     parser.add_argument("--pinned-weight-gib", type=float, default=-1.0)
+    parser.add_argument(
+        "--pinned-arena", action="store_true",
+        help=(
+            "Ticket 534ea49: pin offloaded weights once into a persistent "
+            "per-block flat arena instead of re-pinning them at every "
+            "sampling boundary. Mutually exclusive with --ingraph-training "
+            "(both pin the same weights independently until merged)."
+        ),
+    )
     parser.add_argument("--checkpoint-keep-last", type=int, default=0)
     parser.add_argument("--block-stream-only", action="store_true")
     parser.add_argument("--fp8-training-forward", action="store_true")
@@ -350,6 +382,7 @@ def main():
         {
             "event": "attached_training_memory",
             "seconds": time.perf_counter() - t0,
+            "arena": _arena_summary(transformer),
             "cuda": _cuda_snapshot("attached_training_memory", device),
             "dxgi": _dxgi_snapshot("attached_training_memory"),
         }
@@ -520,6 +553,23 @@ def main():
     }
     rows.append(summary)
     _print_json(summary)
+
+    if args.pinned_arena:
+        # Ticket 534ea49 Phase 2 Slice E: explicit teardown at the very end
+        # (model unload, not a training/sampling boundary). The "weights"
+        # ledger must return to its pre-arena baseline.
+        ledger_before_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+        MemoryManager._destroy_pinned_arena(transformer)
+        ledger_after_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+        teardown_row = {
+            "event": "pinned_arena_destroyed",
+            "ledger_weights_gib_before": _gib(ledger_before_destroy),
+            "ledger_weights_gib_after": _gib(ledger_after_destroy),
+            "arena_present_after": getattr(transformer, "_mm_weight_arena", None)
+            is not None,
+        }
+        rows.append(teardown_row)
+        _print_json(teardown_row)
 
     if args.output_json:
         json_path = Path(args.output_json)

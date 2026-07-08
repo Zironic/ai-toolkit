@@ -91,13 +91,16 @@ class ArenaBuildTests(unittest.TestCase):
         with self.assertRaises(ArenaLayoutError):
             arena.build({"blocks.0": [("lin", layer.weight, layer.bias)]})
 
-    def test_pageable_fallback_when_pin_alloc_refuses(self):
+    def test_pageable_fallback_when_pin_refuses(self):
         layer = _linear()
         arena = PinnedWeightArena()
+        # Arena flats pin via pin_register (cudaHostRegister, exact DXGI
+        # cost) -- refuse that to force the pageable path.
         with mock.patch(
-            "toolkit.memory_management.ingraph_stream.pin_manager.pin_alloc",
+            "toolkit.memory_management.ingraph_stream.pin_manager.pin_register",
             side_effect=lambda nbytes, kind, **kw: pin_manager.PinHandle(
-                tensor=torch.empty(nbytes, dtype=torch.uint8), nbytes=nbytes, kind=kind, pinned=False
+                tensor=torch.empty(nbytes, dtype=torch.uint8), nbytes=nbytes,
+                kind=kind, pinned=False, mechanism="register",
             ),
         ):
             stats = arena.build({"blocks.0": [("lin", layer)]})

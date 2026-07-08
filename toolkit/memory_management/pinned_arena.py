@@ -28,6 +28,7 @@ from toolkit.memory_management.ingraph_stream import (
     ArenaBorrowError,
     BlockPack,
     LeafSpec,
+    _aligned_offsets,
     _flatten_leaves,
     _rebuild_from_leaves,
     leaf_view,
@@ -37,6 +38,18 @@ from toolkit.memory_management.ingraph_stream import (
 )
 
 ARENA_KIND = "weights"
+
+# Every live arena, held with a STRONG ref on purpose. An arena's flats are
+# pinned in place with cudaHostRegister; if the arena (and its base tensors)
+# are garbage-collected before ``release()`` runs, torch frees the storage
+# while the pages are still registered with CUDA -- a dangling registration
+# that makes the next allocation on those recycled pages raise CUDA "resource
+# already mapped" (the 763bb75 collision, reproduced across tests). A weak ref
+# loses that race; a strong ref guarantees the registration outlives nothing
+# but an explicit release. ``release()`` discards from here, so production's
+# one-per-model arena is reclaimed when it is torn down and the set does not
+# grow unbounded. tests/conftest.py sweeps this after each test.
+_LIVE_ARENAS: "set[PinnedWeightArena]" = set()
 
 
 class ArenaLayoutError(ValueError):
@@ -62,6 +75,22 @@ def _validate_entries_frozen(entries) -> None:
             raise ArenaLayoutError(f"arena_trainable_leaf:{entry[0]}:weight")
         if bias is not None and getattr(bias, "requires_grad", False):
             raise ArenaLayoutError(f"arena_trainable_leaf:{entry[0]}:bias")
+
+
+def _entries_total_bytes(entries) -> int:
+    """Estimate a block's flat size (same alignment math pack_block_host
+    uses) WITHOUT allocating -- lets build() decide pin-vs-pageable per block
+    against a byte budget before committing to a pin_alloc attempt."""
+    leaves = []
+    for entry in entries:
+        _, _, weight, bias = _entry_module_and_leaves(entry)
+        w_data = weight.data if isinstance(weight, torch.nn.Parameter) else weight
+        b_data = bias.data if isinstance(bias, torch.nn.Parameter) else bias
+        leaves.extend(_flatten_leaves(w_data))
+        if b_data is not None:
+            leaves.extend(_flatten_leaves(b_data))
+    _, total = _aligned_offsets(leaves)
+    return total
 
 
 @dataclass
@@ -93,10 +122,14 @@ class PinnedWeightArena:
         self._generation: dict[str, int] = {}
         # id(module) -> (block_key, entry_name)
         self._module_index: dict[int, tuple[str, str]] = {}
+        _LIVE_ARENAS.add(self)
 
     # -- build --------------------------------------------------------
 
-    def build(self, entries_by_block: dict, *, kind: str = ARENA_KIND) -> ArenaBuildStats:
+    def build(
+        self, entries_by_block: dict, *, kind: str = ARENA_KIND,
+        budget_bytes: Optional[int] = None,
+    ) -> ArenaBuildStats:
         """Build (or rebuild) arena blocks.
 
         ``entries_by_block`` maps ``block_key -> iterable of (name, module)``
@@ -105,15 +138,52 @@ class PinnedWeightArena:
         block key releases the previous pack's own grant (if any) and bumps
         that block's generation counter -- any module still tagged with the
         old generation is stale (see ``is_current``).
+
+        ``budget_bytes`` (Phase 2 Slice B) caps how much of THIS call's own
+        commitment may be pinned: blocks are built in ``entries_by_block``
+        iteration order, and once the running total would exceed the budget,
+        remaining blocks get pageable flats instead (still repointed --
+        uniform layout, so bounce-pool/pack-borrow keying is unaffected).
+        ``None`` means unlimited (only the OS/headroom backstop in
+        ``pin_alloc(required=False)`` applies). Bytes already committed by an
+        earlier ``build()`` call are NOT part of this budget -- callers
+        (``_build_pinned_arena``) pass only the delta still available --
+        EXCEPT that rebuilding an existing pinned block releases its old
+        flat, so those bytes are credited back to the running budget here
+        (a whole-block rebuild that merely grows a block by a few linears
+        must not be charged the full new flat against a near-zero delta).
         """
         stats = ArenaBuildStats()
+        budget_left = None if budget_bytes is None else int(budget_bytes)
         for block_key, raw_entries in entries_by_block.items():
             entries = list(raw_entries)
             _validate_entries_frozen(entries)
             previous = self._blocks.get(block_key)
-            pack = pack_block_host(block_key, entries, repoint=True, pin=True, kind=kind)
+            if budget_left is not None and previous is not None and previous.pack.pinned:
+                budget_left += previous.pack.required_pin_bytes
+            want_pin = (
+                budget_left is None
+                or _entries_total_bytes(entries) <= budget_left
+            )
+            # Release the old flat's pin BEFORE building the new pack: the
+            # old buffer stays alive and valid (merely pageable) as the copy
+            # source, but its budget is physically back -- cudaHostUnregister
+            # returns DXGI budget immediately, so a rebuild never needs 2x
+            # the block's bytes in transient headroom.
             if previous is not None:
                 release_pack(previous.pack)
+                # Keep committed_pinned_bytes truthful even if the rebuild
+                # below raises mid-way and the old record briefly survives.
+                previous.pack.pinned = False
+            # pin_mechanism="register": exact-size cudaHostRegister, no
+            # caching-allocator power-of-two rounding. pin_alloc flats cost
+            # up to 2x their nbytes in DXGI budget (observed live: 8.86 GiB
+            # ledger -> 12.70 GiB usage), which starved the arena of the
+            # last blocks on a full model.
+            pack = pack_block_host(
+                block_key, entries, repoint=True, pin=want_pin, kind=kind,
+                pin_mechanism="register",
+            )
             generation = self._generation.get(block_key, 0) + 1
             self._generation[block_key] = generation
             entry_names = []
@@ -129,6 +199,8 @@ class PinnedWeightArena:
             stats.blocks += 1
             if pack.pinned:
                 stats.pinned_bytes += pack.required_pin_bytes
+                if budget_left is not None:
+                    budget_left -= pack.required_pin_bytes
             else:
                 stats.pageable_blocks += 1
                 stats.pageable_bytes += pack.required_pin_bytes
@@ -236,18 +308,39 @@ class PinnedWeightArena:
         """
         record = self._blocks.get(block_key)
         if record is None:
+            print(f"[PinnedArena] borrow refused ({block_key}): block_not_in_arena")
             return None
         modules = []
         for entry in linears:
             if len(entry) != 2 or entry[1] is None:
+                print(
+                    f"[PinnedArena] borrow refused ({block_key}): "
+                    "entries_without_module"
+                )
                 return None
             modules.append(entry[1])
-        if not modules or any(not self.is_current(m) for m in modules):
+        if not modules:
+            print(f"[PinnedArena] borrow refused ({block_key}): no_entries")
+            return None
+        stale = [m for m in modules if not self.is_current(m)]
+        if stale:
+            print(
+                f"[PinnedArena] borrow refused ({block_key}): "
+                f"stale_modules={len(stale)}/{len(modules)}"
+            )
             return None
         try:
-            return pack_block_host_from_flat(block_key, linears, record.pack.host_flat)
-        except ArenaBorrowError:
+            pack = pack_block_host_from_flat(block_key, linears, record.pack.host_flat)
+        except ArenaBorrowError as error:
+            print(f"[PinnedArena] borrow refused ({block_key}): {error}")
             return None
+        if not pack.pinned:
+            print(
+                f"[PinnedArena] borrow returns a PAGEABLE pack ({block_key}): "
+                "block was built past the pin budget; strict ingraph will "
+                "reject this as non_pinned_pack"
+            )
+        return pack
 
     # -- introspection ----------------------------------------------------
 
@@ -293,3 +386,4 @@ class PinnedWeightArena:
         self._blocks.clear()
         self._generation.clear()
         self._module_index.clear()
+        _LIVE_ARENAS.discard(self)

@@ -87,6 +87,40 @@ class PinnedArenaSamplingBoundaryTests(unittest.TestCase):
         finally:
             MemoryManager.detach(model)
 
+    def test_reserve_pin_for_ingraph_no_longer_disables_the_arena(self):
+        """Phase 2 Slice C: reserve_pin_for_ingraph used to force
+        use_pinned_arena=False in inference_resident's internal attach calls
+        (arena and ingraph packs were two independent pin grants). Ingraph
+        sampling packs now BORROW arena flats (try_borrow_pack), so the arena
+        must stay active and untouched through this boundary too."""
+        device = torch.device("cuda:0")
+        model = _Model(16, 2)
+        MemoryManager.attach(
+            model, device, _offload_module_ids=self._offload_ids(model),
+            use_pinned_arena=True,
+        )
+        try:
+            arena = model._mm_weight_arena
+            block0 = arena.arena_block_of(model.blocks[0].a)
+            flat_ptr_before = arena.block_pack(block0).host_flat.untyped_storage().data_ptr()
+            weights_before = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+
+            with MemoryManager.inference_resident(
+                model, device, reserve_pin_for_ingraph=True
+            ):
+                x = torch.randn(2, 16, device=device)
+                model(x)
+
+            self.assertIs(model._mm_weight_arena, arena)
+            self.assertEqual(
+                model.blocks[0].a.weight.untyped_storage().data_ptr(), flat_ptr_before
+            )
+            self.assertEqual(
+                pin_manager.pinned_bytes_by_kind().get("weights", 0), weights_before
+            )
+        finally:
+            MemoryManager.detach(model)
+
 
 if __name__ == "__main__":
     unittest.main()

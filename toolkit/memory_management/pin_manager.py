@@ -34,6 +34,13 @@ class PinHandle:
     nbytes: int
     kind: str
     pinned: bool
+    # "alloc" = cudaHostAlloc via torch's caching host allocator (bytes only
+    # return DXGI budget after _empty_host_pin_cache, and the allocator
+    # rounds requests up to power-of-two buckets -- the DXGI cost can be up
+    # to 2x nbytes). "register" = exact-size pageable tensor pinned with
+    # cudaHostRegister (DXGI cost == nbytes, returned immediately on
+    # release).
+    mechanism: str = "alloc"
 
 
 _LOCK = threading.RLock()
@@ -152,7 +159,7 @@ def _spill_reserve_pct() -> float:
     try:
         return max(0.0, float(os.environ.get("AI_TOOLKIT_WDDM_SPILL_RESERVE_PCT", "0.10")))
     except (TypeError, ValueError):
-        return 0.20
+        return 0.10
 
 
 def dxgi_spill_reserve_bytes(budget_bytes: Optional[int] = None) -> int:
@@ -342,6 +349,28 @@ def pin_tensor_in_place(t: torch.Tensor, kind: str = "weights", *, device=None) 
     return True
 
 
+def is_host_pinned(t: torch.Tensor) -> bool:
+    """True if this tensor's storage is usable as pinned host memory.
+
+    torch's ``is_pinned()`` only recognizes buffers allocated by its own
+    caching host allocator; memory pinned in place with cudaHostRegister
+    (``pin_tensor_in_place`` / ``pin_register`` -- the weight/arena tier)
+    reports ``is_pinned() == False`` even though CUDA treats it as pinned for
+    transfer purposes. Consult the registration table too so consumers that
+    gate on "is this flat pinned" (e.g. borrowed ingraph packs) see registered
+    arena flats as pinned rather than falsely rejecting them as pageable.
+    """
+    if not isinstance(t, torch.Tensor):
+        return False
+    try:
+        if t.is_pinned():
+            return True
+    except Exception:
+        pass
+    with _REGISTERED_HOST_PIN_LOCK:
+        return int(t.data_ptr()) in _REGISTERED_HOST_PINS
+
+
 def unpin_tensor_in_place(t: torch.Tensor, kind: Optional[str] = None) -> bool:
     if not isinstance(t, torch.Tensor):
         return False
@@ -371,7 +400,12 @@ def release(handle: PinHandle) -> None:
     original Python object dies while the pinned storage lives on)."""
     if handle is None or not getattr(handle, "pinned", False):
         return
-    release_pinned_bytes(int(handle.nbytes), getattr(handle, "kind", "unknown"))
+    if getattr(handle, "mechanism", "alloc") == "register":
+        # unpin_tensor_in_place does the ledger release itself (and the
+        # cudaHostUnregister returns DXGI budget immediately).
+        unpin_tensor_in_place(handle.tensor, getattr(handle, "kind", None))
+    else:
+        release_pinned_bytes(int(handle.nbytes), getattr(handle, "kind", "unknown"))
     handle.pinned = False
     handle.nbytes = 0
 
@@ -431,6 +465,73 @@ def pin_alloc(
             raise PinBudgetExceeded(_budget_message(kind, nbytes, available, device=device)) from error
     register_pinned_bytes(nbytes, kind)
     return PinHandle(tensor=tensor, nbytes=nbytes, kind=kind, pinned=True)
+
+
+def pin_register(
+    nbytes: int,
+    kind: str,
+    *,
+    device=None,
+    required: bool = False,
+) -> PinHandle:
+    """Exact-size host buffer pinned with cudaHostRegister.
+
+    Unlike pin_alloc, this never touches torch's caching host allocator, so
+    the DXGI shared-budget cost is exactly ``nbytes`` (the caching allocator
+    rounds up to power-of-two buckets: observed live, 8.86 GiB of pin_alloc
+    flats committed 12.70 GiB of DXGI usage -- ~40% invisible overhead) and
+    release returns the budget immediately. Intended for large long-lived
+    buffers (the pinned weight arena); small/churny consumers should keep
+    using pin_alloc.
+    """
+    nbytes = int(nbytes)
+    kind = str(kind or "unknown")
+    if nbytes <= 0 or not torch.cuda.is_available():
+        tensor = torch.empty(max(0, nbytes), dtype=torch.uint8)
+        return PinHandle(tensor=tensor, nbytes=max(0, nbytes) if nbytes > 0 else 0,
+                         kind=kind, pinned=False, mechanism="register")
+    # cudaHostRegister needs a page-aligned, page-rounded range on Windows
+    # (small torch.empty buffers are only 64B-aligned and fail); carve an
+    # aligned view out of a slightly larger pageable base. The view keeps
+    # the base storage alive, and its data_ptr is what the registered-pin
+    # bookkeeping keys on.
+    page = 4096
+    padded = (nbytes + page - 1) // page * page
+    # cudaHostRegister works at PAGE granularity: it registers every 4096-byte
+    # page the range touches. Two buffers that share a page (small buffers
+    # from the same allocator arena, or the boundary page between adjacent
+    # mallocs) collide -- registering the second raises CUDA "resource already
+    # mapped" (the 763bb75 root cause). Guarantee the registered range's pages
+    # are exclusive to THIS allocation: over-allocate with a full slack page on
+    # each side and register only the page-aligned interior, so no neighbor
+    # allocation can own a page we register. The slack bases stay alive with
+    # the returned tensor (the view keeps the base storage referenced).
+    base = torch.empty(padded + 3 * page, dtype=torch.uint8)
+    base_ptr = base.data_ptr()
+    # First page boundary at least one full page into the allocation.
+    aligned_start = ((base_ptr + page + page - 1) // page) * page
+    offset = aligned_start - base_ptr
+    candidate = base[offset:offset + padded]
+    # pin_tensor_in_place budget-checks (with reconcile) and does the ledger
+    # accounting (of the padded size -- the true DXGI cost).
+    if pin_tensor_in_place(candidate, kind, device=device):
+        return PinHandle(tensor=candidate, nbytes=padded, kind=kind,
+                         pinned=True, mechanism="register")
+    tensor = candidate
+    if required:
+        raise PinBudgetExceeded(
+            _budget_message(
+                kind, nbytes,
+                available_for_pin(kind=kind, nbytes=nbytes, device=device),
+                device=device,
+            )
+        )
+    print(
+        f"[PinManager] pin refused ({kind}): {nbytes / GIB:.2f} GiB "
+        "cudaHostRegister denied (ledger/DXGI budget); returning pageable"
+    )
+    return PinHandle(tensor=tensor, nbytes=nbytes, kind=kind, pinned=False,
+                     mechanism="register")
 
 
 def pin_empty(shape, dtype, kind: str, *, device=None, required: bool = False):
