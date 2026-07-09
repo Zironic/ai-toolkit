@@ -20,8 +20,13 @@ import torch.nn as nn
 from toolkit.memory_management import pin_manager
 from toolkit.memory_management.ingraph_stream import (
     IngraphPackError,
+    assemble_leaf_args,
+    block_tensor_views,
+    build_block_leaf_plans,
     build_or_borrow_block_packs,
     release_pack,
+    resident_linear_tensors,
+    streamed_linear_tensors,
 )
 from toolkit.memory_management.manager import MemoryManager
 from toolkit.memory_management.pinned_arena import PinnedWeightArena
@@ -179,6 +184,141 @@ class SharedHelperPolicyTests(_StubbedPinMixin, unittest.TestCase):
         self.assertTrue(arena.block_pack("stages.0").pinned)
         self.assertTrue(arena.is_current(model.stages[0].proj_in))
         self.assertTrue(arena.is_current(model.stages[0].inner.proj_out))
+
+
+def _mark_streamed(*modules):
+    """What MemoryManager.attach leaves on an offloaded Linear. is_streamed_module
+    reads exactly this, so the default predicate is under test too."""
+    for module in modules:
+        module._layer_memory_manager = object()
+
+
+class PartialBlockResidencyTests(_StubbedPinMixin, unittest.TestCase):
+    """A block is routinely part streamed / part resident: the planner splits
+    residency per-Linear. The pack must cover only the streamed leaves, and the
+    resident ones must come straight off their Parameters."""
+
+    def test_fully_streamed_block_packs_every_leaf(self):
+        model = _SynthModel(n=1)
+        _mark_streamed(model.stages[0].proj_in, model.stages[0].inner.proj_out)
+
+        result = build_block_leaf_plans(None, model.block_entries())
+        try:
+            plan = result.plans["stages.0"]
+            self.assertTrue(plan.streams)
+            self.assertEqual(plan.sources, ((True, 0), (True, 1)))
+            self.assertEqual(result.streamed_leaves, 2)
+            self.assertEqual(result.resident_leaves, 0)
+            self.assertEqual(result.fully_resident, 0)
+        finally:
+            for plan in result.plans.values():
+                release_pack(plan.pack)
+
+    def test_partially_resident_block_packs_only_the_streamed_leaf(self):
+        model = _SynthModel(n=1)
+        stage = model.stages[0]
+        _mark_streamed(stage.proj_in)  # inner.proj_out stays resident
+
+        result = build_block_leaf_plans(None, model.block_entries())
+        try:
+            plan = result.plans["stages.0"]
+            self.assertTrue(plan.streams)
+            # Canonical order preserved: proj_in from the flat, proj_out resident.
+            self.assertEqual(plan.sources, ((True, 0), (False, 0)))
+            # The flat is sized for ONE linear -- this is the smaller ring.
+            self.assertEqual(len(plan.pack.linears), 1)
+            self.assertEqual(plan.pack.linears[0].name, "proj_in")
+            self.assertEqual(result.streamed_leaves, 1)
+            self.assertEqual(result.resident_leaves, 1)
+            # The resident leaf aliases the live Parameter, it is not a copy.
+            resident_weight = plan.resident_args[0][0]
+            self.assertEqual(
+                resident_weight.data_ptr(), stage.inner.proj_out.weight.data_ptr()
+            )
+        finally:
+            for plan in result.plans.values():
+                release_pack(plan.pack)
+
+    def test_fully_resident_block_builds_no_pack_at_all(self):
+        model = _SynthModel(n=1)  # nothing marked streamed
+
+        with mock.patch(
+            "toolkit.memory_management.ingraph_stream.pack_block_host"
+        ) as packed:
+            result = build_block_leaf_plans(None, model.block_entries())
+
+        packed.assert_not_called()  # no flat, no pin, no fetch node
+        plan = result.plans["stages.0"]
+        self.assertIsNone(plan.pack)
+        self.assertFalse(plan.streams)
+        self.assertEqual(plan.sources, ((False, 0), (False, 1)))
+        self.assertEqual(result.fully_resident, 1)
+        self.assertEqual(result.streamed_leaves, 0)
+
+    def test_assemble_restores_canonical_order_across_both_sources(self):
+        model = _SynthModel(n=1)
+        stage = model.stages[0]
+        _mark_streamed(stage.inner.proj_out)  # the SECOND leaf streams
+
+        result = build_block_leaf_plans(None, model.block_entries())
+        try:
+            plan = result.plans["stages.0"]
+            self.assertEqual(plan.sources, ((False, 0), (True, 0)))
+            streamed_views = block_tensor_views(plan.pack.host_flat, plan.pack)
+            leaf_args = assemble_leaf_args(plan, streamed_views)
+
+            self.assertEqual(len(leaf_args), 2)
+            # leaf 0 is resident proj_in, leaf 1 is the streamed proj_out view.
+            self.assertEqual(leaf_args[0][0].data_ptr(), stage.proj_in.weight.data_ptr())
+            self.assertTrue(
+                torch.equal(leaf_args[1][0], stage.inner.proj_out.weight.detach())
+            )
+        finally:
+            for plan in result.plans.values():
+                release_pack(plan.pack)
+
+    def test_resident_leaf_computes_what_the_module_computes(self):
+        """The whole premise: a resident triple and a streamed triple are
+        interchangeable inputs to streamed_linear_tensors."""
+        linear = nn.Linear(8, 5, bias=True).eval()
+        x = torch.randn(3, 8)
+
+        (weight, bias, scale), qualifies = resident_linear_tensors(linear)
+        self.assertIsNone(scale)
+        self.assertFalse(qualifies)
+        out = streamed_linear_tensors(x, weight, bias, scale, fp8_qualifies=False)
+
+        torch.testing.assert_close(out, linear(x))
+
+    def test_arena_borrows_the_streamed_subset_of_a_split_block(self):
+        """The stale_modules=3/8 regression: the arena only ever holds the
+        offloaded leaves, so the trunk must ask for exactly those."""
+        model = _SynthModel(n=1)
+        stage = model.stages[0]
+        _mark_streamed(stage.proj_in)
+
+        arena = PinnedWeightArena()
+        self.addCleanup(arena.release)
+        arena.build({"stages.0": [("proj_in", stage.proj_in)]})
+
+        result = build_block_leaf_plans(
+            arena, model.block_entries(), allow_owned_fallback=False
+        )
+        plan = result.plans["stages.0"]
+        self.assertEqual(result.borrowed, 1)
+        self.assertEqual(result.owned, 0)
+        self.assertTrue(plan.borrowed_from_arena)
+        self.assertEqual(plan.sources, ((True, 0), (False, 0)))
+
+    def test_unsupported_resident_wrapper_fails_closed(self):
+        model = _SynthModel(n=1)
+        with mock.patch(
+            "toolkit.memory_management.ingraph_stream._flatten_leaves",
+            return_value=[torch.zeros(2), torch.zeros(2), torch.zeros(2)],
+        ):
+            with self.assertRaises(IngraphPackError) as ctx:
+                build_block_leaf_plans(None, model.block_entries())
+        self.assertEqual(ctx.exception.reasons, ("unsupported_quant_wrapper",))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "attach needs CUDA")

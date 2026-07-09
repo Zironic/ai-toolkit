@@ -219,10 +219,14 @@ def _attach_training_memory(transformer, model_config, device, *, ingraph_traini
         # Phase 3 Slice B: arena + ingraph training coexist; enable_ingraph_-
         # training borrows the arena flats (see mmdit.enable_ingraph_training).
         use_pinned_arena=use_pinned_arena,
-        # Force full-block offload so the arena covers the whole streamed set
-        # (the eager planner keeps some block linears resident otherwise).
-        stream_all_blocks=(use_pinned_arena and ingraph_training),
     )
+    # Mirror krea2.py:815. Residency is per-Linear, so attach leaves some block
+    # linears resident -- and they are still on the CPU until this runs (attach
+    # only offloads the STREAMED ones). It must happen before the trunk is
+    # enabled: _move_unmanaged_parameters REPLACES a quantized Parameter when it
+    # moves it, so a trunk built first would capture the dead CPU tensors and
+    # _scaled_mm would see cuda:0 and cpu.
+    transformer.to(device)
     transformer.enable_gradient_checkpointing(keep_last=max(0, keep_last))
     if getattr(transformer, "_memory_manager", None) is not None:
         MemoryManager._attach_prefetch_pool(transformer, device)
@@ -341,6 +345,13 @@ def main():
         os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
     os.environ.setdefault("AI_TOOLKIT_MEMORY_DIAGNOSTICS", "1")
 
+    # Seed the GLOBAL rng, not just the noise generator below: LoRA A/B are
+    # initialized from it, and they feed the loss from step 0. Without this the
+    # harness drifts run to run (observed: 6.6161 vs 6.6133 for identical math),
+    # which is exactly the signal the loss-parity checks read.
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
     device = torch.device(args.device)
     if device.type != "cuda":
         raise SystemExit("This smoke is CUDA-only; pass --device cuda")
@@ -440,7 +451,7 @@ def main():
         # enable after LoRA apply so entries see the final module state.
         print("[smoke] enabling in-graph streamed training trunk")
         t0 = time.perf_counter()
-        pack_count = transformer.enable_ingraph_training(
+        block_count = transformer.enable_ingraph_training(
             depth=args.ingraph_depth, compile=not args.no_ingraph_compile
         )
         borrowed = int(getattr(transformer, "_ingraph_training_borrowed_count", 0))
@@ -449,9 +460,20 @@ def main():
             {
                 "event": "ingraph_training_enabled",
                 "seconds": time.perf_counter() - t0,
-                "packs": pack_count,
+                "blocks": block_count,
                 "borrowed": borrowed,
                 "owned": owned,
+                # Residency is per-Linear: a block may be part streamed / part
+                # resident, and a fully-resident block builds no pack at all.
+                "fully_resident_blocks": int(
+                    getattr(transformer, "_ingraph_training_resident_blocks", 0)
+                ),
+                "streamed_leaves": int(
+                    getattr(transformer, "_ingraph_training_streamed_leaves", 0)
+                ),
+                "resident_leaves": int(
+                    getattr(transformer, "_ingraph_training_resident_leaves", 0)
+                ),
                 "depth": args.ingraph_depth,
                 "compiled": not args.no_ingraph_compile,
                 "lora_blocks": len(getattr(transformer, "_ingraph_training_loras", {})),
@@ -467,8 +489,8 @@ def main():
         if args.pinned_arena and owned:
             raise SystemExit(
                 f"[smoke] pinned-arena ingraph training built {owned} OWNED "
-                f"pack(s) (expected all {pack_count} borrowed); arena did not "
-                "cover the full streamed set"
+                f"pack(s) (expected all {borrowed + owned} borrowed); arena did "
+                "not cover the streamed leaves"
             )
 
     if args.train_compile_blocks:

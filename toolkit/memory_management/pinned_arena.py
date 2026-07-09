@@ -30,20 +30,21 @@ only (3) and (4) live in the model file, and neither contains arena logic.
    happens AFTER ``load_model()``, and ``load_model()`` is where the attach
    lives, so a model that offloads must freeze its own base first.
 
-2. **Plumb the flag.** Pass ``use_pinned_arena`` (and, when the model's whole
-   block set is streamed by a compiled trunk, ``stream_all_blocks``) into
-   ``attach_smart_training`` / the ``inference_resident`` attach sites. The
-   manager builds and reuses ``module._mm_weight_arena`` generically; the
-   model does nothing here.
+2. **Plumb the flag.** Pass ``use_pinned_arena`` into ``attach_smart_training``
+   / the ``inference_resident`` attach sites. The manager builds and reuses
+   ``module._mm_weight_arena`` generically; the model does nothing here.
 
-3. **Enumerate blocks.** Yield, per streamed block, a stable ``block_key: str``
-   and that block's ``(name, module)`` linear entries. The key must be stable
-   across attach cycles and agree with ``MemoryManager._offload_group_key``
-   grouping. The shape of the model's block container is irrelevant.
+3. **Enumerate blocks.** Yield, per block, a stable ``block_key: str`` and that
+   block's FULL ``(name, module)`` linear entries, in a canonical order. The key
+   must be stable across attach cycles and agree with
+   ``MemoryManager._offload_group_key`` grouping. The shape of the model's block
+   container is irrelevant. Pass every leaf, streamed or not: the helper splits
+   them (residency is chosen per-Linear, so a block is routinely part streamed /
+   part resident) and packs only the streamed ones.
 
 4. **Enable via the shared helper.** ``enable_ingraph_sampling`` /
    ``enable_ingraph_training`` call
-   ``ingraph_stream.build_or_borrow_block_packs(arena, entries_by_block, ...)``,
+   ``ingraph_stream.build_block_leaf_plans(arena, entries_by_block, ...)``,
    which owns the borrow-or-own policy, the fail-closed reasons
    (``non_pinned_pack``, ``unsupported_quant_wrapper``, ``wrapper_pack_missing``,
    ``arena_borrow_required``) and the release-only-what-we-own cleanup. It

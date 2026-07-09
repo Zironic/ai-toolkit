@@ -533,6 +533,180 @@ def build_or_borrow_block_packs(
     return PackBuildResult(packs=packs, borrowed=borrowed, owned=owned, pageable=0)
 
 
+def is_streamed_module(module) -> bool:
+    """The memory manager's marker for "this Linear's weights live on the host
+    and are fetched per call".
+
+    Read it BEFORE stripping compile contaminants -- the strip deletes the
+    attribute, after which every leaf looks resident.
+    """
+    return hasattr(module, "_layer_memory_manager")
+
+
+def resident_linear_tensors(module) -> "tuple[tuple, bool]":
+    """``((weight, bias, scale), fp8_qualifies)`` from a Linear's live
+    Parameters, wherever they are.
+
+    Mirrors ``pack_block_host``'s leaf extraction so a resident leaf and a
+    streamed leaf are interchangeable inputs to ``streamed_linear_tensors``: a
+    streamed leaf's triple is a view into the fetched flat, a resident leaf's is
+    the Parameter itself. Neither the block forward nor the LoRA fold can tell
+    them apart.
+    """
+    weight = module.weight
+    bias = getattr(module, "bias", None)
+    w_data = weight.data if isinstance(weight, torch.nn.Parameter) else weight
+    b_data = bias.data if isinstance(bias, torch.nn.Parameter) else bias
+    leaves = _flatten_leaves(w_data)
+    if len(leaves) == 1:
+        return (leaves[0], b_data, None), False
+    if (
+        len(leaves) == 2
+        and leaves[0].dtype == torch.float8_e4m3fn
+        and leaves[1].is_floating_point()
+    ):
+        return (
+            (leaves[0], b_data, leaves[1]),
+            _fp8_rowwise_qualifies(leaves[0], leaves[1]),
+        )
+    raise ValueError("unsupported_quant_wrapper")
+
+
+@dataclass(frozen=True)
+class BlockLeafPlan:
+    """Where each of a block's Linear leaves gets its weights this phase.
+
+    The pack is a transfer-coalescing device (one H2D for N leaves), NOT a
+    residency decision. The memory planner splits residency per-Linear, so a
+    block is routinely part streamed / part resident. ``sources`` records, in
+    the caller's canonical leaf order, whether each leaf reads from the fetched
+    flat (``(True, i)`` -> ``streamed_views[i]``) or straight off its resident
+    Parameter (``(False, i)`` -> ``resident_args[i]``). Both are trace-time
+    constants, so the compiled block specializes on its residency pattern.
+
+    ``pack is None`` means every leaf is resident: no flat, no fetch, no token.
+    """
+
+    block_key: str
+    pack: "BlockPack | None"
+    sources: tuple
+    resident_args: tuple
+    fp8_flags: tuple
+    borrowed_from_arena: bool = False
+
+    @property
+    def streams(self) -> bool:
+        return self.pack is not None
+
+
+def assemble_leaf_args(plan: BlockLeafPlan, streamed_views: tuple = ()) -> tuple:
+    """Interleave fetched views and resident Parameters back into the block's
+    canonical leaf order. Pure Python over trace-time constants."""
+    return tuple(
+        streamed_views[index] if from_pack else plan.resident_args[index]
+        for from_pack, index in plan.sources
+    )
+
+
+@dataclass
+class BlockPlanResult:
+    plans: "dict[str, BlockLeafPlan]"
+    borrowed: int
+    owned: int
+    fully_resident: int
+    streamed_leaves: int
+    resident_leaves: int
+    reasons: tuple = ()
+
+
+def build_block_leaf_plans(
+    arena,
+    entries_by_block: dict,
+    *,
+    is_streamed=is_streamed_module,
+    repoint: bool = False,
+    pin_mechanism: str = "register",
+    allow_owned_fallback: bool = True,
+) -> BlockPlanResult:
+    """Plan every block's leaves, packing only the ones the manager streams.
+
+    ``entries_by_block`` maps a stable ``block_key`` to that block's FULL
+    ``(name, module)`` leaf list in canonical order. This splits each block by
+    ``is_streamed``, builds/borrows a pack over the streamed subset only, and
+    reads the resident leaves straight off their Parameters.
+
+    Packing only the streamed subset is what lets the trunk coexist with the
+    planner's per-Linear residency: a partially-resident block yields a smaller
+    flat (so a smaller prefetch ring) and skips the fetch entirely for leaves
+    already on the device. Asking the arena for leaves it never offloaded is
+    what produced ``borrow refused: stale_modules=3/8``.
+    """
+    streamed_by_block: dict = {}
+    for block_key, raw_entries in entries_by_block.items():
+        streamed = [(name, module) for name, module in raw_entries if is_streamed(module)]
+        if streamed:
+            streamed_by_block[block_key] = streamed
+
+    result = build_or_borrow_block_packs(
+        arena,
+        streamed_by_block,
+        repoint=repoint,
+        pin_mechanism=pin_mechanism,
+        allow_owned_fallback=allow_owned_fallback,
+    )
+    try:
+        plans: "dict[str, BlockLeafPlan]" = {}
+        streamed_leaves = 0
+        resident_leaves = 0
+        for block_key, raw_entries in entries_by_block.items():
+            pack = result.packs.get(block_key)
+            stream_index = {
+                name: index
+                for index, (name, _) in enumerate(streamed_by_block.get(block_key, ()))
+            }
+            sources = []
+            resident_args = []
+            fp8_flags = []
+            for name, module in raw_entries:
+                index = stream_index.get(name)
+                if index is not None:
+                    sources.append((True, index))
+                    fp8_flags.append(pack.fp8_flags[index])
+                    streamed_leaves += 1
+                    continue
+                try:
+                    triple, qualifies = resident_linear_tensors(module)
+                except ValueError as error:
+                    raise IngraphPackError(
+                        ("unsupported_quant_wrapper",),
+                        f"unsupported_quant_wrapper ({block_key}.{name}: {error})",
+                    ) from error
+                sources.append((False, len(resident_args)))
+                resident_args.append(triple)
+                fp8_flags.append(qualifies)
+                resident_leaves += 1
+            plans[block_key] = BlockLeafPlan(
+                block_key=block_key,
+                pack=pack,
+                sources=tuple(sources),
+                resident_args=tuple(resident_args),
+                fp8_flags=tuple(fp8_flags),
+                borrowed_from_arena=bool(pack is not None and pack.borrowed_from_arena),
+            )
+    except BaseException:
+        for pack in result.packs.values():
+            release_pack(pack)
+        raise
+    return BlockPlanResult(
+        plans=plans,
+        borrowed=result.borrowed,
+        owned=result.owned,
+        fully_resident=sum(1 for plan in plans.values() if not plan.streams),
+        streamed_leaves=streamed_leaves,
+        resident_leaves=resident_leaves,
+    )
+
+
 def _flat_view(
     flat: torch.Tensor,
     offset: int,

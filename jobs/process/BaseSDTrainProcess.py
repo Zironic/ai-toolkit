@@ -626,16 +626,42 @@ class BaseSDTrainProcess(BaseTrainProcess):
             )
             else contextlib.nullcontext()
         )
-        with sampling_context:
-            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        # The in-graph training trunk marks every streamed block linear as a pack
+        # source (_mm_ingraph_pack_source), and _move_unmanaged_parameters never
+        # moves a pack source -- its CPU residency IS the design, the trunk
+        # streams it from the pinned pack. Sampling, however, promotes some of
+        # those same blocks to GPU residency, and with the marks up it cannot:
+        # the resident sampler block then runs F.linear against a CPU weight
+        # ("mat2 is on cpu"). So take the trunk down for the duration of
+        # sampling and stand it back up once _restore_offload has put the
+        # training layout back. With the pinned arena this is cheap -- the
+        # re-enable BORROWS the persistent flats rather than re-pinning ~12 GiB.
+        inner_unet = None
+        ingraph_depth = None
+        if getattr(self, '_ingraph_training_enabled', False):
+            inner_unet = unwrap_model(self.sd.unet)
+            disable_ingraph_training = getattr(
+                inner_unet, 'disable_ingraph_training', None
+            )
+            if disable_ingraph_training is not None:
+                disable_ingraph_training()
+                ingraph_depth = getattr(self, '_ingraph_training_depth', 2)
 
-        # Restoring offload may have moved the base transformer to CPU and back; if the LoRA
-        # network rode along, make sure it's back on the training device before training resumes.
-        if getattr(self, 'network', None) is not None:
-            try:
-                self.network.to(self.device_torch)
-            except Exception:
-                pass
+        try:
+            with sampling_context:
+                self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        finally:
+            # Restoring offload may have moved the base transformer to CPU and back; if the LoRA
+            # network rode along, make sure it's back on the training device before training resumes.
+            if getattr(self, 'network', None) is not None:
+                try:
+                    self.network.to(self.device_torch)
+                except Exception:
+                    pass
+            # Re-arm the trunk only after the LoRA network is back on-device: its
+            # adapters enter the compiled graph as ordinary trainable inputs.
+            if ingraph_depth is not None:
+                inner_unet.enable_ingraph_training(depth=ingraph_depth, compile=True)
 
 
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
@@ -3197,9 +3223,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # Fail closed and loud (no try/except fallback): silently training
             # eager would make every perf/parity number mean the wrong thing.
             depth = int(getattr(self.model_config, 'layer_offloading_ingraph_depth', 2))
-            pack_count = enable_ingraph_training(depth=depth, compile=True)
+            block_count = enable_ingraph_training(depth=depth, compile=True)
+            # sample() takes the trunk down and stands it back up around every
+            # sampling boundary (see the pack-source note there).
+            self._ingraph_training_enabled = True
+            self._ingraph_training_depth = depth
             print_acc(
-                f"In-graph streamed training enabled: {pack_count} block pack(s), "
+                f"In-graph streamed training enabled: {block_count} block(s), "
+                f"{getattr(inner_unet, '_ingraph_training_resident_blocks', 0)} fully "
+                "resident; leaves streamed/resident="
+                f"{getattr(inner_unet, '_ingraph_training_streamed_leaves', 0)}/"
+                f"{getattr(inner_unet, '_ingraph_training_resident_leaves', 0)}; "
+                f"packs borrowed={getattr(inner_unet, '_ingraph_training_borrowed_count', 0)} "
+                f"owned={getattr(inner_unet, '_ingraph_training_owned_count', 0)}; "
                 f"depth={depth}. First training step will compile."
             )
 

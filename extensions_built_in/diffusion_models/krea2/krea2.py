@@ -771,14 +771,6 @@ class Krea2Model(BaseModel):
                         # The arena is the single pin authority for the base
                         # weights across both train and sample.
                         use_pinned_arena=self.model_config.layer_offloading_pinned_arena,
-                        # When the arena feeds the all-streamed in-graph trunk,
-                        # every block linear must be offloaded so the arena
-                        # covers the full streamed set (the eager planner keeps
-                        # some resident -- correct there, wrong here).
-                        stream_all_blocks=(
-                            self.model_config.layer_offloading_pinned_arena
-                            and self.model_config.layer_offloading_ingraph_training
-                        ),
                     )
                     # Smart offload budgets weights, but an uncheckpointed Krea
                     # graph retains every block's activations (~16 GiB at the

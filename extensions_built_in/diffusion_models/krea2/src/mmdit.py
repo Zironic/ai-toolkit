@@ -33,15 +33,18 @@ from toolkit.memory_management.ingraph_stream import (
     IngraphPackError,
     LoraEntry,
     TrainLeaf,
+    assemble_leaf_args,
     assert_compile_region_clean,
     block_linear_views,
     block_tensor_views,
+    build_block_leaf_plans,
     build_or_borrow_block_packs,
     checkpoint_recompute_context,
     compiled_checkpoint_context,
     configure_fetch_runtime,
     free_on_backward,
     in_recompute,
+    is_streamed_module,
     release_pack,
     streamed_linear,
     streamed_linear_tensors,
@@ -682,7 +685,7 @@ class SingleStreamDiT(nn.Module):
         self._compiled_ingraph_sampling_blocks: dict[int, object] = {}
         self._compiled_ingraph_fingerprint: tuple | None = None
         self._ingraph_sampling_measure = False
-        self._ingraph_training_packs: dict[int, object] = {}
+        self._ingraph_training_plans: dict[int, object] = {}
         self._ingraph_training_loras: dict[int, dict] = {}
         self._ingraph_training_restores: list = []
         self._ingraph_training_block_fns: list = []
@@ -1001,6 +1004,17 @@ class SingleStreamDiT(nn.Module):
                     else:
                         managed_forward = getattr(child, "forward", None)
                         child.forward = original_forward
+                # When a LoRA is attached, the manager installs its streaming
+                # forward into the LoRA's org_forward slot (_capture_base_forward),
+                # so child.forward is still the LoRA hijack and managed_forward
+                # above captured org_forward instead. The blanket delete below
+                # would drop that hijack with nothing recording it: a
+                # disable -> enable cycle (i.e. a sampling boundary) would strip
+                # every LoRA off the model, sample the bare base, and then build
+                # a trunk of pure frozen math whose loss has no grad_fn. Save it.
+                orphaned_forward = None
+                if container is not None and container is not child:
+                    orphaned_forward = child.__dict__.get("forward")
                 if "forward" in child.__dict__:
                     del child.__dict__["forward"]
                 saved_attrs = {}
@@ -1013,7 +1027,17 @@ class SingleStreamDiT(nn.Module):
                     if hasattr(child, attr):
                         saved_attrs[attr] = getattr(child, attr)
                         delattr(child, attr)
-                restores.append((child, lmm, container, attribute, managed_forward, saved_attrs))
+                restores.append(
+                    (
+                        child,
+                        lmm,
+                        container,
+                        attribute,
+                        managed_forward,
+                        saved_attrs,
+                        orphaned_forward,
+                    )
+                )
             if hook_state:
                 restores.append(("hooks", hook_state))
         return restores
@@ -1024,7 +1048,15 @@ class SingleStreamDiT(nn.Module):
             if item and item[0] == "hooks":
                 SingleStreamDiT._restore_forward_hooks(item[1])
                 continue
-            child, lmm, container, attribute, managed_forward, saved_attrs = item
+            (
+                child,
+                lmm,
+                container,
+                attribute,
+                managed_forward,
+                saved_attrs,
+                orphaned_forward,
+            ) = item
             for attr, value in saved_attrs.items():
                 setattr(child, attr, value)
             if managed_forward is not None:
@@ -1032,6 +1064,10 @@ class SingleStreamDiT(nn.Module):
                     setattr(container, attribute, managed_forward)
                 else:
                     child.forward = managed_forward
+            # Reinstall the LoRA hijack the strip deleted, after org_forward is
+            # back, so the eager path routes through the LoRA again.
+            if orphaned_forward is not None:
+                child.forward = orphaned_forward
 
     def reset_ingraph_sampling_timing(self):
         self._ingraph_sampling_timing = {
@@ -1310,12 +1346,34 @@ class SingleStreamDiT(nn.Module):
 
     def _make_ingraph_train_block_fn(self, index):
         block = self.blocks[index]
-        pack = self._ingraph_training_packs[index]
+        plan = self._ingraph_training_plans[index]
         loras = self._ingraph_training_loras.get(index, {})
+        fp8_flags = plan.fp8_flags
+        lora_args = self._block_lora_tuple(loras)
+
+        if not plan.streams:
+            # Every leaf is already on the device: no flat, no fetch, no token.
+            # The planner keeps blocks resident when VRAM allows, and a resident
+            # leaf's Parameter is an ordinary graph input.
+            leaf_args = assemble_leaf_args(plan)
+
+            def fn(x, tvec, freqs, mask):
+                return block.forward_streamed(
+                    x,
+                    tvec,
+                    freqs,
+                    mask,
+                    leaf_args,
+                    fp8_flags,
+                    training=True,
+                    loras=lora_args,
+                )
+
+            return fn
+
+        pack = plan.pack
         host = pack.host_flat
         nbytes = int(pack.required_pin_bytes)
-        fp8_flags = pack.fp8_flags
-        lora_args = self._block_lora_tuple(loras)
 
         def fn(x, tvec, freqs, mask):
             compiling = torch.compiler.is_compiling()
@@ -1324,7 +1382,9 @@ class SingleStreamDiT(nn.Module):
             else:
                 token = torch.ops.mm.fetch_start(host)
             flat = torch.ops.mm.fetch_wait(token, nbytes)
-            leaf_args = block_tensor_views(flat, pack)
+            # One coalesced fetch over this block's STREAMED leaves only; the
+            # resident ones are spliced back into canonical order.
+            leaf_args = assemble_leaf_args(plan, block_tensor_views(flat, pack))
             if torch.is_grad_enabled():
                 # Saved-token swap: backward frees the recompute generation.
                 x = free_on_backward(x, token)
@@ -1346,6 +1406,27 @@ class SingleStreamDiT(nn.Module):
             return out
 
         return fn
+
+    def _assert_ingraph_training_current(self, x):
+        """A trunk's resident leaves are the tensors captured at enable time.
+
+        `_move_unmanaged_parameters` cannot move a quantized Parameter in place;
+        it swaps in a new object. For a FROZEN base that churn is benign (same
+        values, old storage still alive), so Parameter identity is the wrong
+        thing to police -- `get_noise_prediction` re-runs the move on every call
+        whenever any weight is streamed, since the model then reports device=cpu.
+
+        What is NOT benign is a cpu->cuda move after enable: the trunk keeps the
+        host tensors and the fp8 path feeds `_scaled_mm` a cuda activation and a
+        cpu weight. Compare devices, O(1), and fail closed."""
+        expected = getattr(self, "_ingraph_training_resident_device", None)
+        if expected is not None and expected != x.device:
+            raise RuntimeError(
+                "in-graph training trunk is stale: its resident leaves are on "
+                f"{expected} but activations are on {x.device} (the model moved "
+                "after enable_ingraph_training). Re-enable the trunk after "
+                "moving the model."
+            )
 
     def _ingraph_training_trunk(self, combined, tvec, freqs, mask):
         context_fn = (
@@ -1374,7 +1455,17 @@ class SingleStreamDiT(nn.Module):
         Call AFTER the LoRA network is applied and configured (multiplier
         must be a nonzero scalar at enable time)."""
         self.disable_ingraph_training()
+        # Every block runs through the trunk; only the FETCH is conditional. A
+        # block whose leaves the planner left resident simply has no pack.
         streamed_blocks = tuple(range(len(self.blocks)))
+        # Snapshot which leaves the manager streams, BEFORE the strip removes
+        # `_layer_memory_manager` and makes every leaf look resident.
+        streamed_ids = {
+            id(child)
+            for index in streamed_blocks
+            for _, child in self._block_linear_entries(self.blocks[index])
+            if is_streamed_module(child)
+        }
         # Collect LoRA entries BEFORE stripping compile contaminants: the
         # strip deletes instance forwards, including the LoRA hijacks the
         # entries are read from (learned the hard way: 232/512 LoRA grads).
@@ -1393,6 +1484,21 @@ class SingleStreamDiT(nn.Module):
             raise RuntimeError(
                 "in-graph training unavailable: " + ",".join(error.reasons)
             ) from error
+        # _collect_lora_entry reads the hijack out of the Linear's instance
+        # forward and returns None when it is absent -- so anything that eats the
+        # hijack (see _strip_ingraph_compile_contaminants) yields an empty `loras`
+        # and a trunk of pure frozen math, whose loss silently has no grad_fn.
+        # A re-enable must never see fewer adapters than the enable before it.
+        collected_loras = sum(len(entries) for entries in loras.values())
+        expected_loras = getattr(self, "_ingraph_training_lora_leaf_count", None)
+        if expected_loras is not None and collected_loras < expected_loras:
+            self._ingraph_unavailable_reasons = ("lora_hijack_missing",)
+            raise RuntimeError(
+                "in-graph training unavailable: lora_hijack_missing "
+                f"(collected {collected_loras} LoRA leaves, expected {expected_loras})"
+            )
+        if collected_loras:
+            self._ingraph_training_lora_leaf_count = collected_loras
         self._ingraph_training_restores = self._strip_ingraph_compile_contaminants(
             streamed_blocks
         )
@@ -1430,23 +1536,35 @@ class SingleStreamDiT(nn.Module):
         # budget. Over the full 28-block streamed set that overhead starves the
         # last packs ("pin refused (ingraph_pack): 0.40 GiB > 0.33 GiB
         # available") and fails the whole compile with non_pinned_pack.
+        #
+        # Only the STREAMED leaves are packed. The memory planner splits
+        # residency per-Linear, so a block is routinely part streamed / part
+        # resident, and the arena only ever holds the offloaded leaves --
+        # demanding all 8 is what produced `borrow refused: stale_modules=3/8`.
         entries_by_block = {
             f"blocks.{index}": list(self._block_linear_entries(self.blocks[index]))
             for index in streamed_blocks
         }
         try:
-            result = build_or_borrow_block_packs(
+            result = build_block_leaf_plans(
                 getattr(self, "_mm_weight_arena", None),
                 entries_by_block,
+                is_streamed=lambda module: id(module) in streamed_ids,
                 repoint=False,
                 pin_mechanism="register",
             )
         except IngraphPackError as error:
             self._ingraph_unavailable_reasons = error.reasons
             raise RuntimeError(f"in-graph training unavailable: {error}") from error
-        packs = {index: result.packs[f"blocks.{index}"] for index in streamed_blocks}
+        plans = {index: result.plans[f"blocks.{index}"] for index in streamed_blocks}
         for index in streamed_blocks:
             for _, child in self._block_linear_entries(self.blocks[index]):
+                if id(child) not in streamed_ids:
+                    # A resident leaf is supposed to be on the device, and the
+                    # manager already put it there. Marking it a pack source
+                    # would pin it to the host and make a promoted sampler
+                    # block run F.linear against a CPU weight ("mat2 is on cpu").
+                    continue
                 # Keep unmanaged-parameter moves (model.to) off the pack
                 # sources: their CPU residency is the design, the trunk
                 # streams them from the pinned pack.
@@ -1457,8 +1575,30 @@ class SingleStreamDiT(nn.Module):
         # borrowed/owned counts.
         self._ingraph_training_borrowed_count = result.borrowed
         self._ingraph_training_owned_count = result.owned
-        self._ingraph_training_packs = packs
+        self._ingraph_training_resident_blocks = result.fully_resident
+        self._ingraph_training_streamed_leaves = result.streamed_leaves
+        self._ingraph_training_resident_leaves = result.resident_leaves
+        self._ingraph_training_plans = plans
         self._ingraph_training_loras = loras
+        # Remember where this trunk's resident leaves live, so a later device
+        # move fails closed instead of reaching _scaled_mm (see
+        # _assert_ingraph_training_current). A split across devices is nonsense.
+        resident_devices = {
+            tensor.device
+            for plan in plans.values()
+            for triple in plan.resident_args
+            for tensor in triple
+            if tensor is not None
+        }
+        if len(resident_devices) > 1:
+            self._ingraph_unavailable_reasons = ("resident_leaf_device_split",)
+            raise RuntimeError(
+                "in-graph training unavailable: resident_leaf_device_split "
+                f"({sorted(str(d) for d in resident_devices)})"
+            )
+        self._ingraph_training_resident_device = (
+            next(iter(resident_devices)) if resident_devices else None
+        )
         self._ingraph_unavailable_reasons = ()
         self._ingraph_training_block_fns = [
             self._make_ingraph_train_block_fn(i) for i in streamed_blocks
@@ -1478,7 +1618,7 @@ class SingleStreamDiT(nn.Module):
             )
         else:
             self._compiled_ingraph_training = self._ingraph_training_trunk
-        return len(packs)
+        return len(plans)
 
     def disable_ingraph_training(self):
         for block in self.blocks:
@@ -1489,13 +1629,19 @@ class SingleStreamDiT(nn.Module):
         if restores:
             self._restore_ingraph_compile_contaminants(restores)
         self._ingraph_training_restores = []
-        for pack in getattr(self, "_ingraph_training_packs", {}).values():
-            release_pack(pack)
-        self._ingraph_training_packs = {}
+        for plan in getattr(self, "_ingraph_training_plans", {}).values():
+            # No-ops on a fully-resident block (pack is None) and on a borrowed
+            # arena flat (owns_flat=False).
+            release_pack(plan.pack)
+        self._ingraph_training_plans = {}
         self._ingraph_training_loras = {}
         self._ingraph_training_block_fns = []
         self._ingraph_training_borrowed_count = 0
         self._ingraph_training_owned_count = 0
+        self._ingraph_training_resident_blocks = 0
+        self._ingraph_training_streamed_leaves = 0
+        self._ingraph_training_resident_leaves = 0
+        self._ingraph_training_resident_device = None
         self._compiled_ingraph_training = None
 
     def _enable_lora_compile_fast_path(self):
@@ -1637,6 +1783,7 @@ class SingleStreamDiT(nn.Module):
         freqs = self.posemb(pos)
 
         if use_ingraph_train:
+            self._assert_ingraph_training_current(combined)
             combined = self._compiled_ingraph_training(combined, tvec, freqs, mask)
         elif use_ingraph and self._compiled_ingraph_sampling is not None:
             if getattr(self, "_ingraph_sampling_measure", False):

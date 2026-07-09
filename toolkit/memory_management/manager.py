@@ -1096,7 +1096,9 @@ class MemoryManager:
                 # the compile region, but its weights are pack sources that
                 # must stay on CPU -- the trunk streams them from the pinned
                 # pack. Moving them here silently hauls the whole model onto
-                # the card (observed: 12.23 GiB and a WDDM spill).
+                # the card (observed: 12.23 GiB and a WDDM spill). Only the
+                # STREAMED leaves carry this mark; a block's resident leaves are
+                # supposed to move, and a compiled trunk reads them here.
                 continue
             for name, param in list(child._parameters.items()):
                 if param is None:
@@ -1106,6 +1108,13 @@ class MemoryManager:
                     replacement = torch.nn.Parameter(
                         moved, requires_grad=param.requires_grad
                     )
+                    # A quantized Parameter cannot be moved in place, so it is
+                    # swapped for a new object. Anything holding the old one --
+                    # notably an in-graph trunk, whose resident leaves are
+                    # captured at enable time -- keeps the old tensor. For a
+                    # FROZEN base that is benign (identical values, and the old
+                    # storage stays alive), but a cpu->cuda move here strands the
+                    # trunk on the host: see _assert_ingraph_training_current.
                     child._parameters[name] = replacement
                     if name in child.__dict__:
                         object.__setattr__(child, name, replacement)
@@ -1743,18 +1752,14 @@ class MemoryManager:
         pinned_resident_keys=None,
         cold_growth=False,
         block_stream_only=False,
-        stream_all_blocks=False,
     ):
         """Choose training-resident layers with stream buffers before growth.
 
-        ``stream_all_blocks`` (Phase 3 Slice B): the compiled in-graph training
-        trunk streams EVERY transformer-block linear from a pinned pack, so the
-        eager path's partial-resident selection does not apply -- keeping a
-        block linear resident would leave it OUT of the pinned arena and make
-        the borrow fail closed. When set, every streaming-block candidate is
-        forced offloaded (and excluded from the resident-growth loops), exactly
-        like the sampling attach does. Non-block layers (tproj, embedders) are
-        never in the trunk and follow the usual resident rules."""
+        Residency is chosen per-Linear, so a transformer block is routinely part
+        streamed / part resident. That is fine for the compiled in-graph trunk:
+        it packs only a block's streamed leaves (one coalesced fetch over a
+        smaller flat) and reads the resident ones straight off their Parameters.
+        See ``ingraph_stream.build_block_leaf_plans``."""
         ignore_modules = list(ignore_modules or [])
         device = torch.device(device)
         free_bytes, total_bytes = torch.cuda.mem_get_info(device)
@@ -1830,12 +1835,7 @@ class MemoryManager:
             item["block_stream_resident"] = bool(
                 block_stream_only and not _is_streaming_block(group_key)
             )
-            if stream_all_blocks and item["is_streaming_block"]:
-                # The in-graph trunk streams every block linear; it must be in
-                # the arena, so it can never be resident (nor grown resident
-                # below).
-                offloaded.append(item)
-            elif (
+            if (
                 item["pinned_resident"]
                 or item["block_stream_resident"]
                 or any(token and token in item["key"] for token in must_tokens)
@@ -1874,8 +1874,6 @@ class MemoryManager:
                 ),
             ):
                 need = item["resident_bytes"]
-                if stream_all_blocks and item["is_streaming_block"]:
-                    continue
                 if resident_bytes >= resident_floor_bytes or need > remaining:
                     continue
                 resident.append(item)
@@ -1919,8 +1917,6 @@ class MemoryManager:
                 reverse=True,
             ):
                 need = item["resident_bytes"]
-                if stream_all_blocks and item["is_streaming_block"]:
-                    continue
                 if need <= remaining:
                     resident.append(item)
                     offloaded.remove(item)
@@ -2622,7 +2618,6 @@ class MemoryManager:
         pinned_weight_gib=None,
         wddm_spill_reserve_pct=None,
         use_pinned_arena=False,
-        stream_all_blocks=False,
     ):
         cls._apply_wddm_hard_allocator_cap(device, wddm_hard_gib)
         ignore_modules = list(ignore_modules or [])
@@ -2665,7 +2660,6 @@ class MemoryManager:
             # surplus at attach. Auto working_reserve leaves the climb to the live loop.
             cold_growth=not auto_working_reserve,
             block_stream_only=block_stream_only,
-            stream_all_blocks=stream_all_blocks,
         )
         # Pin budget: size to the layers ACTUALLY selected for streaming (auto
         # mode), or honor a positive config value as a requested budget, then
