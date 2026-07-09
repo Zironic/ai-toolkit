@@ -208,8 +208,19 @@ def _streamed_arg_linear_sample(
     x: Tensor,
     arg,
     fp8_qualifies: bool,
+    lora=None,
 ) -> Tensor:
     weight, bias, scale = arg
+    if lora is None:
+        return streamed_linear_tensors(
+            x,
+            weight,
+            bias,
+            scale,
+            fp8_qualifies=fp8_qualifies,
+            training=False,
+        )
+    lora_a, lora_b, lora_scale = lora
     return streamed_linear_tensors(
         x,
         weight,
@@ -217,6 +228,9 @@ def _streamed_arg_linear_sample(
         scale,
         fp8_qualifies=fp8_qualifies,
         training=False,
+        lora_a=lora_a,
+        lora_b=lora_b,
+        lora_scale=lora_scale,
     )
 
 
@@ -390,8 +404,8 @@ class SwiGLU(torch.nn.Module):
         training: bool = False,
         loras=None,
     ) -> Tensor:
+        loras = (None, None, None) if loras is None else loras
         if training:
-            loras = (None, None, None) if loras is None else loras
             gate = _streamed_arg_linear_train(x, gate_arg, fp8_flags[0], loras[0])
             up = _streamed_arg_linear_train(x, up_arg, fp8_flags[1], loras[1])
             return _streamed_arg_linear_train(
@@ -400,9 +414,14 @@ class SwiGLU(torch.nn.Module):
                 fp8_flags[2],
                 loras[2],
             )
-        gate = _streamed_arg_linear_sample(x, gate_arg, fp8_flags[0])
-        up = _streamed_arg_linear_sample(x, up_arg, fp8_flags[1])
-        return _streamed_arg_linear_sample(F.silu(gate) * up, down_arg, fp8_flags[2])
+        gate = _streamed_arg_linear_sample(x, gate_arg, fp8_flags[0], loras[0])
+        up = _streamed_arg_linear_sample(x, up_arg, fp8_flags[1], loras[1])
+        return _streamed_arg_linear_sample(
+            F.silu(gate) * up,
+            down_arg,
+            fp8_flags[2],
+            loras[2],
+        )
 
 
 class Attention(torch.nn.Module):
@@ -467,17 +486,17 @@ class Attention(torch.nn.Module):
         training: bool = False,
         loras=None,
     ) -> Tensor:
+        loras = (None, None, None, None, None) if loras is None else loras
         if training:
-            loras = (None, None, None, None, None) if loras is None else loras
             q = _streamed_arg_linear_train(qkv, wq_arg, fp8_flags[0], loras[0])
             k = _streamed_arg_linear_train(qkv, wk_arg, fp8_flags[1], loras[1])
             v = _streamed_arg_linear_train(qkv, wv_arg, fp8_flags[2], loras[2])
             gate = _streamed_arg_linear_train(qkv, gate_arg, fp8_flags[3], loras[3])
         else:
-            q = _streamed_arg_linear_sample(qkv, wq_arg, fp8_flags[0])
-            k = _streamed_arg_linear_sample(qkv, wk_arg, fp8_flags[1])
-            v = _streamed_arg_linear_sample(qkv, wv_arg, fp8_flags[2])
-            gate = _streamed_arg_linear_sample(qkv, gate_arg, fp8_flags[3])
+            q = _streamed_arg_linear_sample(qkv, wq_arg, fp8_flags[0], loras[0])
+            k = _streamed_arg_linear_sample(qkv, wk_arg, fp8_flags[1], loras[1])
+            v = _streamed_arg_linear_sample(qkv, wv_arg, fp8_flags[2], loras[2])
+            gate = _streamed_arg_linear_sample(qkv, gate_arg, fp8_flags[3], loras[3])
 
         q, k, v = (
             _split_heads(q, self.heads),
@@ -491,7 +510,7 @@ class Attention(torch.nn.Module):
         out = attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate)
         if training:
             return _streamed_arg_linear_train(out, wo_arg, fp8_flags[4], loras[4])
-        return _streamed_arg_linear_sample(out, wo_arg, fp8_flags[4])
+        return _streamed_arg_linear_sample(out, wo_arg, fp8_flags[4], loras[4])
 
 
 class LastLayer(torch.nn.Module):
@@ -678,6 +697,14 @@ class SingleStreamDiT(nn.Module):
         self._compiled_training_fp8_restores: list = []
         self._compiled_training_lora_restores: list = []
         self._ingraph_sampling_packs: dict[int, object] = {}
+        self._ingraph_sampling_loras: dict[int, dict] = {}
+        self._ingraph_sampling_lora_leaf_count = None
+        # One live scalar per model, shared by the sampling and training trunks
+        # (they never coexist). Identity is stable so torch.compile does not
+        # recompile when generate_images reassigns network.multiplier per image.
+        self._ingraph_lora_multiplier = None
+        self._ingraph_lora_multiplier_value = None
+        self._ingraph_lora_network = None
         self._ingraph_sampling_restores: list = []
         self._ingraph_unavailable_reasons: tuple[str, ...] = ()
         self._ingraph_sampling_depth = 2
@@ -1138,6 +1165,31 @@ class SingleStreamDiT(nn.Module):
         if streamed_blocks is None:
             streamed_blocks = range(len(self.blocks))
         streamed_blocks = tuple(int(index) for index in streamed_blocks)
+        # Collect LoRA entries BEFORE stripping compile contaminants: the strip
+        # deletes the instance forwards the entries are read from. Sampling
+        # needs this as much as training does -- `can_merge_in` is forced False
+        # whenever we quantize or offload, so `generate_images` never takes its
+        # merge-in shortcut and the adapter stays a live forward hijack that
+        # `forward_streamed` would otherwise walk straight past.
+        try:
+            loras, network = self._collect_block_loras(streamed_blocks)
+        except CompileRegionError as error:
+            self._ingraph_unavailable_reasons = error.reasons
+            raise RuntimeError(
+                "in-graph sampling unavailable: " + ",".join(error.reasons)
+            ) from error
+        collected_loras = sum(len(entries) for entries in loras.values())
+        expected_loras = getattr(self, "_ingraph_sampling_lora_leaf_count", None)
+        if expected_loras is not None and collected_loras < expected_loras:
+            self._ingraph_unavailable_reasons = ("lora_hijack_missing",)
+            raise RuntimeError(
+                "in-graph sampling unavailable: lora_hijack_missing "
+                f"(collected {collected_loras} LoRA leaves, expected {expected_loras})"
+            )
+        if collected_loras:
+            self._ingraph_sampling_lora_leaf_count = collected_loras
+        self._ingraph_sampling_loras = loras
+        self._ensure_ingraph_lora_multiplier(network, loras)
         self._ingraph_sampling_restores = self._strip_ingraph_compile_contaminants(streamed_blocks)
         reasons = []
         details = []
@@ -1235,6 +1287,7 @@ class SingleStreamDiT(nn.Module):
         for pack in getattr(self, "_ingraph_sampling_packs", {}).values():
             release_pack(pack)
         self._ingraph_sampling_packs = {}
+        self._ingraph_sampling_loras = {}
         self._ingraph_sampling_borrowed_count = 0
         self._ingraph_sampling_owned_count = 0
         self._ingraph_unavailable_reasons = ()
@@ -1244,13 +1297,63 @@ class SingleStreamDiT(nn.Module):
         self._compiled_ingraph_fingerprint = None
 
     @staticmethod
+    def _lora_owners_on(child):
+        """Every LoRA module in this Linear's forward chain.
+
+        A second network applied to the same Linear (`assistant_lora`) chains
+        its hijack onto the first, and only the outermost is reachable from
+        `child.forward`. The memory manager complicates the walk: with a LoRA
+        present, `_capture_base_forward` takes over the LoRA's `org_forward`
+        slot and parks whatever was there on `_layer_memory_manager
+        ._original_forward` -- so the rest of the chain hangs off the manager,
+        not off the Linear."""
+        owners = []
+        seen = set()
+        pending = [getattr(child, "__dict__", {}).get("forward")]
+        lmm = getattr(child, "_layer_memory_manager", None)
+        if lmm is not None:
+            pending.append(getattr(lmm, "_original_forward", None))
+        while pending:
+            owner = getattr(pending.pop(0), "__self__", None)
+            if owner is None or id(owner) in seen:
+                continue
+            seen.add(id(owner))
+            if hasattr(owner, "lora_down"):
+                owners.append(owner)
+            pending.append(getattr(owner, "org_forward", None))
+        return owners
+
+    @staticmethod
+    def _has_foreign_forward_hijack(child):
+        """True when child.forward is wrapped by something that is not the
+        memory manager's own streaming forward -- i.e. something the trunk
+        would bypass without folding."""
+        if "forward" not in getattr(child, "__dict__", {}):
+            return False
+        lmm = getattr(child, "_layer_memory_manager", None)
+        if lmm is None:
+            return True
+        return not (
+            getattr(lmm, "_forward_container", None) is child
+            and getattr(lmm, "_forward_attribute", None) == "forward"
+        )
+
+    @staticmethod
     def _collect_lora_entry(child):
         """LoraEntry from a Linear's LoRA hijack, None if no LoRA, raise if
-        a LoRA is present but not expressible as pure traced math."""
-        fwd = getattr(child, "__dict__", {}).get("forward")
-        owner = getattr(fwd, "__self__", None)
-        if owner is None or not hasattr(owner, "lora_down"):
+        a LoRA is present but not expressible as pure traced math.
+
+        `scale` carries only alpha/rank -- the network multiplier is a live
+        tensor applied in the block fn (see `_block_lora_tuple`), because
+        `generate_images` reassigns it per image and krea2 reuses one trunk
+        across them."""
+        owners = SingleStreamDiT._lora_owners_on(child)
+        if not owners:
             return None
+        if len(owners) > 1:
+            # Two networks over one Linear cannot share a single multiplier.
+            raise CompileRegionError(["lora_chained"])
+        owner = owners[0]
         network_ref = getattr(owner, "network_ref", None)
         network = network_ref() if network_ref is not None else None
         multiplier = getattr(network, "torch_multiplier", None)
@@ -1259,22 +1362,106 @@ class SingleStreamDiT(nn.Module):
             network is None
             or multiplier is None
             or getattr(multiplier, "numel", lambda: 0)() != 1
+            or getattr(network, "is_lorm", False)
+            or getattr(network, "vector_gates", None) is not None
             or owner.__class__.__name__ in ("DoRAModule", "LokrModule")
             or getattr(owner, "module_dropout", None) is not None
             or getattr(owner, "rank_dropout", None) not in (None, 0)
             or (dropout is not None and not isinstance(dropout, torch.nn.Identity))
         ):
             raise CompileRegionError(["lora_untraceable"])
-        m = float(multiplier.reshape(()).item())
-        if m == 0.0:
-            # A zero multiplier at enable time would silently bake LoRA out
-            # of the trunk for the whole session.
-            raise CompileRegionError(["lora_untraceable"])
         return LoraEntry(
             a=owner.lora_down.weight,
             b=owner.lora_up.weight,
-            scale=float(owner.scale) * m,
+            scale=float(owner.scale),
         )
+
+    def _collect_block_loras(self, block_indices):
+        """Per-block LoRA entries plus the one network they all belong to.
+
+        MUST run before `_strip_ingraph_compile_contaminants`, which deletes the
+        instance forwards the entries are read from. Fails closed rather than
+        quietly returning fewer entries: a trunk that drops a LoRA renders the
+        base model (sampling) or produces a loss with no grad_fn (training)."""
+        loras = {}
+        networks = []
+        for index in block_indices:
+            block_loras = {}
+            for name, child in self._block_linear_entries(self.blocks[index]):
+                entry = self._collect_lora_entry(child)
+                if entry is None:
+                    if self._has_foreign_forward_hijack(child):
+                        # Some wrapper we cannot express; the trunk calls the
+                        # leaf tensors directly and would silently skip it.
+                        raise CompileRegionError(["unknown_forward_hijack"])
+                    continue
+                block_loras[name] = entry
+                network = self._lora_owners_on(child)[0].network_ref()
+                if all(network is not seen for seen in networks):
+                    networks.append(network)
+            if block_loras:
+                loras[index] = block_loras
+        if len(networks) > 1:
+            raise CompileRegionError(["lora_multiple_networks"])
+        return loras, (networks[0] if networks else None)
+
+    @staticmethod
+    def _effective_lora_multiplier(network):
+        """What the eager LoRA forward would multiply by, right now.
+
+        Zero covers the three cases where `LoRAModule.forward` skips the adapter
+        entirely (inactive, merged into the base, multiplier 0); the trunk has no
+        branch, so it renders `base + lora * 0` instead."""
+        if network is None:
+            return 1.0
+        if not getattr(network, "is_active", True) or getattr(network, "is_merged_in", False):
+            return 0.0
+        if getattr(network, "_multiplier", None) == 0:
+            return 0.0
+        multiplier = getattr(network, "torch_multiplier", None)
+        if multiplier is None or multiplier.numel() != 1:
+            raise RuntimeError(
+                "in-graph trunk: network multiplier is no longer a scalar "
+                f"(numel={0 if multiplier is None else multiplier.numel()}); "
+                "the trunk folds one scalar per model and cannot express it"
+            )
+        return float(multiplier.reshape(()))
+
+    def _ensure_ingraph_lora_multiplier(self, network, loras):
+        """One live scalar shared by every folded LoRA leaf.
+
+        Its identity is stable across forwards so torch.compile never
+        recompiles; only its value changes, in place. Rebuilt only when the
+        adapters move device/dtype."""
+        if not loras:
+            return None
+        entry = next(iter(next(iter(loras.values())).values()))
+        multiplier = getattr(self, "_ingraph_lora_multiplier", None)
+        if (
+            multiplier is None
+            or multiplier.device != entry.a.device
+            or multiplier.dtype != entry.a.dtype
+        ):
+            multiplier = torch.ones((), device=entry.a.device, dtype=entry.a.dtype)
+            self._ingraph_lora_multiplier = multiplier
+        self._ingraph_lora_network = network
+        self._ingraph_lora_multiplier_value = None
+        self._refresh_ingraph_lora_multiplier()
+        return multiplier
+
+    def _refresh_ingraph_lora_multiplier(self):
+        """Pull the network's current multiplier into the trunk's live scalar.
+
+        Called from `_forward_impl` before either trunk runs, outside every
+        compiled region."""
+        multiplier = getattr(self, "_ingraph_lora_multiplier", None)
+        if multiplier is None:
+            return
+        value = self._effective_lora_multiplier(getattr(self, "_ingraph_lora_network", None))
+        if value != self._ingraph_lora_multiplier_value:
+            with torch.no_grad():
+                multiplier.fill_(value)
+            self._ingraph_lora_multiplier_value = value
 
     @staticmethod
     def _nest_block_train_leaves(views, loras):
@@ -1302,11 +1489,19 @@ class SingleStreamDiT(nn.Module):
         host = pack.host_flat
         nbytes = int(pack.required_pin_bytes)
         fp8_flags = pack.fp8_flags
+        # The pack carries the FROZEN base weights. A LoRA is a live forward
+        # hijack that forward_streamed bypasses, so it has to be folded back in
+        # here or the preview renders the base model.
+        loras = self._ingraph_sampling_loras.get(index, {})
+        multiplier = self._ingraph_lora_multiplier
 
         def fn(x, tvec, freqs, mask):
             token = torch.ops.mm.fetch_start_after(host, x)
             flat = torch.ops.mm.fetch_wait(token, nbytes)
             leaf_args = block_tensor_views(flat, pack)
+            lora_args = (
+                SingleStreamDiT._block_lora_tuple(loras, multiplier) if loras else None
+            )
             out = block.forward_streamed(
                 x,
                 tvec,
@@ -1314,6 +1509,7 @@ class SingleStreamDiT(nn.Module):
                 mask,
                 leaf_args,
                 fp8_flags,
+                loras=lora_args,
             )
             torch.ops.mm.fetch_free_after(token, out)
             return out
@@ -1321,14 +1517,21 @@ class SingleStreamDiT(nn.Module):
         return fn
 
     @staticmethod
-    def _block_lora_tuple(loras):
+    def _block_lora_tuple(loras, multiplier=None):
+        """(a, b, scale) per canonical leaf, in `_block_linear_entries` order.
+
+        Call this INSIDE the traced block fn: with a live `multiplier` tensor
+        the scale is a traced op, so a per-image multiplier change costs no
+        recompile. Hoisting it to build time would freeze the first value."""
         out = []
         for name, _ in SingleStreamDiT._block_linear_entries_for_lora_order():
             entry = loras.get(name)
             if entry is None:
                 out.append(None)
-            else:
+            elif multiplier is None:
                 out.append((entry.a, entry.b, entry.scale))
+            else:
+                out.append((entry.a, entry.b, entry.scale * multiplier))
         return tuple(out)
 
     @staticmethod
@@ -1349,7 +1552,7 @@ class SingleStreamDiT(nn.Module):
         plan = self._ingraph_training_plans[index]
         loras = self._ingraph_training_loras.get(index, {})
         fp8_flags = plan.fp8_flags
-        lora_args = self._block_lora_tuple(loras)
+        multiplier = self._ingraph_lora_multiplier
 
         if not plan.streams:
             # Every leaf is already on the device: no flat, no fetch, no token.
@@ -1358,6 +1561,11 @@ class SingleStreamDiT(nn.Module):
             leaf_args = assemble_leaf_args(plan)
 
             def fn(x, tvec, freqs, mask):
+                lora_args = (
+                    SingleStreamDiT._block_lora_tuple(loras, multiplier)
+                    if loras
+                    else None
+                )
                 return block.forward_streamed(
                     x,
                     tvec,
@@ -1385,6 +1593,9 @@ class SingleStreamDiT(nn.Module):
             # One coalesced fetch over this block's STREAMED leaves only; the
             # resident ones are spliced back into canonical order.
             leaf_args = assemble_leaf_args(plan, block_tensor_views(flat, pack))
+            lora_args = (
+                SingleStreamDiT._block_lora_tuple(loras, multiplier) if loras else None
+            )
             if torch.is_grad_enabled():
                 # Saved-token swap: backward frees the recompute generation.
                 x = free_on_backward(x, token)
@@ -1452,8 +1663,8 @@ class SingleStreamDiT(nn.Module):
         Each block is checkpoint(fetch + leaves-passing block call); backward
         re-fetch falls out of checkpoint recompute; LoRA A/B enter as
         ordinary trainable graph inputs. Fail-closed like the sampler enable.
-        Call AFTER the LoRA network is applied and configured (multiplier
-        must be a nonzero scalar at enable time)."""
+        Call AFTER the LoRA network is applied and configured (its multiplier
+        must be a scalar; its value is read live, not folded)."""
         self.disable_ingraph_training()
         # Every block runs through the trunk; only the FETCH is conditional. A
         # block whose leaves the planner left resident simply has no pack.
@@ -1470,15 +1681,7 @@ class SingleStreamDiT(nn.Module):
         # strip deletes instance forwards, including the LoRA hijacks the
         # entries are read from (learned the hard way: 232/512 LoRA grads).
         try:
-            loras = {}
-            for index in streamed_blocks:
-                block_loras = {}
-                for name, child in self._block_linear_entries(self.blocks[index]):
-                    entry = self._collect_lora_entry(child)
-                    if entry is not None:
-                        block_loras[name] = entry
-                if block_loras:
-                    loras[index] = block_loras
+            loras, network = self._collect_block_loras(streamed_blocks)
         except CompileRegionError as error:
             self._ingraph_unavailable_reasons = error.reasons
             raise RuntimeError(
@@ -1580,6 +1783,7 @@ class SingleStreamDiT(nn.Module):
         self._ingraph_training_resident_leaves = result.resident_leaves
         self._ingraph_training_plans = plans
         self._ingraph_training_loras = loras
+        self._ensure_ingraph_lora_multiplier(network, loras)
         # Remember where this trunk's resident leaves live, so a later device
         # move fails closed instead of reaching _scaled_mm (see
         # _assert_ingraph_training_current). A split across devices is nonsense.
@@ -1782,6 +1986,13 @@ class SingleStreamDiT(nn.Module):
         mask = _mask(mask)
         freqs = self.posemb(pos)
 
+        if use_ingraph or use_ingraph_train:
+            # generate_images reassigns network.multiplier per image, and the
+            # network can be deactivated around a forward. Pull the current
+            # value into the trunk's live scalar here, outside every compiled
+            # region, so neither costs a recompile.
+            self._refresh_ingraph_lora_multiplier()
+
         if use_ingraph_train:
             self._assert_ingraph_training_current(combined)
             combined = self._compiled_ingraph_training(combined, tvec, freqs, mask)
@@ -1861,6 +2072,7 @@ class SingleStreamDiT(nn.Module):
                     token = torch.ops.mm.fetch_start_after(pack.host_flat, combined)
                     flat = torch.ops.mm.fetch_wait(token, int(pack.required_pin_bytes))
                     leaf_args = block_tensor_views(flat, pack)
+                    block_loras = self._ingraph_sampling_loras.get(i)
                     combined = block.forward_streamed(
                         combined,
                         tvec,
@@ -1868,6 +2080,13 @@ class SingleStreamDiT(nn.Module):
                         mask,
                         leaf_args,
                         pack.fp8_flags,
+                        loras=(
+                            self._block_lora_tuple(
+                                block_loras, self._ingraph_lora_multiplier
+                            )
+                            if block_loras
+                            else None
+                        ),
                     )
                     torch.ops.mm.fetch_free_after(token, combined)
             else:

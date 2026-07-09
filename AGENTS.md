@@ -155,6 +155,23 @@ asks. The user launches real jobs through the web interface. Treat env vars as
 nonexistent for real training: required runtime behavior must be wired through
 config/UI, not hidden behind environment variables.
 
+### Do not hunt test-order leaks
+
+Some `tests/` files pass alone and fail only in the full suite. The known cause
+is process-global state -- the pin ledger, CUDA allocator, and the
+`qfloat8`->torchao shim all outlive a test. Chasing these is slow and almost
+never finds a product bug.
+
+The rule: **confirm it is order-dependent, note it on ticket `f2aceba`, move
+on.** Confirming is two runs -- the file alone (passes) and the suite with the
+suspect file ignored (passes). That distinguishes a real regression from a leak,
+which is the only thing worth knowing. Do not bisect further, do not instrument
+`sys.modules`, do not restructure other people's tests to isolate it.
+
+If a test *you are adding* triggers one, prefer testing the seam directly over
+driving the whole machine: a test that only needs to prove a helper collects the
+right entries should not build real pinned packs.
+
 ## Memory-Management Principles
 
 - Windows/WDDM cliff behavior matters: avoid policies that drive driver-free

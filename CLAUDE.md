@@ -175,6 +175,17 @@ overrides that are not required for normal training.
   prefer explicit config flags and informative errors. Add a focused test under
   `tests/` for new memory-manager behaviour; the controllers have CPU/sim
   coverage precisely because GPU CI doesn't exist.
+- **Don't hunt test-order leaks.** Some `tests/` files pass alone and fail only
+  in the full suite, because process-global state (the pin ledger, the CUDA
+  allocator, the `qfloat8`→torchao shim) outlives a test. Chasing these is slow
+  and almost never finds a product bug. Confirm it's order-dependent — run the
+  file alone (passes) and the suite with the suspect file ignored (passes),
+  which is all you need to tell a real regression from a leak — then **note it
+  on git-bug ticket `f2aceba` and move on.** No further bisecting, no
+  `sys.modules` spelunking, no restructuring other tests. If a test *you're
+  adding* triggers one, test the seam directly instead of driving the whole
+  machine (e.g. assert a helper collects the right entries rather than building
+  real pinned packs).
 - **Search before adding** — the toolkit has a lot of helpers; reuse over
   reimplement. Offload changes must stay off-by-default / behaviour-preserving
   when their flags are off (see `docs/decisions/UPSTREAM_PR_PLAN.md`).
