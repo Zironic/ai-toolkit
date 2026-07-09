@@ -30,17 +30,18 @@ from torch.utils.checkpoint import checkpoint
 
 from toolkit.memory_management.ingraph_stream import (
     CompileRegionError,
+    IngraphPackError,
     LoraEntry,
     TrainLeaf,
     assert_compile_region_clean,
     block_linear_views,
     block_tensor_views,
+    build_or_borrow_block_packs,
     checkpoint_recompute_context,
     compiled_checkpoint_context,
     configure_fetch_runtime,
     free_on_backward,
     in_recompute,
-    pack_block_host,
     release_pack,
     streamed_linear,
     streamed_linear_tensors,
@@ -1125,56 +1126,34 @@ class SingleStreamDiT(nn.Module):
             raise RuntimeError(
                 "in-graph sampling unavailable: " + ",".join(self._ingraph_unavailable_reasons) + suffix
             )
-        packs = {}
-        arena = getattr(self, "_mm_weight_arena", None)
+        # Model-side glue: enumerate blocks into stable keys; the shared helper
+        # owns the borrow-or-own policy, the fail-closed reasons, and cleanup.
+        entries_by_block = {
+            f"blocks.{index}": list(self._block_linear_entries(self.blocks[index]))
+            for index in streamed_blocks
+        }
         try:
-            for index in streamed_blocks:
-                entries = list(self._block_linear_entries(self.blocks[index]))
-                borrowed = (
-                    arena.try_borrow_pack(f"blocks.{index}", entries)
-                    if arena is not None
-                    else None
-                )
-                if borrowed is not None:
-                    # Ticket 534ea49/763bb75: this block's weights are already
-                    # pinned by the persistent arena -- reuse that flat
-                    # instead of allocating (and separately pinning) a fresh
-                    # ingraph pack over the same bytes.
-                    packs[index] = borrowed
-                    continue
-                try:
-                    packs[index] = pack_block_host(
-                        f"blocks.{index}",
-                        entries,
-                        repoint=False,
-                    )
-                except ValueError as error:
-                    message = str(error)
-                    reason = "wrapper_pack_missing" if "wrapper packing" in message else "unsupported_quant_wrapper"
-                    self._ingraph_unavailable_reasons = (reason,)
-                    raise RuntimeError(
-                        "in-graph sampling unavailable: " + reason + f" ({message})"
-                    ) from error
-            if streamed_blocks and len(packs) != len(streamed_blocks):
-                self._ingraph_unavailable_reasons = ("dynamic_streamed_block_set",)
-                raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
-            for pack in packs.values():
-                if not pack.pinned:
-                    self._ingraph_unavailable_reasons = ("non_pinned_pack",)
-                    raise RuntimeError("in-graph sampling unavailable: non_pinned_pack")
-            # Ticket 534ea49 Phase 2 Slice E: diagnostics only, not a gate --
-            # every STREAMED pack must be pinned (checked above); it need not
-            # be arena-borrowed (a block outside the arena, or one that fell
-            # back to an owned pack, is equally valid). Exposed for the smoke
-            # harness / tests to assert borrowed-vs-owned counts.
-            self._ingraph_sampling_borrowed_count = sum(
-                1 for pack in packs.values() if pack.borrowed_from_arena
+            result = build_or_borrow_block_packs(
+                getattr(self, "_mm_weight_arena", None),
+                entries_by_block,
+                repoint=False,
+                pin_mechanism="register",
             )
-            self._ingraph_sampling_owned_count = len(packs) - self._ingraph_sampling_borrowed_count
-        except Exception:
+        except IngraphPackError as error:
+            self._ingraph_unavailable_reasons = error.reasons
+            raise RuntimeError(f"in-graph sampling unavailable: {error}") from error
+        packs = {index: result.packs[f"blocks.{index}"] for index in streamed_blocks}
+        if streamed_blocks and len(packs) != len(streamed_blocks):
             for pack in packs.values():
                 release_pack(pack)
-            raise
+            self._ingraph_unavailable_reasons = ("dynamic_streamed_block_set",)
+            raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
+        # Ticket 534ea49 Phase 2 Slice E: diagnostics only, not a gate -- every
+        # STREAMED pack must be pinned (the helper enforces that); it need not be
+        # arena-borrowed (a block outside the arena, or one that fell back to an
+        # owned pack, is equally valid). Exposed for the smoke harness / tests.
+        self._ingraph_sampling_borrowed_count = result.borrowed
+        self._ingraph_sampling_owned_count = result.owned
         self._ingraph_sampling_packs = packs
         self._ingraph_unavailable_reasons = ()
         self._ingraph_sampling_depth = max(1, int(depth))
@@ -1437,40 +1416,47 @@ class SingleStreamDiT(nn.Module):
                 "in-graph training unavailable: "
                 + ",".join(self._ingraph_unavailable_reasons)
             )
-        packs = {}
+        # Phase 3 Slice B: BORROW the persistent arena flat for a block whose
+        # frozen base is already pinned by the arena (the same mechanic the
+        # sampler enable uses), instead of pinning a second independent copy of
+        # the base weights. LoRA composition happens in the block fn below;
+        # grads flow only to the resident adapters, so the borrowed frozen flat
+        # is a read-only source. An owned pack is the fallback for any block the
+        # arena does not currently cover.
+        # pin_mechanism="register": exact-size cudaHostRegister for any OWNED
+        # fallback pack. The default "alloc" path goes through torch's caching
+        # host allocator, which rounds each request up to a power-of-two bucket
+        # -- a 0.40 GiB block can commit up to 2x that against the DXGI shared
+        # budget. Over the full 28-block streamed set that overhead starves the
+        # last packs ("pin refused (ingraph_pack): 0.40 GiB > 0.33 GiB
+        # available") and fails the whole compile with non_pinned_pack.
+        entries_by_block = {
+            f"blocks.{index}": list(self._block_linear_entries(self.blocks[index]))
+            for index in streamed_blocks
+        }
         try:
-            for index in streamed_blocks:
-                packs[index] = pack_block_host(
-                    f"blocks.{index}",
-                    self._block_linear_entries(self.blocks[index]),
-                    repoint=False,
-                )
-            for pack in packs.values():
-                if not pack.pinned:
-                    self._ingraph_unavailable_reasons = ("non_pinned_pack",)
-                    raise RuntimeError("in-graph training unavailable: non_pinned_pack")
-        except ValueError as error:
-            reason = (
-                "wrapper_pack_missing"
-                if "wrapper packing" in str(error)
-                else "unsupported_quant_wrapper"
+            result = build_or_borrow_block_packs(
+                getattr(self, "_mm_weight_arena", None),
+                entries_by_block,
+                repoint=False,
+                pin_mechanism="register",
             )
-            self._ingraph_unavailable_reasons = (reason,)
-            for pack in packs.values():
-                release_pack(pack)
-            raise RuntimeError(
-                f"in-graph training unavailable: {reason} ({error})"
-            ) from error
-        except Exception:
-            for pack in packs.values():
-                release_pack(pack)
-            raise
+        except IngraphPackError as error:
+            self._ingraph_unavailable_reasons = error.reasons
+            raise RuntimeError(f"in-graph training unavailable: {error}") from error
+        packs = {index: result.packs[f"blocks.{index}"] for index in streamed_blocks}
         for index in streamed_blocks:
             for _, child in self._block_linear_entries(self.blocks[index]):
                 # Keep unmanaged-parameter moves (model.to) off the pack
                 # sources: their CPU residency is the design, the trunk
                 # streams them from the pinned pack.
                 child._mm_ingraph_pack_source = True
+        # Diagnostics (Slice B): under strict pinned-arena validation the smoke
+        # harness treats any owned-fallback pack as a FAILURE -- every streamed
+        # base block must be borrowed from the arena. Exposed like the sampler's
+        # borrowed/owned counts.
+        self._ingraph_training_borrowed_count = result.borrowed
+        self._ingraph_training_owned_count = result.owned
         self._ingraph_training_packs = packs
         self._ingraph_training_loras = loras
         self._ingraph_unavailable_reasons = ()
@@ -1508,6 +1494,8 @@ class SingleStreamDiT(nn.Module):
         self._ingraph_training_packs = {}
         self._ingraph_training_loras = {}
         self._ingraph_training_block_fns = []
+        self._ingraph_training_borrowed_count = 0
+        self._ingraph_training_owned_count = 0
         self._compiled_ingraph_training = None
 
     def _enable_lora_compile_fast_path(self):

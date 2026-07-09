@@ -337,16 +337,18 @@ class ArenaIsSolePinnerDuringAttachTests(unittest.TestCase):
 
         def _zero_grant_plan(**kwargs):
             # Force zero pinnable headroom through EVERY path attach reads:
-            # the arena now derives its build budget from headroom - reserve -
-            # bounce (the sole-pinner "use all usable headroom" rule), so
-            # zeroing weight_budget_bytes alone no longer forces pageable.
+            # the arena now derives its build budget from the weight-tier
+            # available_for_pin (the sole-pinner "use all usable weight-tier
+            # headroom" rule), so zeroing weight_budget_bytes alone no longer
+            # forces pageable -- the direct available_for_pin below does.
             plan = dict(real_plan(**kwargs))
             plan["weight_budget_bytes"] = 0
             plan["bounce_budget_bytes"] = 0
             plan["reserve_bytes"] = int(plan.get("headroom_bytes") or 0)
             return plan
 
-        with mock.patch.object(pin_manager, "plan_budgets", side_effect=_zero_grant_plan):
+        with mock.patch.object(pin_manager, "plan_budgets", side_effect=_zero_grant_plan), \
+                mock.patch.object(pin_manager, "available_for_pin", return_value=0):
             MemoryManager.attach(
                 model, device, _offload_module_ids=self._offload_ids(model),
                 use_pinned_arena=True,

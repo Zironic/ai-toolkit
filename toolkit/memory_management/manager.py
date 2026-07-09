@@ -633,26 +633,30 @@ class MemoryManager:
             mode="training",
         )
         budget = int(pin_plan["weight_budget_bytes"])
-        if use_pinned_arena and pin_plan.get("headroom_bytes") is not None:
-            # The arena is the SOLE pinner (bounce_reserve=0 above), so it
-            # should pin every offloaded block that fits the REAL usable pin
-            # headroom, not min(desired, usable): `desired` is a physical
-            # estimate (bytes x 1.03) that undercounts each flat's per-leaf
-            # 256B alignment AND the register mechanism's 4096B page-padding.
-            # On production's large blocks that overhead is noise, but capping
-            # build() at the undercounting desired forces marginal blocks
-            # pageable -> non_pinned_pack. pin_register enforces the true
-            # per-block DXGI limit and the host-cache reserve itself, so
-            # handing build() the full usable headroom is safe: build() only
-            # (re)builds stale/pageable groups, and a per-block pin that would
-            # cross the reserve is refused into a pageable fallback exactly as
-            # a tight budget_bytes would have.
-            usable_weight_headroom = (
-                int(pin_plan["headroom_bytes"])
-                - int(pin_plan["reserve_bytes"])
-                - int(pin_plan["bounce_budget_bytes"])
+        if use_pinned_arena:
+            # The arena is the SOLE pinner (bounce_reserve=0 above) and pins
+            # under the "weights" tier, so size build() to the ACTUAL
+            # weight-tier usable headroom -- NOT plan_budgets' headroom_bytes.
+            # plan_budgets probes headroom with the generic "unknown" kind,
+            # which applies the conservative pct spill reserve (~0.20 x budget,
+            # ~3 GiB here); the weight tier's spill reserve is only the ~1 GiB
+            # floor, so available_for_pin(kind="weights") is ~2 GiB larger.
+            # Using the unknown-kind figure under-grants the weight tier and
+            # forced the LAST block of a full 28-block ingraph-training set
+            # pageable (11.0 GiB budget vs an ~11.4 GiB set, with ~4 GiB of
+            # real DXGI headroom idle) -> non_pinned_pack. Per-block
+            # pin_register(kind="weights", required=False) still enforces the
+            # true per-block DXGI limit + reserve, so a generous budget can
+            # never cross the cliff: build() only (re)builds stale/pageable
+            # groups and a per-block pin over the reserve falls back to
+            # pageable exactly as a tight budget_bytes would have. `desired`
+            # (bytes x 1.03) also undercounts each flat's 256B leaf alignment +
+            # 4096B register page-padding, so it is a floor, not a cap.
+            weight_tier_usable = pin_manager.available_for_pin(
+                kind="weights", device=device
             )
-            budget = max(budget, usable_weight_headroom)
+            if weight_tier_usable is not None:
+                budget = max(budget, int(weight_tier_usable))
         # Ticket 534ea49 Phase 2 Slice B2: when the arena is active it is the
         # SOLE pinner. Give the per-layer deferred attach below a budget of 0
         # so it never cudaHostRegisters anything; _build_pinned_arena spends
@@ -1739,8 +1743,18 @@ class MemoryManager:
         pinned_resident_keys=None,
         cold_growth=False,
         block_stream_only=False,
+        stream_all_blocks=False,
     ):
-        """Choose training-resident layers with stream buffers before growth."""
+        """Choose training-resident layers with stream buffers before growth.
+
+        ``stream_all_blocks`` (Phase 3 Slice B): the compiled in-graph training
+        trunk streams EVERY transformer-block linear from a pinned pack, so the
+        eager path's partial-resident selection does not apply -- keeping a
+        block linear resident would leave it OUT of the pinned arena and make
+        the borrow fail closed. When set, every streaming-block candidate is
+        forced offloaded (and excluded from the resident-growth loops), exactly
+        like the sampling attach does. Non-block layers (tproj, embedders) are
+        never in the trunk and follow the usual resident rules."""
         ignore_modules = list(ignore_modules or [])
         device = torch.device(device)
         free_bytes, total_bytes = torch.cuda.mem_get_info(device)
@@ -1811,11 +1825,17 @@ class MemoryManager:
         for item in candidates:
             group_key = cls._offload_group_key(item["key"])
             item["group_key"] = group_key
+            item["is_streaming_block"] = _is_streaming_block(group_key)
             item["pinned_resident"] = group_key in pinned_keys
             item["block_stream_resident"] = bool(
                 block_stream_only and not _is_streaming_block(group_key)
             )
-            if (
+            if stream_all_blocks and item["is_streaming_block"]:
+                # The in-graph trunk streams every block linear; it must be in
+                # the arena, so it can never be resident (nor grown resident
+                # below).
+                offloaded.append(item)
+            elif (
                 item["pinned_resident"]
                 or item["block_stream_resident"]
                 or any(token and token in item["key"] for token in must_tokens)
@@ -1854,6 +1874,8 @@ class MemoryManager:
                 ),
             ):
                 need = item["resident_bytes"]
+                if stream_all_blocks and item["is_streaming_block"]:
+                    continue
                 if resident_bytes >= resident_floor_bytes or need > remaining:
                     continue
                 resident.append(item)
@@ -1897,6 +1919,8 @@ class MemoryManager:
                 reverse=True,
             ):
                 need = item["resident_bytes"]
+                if stream_all_blocks and item["is_streaming_block"]:
+                    continue
                 if need <= remaining:
                     resident.append(item)
                     offloaded.remove(item)
@@ -2598,6 +2622,7 @@ class MemoryManager:
         pinned_weight_gib=None,
         wddm_spill_reserve_pct=None,
         use_pinned_arena=False,
+        stream_all_blocks=False,
     ):
         cls._apply_wddm_hard_allocator_cap(device, wddm_hard_gib)
         ignore_modules = list(ignore_modules or [])
@@ -2640,6 +2665,7 @@ class MemoryManager:
             # surplus at attach. Auto working_reserve leaves the climb to the live loop.
             cold_growth=not auto_working_reserve,
             block_stream_only=block_stream_only,
+            stream_all_blocks=stream_all_blocks,
         )
         # Pin budget: size to the layers ACTUALLY selected for streaming (auto
         # mode), or honor a positive config value as a requested budget, then

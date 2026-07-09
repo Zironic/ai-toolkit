@@ -435,6 +435,104 @@ def pack_block_host_from_flat(block_key: str, linears, flat: torch.Tensor) -> "B
     return pack
 
 
+class IngraphPackError(RuntimeError):
+    """A block pack could not be built or borrowed. ``reasons`` carries the
+    stable fail-closed tokens callers surface as ``_ingraph_unavailable_reasons``
+    (``non_pinned_pack``, ``unsupported_quant_wrapper``, ``wrapper_pack_missing``,
+    ``arena_borrow_required``)."""
+
+    def __init__(self, reasons, message: str = ""):
+        self.reasons = tuple(dict.fromkeys(reasons))
+        super().__init__(message or ",".join(self.reasons))
+
+
+@dataclass
+class PackBuildResult:
+    # Keyed by the model's STABLE block_key string, never a positional index --
+    # the caller maps its own indices back locally.
+    packs: "dict[str, BlockPack]"
+    borrowed: int
+    owned: int
+    pageable: int  # always 0 on success (a pageable pack raises non_pinned_pack)
+    reasons: tuple = ()
+
+
+def build_or_borrow_block_packs(
+    arena,
+    entries_by_block: dict,
+    *,
+    repoint: bool = False,
+    pin_mechanism: str = "register",
+    allow_owned_fallback: bool = True,
+) -> PackBuildResult:
+    """Borrow each block's pack from the pinned arena, else build an owned one.
+
+    The single place the in-graph pack policy lives, shared by every model's
+    ``enable_ingraph_sampling`` / ``enable_ingraph_training`` glue (see the
+    "in-graph arena protocol" in ``pinned_arena``). Nothing here knows about any
+    particular model: ``entries_by_block`` maps a stable ``block_key`` to that
+    block's ``(name, module)`` linear entries, and ``arena`` is duck-typed (any
+    object exposing ``try_borrow_pack(block_key, entries)``), so this module
+    never imports ``pinned_arena`` -- which imports it.
+
+    Policy, centralized so callers cannot re-implement it inconsistently:
+
+    * Borrow when the arena holds a current, pinned flat for the block: zero
+      alloc, zero copy, no second pin of the same bytes.
+    * Otherwise build an owned pack, but only if ``allow_owned_fallback``.
+      Under strict pinned-arena validation the caller passes False so a silent
+      fall back to owned packs cannot make a run "pass" without proving a
+      single borrow.
+    * Every streamed pack must be pinned; a pageable one fails the whole set
+      closed (``non_pinned_pack``) -- strict in-graph is all-or-nothing.
+    * On any failure, release ONLY packs we own. ``release_pack`` no-ops on a
+      borrowed pack (``owns_flat=False``), so the arena's flats are never freed
+      out from under it.
+    """
+    packs: "dict[str, BlockPack]" = {}
+    borrowed = 0
+    owned = 0
+    try:
+        for block_key, raw_entries in entries_by_block.items():
+            entries = list(raw_entries)
+            pack = arena.try_borrow_pack(block_key, entries) if arena is not None else None
+            if pack is not None:
+                borrowed += 1
+            else:
+                if not allow_owned_fallback:
+                    raise IngraphPackError(
+                        ("arena_borrow_required",),
+                        f"arena_borrow_required: block {block_key!r} is not "
+                        "borrowable from the pinned arena",
+                    )
+                try:
+                    pack = pack_block_host(
+                        block_key,
+                        entries,
+                        repoint=repoint,
+                        pin_mechanism=pin_mechanism,
+                    )
+                except ValueError as error:
+                    message = str(error)
+                    reason = (
+                        "wrapper_pack_missing"
+                        if "wrapper packing" in message
+                        else "unsupported_quant_wrapper"
+                    )
+                    raise IngraphPackError(
+                        (reason,), f"{reason} ({message})"
+                    ) from error
+                owned += 1
+            packs[block_key] = pack
+        if any(not pack.pinned for pack in packs.values()):
+            raise IngraphPackError(("non_pinned_pack",))
+    except BaseException:
+        for pack in packs.values():
+            release_pack(pack)
+        raise
+    return PackBuildResult(packs=packs, borrowed=borrowed, owned=owned, pageable=0)
+
+
 def _flat_view(
     flat: torch.Tensor,
     offset: int,

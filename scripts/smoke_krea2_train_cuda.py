@@ -177,10 +177,24 @@ def _build_model_config(args):
 
 def _attach_training_memory(transformer, model_config, device, *, ingraph_training=False):
     # Mirror Krea2Model.load_model()'s smart-offload attach exactly.
-    # Ingraph training pins its own packs; attach pins would double-commit.
+    # Phase 3 Slice B: the arena and ingraph training coexist -- ingraph training
+    # BORROWS the arena flats for the frozen base. When the arena is off, ingraph
+    # training pins its own packs (attach pins would double-commit), so keep the
+    # legacy pinned_weight_gib=0.0 for the arena-off ingraph path.
+    use_pinned_arena = bool(model_config.layer_offloading_pinned_arena)
     pinned_weight_gib = (
-        0.0 if ingraph_training else model_config.layer_offloading_pinned_weight_gb
+        0.0
+        if (ingraph_training and not use_pinned_arena)
+        else model_config.layer_offloading_pinned_weight_gb
     )
+    if use_pinned_arena:
+        # The arena covers FROZEN base weights only, and it is built inside
+        # attach. In the real trainer the base is frozen (BaseSDTrainProcess:
+        # 2524) but that runs AFTER load_model's attach, so freeze here to
+        # realize the "frozen before attach" invariant. Safe: the base is
+        # fp8-quantized (never genuinely trainable) and LoRA trains adapters,
+        # so an early freeze is behavior-neutral for adapter training.
+        transformer.requires_grad_(False)
     ignore_modules = [
         module
         for module in transformer.modules()
@@ -202,11 +216,12 @@ def _attach_training_memory(transformer, model_config, device, *, ingraph_traini
         pinned_weight_gib=pinned_weight_gib,
         wddm_spill_reserve_pct=model_config.layer_offloading_wddm_spill_reserve_pct,
         fp8_training_forward=bool(model_config.layer_offloading_fp8_forward),
-        # Mirror krea2.py: the arena and ingraph packs are two independent
-        # pin grants until they're merged, so only one may be active.
-        use_pinned_arena=(
-            bool(model_config.layer_offloading_pinned_arena) and not ingraph_training
-        ),
+        # Phase 3 Slice B: arena + ingraph training coexist; enable_ingraph_-
+        # training borrows the arena flats (see mmdit.enable_ingraph_training).
+        use_pinned_arena=use_pinned_arena,
+        # Force full-block offload so the arena covers the whole streamed set
+        # (the eager planner keeps some block linears resident otherwise).
+        stream_all_blocks=(use_pinned_arena and ingraph_training),
     )
     transformer.enable_gradient_checkpointing(keep_last=max(0, keep_last))
     if getattr(transformer, "_memory_manager", None) is not None:
@@ -283,8 +298,9 @@ def _parse_args():
         help=(
             "Ticket 534ea49: pin offloaded weights once into a persistent "
             "per-block flat arena instead of re-pinning them at every "
-            "sampling boundary. Mutually exclusive with --ingraph-training "
-            "(both pin the same weights independently until merged)."
+            "sampling boundary. Combine with --ingraph-training (Phase 3 "
+            "Slice B): the training trunk borrows the arena flats for the "
+            "frozen base instead of pinning a second copy."
         ),
     )
     parser.add_argument("--checkpoint-keep-last", type=int, default=0)
@@ -427,11 +443,15 @@ def main():
         pack_count = transformer.enable_ingraph_training(
             depth=args.ingraph_depth, compile=not args.no_ingraph_compile
         )
+        borrowed = int(getattr(transformer, "_ingraph_training_borrowed_count", 0))
+        owned = int(getattr(transformer, "_ingraph_training_owned_count", 0))
         rows.append(
             {
                 "event": "ingraph_training_enabled",
                 "seconds": time.perf_counter() - t0,
                 "packs": pack_count,
+                "borrowed": borrowed,
+                "owned": owned,
                 "depth": args.ingraph_depth,
                 "compiled": not args.no_ingraph_compile,
                 "lora_blocks": len(getattr(transformer, "_ingraph_training_loras", {})),
@@ -440,6 +460,16 @@ def main():
             }
         )
         _print_json(rows[-1])
+        # Phase 3 Slice B validation: under --pinned-arena every streamed base
+        # block MUST be borrowed from the arena. An owned-fallback pack means
+        # the arena did not cover a streamed block -- a silent regression that
+        # a green run would otherwise hide.
+        if args.pinned_arena and owned:
+            raise SystemExit(
+                f"[smoke] pinned-arena ingraph training built {owned} OWNED "
+                f"pack(s) (expected all {pack_count} borrowed); arena did not "
+                "cover the full streamed set"
+            )
 
     if args.train_compile_blocks:
         # Mirror BaseSDTrainProcess's train_compile_blocks wiring: compile the

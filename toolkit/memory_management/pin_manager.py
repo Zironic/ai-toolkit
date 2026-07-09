@@ -170,12 +170,17 @@ def dxgi_spill_reserve_bytes(budget_bytes: Optional[int] = None) -> int:
 
 
 def _spill_reserve_for_kind(kind: str, budget_bytes: Optional[int]) -> int:
-    # Ingraph packs are a one-shot static commitment sized at attach and
-    # fail-closed (strict mode raises rather than degrade); the pct-based
-    # reserve exists as slack for the *dynamic* streaming consumers. Packs
-    # keep only the floor -- the all-28 proof ran at 14.07/15.13 GiB
-    # committed, which the pct reserve would have refused.
-    if kind == "ingraph_pack":
+    # Weight-tier pins are one-shot STATIC commitments sized at attach/enable
+    # and fail-closed (strict mode raises rather than degrade): the per-tensor
+    # weight pins, the ingraph packs, and the pinned arena (kind="weights").
+    # The pct-based reserve exists as slack for the *dynamic* streaming
+    # consumer (the bounce pool), which grows at runtime -- a static commitment
+    # does not need it and keeps only the floor. The all-28 ingraph proof ran
+    # at 14.07/15.13 GiB committed, which the pct reserve would have refused;
+    # the pinned arena feeding the same all-streamed trunk (Phase 3 Slice B) is
+    # the identical commitment and must get the same floor, or a full-model
+    # training arena loses its last block to the pct reserve -> non_pinned_pack.
+    if kind in _WEIGHT_TIER_KINDS:
         return int(_spill_reserve_floor_gib() * GIB)
     return dxgi_spill_reserve_bytes(budget_bytes)
 
@@ -389,6 +394,64 @@ def unpin_tensor_in_place(t: torch.Tensor, kind: Optional[str] = None) -> bool:
         return False
     release_pinned_bytes(size, kind or registered_kind)
     return True
+
+
+# Storage-base data_ptrs of pinned arena flats. A streamed leaf is a VIEW into
+# one of these flats at an offset, so its OWN data_ptr misses the exact-ptr
+# _REGISTERED_HOST_PINS table (which keys on the registered flat ptr, not the
+# view). But every such view shares the flat's untyped storage, whose base ptr
+# is recorded here. The eager/pre-compile streaming pinned-bypass
+# (manager_modules._profile_is_pinned / bounce_pool._is_pinned) consults this so
+# register-pinned arena views are recognized as pinned and skip bounce staging.
+# O(1) storage-base lookup, NOT the rejected per-forward range scan. Refcounted
+# so a rebuild that recycles the same storage base ptr (release old flat, alloc
+# new) never leaves a transient gap.
+_ARENA_BACKED_STORAGE_LOCK = threading.Lock()
+_ARENA_BACKED_STORAGE_PTRS: dict[int, int] = {}
+
+
+def _storage_base_ptr(t: torch.Tensor) -> Optional[int]:
+    if not isinstance(t, torch.Tensor):
+        return None
+    try:
+        if t.device.type != "cpu":
+            return None
+        ptr = int(t.untyped_storage().data_ptr())
+    except Exception:
+        return None
+    return ptr if ptr != 0 else None
+
+
+def register_arena_storage(t: torch.Tensor) -> None:
+    """Mark a pinned arena flat's storage so views into it read as pinned."""
+    ptr = _storage_base_ptr(t)
+    if ptr is None:
+        return
+    with _ARENA_BACKED_STORAGE_LOCK:
+        _ARENA_BACKED_STORAGE_PTRS[ptr] = _ARENA_BACKED_STORAGE_PTRS.get(ptr, 0) + 1
+
+
+def unregister_arena_storage(t: torch.Tensor) -> None:
+    ptr = _storage_base_ptr(t)
+    if ptr is None:
+        return
+    with _ARENA_BACKED_STORAGE_LOCK:
+        count = _ARENA_BACKED_STORAGE_PTRS.get(ptr)
+        if count is None:
+            return
+        if count <= 1:
+            _ARENA_BACKED_STORAGE_PTRS.pop(ptr, None)
+        else:
+            _ARENA_BACKED_STORAGE_PTRS[ptr] = count - 1
+
+
+def is_arena_backed(t: torch.Tensor) -> bool:
+    """True if this CPU tensor is a view into a pinned arena flat."""
+    ptr = _storage_base_ptr(t)
+    if ptr is None:
+        return False
+    with _ARENA_BACKED_STORAGE_LOCK:
+        return ptr in _ARENA_BACKED_STORAGE_PTRS
 
 
 def release(handle: PinHandle) -> None:

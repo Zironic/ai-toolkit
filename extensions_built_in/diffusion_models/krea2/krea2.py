@@ -723,6 +723,16 @@ class Krea2Model(BaseModel):
                     pinned_resident_keys = MemoryManager.training_pinned_keys_for_keep_last(
                         transformer, max(0, keep_last)
                     )
+                    if self.model_config.layer_offloading_pinned_arena:
+                        # Phase 3 Slice B: the pinned arena covers FROZEN base
+                        # weights only and is built inside attach. The trainer
+                        # freezes the base (BaseSDTrainProcess:2524) only AFTER
+                        # this load_model runs, so freeze here to satisfy the
+                        # "frozen before attach" invariant. Safe: the base is
+                        # fp8-quantized (never genuinely trainable) and LoRA
+                        # trains separate adapters, so an early freeze is
+                        # behavior-neutral for adapter training.
+                        transformer.requires_grad_(False)
                     MemoryManager.attach_smart_training(
                         transformer,
                         self.device_torch,
@@ -732,13 +742,20 @@ class Krea2Model(BaseModel):
                         ignore_modules=ignore_modules,
                         pinned_resident_keys=pinned_resident_keys,
                         block_stream_only=self.model_config.layer_offloading_block_stream_only,
-                        # Ingraph training pins its own block packs
-                        # (repoint=False duplicates); per-tensor attach pins
-                        # for the same weights would double-commit the shared
-                        # WDDM pinned budget.
+                        # Ingraph training WITHOUT the arena pins its own block
+                        # packs (repoint=False duplicates); per-tensor attach
+                        # pins for the same weights would double-commit the
+                        # shared WDDM pinned budget, so zero the attach budget.
+                        # WITH the arena, the arena IS the pin authority and
+                        # must be sized (auto/config value) to cover the whole
+                        # streamed set -- zeroing it would make every block
+                        # pageable and fail the borrow.
                         pinned_weight_gib=(
                             0.0
-                            if self.model_config.layer_offloading_ingraph_training
+                            if (
+                                self.model_config.layer_offloading_ingraph_training
+                                and not self.model_config.layer_offloading_pinned_arena
+                            )
                             else self.model_config.layer_offloading_pinned_weight_gb
                         ),
                         wddm_spill_reserve_pct=self.model_config.layer_offloading_wddm_spill_reserve_pct,
@@ -747,15 +764,20 @@ class Krea2Model(BaseModel):
                             and self.model_config.qtype in ('qfloat8', 'float8')
                             and self.model_config.layer_offloading_fp8_forward
                         ),
-                        # Ingraph training builds its own pinned block packs
-                        # (see the pinned_weight_gib=0.0 comment above); the
-                        # arena and ingraph packs are two independent pinning
-                        # mechanisms for the same weights until they're merged
-                        # (see PIN_MANAGER_PLAN's borrowed-pack slice), so only
-                        # one may be active at a time.
-                        use_pinned_arena=(
+                        # Phase 3 (Slice B): the arena and ingraph training now
+                        # coexist -- enable_ingraph_training BORROWS the arena
+                        # flats for the frozen base (see mmdit.enable_ingraph_-
+                        # training) instead of pinning a second, independent copy.
+                        # The arena is the single pin authority for the base
+                        # weights across both train and sample.
+                        use_pinned_arena=self.model_config.layer_offloading_pinned_arena,
+                        # When the arena feeds the all-streamed in-graph trunk,
+                        # every block linear must be offloaded so the arena
+                        # covers the full streamed set (the eager planner keeps
+                        # some resident -- correct there, wrong here).
+                        stream_all_blocks=(
                             self.model_config.layer_offloading_pinned_arena
-                            and not self.model_config.layer_offloading_ingraph_training
+                            and self.model_config.layer_offloading_ingraph_training
                         ),
                     )
                     # Smart offload budgets weights, but an uncheckpointed Krea

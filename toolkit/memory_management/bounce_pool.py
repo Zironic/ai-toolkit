@@ -88,7 +88,12 @@ def _is_pinned(t) -> bool:
         names, _ = t.__tensor_flatten__()
     except Exception:
         try:
-            return t.device.type == "cpu" and t.is_pinned()
+            # See manager_modules._profile_is_pinned: register-pinned arena
+            # flat views report is_pinned()==False, so consult the arena
+            # storage set too.
+            return t.device.type == "cpu" and (
+                t.is_pinned() or pin_manager.is_arena_backed(t)
+            )
         except Exception:
             return False
     leaves = [getattr(t, name, None) for name in names]

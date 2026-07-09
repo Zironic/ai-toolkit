@@ -169,7 +169,13 @@ def _profile_is_pinned(t: Optional[torch.Tensor]) -> bool:
         names, _ = t.__tensor_flatten__()
     except Exception:
         try:
-            return t.device.type == "cpu" and t.is_pinned()
+            # is_arena_backed: a register-pinned arena flat view reports
+            # is_pinned()==False (torch only tracks its own caching-allocator
+            # pins), so consult the arena storage set too or the streaming
+            # bypass would needlessly bounce-stage already-pinned weights.
+            return t.device.type == "cpu" and (
+                t.is_pinned() or pin_manager.is_arena_backed(t)
+            )
         except Exception:
             return False
     leaves = [getattr(t, name, None) for name in names]

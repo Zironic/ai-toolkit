@@ -93,20 +93,32 @@ train->sample growth), all 18 streamed ingraph packs BORROW the arena flats
 ### Slice A -- streaming path recognizes register-pinned flats (prerequisite)
 The eager/pre-compile streaming bypass (`manager_modules._profile_is_pinned`
 :165, `bounce_pool.py:91`) gates on torch `is_pinned()`, which is False for
-register-pinned arena flats. Worse, a streamed leaf is a VIEW into the flat, so
-`is_host_pinned`'s exact-ptr table lookup misses it (table is keyed on the
-flat's base ptr). Consequence today: training's eager and pre-compile forwards
-stream arena weights through bounce staging anyway -- correctness OK, but the
-pin buys nothing off the ingraph path.
-- Prefer O(1) tagging over a range scan on the hot path: when the arena
-  repoints a module's params, tag the module (`_mm_arena_block` exists) and/or
-  stamp the leaf; `_profile_is_pinned` short-circuits True for arena-backed
-  storage. If a tensor-only signal is required, extend `is_host_pinned` with a
-  registered-range check (ptr within any `[base, base+size)`) backed by a
-  sorted interval list, and measure the per-forward cost before adopting.
-- Tests: a streamed arena weight reports pinned to the profiler; the eager
-  forward issues zero bounce-staged copies for arena blocks (spy on the bounce
-  pool); flag-off path unchanged.
+register-pinned arena flats. Worse, a streamed leaf is a VIEW into the flat at
+an offset, so its `data_ptr` differs from the flat's registered base ptr and
+`is_host_pinned`'s exact-ptr table lookup ALSO misses it. Consequence today:
+training's eager and pre-compile forwards stream arena weights through bounce
+staging anyway -- correctness OK, but the pin buys nothing off the ingraph
+path.
+
+**Chosen route (v1): tensor marker.** When the arena repoints a leaf into a
+flat (`build`/`restore_view`), stamp the leaf tensor with a lightweight marker
+(a Python attribute is not durable across view ops -- use a small identity set
+of arena-backed untyped-storage ids, or stamp the storage). `_profile_is_pinned`
+checks that first, before `is_pinned()`. This is O(1) and needs no module
+context threaded into the tensor-only profiler. Rejected alternatives:
+threading `module` into `_profile_is_pinned` + every `_stage_forward_weight`
+caller (Option A -- wider blast radius); a registered-range interval scan in
+`is_host_pinned` (Option C -- hot-path cost, only adopt if a tensor-range
+signal is truly required and measured).
+- Tests -- must cover EVERY training access path, not just the first eager
+  forward:
+  - arena-backed plain tensor view reports pinned to the streaming bypass;
+  - arena-backed fp8 qdata/scale leaves report pinned (the wrapper-flatten
+    recursion in `_profile_is_pinned`);
+  - bounce pool acquire is NOT called for an arena-backed forward;
+  - ...nor for checkpoint recompute;
+  - ...nor for backward grad-input refetch;
+  - flag-off path unchanged.
 
 ### Slice B -- training borrows the arena
 - `krea2.py:756`: drop the `and not layer_offloading_ingraph_training` gate so
@@ -116,24 +128,80 @@ pin buys nothing off the ingraph path.
   `pack_block_host(pin_mechanism="register")` fallback; release only
   `owns_flat` packs on teardown/failure. LoRA composition in the block fn is
   unchanged.
+- **Arena must cover the full ingraph-streamed set.** `enable_ingraph_training`
+  streams ALL blocks (`range(len(self.blocks))`, mmdit.py:1398) and fails
+  closed on any block still carrying a legacy per-layer manager. So the arena
+  built at attach must cover every block, or the uncovered ones borrow-miss and
+  fall to owned packs -- correct, but the arena then only partially delivers.
+  Two acceptable resolutions (pick one, do not leave implicit):
+  - attach with `use_pinned_arena` under ingraph training offloads ALL blocks
+    so the build covers the whole streamed set (simplest; matches "all blocks
+    stream" already); or
+  - `enable_ingraph_training` extends the arena (the existing whole-group
+    rebuild / `is_current` union-grow path) for any block not yet covered, at
+    the safe point before compile.
+- **Live layout mutation is out of scope for the compiled path** (this is where
+  external review's "layout policy" concern actually lands): the ingraph
+  training trunk is `torch.compile(fullgraph=True)` over a FIXED streamed set,
+  so there is no mid-training promote/demote of a non-arena block to handle.
+  The separate EAGER + live-autotune training mode (working_reserve/keep_last
+  promote/demote) combined with the arena is a distinct future combination:
+  there a demote of a not-yet-arena block would take the old per-tensor pin
+  path. Out of scope for Phase 3; note it and gate the arena to the ingraph
+  (fixed-layout) training path for now.
 - Confirm the backward pass treats the borrowed flat as a read-only source (no
   grad write-back into pinned host memory); base is frozen so there is no base
   grad, but assert the fetch/scatter path never targets the flat.
-- Sequencing check: arena builds inside `attach_smart_training` (base frozen),
-  BEFORE LoRA apply + optimizer construction. Add an explicit assertion/log
-  that no arena-repointed leaf has `requires_grad=True` at optimizer-build time.
+- **Sequencing (verified order, keep it):** arena BUILD is at attach
+  (`hook_after_model_load`, BaseSDTrainProcess:2547), which runs BEFORE the
+  LoRA network is created (:2573) and before the optimizer. `enable_ingraph_-
+  training` runs much later (:3200), AFTER LoRA, and only borrows/builds packs
+  (it does not rebuild the arena). This order is correct as long as LoRA adds
+  parallel adapter Parameters and wraps forward rather than replacing the base
+  weight Parameter (kohya-style LoRA does; verify for LyCORIS/LoRM). Guard it
+  with assertions rather than assuming:
+  - no arena-repointed base leaf has `requires_grad=True`;
+  - optimizer param groups contain no arena-backed base Parameters;
+  - after LoRA apply, arena-backed base modules are still `arena.is_current`
+    (LoRA did not replace the repointed base Parameter and strand the flat).
 - Tests (GPU): train ingraph with `--pinned-arena`, every streamed base pack
-  `borrowed_from_arena and pinned`, owned-fallback count 0; one train step runs
-  and produces a LoRA grad; `weights` ledger flat across a train->sample->train
-  cycle.
+  `borrowed_from_arena and pinned`, **owned-fallback count is treated as a
+  validation FAILURE** (owned fallback may stay available for non-arena /
+  non-strict compatibility, but the PoC must not silently pass by building
+  owned packs); one train step runs and produces a LoRA grad; `weights` ledger
+  flat across a train->sample->train cycle.
 
 ### Slice C -- model-agnostic seam
 - Extract the duplicated borrow-or-own loop from
   `enable_ingraph_sampling`/`enable_ingraph_training` into a shared helper in
-  `ingraph_stream.py`, e.g. `build_or_borrow_block_packs(arena, entries_by_block,
-  *, repoint, pin_mechanism)` returning `{index: BlockPack}` + borrowed/owned
-  counts, with the fail-closed reasons centralized. Block enumeration stays
-  model-side (the model knows its block/linear structure).
+  `ingraph_stream.py`. Return by STABLE `block_key` (str), never a Krea2
+  integer index -- the caller maps `"blocks.{i}"` back to `i` locally:
+
+  ```python
+  @dataclass
+  class PackBuildResult:
+      packs: dict[str, BlockPack]   # keyed by block_key
+      borrowed: int
+      owned: int
+      pageable: int
+      reasons: tuple[str, ...]
+
+  def build_or_borrow_block_packs(
+      arena,
+      entries_by_block: dict[str, list[tuple[str, nn.Module]]],
+      *,
+      repoint: bool,
+      pin_mechanism: str,
+      allow_owned_fallback: bool,
+  ) -> PackBuildResult:
+      ...
+  ```
+  Rules, centralized so callers do not re-implement them: borrow if the arena
+  has a current block; owned fallback only if `allow_owned_fallback=True`;
+  release only `owns_flat` packs on failure; never release borrowed arena
+  flats; fail-closed reasons in one place (`non_pinned_pack`,
+  `arena_block_stale`, `unsupported_quant_wrapper`, `wrapper_pack_missing`).
+  Block enumeration stays model-side.
 - Document the "ingraph arena protocol" a model implements to opt in: (1) freeze
   base before attach; (2) pass `use_pinned_arena` through
   `attach_smart_training`/`inference_resident`; (3) expose
@@ -153,6 +221,10 @@ pin buys nothing off the ingraph path.
 - Full `train -> sample -> train` on one real short run: DXGI `weights` ledger
   flat across boundaries, no WDDM spill, boundary detach/attach << the 1.2s/2.0s
   baseline.
+- **Explicit leak checks (ledger-flat is necessary but not sufficient):** after
+  explicit teardown / at test end, no registered host-pin ranges remain
+  (`_REGISTERED_HOST_PINS` empty for arena kinds), pin ledger back to baseline,
+  `_LIVE_ARENAS` swept. Stale registration metadata can survive a flat ledger.
 - Only after the matrix passes: consider flipping
   `layer_offloading_pinned_arena` default (separate commit, rollback lever).
 
@@ -178,16 +250,18 @@ Krea2-specific, and no arena logic lives in the model file beyond the glue in
    `enable_ingraph_training` call the Slice-C helper:
 
    ```
-   packs, borrowed, owned = build_or_borrow_block_packs(
+   result = build_or_borrow_block_packs(
        arena=getattr(model, "_mm_weight_arena", None),
        entries_by_block={block_key: [(name, module), ...], ...},
        repoint=<False for training-owned trunk, True where the model wants
                 the params repointed>,
        pin_mechanism="register",
+       allow_owned_fallback=<False under strict pinned-arena validation>,
    )
-   # every streamed pack must be `pack.pinned`; helper raises the
-   # centralized fail-closed reasons (non_pinned_pack, arena_block_stale,
-   # unsupported_quant_wrapper, ...) so callers do not re-implement them.
+   # result.packs is keyed by block_key; every streamed pack must be
+   # `pack.pinned`; the helper raises the centralized fail-closed reasons
+   # (non_pinned_pack, arena_block_stale, unsupported_quant_wrapper, ...) so
+   # callers do not re-implement them. See PackBuildResult in Slice C.
    ```
 
    The helper borrows from the arena when a block is arena-current, else builds
@@ -208,8 +282,13 @@ needs no trainer changes.
 - `weights`-kind ledger is flat across a full `train -> sample -> train` cycle;
   boundary detach/attach cost is bounded well under the 1.2s/2.0s pin-churn
   baseline; no `resource already mapped`, no WDDM spill.
-- Eager/pre-compile training forwards issue zero bounce-staged copies for
-  arena blocks (Slice A): the streaming bypass sees register-pinned flats.
+- The streaming bypass recognizes register-pinned arena views and issues zero
+  bounce-staged copies for arena blocks across ALL access paths -- forward,
+  checkpoint recompute, and backward grad-input refetch (Slice A).
+- Optimizer param groups contain no arena-backed frozen base Parameters (only
+  LoRA/adapter params are trainable).
+- No registered host-pin ranges remain after explicit teardown / at test end
+  (not just a flat ledger).
 - A synthetic non-Krea2 multi-block module drives `_build_pinned_arena` + the
   shared borrow helper end-to-end (Slice C), proving no Krea2 dependency.
 - Flag off (`layer_offloading_pinned_arena=False`): byte-identical to today,

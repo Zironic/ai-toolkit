@@ -15,6 +15,49 @@ closed) -- the arena covers offloaded base weights, never trainable
 adapters. Every arena flat is pinned under the ``"weights"`` ledger kind
 (the existing weight-tier priority rules -- never evicts the bounce pool --
 apply unchanged).
+
+The in-graph arena protocol (Phase 3 Slice C)
+---------------------------------------------
+Nothing in this module, ``ingraph_stream``, or ``MemoryManager`` knows about
+any particular model. A model opts into the arena by satisfying four points;
+only (3) and (4) live in the model file, and neither contains arena logic.
+
+1. **Freeze the base before attach.** Every offloaded base Linear must have
+   ``requires_grad=False`` before ``attach_smart_training`` /
+   ``inference_resident`` runs -- the arena is built inside attach and fails
+   closed (``arena_trainable_leaf``) on a trainable leaf. Note the shared
+   trainer's freeze (``BaseSDTrainProcess`` ``unet.requires_grad_(False)``)
+   happens AFTER ``load_model()``, and ``load_model()`` is where the attach
+   lives, so a model that offloads must freeze its own base first.
+
+2. **Plumb the flag.** Pass ``use_pinned_arena`` (and, when the model's whole
+   block set is streamed by a compiled trunk, ``stream_all_blocks``) into
+   ``attach_smart_training`` / the ``inference_resident`` attach sites. The
+   manager builds and reuses ``module._mm_weight_arena`` generically; the
+   model does nothing here.
+
+3. **Enumerate blocks.** Yield, per streamed block, a stable ``block_key: str``
+   and that block's ``(name, module)`` linear entries. The key must be stable
+   across attach cycles and agree with ``MemoryManager._offload_group_key``
+   grouping. The shape of the model's block container is irrelevant.
+
+4. **Enable via the shared helper.** ``enable_ingraph_sampling`` /
+   ``enable_ingraph_training`` call
+   ``ingraph_stream.build_or_borrow_block_packs(arena, entries_by_block, ...)``,
+   which owns the borrow-or-own policy, the fail-closed reasons
+   (``non_pinned_pack``, ``unsupported_quant_wrapper``, ``wrapper_pack_missing``,
+   ``arena_borrow_required``) and the release-only-what-we-own cleanup. It
+   returns a ``PackBuildResult`` keyed by ``block_key``; the model maps those
+   back to its own indices and composes any per-block extras (LoRA,
+   checkpointing) in its own block fn.
+
+The arena itself is duck-typed by the helper (anything exposing
+``try_borrow_pack(block_key, entries)``), so ``ingraph_stream`` never imports
+this module -- which imports it.
+
+The trainer seam is already generic: ``BaseSDTrainProcess`` looks up
+``enable_ingraph_training`` with ``getattr`` and fails loud if absent, so a
+conforming model needs no trainer changes.
 """
 
 from __future__ import annotations
@@ -24,6 +67,7 @@ from typing import Iterable, Optional
 
 import torch
 
+from toolkit.memory_management import pin_manager
 from toolkit.memory_management.ingraph_stream import (
     ArenaBorrowError,
     BlockPack,
@@ -171,6 +215,8 @@ class PinnedWeightArena:
             # returns DXGI budget immediately, so a rebuild never needs 2x
             # the block's bytes in transient headroom.
             if previous is not None:
+                if previous.pack.pinned:
+                    pin_manager.unregister_arena_storage(previous.pack.host_flat)
                 release_pack(previous.pack)
                 # Keep committed_pinned_bytes truthful even if the rebuild
                 # below raises mid-way and the old record briefly survives.
@@ -196,6 +242,10 @@ class PinnedWeightArena:
             self._blocks[block_key] = _ArenaBlock(
                 pack=pack, generation=generation, entry_names=tuple(entry_names)
             )
+            if pack.pinned:
+                # Views into this flat report is_pinned()==False (cudaHostRegister);
+                # record the storage so the streaming bypass treats them as pinned.
+                pin_manager.register_arena_storage(pack.host_flat)
             stats.blocks += 1
             if pack.pinned:
                 stats.pinned_bytes += pack.required_pin_bytes
@@ -324,9 +374,20 @@ class PinnedWeightArena:
             return None
         stale = [m for m in modules if not self.is_current(m)]
         if stale:
+            # Distinguish the two very different causes: a module the arena
+            # never built (it was RESIDENT when build() ran, so the streamed
+            # set and the arena set disagree -- a coverage bug) versus one
+            # whose block was rebuilt/invalidated under it (a staleness bug).
+            names = dict(zip((entry[0] for entry in linears), modules))
+            missing = [n for n, m in names.items() if self.arena_block_of(m) is None]
+            outdated = [
+                n for n, m in names.items()
+                if self.arena_block_of(m) is not None and not self.is_current(m)
+            ]
             print(
                 f"[PinnedArena] borrow refused ({block_key}): "
-                f"stale_modules={len(stale)}/{len(modules)}"
+                f"stale_modules={len(stale)}/{len(modules)} "
+                f"not_in_arena={missing} generation_mismatch={outdated}"
             )
             return None
         try:
@@ -382,6 +443,8 @@ class PinnedWeightArena:
         """Release every owned pack (process/test teardown only -- the
         arena is meant to live for the whole run otherwise)."""
         for record in self._blocks.values():
+            if record.pack.pinned:
+                pin_manager.unregister_arena_storage(record.pack.host_flat)
             release_pack(record.pack)
         self._blocks.clear()
         self._generation.clear()
