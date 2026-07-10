@@ -968,10 +968,14 @@ class MemoryManager:
 
             original_forward = getattr(lmm, "_original_forward", None)
             if original_forward is not None:
-                container = getattr(lmm, "_forward_container", None)
-                attribute = getattr(lmm, "_forward_attribute", None)
-                if container is not None and attribute is not None:
-                    setattr(container, attribute, original_forward)
+                # Unwind our streaming forward from wherever it lives NOW: a
+                # LoRA applied after attach moved it into the LoRA's
+                # org_forward slot, and writing the original into the
+                # attach-time slot would overwrite the LoRA hijack
+                # (lora_hijack_missing at the sampling boundary).
+                uninstall = getattr(lmm, "_uninstall_base_forward", None)
+                if uninstall is not None:
+                    uninstall()
                 elif hasattr(child, "ara_lora_ref"):
                     ara = child.ara_lora_ref()
                     if ara is not None:
@@ -2508,7 +2512,9 @@ class MemoryManager:
                     object.__setattr__(child, name, param)
             raise
 
-        lmm._install_base_forward(lmm._original_forward)
+        # Same chain-aware unwind as detach: the recorded slot may hold a LoRA
+        # hijack applied after attach; only our own forward gets removed.
+        lmm._uninstall_base_forward()
         if hasattr(child, "_memory_management_device"):
             del child._memory_management_device
         # Return this layer's pinned budget: its CPU copy is now on GPU, so the

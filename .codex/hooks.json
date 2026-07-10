@@ -1,0 +1,56 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agent-hooks/agent_hooks.py\" pre-bash",
+            "commandWindows": "py -3 \"$((git rev-parse --show-toplevel).Trim())\\.agent-hooks\\agent_hooks.py\" pre-bash",
+            "timeout": 10,
+            "statusMessage": "Checking shell command policy"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*__(read|get|open).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agent-hooks/agent_hooks.py\" pre-read",
+            "commandWindows": "py -3 \"$((git rev-parse --show-toplevel).Trim())\\.agent-hooks\\agent_hooks.py\" pre-read",
+            "timeout": 10,
+            "statusMessage": "Checking file-read size"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agent-hooks/agent_hooks.py\" post-output --agent codex",
+            "commandWindows": "py -3 \"$((git rev-parse --show-toplevel).Trim())\\.agent-hooks\\agent_hooks.py\" post-output --agent codex",
+            "timeout": 10,
+            "statusMessage": "Capping large tool output"
+          }
+        ]
+      },
+      {
+        "matcher": "^apply_patch$|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agent-hooks/agent_hooks.py\" format-after-edit",
+            "commandWindows": "py -3 \"$((git rev-parse --show-toplevel).Trim())\\.agent-hooks\\agent_hooks.py\" format-after-edit",
+            "timeout": 120,
+            "statusMessage": "Formatting edited files"
+          }
+        ]
+      }
+    ]
+  }
+}

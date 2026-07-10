@@ -1,0 +1,51 @@
+line-length = 120
+indent-width = 4
+target-version = "py310"
+
+output-format = "concise"
+respect-gitignore = true
+force-exclude = true
+preview = false
+unsafe-fixes = false
+show-fixes = false
+
+[format]
+quote-style = "preserve"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = false
+skip-magic-trailing-comma = false
+
+[lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "B",
+    "I",
+    "UP",
+    "RUF",
+    "LOG",
+    "G",
+    "PLE",
+]
+ignore = [
+    "E501",
+]
+explicit-preview-rules = true
+fixable = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "RUF",
+]
+unfixable = [
+    "F401",
+]
+logger-objects = []
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/**" = ["S101"]

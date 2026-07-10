@@ -168,7 +168,8 @@ cython_debug/
 !/custom/.gitkeep
 /.tmp
 /tmp/
-/.codex/
+/.codex/*
+!/.codex/hooks.json
 /venv.bkp
 /venv.*
 /config/*
@@ -186,7 +187,10 @@ cython_debug/
 aitk_db.db
 /notes.md
 /data
-.claude
+/.claude/*
+!/.claude/settings.json
+!/.claude/skills/
+/.agent/
 masks/*
 MULTITRIGGER_DOP_REFACTOR_PLAN.md
 /tools/git-bug.exe

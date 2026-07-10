@@ -38,7 +38,6 @@ from toolkit.memory_management.ingraph_stream import (
     block_linear_views,
     block_tensor_views,
     build_block_leaf_plans,
-    build_or_borrow_block_packs,
     checkpoint_recompute_context,
     compiled_checkpoint_context,
     configure_fetch_runtime,
@@ -697,6 +696,7 @@ class SingleStreamDiT(nn.Module):
         self._compiled_training_fp8_restores: list = []
         self._compiled_training_lora_restores: list = []
         self._ingraph_sampling_packs: dict[int, object] = {}
+        self._ingraph_sampling_plans: dict[int, object] = {}
         self._ingraph_sampling_loras: dict[int, dict] = {}
         self._ingraph_sampling_lora_leaf_count = None
         # One live scalar per model, shared by the sampling and training trunks
@@ -931,7 +931,7 @@ class SingleStreamDiT(nn.Module):
 
         Returns (compiled_count, eager_count).
         """
-        streamed = set(getattr(self, "_ingraph_sampling_packs", {}) or {})
+        streamed = set(getattr(self, "_ingraph_sampling_plans", {}) or {})
         clean = tuple(
             i for i, block in enumerate(self.blocks)
             if i not in streamed and self._block_compile_safe(block)
@@ -1165,6 +1165,14 @@ class SingleStreamDiT(nn.Module):
         if streamed_blocks is None:
             streamed_blocks = range(len(self.blocks))
         streamed_blocks = tuple(int(index) for index in streamed_blocks)
+        # Snapshot which leaves the manager streams, BEFORE the strip removes
+        # `_layer_memory_manager` and makes every leaf look resident.
+        streamed_ids = {
+            id(child)
+            for index in streamed_blocks
+            for _, child in self._block_linear_entries(self.blocks[index])
+            if is_streamed_module(child)
+        }
         # Collect LoRA entries BEFORE stripping compile contaminants: the strip
         # deletes the instance forwards the entries are read from. Sampling
         # needs this as much as training does -- `can_merge_in` is forced False
@@ -1216,42 +1224,53 @@ class SingleStreamDiT(nn.Module):
             )
         # Model-side glue: enumerate blocks into stable keys; the shared helper
         # owns the borrow-or-own policy, the fail-closed reasons, and cleanup.
+        #
+        # Only the STREAMED leaves are packed (same fix 07563ad made on the
+        # training side). The memory planner splits residency per-Linear, so a
+        # block is routinely part streamed / part resident, and the arena only
+        # ever holds the offloaded leaves -- demanding all 8 is what produced
+        # `borrow refused: stale_modules=3/8`, an owned-pack fallback, and a
+        # failed pin budget at every sampling boundary.
         entries_by_block = {
             f"blocks.{index}": list(self._block_linear_entries(self.blocks[index]))
             for index in streamed_blocks
         }
         try:
-            result = build_or_borrow_block_packs(
+            result = build_block_leaf_plans(
                 getattr(self, "_mm_weight_arena", None),
                 entries_by_block,
+                is_streamed=lambda module: id(module) in streamed_ids,
                 repoint=False,
                 pin_mechanism="register",
             )
         except IngraphPackError as error:
             self._ingraph_unavailable_reasons = error.reasons
             raise RuntimeError(f"in-graph sampling unavailable: {error}") from error
-        packs = {index: result.packs[f"blocks.{index}"] for index in streamed_blocks}
-        if streamed_blocks and len(packs) != len(streamed_blocks):
-            for pack in packs.values():
-                release_pack(pack)
-            self._ingraph_unavailable_reasons = ("dynamic_streamed_block_set",)
-            raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
+        plans = {index: result.plans[f"blocks.{index}"] for index in streamed_blocks}
         # Ticket 534ea49 Phase 2 Slice E: diagnostics only, not a gate -- every
         # STREAMED pack must be pinned (the helper enforces that); it need not be
         # arena-borrowed (a block outside the arena, or one that fell back to an
         # owned pack, is equally valid). Exposed for the smoke harness / tests.
         self._ingraph_sampling_borrowed_count = result.borrowed
         self._ingraph_sampling_owned_count = result.owned
-        self._ingraph_sampling_packs = packs
+        self._ingraph_sampling_resident_blocks = result.fully_resident
+        self._ingraph_sampling_streamed_leaves = result.streamed_leaves
+        self._ingraph_sampling_resident_leaves = result.resident_leaves
+        self._ingraph_sampling_plans = plans
+        # Compat/diagnostic view: only the blocks that actually stream carry a
+        # pack. Ownership stays with the plans; disable releases through them.
+        self._ingraph_sampling_packs = {
+            index: plan.pack for index, plan in plans.items() if plan.streams
+        }
         self._ingraph_unavailable_reasons = ()
         self._ingraph_sampling_depth = max(1, int(depth))
         if getattr(self, "_ingraph_sampling_measure", False):
             self.reset_ingraph_sampling_timing()
         configure_fetch_runtime(depth=self._ingraph_sampling_depth)
-        fingerprint = tuple(sorted(packs))
+        fingerprint = tuple(sorted(plans))
         self._compiled_ingraph_fingerprint = fingerprint
-        if compile and packs:
-            if len(packs) != len(self.blocks):
+        if compile and plans:
+            if len(plans) != len(self.blocks):
                 self._compiled_ingraph_sampling_blocks = {
                     index: torch.compile(
                         self._make_ingraph_sample_block_fn(index),
@@ -1259,9 +1278,9 @@ class SingleStreamDiT(nn.Module):
                         dynamic=False,
                         mode="default",
                     )
-                    for index in packs
+                    for index in plans
                 }
-                return len(packs)
+                return len(plans)
             self._compiled_ingraph_sampling = torch.compile(
                 lambda combined, tvec, freqs, mask: self._blocks_trunk(
                     combined,
@@ -1274,7 +1293,7 @@ class SingleStreamDiT(nn.Module):
                 dynamic=False,
                 mode="default",
             )
-        return len(packs)
+        return len(plans)
 
     def disable_ingraph_sampling(self):
         snapshot = self.ingraph_sampling_timing_snapshot()
@@ -1284,12 +1303,18 @@ class SingleStreamDiT(nn.Module):
         if restores:
             self._restore_ingraph_compile_contaminants(restores)
         self._ingraph_sampling_restores = []
-        for pack in getattr(self, "_ingraph_sampling_packs", {}).values():
-            release_pack(pack)
+        for plan in getattr(self, "_ingraph_sampling_plans", {}).values():
+            # No-ops on a fully-resident block (pack is None) and on a borrowed
+            # arena flat (owns_flat=False).
+            release_pack(plan.pack)
+        self._ingraph_sampling_plans = {}
         self._ingraph_sampling_packs = {}
         self._ingraph_sampling_loras = {}
         self._ingraph_sampling_borrowed_count = 0
         self._ingraph_sampling_owned_count = 0
+        self._ingraph_sampling_resident_blocks = 0
+        self._ingraph_sampling_streamed_leaves = 0
+        self._ingraph_sampling_resident_leaves = 0
         self._ingraph_unavailable_reasons = ()
         self._ingraph_sampling_depth = 2
         self._compiled_ingraph_sampling = None
@@ -1322,6 +1347,51 @@ class SingleStreamDiT(nn.Module):
                 owners.append(owner)
             pending.append(getattr(owner, "org_forward", None))
         return owners
+
+    @staticmethod
+    def _describe_lora_chain(child):
+        """One-line forensic description of a Linear's forward chain, for the
+        lora_hijack_missing error: where (if anywhere) the LoRA hijack went."""
+
+        def _name(fn):
+            if fn is None:
+                return "None"
+            owner = getattr(fn, "__self__", None)
+            label = getattr(fn, "__qualname__", None) or getattr(
+                fn, "__name__", type(fn).__name__
+            )
+            if owner is not None:
+                return f"{label}@{type(owner).__name__}"
+            return label
+
+        parts = []
+        parts.append(
+            "inst_fwd=" + _name(getattr(child, "__dict__", {}).get("forward"))
+        )
+        lmm = getattr(child, "_layer_memory_manager", None)
+        if lmm is None:
+            parts.append("lmm=None")
+        else:
+            container = getattr(lmm, "_forward_container", None)
+            parts.append(
+                "lmm(container="
+                + ("child" if container is child else type(container).__name__)
+                + f",attr={getattr(lmm, '_forward_attribute', None)}"
+                + f",orig={_name(getattr(lmm, '_original_forward', None))})"
+            )
+        ara = getattr(child, "ara_lora_ref", None)
+        if ara is None:
+            parts.append("ara=None")
+        else:
+            owner = ara()
+            if owner is None:
+                parts.append("ara=dead")
+            else:
+                parts.append(
+                    f"ara={type(owner).__name__}"
+                    f"(org_forward={_name(getattr(owner, 'org_forward', None))})"
+                )
+        return " ".join(parts)
 
     @staticmethod
     def _has_foreign_forward_hijack(child):
@@ -1485,20 +1555,48 @@ class SingleStreamDiT(nn.Module):
 
     def _make_ingraph_sample_block_fn(self, index):
         block = self.blocks[index]
-        pack = self._ingraph_sampling_packs[index]
-        host = pack.host_flat
-        nbytes = int(pack.required_pin_bytes)
-        fp8_flags = pack.fp8_flags
+        plan = self._ingraph_sampling_plans[index]
+        fp8_flags = plan.fp8_flags
         # The pack carries the FROZEN base weights. A LoRA is a live forward
         # hijack that forward_streamed bypasses, so it has to be folded back in
         # here or the preview renders the base model.
         loras = self._ingraph_sampling_loras.get(index, {})
         multiplier = self._ingraph_lora_multiplier
 
+        if not plan.streams:
+            # Every leaf is already on the device: no flat, no fetch, no token.
+            # The planner keeps leaves resident when VRAM allows, and a resident
+            # leaf's Parameter is an ordinary graph input.
+            leaf_args = assemble_leaf_args(plan)
+
+            def fn(x, tvec, freqs, mask):
+                lora_args = (
+                    SingleStreamDiT._block_lora_tuple(loras, multiplier)
+                    if loras
+                    else None
+                )
+                return block.forward_streamed(
+                    x,
+                    tvec,
+                    freqs,
+                    mask,
+                    leaf_args,
+                    fp8_flags,
+                    loras=lora_args,
+                )
+
+            return fn
+
+        pack = plan.pack
+        host = pack.host_flat
+        nbytes = int(pack.required_pin_bytes)
+
         def fn(x, tvec, freqs, mask):
             token = torch.ops.mm.fetch_start_after(host, x)
             flat = torch.ops.mm.fetch_wait(token, nbytes)
-            leaf_args = block_tensor_views(flat, pack)
+            # One coalesced fetch over this block's STREAMED leaves only; the
+            # resident ones are spliced back into canonical order.
+            leaf_args = assemble_leaf_args(plan, block_tensor_views(flat, pack))
             lora_args = (
                 SingleStreamDiT._block_lora_tuple(loras, multiplier) if loras else None
             )
@@ -1696,9 +1794,23 @@ class SingleStreamDiT(nn.Module):
         expected_loras = getattr(self, "_ingraph_training_lora_leaf_count", None)
         if expected_loras is not None and collected_loras < expected_loras:
             self._ingraph_unavailable_reasons = ("lora_hijack_missing",)
+            details = []
+            for index in streamed_blocks:
+                for name, child in self._block_linear_entries(self.blocks[index]):
+                    if name in loras.get(index, {}):
+                        continue
+                    details.append(
+                        f"blocks.{index}.{name}: "
+                        + self._describe_lora_chain(child)
+                    )
+                    if len(details) >= 4:
+                        break
+                if len(details) >= 4:
+                    break
             raise RuntimeError(
                 "in-graph training unavailable: lora_hijack_missing "
-                f"(collected {collected_loras} LoRA leaves, expected {expected_loras})"
+                f"(collected {collected_loras} LoRA leaves, expected {expected_loras}) "
+                "first missing leaves: [" + "; ".join(details) + "]"
             )
         if collected_loras:
             self._ingraph_training_lora_leaf_count = collected_loras
@@ -1967,7 +2079,7 @@ class SingleStreamDiT(nn.Module):
             self._compiled_blocks is not None
             and not torch.is_grad_enabled()
         )
-        use_ingraph = bool(self._ingraph_sampling_packs) and not torch.is_grad_enabled()
+        use_ingraph = bool(self._ingraph_sampling_plans) and not torch.is_grad_enabled()
         use_ingraph_train = (
             self._compiled_ingraph_training is not None and torch.is_grad_enabled()
         )
@@ -2035,7 +2147,7 @@ class SingleStreamDiT(nn.Module):
             and not torch.is_grad_enabled()
         )
         use_ingraph = (
-            force_ingraph or bool(self._ingraph_sampling_packs)
+            force_ingraph or bool(self._ingraph_sampling_plans)
         ) and not torch.is_grad_enabled()
         checkpoint_cutoff = len(self.blocks) - self._checkpoint_keep_last
         use_compiled_training = (
@@ -2063,32 +2175,51 @@ class SingleStreamDiT(nn.Module):
                 # Hook-free block: run its compiled graph. The block that still
                 # streams weights falls through to the eager call below.
                 combined = self._compiled_blocks[i](combined, tvec, freqs, mask)
-            elif use_ingraph and i in self._ingraph_sampling_packs:
+            elif use_ingraph and i in self._ingraph_sampling_plans:
                 compiled_ingraph = self._compiled_ingraph_sampling_blocks.get(i)
                 if compiled_ingraph is not None and not force_ingraph:
                     combined = compiled_ingraph(combined, tvec, freqs, mask)
                 else:
-                    pack = self._ingraph_sampling_packs[i]
-                    token = torch.ops.mm.fetch_start_after(pack.host_flat, combined)
-                    flat = torch.ops.mm.fetch_wait(token, int(pack.required_pin_bytes))
-                    leaf_args = block_tensor_views(flat, pack)
+                    plan = self._ingraph_sampling_plans[i]
                     block_loras = self._ingraph_sampling_loras.get(i)
-                    combined = block.forward_streamed(
-                        combined,
-                        tvec,
-                        freqs,
-                        mask,
-                        leaf_args,
-                        pack.fp8_flags,
-                        loras=(
-                            self._block_lora_tuple(
-                                block_loras, self._ingraph_lora_multiplier
-                            )
-                            if block_loras
-                            else None
-                        ),
+                    lora_args = (
+                        self._block_lora_tuple(
+                            block_loras, self._ingraph_lora_multiplier
+                        )
+                        if block_loras
+                        else None
                     )
-                    torch.ops.mm.fetch_free_after(token, combined)
+                    if plan.streams:
+                        pack = plan.pack
+                        token = torch.ops.mm.fetch_start_after(
+                            pack.host_flat, combined
+                        )
+                        flat = torch.ops.mm.fetch_wait(
+                            token, int(pack.required_pin_bytes)
+                        )
+                        leaf_args = assemble_leaf_args(
+                            plan, block_tensor_views(flat, pack)
+                        )
+                        combined = block.forward_streamed(
+                            combined,
+                            tvec,
+                            freqs,
+                            mask,
+                            leaf_args,
+                            plan.fp8_flags,
+                            loras=lora_args,
+                        )
+                        torch.ops.mm.fetch_free_after(token, combined)
+                    else:
+                        combined = block.forward_streamed(
+                            combined,
+                            tvec,
+                            freqs,
+                            mask,
+                            assemble_leaf_args(plan),
+                            plan.fp8_flags,
+                            loras=lora_args,
+                        )
             else:
                 combined = block_call(combined, tvec, freqs, mask)
         return combined

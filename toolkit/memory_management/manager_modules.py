@@ -2411,7 +2411,51 @@ class BaseLayerMemoryManager:
         return getattr(self.module, "forward")
 
     def _install_base_forward(self, forward):
+        self._installed_forward = forward
         setattr(self._forward_container, self._forward_attribute, forward)
+
+    def _locate_installed_forward_slot(self):
+        """Find where OUR streaming forward lives RIGHT NOW.
+
+        The slot recorded at attach time can go stale: a LoRA applied AFTER
+        attach hijacks ``module.forward`` and chains to our forward through its
+        ``org_forward`` -- so the recorded ``(module, 'forward')`` slot now
+        holds the LoRA hijack, and writing the original there on detach eats
+        the LoRA (the lora_hijack_missing boundary crash). Walk the live
+        forward chain from the module and return the (container, attribute)
+        that actually holds our installed forward, or None if we are not in
+        the chain (already unwound, or stripped by the in-graph enable).
+        """
+        installed = getattr(self, "_installed_forward", None)
+        if installed is None:
+            return None
+        fwd = self.module.__dict__.get("forward")
+        if fwd is installed:
+            return self.module, "forward"
+        seen = set()
+        owner = getattr(fwd, "__self__", None)
+        while owner is not None and id(owner) not in seen:
+            seen.add(id(owner))
+            org = getattr(owner, "org_forward", None)
+            if org is installed:
+                return owner, "org_forward"
+            owner = getattr(org, "__self__", None)
+        return None
+
+    def _uninstall_base_forward(self):
+        """Remove our streaming forward from the live chain and put the
+        captured original back -- the inverse of ``_install_base_forward``,
+        robust to a LoRA hijack applied after attach. Falls back to the
+        attach-time slot when our forward is not in the live chain."""
+        slot = self._locate_installed_forward_slot()
+        if slot is None:
+            container = getattr(self, "_forward_container", None)
+            attribute = getattr(self, "_forward_attribute", None)
+            if container is None or attribute is None:
+                return False
+            slot = (container, attribute)
+        setattr(slot[0], slot[1], self._original_forward)
+        return True
 
     @classmethod
     def attach(cls, module: nn.Module, manager: "MemoryManager"):

@@ -6,7 +6,11 @@ from extensions_built_in.diffusion_models.krea2.src.mmdit import (
     SingleMMDiTConfig,
     SingleStreamDiT,
 )
-from toolkit.memory_management.ingraph_stream import block_tensor_views, pack_block_host
+from toolkit.memory_management.ingraph_stream import (
+    BlockLeafPlan,
+    block_tensor_views,
+    pack_block_host,
+)
 
 
 class InGraphSamplerTests(unittest.TestCase):
@@ -68,6 +72,15 @@ class InGraphSamplerTests(unittest.TestCase):
             repoint=False,
             pin=False,
         )
+        model._ingraph_sampling_plans = {
+            0: BlockLeafPlan(
+                block_key="blocks.0",
+                pack=pack,
+                sources=tuple((True, i) for i in range(len(pack.fp8_flags))),
+                resident_args=(),
+                fp8_flags=pack.fp8_flags,
+            )
+        }
         model._ingraph_sampling_packs = {0: pack}
 
         fn = model._make_ingraph_sample_block_fn(0)

@@ -947,18 +947,18 @@ class Krea2Model(BaseModel):
                     # enable_ingraph_sampling() strips the legacy streaming
                     # markers that ingraph_streamed_block_indices() detects, so
                     # on a layout retained across calls (keep_ingraph_sampling)
-                    # the live packs are the source of truth for the streamed
+                    # the live plans are the source of truth for the streamed
                     # set; markers only reappear if the layout changed since.
-                    retained_packs = getattr(self.model, "_ingraph_sampling_packs", {}) or {}
+                    retained_plans = getattr(self.model, "_ingraph_sampling_plans", {}) or {}
                     streamed_blocks = tuple(sorted(
                         {int(i) for i in self.model.ingraph_streamed_block_indices()}
-                        | {int(i) for i in retained_packs}
+                        | {int(i) for i in retained_plans}
                     ))
                 if strict_ingraph and not streamed_blocks:
                     raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
                 requested_streamed = tuple(sorted(int(index) for index in streamed_blocks))
-                current_packs = getattr(self.model, "_ingraph_sampling_packs", {}) or {}
-                current_streamed = tuple(sorted(int(index) for index in current_packs))
+                current_plans = getattr(self.model, "_ingraph_sampling_plans", {}) or {}
+                current_streamed = tuple(sorted(int(index) for index in current_plans))
                 compiled_ingraph_blocks = getattr(
                     self.model, "_compiled_ingraph_sampling_blocks", {}
                 ) or {}

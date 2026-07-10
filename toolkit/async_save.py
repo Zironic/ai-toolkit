@@ -118,8 +118,11 @@ class PinnedStager:
 
         if not torch.cuda.is_available():
             # No device staging to do; mirror the plain per-tensor path.
+            # copy=True: if the tensor is already a CPU tensor of out_dtype,
+            # plain .to() returns it unchanged -- an alias of the live weight
+            # that the training thread keeps mutating under the async writer.
             return OrderedDict(
-                (k, v.detach().to("cpu").to(out_dtype)) for k, v in items
+                (k, v.detach().to("cpu", out_dtype, copy=True)) for k, v in items
             )
 
         self._ensure_buf()
@@ -134,8 +137,10 @@ class PinnedStager:
             torch.cuda.synchronize()
             for key, off, nb, dt, shape in chunk:
                 view = self._buf[off:off + nb].view(dt).view(shape)
-                # .to() allocates a fresh pageable CPU tensor, freeing the slot.
-                out[key] = view.to(out_dtype)
+                # copy=True: on a dtype no-op, plain .to() would return the view
+                # itself -- an alias into this shared pinned buffer that the next
+                # chunk overwrites (and safetensors refuses to serialize).
+                out[key] = view.to(out_dtype, copy=True)
             chunk = []
             offset = 0
 

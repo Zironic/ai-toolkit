@@ -1,0 +1,63 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|PowerShell)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/venv/Scripts/python.exe\" \"$CLAUDE_PROJECT_DIR/.agent-hooks/agent_hooks.py\" pre-bash",
+            "timeout": 10,
+            "statusMessage": "Checking shell command policy"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/venv/Scripts/python.exe\" \"$CLAUDE_PROJECT_DIR/.agent-hooks/agent_hooks.py\" pre-edit",
+            "timeout": 10,
+            "statusMessage": "ASCII-fying edit payload"
+          }
+        ]
+      },
+      {
+        "matcher": "^Read$|^mcp__.*__(read|get|open)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/venv/Scripts/python.exe\" \"$CLAUDE_PROJECT_DIR/.agent-hooks/agent_hooks.py\" pre-read",
+            "timeout": 10,
+            "statusMessage": "Checking file-read size"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Bash|PowerShell)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/venv/Scripts/python.exe\" \"$CLAUDE_PROJECT_DIR/.agent-hooks/agent_hooks.py\" post-output --agent claude",
+            "timeout": 10,
+            "statusMessage": "Capping large tool output"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/venv/Scripts/python.exe\" \"$CLAUDE_PROJECT_DIR/.agent-hooks/agent_hooks.py\" format-after-edit",
+            "timeout": 60,
+            "statusMessage": "Linting edited files"
+          }
+        ]
+      }
+    ]
+  }
+}

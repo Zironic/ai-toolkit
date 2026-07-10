@@ -79,7 +79,7 @@ class CompileStreamedOffloadSliceTests(unittest.TestCase):
 
     def test_regional_sampling_compile_skips_ingraph_streamed_blocks(self):
         model = self._model()
-        model._ingraph_sampling_packs = {0: object()}
+        model._ingraph_sampling_plans = {0: object()}
         compiled_count, eager_count = model.enable_compiled_sampling()
         self.assertEqual(0, compiled_count)
         self.assertEqual(1, eager_count)
