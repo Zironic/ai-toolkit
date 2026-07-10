@@ -444,6 +444,9 @@ class Attention(torch.nn.Module):
         freqs: Tensor | None = None,
         mask: Tensor | None = None,
         leaves: dict | None = None,
+        ref_span: tuple[int, int] | None = None,
+        kv_capture: list | None = None,
+        kv_cache: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         if leaves is None:
             q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
@@ -462,6 +465,16 @@ class Attention(torch.nn.Module):
         q, k, v = self.qknorm(q, k, v)
         if freqs is not None:
             q, k = ropeapply(q, k, freqs)
+        if kv_capture is not None and ref_span is not None:
+            kv_capture.append(
+                (
+                    k[:, :, ref_span[0] : ref_span[1]].clone(),
+                    v[:, :, ref_span[0] : ref_span[1]].clone(),
+                )
+            )
+        if kv_cache is not None:
+            k = torch.cat((k, kv_cache[0]), dim=2)
+            v = torch.cat((v, kv_cache[1]), dim=2)
         out = attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate)
         if leaves is None:
             out = self.wo(out)
@@ -616,7 +629,40 @@ class SingleStreamBlock(nn.Module):
         freqs: Tensor,
         mask: Tensor | None = None,
         leaves: dict | None = None,
+        ref_span: tuple[int, int] | None = None,
+        kv_capture: list | None = None,
+        kv_cache: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
+        attn_kwargs = dict(ref_span=ref_span, kv_capture=kv_capture, kv_cache=kv_cache)
+        # ``vec`` is the (B, 1, 6*features) modulation input, or a tuple
+        # ``(vec, refvec, split)`` for reference-image conditioning: tokens
+        # ``[:split]`` (text + noisy image) are modulated with ``vec`` while
+        # tokens ``[split:]`` (clean reference tokens) use ``refvec`` built from
+        # t=0 (ComfyUI Kontext "index_timestep_zero"). Applied per span rather
+        # than materializing a per-token (B, L, 6*features) tensor.
+        if isinstance(vec, tuple):
+            vec, refvec, split = vec
+            m = self.mod(vec)
+            r = self.mod(refvec)
+
+            def mod(h, scale, shift):
+                return torch.cat(
+                    (
+                        (1 + m[scale]) * h[:, :split] + m[shift],
+                        (1 + r[scale]) * h[:, split:] + r[shift],
+                    ),
+                    dim=1,
+                )
+
+            def gate(h, g):
+                return torch.cat((m[g] * h[:, :split], r[g] * h[:, split:]), dim=1)
+
+            x = x + gate(
+                self.attn(mod(self.prenorm(x), 0, 1), freqs, mask, **attn_kwargs), 2
+            )
+            x = x + gate(self.mlp(mod(self.postnorm(x), 3, 4)), 5)
+            return x
+
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
         attn_leaves = None if leaves is None else leaves["attn"]
         mlp_leaves = None if leaves is None else leaves["mlp"]
@@ -625,6 +671,7 @@ class SingleStreamBlock(nn.Module):
             freqs,
             mask,
             leaves=attn_leaves,
+            **attn_kwargs,
         )
         x = x + postgate * self.mlp(
             (1 + postscale) * self.postnorm(x) + postshift,
@@ -2050,8 +2097,22 @@ class SingleStreamDiT(nn.Module):
         t: Tensor,
         pos: Tensor,
         mask: Tensor | None = None,
+        reflen: int = 0,
+        isolate_refs: bool = False,
+        ref_kv_capture: list | None = None,
+        ref_kv_cache: tuple[list, Tensor] | None = None,
     ) -> Tensor:
-        return self._forward_impl(img, context, t, pos, mask)
+        return self._forward_impl(
+            img,
+            context,
+            t,
+            pos,
+            mask,
+            reflen=reflen,
+            isolate_refs=isolate_refs,
+            ref_kv_capture=ref_kv_capture,
+            ref_kv_cache=ref_kv_cache,
+        )
 
     def _forward_impl(
         self,
@@ -2062,6 +2123,10 @@ class SingleStreamDiT(nn.Module):
         mask: Tensor | None = None,
         *,
         force_ingraph: bool = False,
+        reflen: int = 0,
+        isolate_refs: bool = False,
+        ref_kv_capture: list | None = None,
+        ref_kv_cache: tuple[list, Tensor] | None = None,
     ) -> Tensor:
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
@@ -2075,13 +2140,23 @@ class SingleStreamDiT(nn.Module):
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)
 
+        reference_mode = (
+            reflen > 0 or ref_kv_capture is not None or ref_kv_cache is not None
+        )
         use_compiled = (
             self._compiled_blocks is not None
             and not torch.is_grad_enabled()
+            and not reference_mode
         )
-        use_ingraph = bool(self._ingraph_sampling_plans) and not torch.is_grad_enabled()
+        use_ingraph = (
+            bool(self._ingraph_sampling_plans)
+            and not torch.is_grad_enabled()
+            and not reference_mode
+        )
         use_ingraph_train = (
-            self._compiled_ingraph_training is not None and torch.is_grad_enabled()
+            self._compiled_ingraph_training is not None
+            and torch.is_grad_enabled()
+            and not reference_mode
         )
 
         # Pad the combined sequence to a multiple of 256 when a compiled block
@@ -2095,7 +2170,45 @@ class SingleStreamDiT(nn.Module):
                 mask = F.pad(mask, (0, _padlen), value=False)
                 pos = F.pad(pos, (0, 0, 0, _padlen))
 
+        blockvec = tvec
+        if reflen > 0:
+            # The last ``reflen`` image tokens are clean reference tokens: they
+            # get t=0 modulation (ComfyUI Kontext "index_timestep_zero") while
+            # text + noisy image tokens keep the real t. Padding tokens fall in
+            # the t=0 span, but they are masked from attention and sliced off
+            # the output, so their values never matter.
+            t0 = self.tmlp(
+                temb(
+                    torch.zeros_like(t[:, 0, 0]),
+                    self.config.tdim,
+                    device=img.device,
+                    dtype=img.dtype,
+                )
+            )
+            blockvec = (tvec, self.tproj(t0), txtlen + imglen - reflen)
+
+        padmask = mask  # (B, L) key-padding mask, incl. the 256-alignment pad
         mask = _mask(mask)
+        if reflen > 0 and isolate_refs:
+            split = txtlen + imglen - reflen
+            is_ref = torch.zeros(
+                combined.shape[1], dtype=torch.bool, device=combined.device
+            )
+            is_ref[split : split + reflen] = True
+            mask = mask & (~is_ref[:, None] | is_ref[None, :])
+
+        ref_span = None
+        if ref_kv_capture is not None and reflen > 0:
+            if not isolate_refs:
+                raise ValueError("ref K/V capture requires isolate_refs")
+            split = txtlen + imglen - reflen
+            ref_span = (split, split + reflen)
+
+        blockcaches = None
+        if ref_kv_cache is not None:
+            blockcaches, refmask = ref_kv_cache
+            extra = padmask.unsqueeze(1).unsqueeze(3) & refmask.unsqueeze(1).unsqueeze(2)
+            mask = torch.cat((mask, extra), dim=3)
         freqs = self.posemb(pos)
 
         if use_ingraph or use_ingraph_train:
@@ -2122,14 +2235,17 @@ class SingleStreamDiT(nn.Module):
         else:
             combined = self._blocks_trunk(
                 combined,
-                tvec,
+                blockvec,
                 freqs,
                 mask,
                 force_ingraph=force_ingraph,
+                ref_span=ref_span,
+                ref_kv_capture=ref_kv_capture,
+                blockcaches=blockcaches,
             )
 
         final = self.last(combined, t)
-        output = final[:, txtlen : txtlen + imglen, :]
+        output = final[:, txtlen : txtlen + imglen - reflen, :]
 
         return output
 
@@ -2141,20 +2257,32 @@ class SingleStreamDiT(nn.Module):
         mask: Tensor | None,
         *,
         force_ingraph: bool = False,
+        ref_span: tuple[int, int] | None = None,
+        ref_kv_capture: list | None = None,
+        blockcaches: list | None = None,
     ) -> Tensor:
+        reference_mode = (
+            isinstance(tvec, tuple)
+            or ref_kv_capture is not None
+            or blockcaches is not None
+        )
         use_compiled = (
             self._compiled_blocks is not None
             and not torch.is_grad_enabled()
+            and not reference_mode
         )
         use_ingraph = (
             force_ingraph or bool(self._ingraph_sampling_plans)
-        ) and not torch.is_grad_enabled()
+        ) and not torch.is_grad_enabled() and not reference_mode
         checkpoint_cutoff = len(self.blocks) - self._checkpoint_keep_last
         use_compiled_training = (
             self._compiled_training_blocks is not None
             and torch.is_grad_enabled()
+            and not reference_mode
         )
-        for i, block in enumerate(self.blocks):
+        if blockcaches is None:
+            blockcaches = [None] * len(self.blocks)
+        for i, (block, blockkv) in enumerate(zip(self.blocks, blockcaches)):
             block_call = block
             if use_compiled_training and self._compiled_training_blocks[i] is not None:
                 block_call = self._compiled_training_blocks[i]
@@ -2170,6 +2298,9 @@ class SingleStreamDiT(nn.Module):
                     freqs,
                     mask,
                     use_reentrant=False,
+                    ref_span=ref_span,
+                    kv_capture=ref_kv_capture,
+                    kv_cache=blockkv,
                 )
             elif use_compiled and self._compiled_blocks[i] is not None:
                 # Hook-free block: run its compiled graph. The block that still
@@ -2221,5 +2352,13 @@ class SingleStreamDiT(nn.Module):
                             loras=lora_args,
                         )
             else:
-                combined = block_call(combined, tvec, freqs, mask)
+                combined = block_call(
+                    combined,
+                    tvec,
+                    freqs,
+                    mask,
+                    ref_span=ref_span,
+                    kv_capture=ref_kv_capture,
+                    kv_cache=blockkv,
+                )
         return combined
