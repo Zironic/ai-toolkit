@@ -1003,7 +1003,6 @@ class SingleStreamDiT(nn.Module):
             compiled[i] = torch.compile(
                 self.blocks[i],
                 fullgraph=False,
-                dynamic=False,
                 mode="default",
             )
         self._compiled_blocks = compiled
@@ -1332,7 +1331,6 @@ class SingleStreamDiT(nn.Module):
                     index: torch.compile(
                         self._make_ingraph_sample_block_fn(index),
                         fullgraph=True,
-                        dynamic=False,
                         mode="default",
                     )
                     for index in plans
@@ -1347,7 +1345,6 @@ class SingleStreamDiT(nn.Module):
                     force_ingraph=True,
                 ),
                 fullgraph=True,
-                dynamic=False,
                 mode="default",
             )
         return len(plans)
@@ -2061,7 +2058,6 @@ class SingleStreamDiT(nn.Module):
             self._compiled_ingraph_training = torch.compile(
                 self._ingraph_training_trunk,
                 fullgraph=True,
-                dynamic=False,
                 mode="default",
             )
         else:
@@ -2139,7 +2135,6 @@ class SingleStreamDiT(nn.Module):
                 compiled[i] = torch.compile(
                     self.blocks[i],
                     fullgraph=False,
-                    dynamic=False,
                     mode="default",
                 )
             self._compiled_training_blocks = compiled

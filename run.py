@@ -29,7 +29,7 @@ def _configure_windows_torch_allocator() -> None:
 
     # Respect an explicit user choice.
     if "garbage_collection_threshold" not in parsed:
-        options.append("garbage_collection_threshold:0.95")
+        options.append("garbage_collection_threshold:0.7")
 
     os.environ[key] = ",".join(options)
 

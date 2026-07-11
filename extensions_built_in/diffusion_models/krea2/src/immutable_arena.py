@@ -518,7 +518,6 @@ class KreaImmutablePlanExecutor:
             kernel = torch.compile(
                 kernel,
                 mode="default",
-                dynamic=False,
                 fullgraph=False,
             )
 
@@ -527,12 +526,18 @@ class KreaImmutablePlanExecutor:
     def _capture_arena_signature(self):
         arena = self.residency.arena
         return (
+            arena.canonicalized,
             tuple(
-                (block_key, arena.block_record(block_key).host_flat.data_ptr())
+                (
+                    block_key,
+                    record.host_flat.data_ptr(),
+                    record.committed_bytes,
+                    pin_manager.is_host_pinned(record.host_flat),
+                    pin_manager.is_arena_backed(record.host_flat),
+                )
                 for block_key in arena.block_keys()
+                for record in (arena.block_record(block_key),)
             ),
-            pin_manager.total_pinned_bytes(),
-            tuple(sorted(pin_manager.pinned_bytes_by_kind().items())),
         )
 
     def _assert_arena_stable(self, where: str) -> None:
@@ -665,11 +670,16 @@ class KreaImmutablePlanExecutor:
 
         if training:
             def train_fn(x, tvec, freqs, mask):
+                # The ordered custom op declares its guard mutated. Do not use the
+                # checkpoint-saved block activation itself as that guard, because the
+                # resulting version bump makes checkpoint backward reject the input.
+                ordering_guard = x.reshape(-1)[:1].clone()
+
                 token = torch.ops.mm.fetch_start_multi_after(
                     host,
                     ranges,
                     nbytes,
-                    x,
+                    ordering_guard,
                 )
                 flat = torch.ops.mm.fetch_wait(token, nbytes)
                 leaf_args = assemble(flat)

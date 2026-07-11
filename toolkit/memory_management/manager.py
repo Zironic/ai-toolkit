@@ -2661,7 +2661,18 @@ class MemoryManager:
             ConvLayerMemoryManager.attach(child, manager)
         else:
             return False
-
+        if (
+            getattr(manager, "_attach_args", {}).get("training_strategy")
+            == "smart_immutable"
+            and any(
+                parameter.requires_grad
+                for parameter in child.parameters(recurse=False)
+            )
+        ):
+            raise RuntimeError(
+                "immutable training attempted to demote a trainable module: "
+                f"{layer_key or child.__class__.__name__}"
+            )
         child._mm_layer_key = (
             layer_key
             or getattr(child, "_mm_layer_key", None)
@@ -2993,7 +3004,17 @@ class MemoryManager:
             cold_growth=not auto_working_reserve,
             block_stream_only=block_stream_only,
         )
-        legacy_ignore = list(dict.fromkeys(planner_ignore + canonical_modules))
+        legacy_ignore_ids = {id(child) for child in legacy_ignore}
+
+        runtime_candidate_ids = {
+            id(child)
+            for _name, child in module.named_modules()
+            if id(child) not in legacy_ignore_ids
+            and (
+                child.__class__.__name__ in LINEAR_MODULES
+                or child.__class__.__name__ in CONV_MODULES
+            )
+        }
         legacy_offload_ids = set(plan["offload_ids"]) - canonical_ids
         cls.attach(
             module,
@@ -3008,9 +3029,15 @@ class MemoryManager:
             use_pinned_arena=False,
         )
         mm = module._memory_manager
+        mm._training_runtime_candidate_ids = set(runtime_candidate_ids)
         mm._smart_training_plan = plan
         mm._training_must_resident_keys = set(
             plan.get("must_resident_layer_keys", ())
+        )
+        runtime_candidate_ids = getattr(
+            mm,
+            "_training_runtime_candidate_ids",
+            None,
         )
         mm._training_pinned_resident_keys = pinned_resident_keys
         mm._training_block_stream_only = bool(block_stream_only)
@@ -3224,7 +3251,7 @@ class MemoryManager:
             cls._streaming_block_parents(item["group_key"] for item in layout)
             if block_only else set()
         )
-
+        
         def _streamable(item):
             if not block_only:
                 return True
@@ -3236,6 +3263,14 @@ class MemoryManager:
             if not item["managed"]
             and not item.get("pinned_resident")
             and item["name"] not in must_resident_keys
+            and (
+                runtime_candidate_ids is None
+                or id(item["module"]) in runtime_candidate_ids
+            )
+            and not any(
+                parameter.requires_grad
+                for parameter in item["module"].parameters(recurse=False)
+            )
             and _streamable(item)
         ]
         candidates.sort(
@@ -3251,6 +3286,22 @@ class MemoryManager:
             cls._refresh_training_plan_from_layout(module, mm)
             cls.reset_trace_due_to_execution_shape_change()
             cls._clear_cuda_pipeline_state()
+
+        demoted_names = []
+
+        for item in candidates[: max(0, int(count))]:
+            if cls.demote_layer(
+                item["module"],
+                mm,
+                layer_key=item["name"],
+            ):
+                changed += 1
+                demoted_names.append(item["name"])
+        if demoted_names and cls._diagnostics_enabled():
+            print(
+                "[MemoryManager] training demoted modules: "
+                + ", ".join(demoted_names)
+            )
         return changed
 
     @classmethod
@@ -3486,7 +3537,7 @@ class MemoryManager:
             hard_gib,
             float(_env("AI_TOOLKIT_TRAINING_WDDM_STOP_GIB", str(hard_gib + 0.5))),
         )
-        retreat_layers = max(1, int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "3")))
+        retreat_layers = max(1, int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "1")))
         max_demote = int(_env("AI_TOOLKIT_TRAINING_SAFETY_MAX_DEMOTE", "12"))
 
         def _pressure():
@@ -3659,7 +3710,7 @@ class MemoryManager:
         pad_gib = float(_env("AI_TOOLKIT_TRAINING_WORKING_RESERVE_PAD_GIB", "0.5"))
         step_gib = float(_env("AI_TOOLKIT_TRAINING_WORKING_RESERVE_STEP_GIB", "0.5"))
         retreat_gib = float(_env("AI_TOOLKIT_TRAINING_RETREAT_GIB", "1.0"))
-        retreat_layers = int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "3"))
+        retreat_layers = int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "1"))
         promote_interval = int(_env("AI_TOOLKIT_TRAINING_PROMOTE_INTERVAL", "4"))
         cache_pad_gib = float(_env("AI_TOOLKIT_TRAINING_CACHE_PAD_GIB", "0.25"))
         min_working_reserve_gib = float(_env("AI_TOOLKIT_TRAINING_MIN_WORKING_RESERVE_GIB", "1.5"))
@@ -4087,7 +4138,7 @@ class MemoryManager:
             float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0")),
             float(plan.get("wddm_hard_bytes", 0)) / gib,
         )
-        retreat_layers = max(1, int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "3")))
+        retreat_layers = max(1, int(_env("AI_TOOLKIT_TRAINING_RETREAT_LAYERS", "1")))
         max_demote = int(_env("AI_TOOLKIT_TRAINING_SAFETY_MAX_DEMOTE", "12"))
         target_gib = max(
             hard_gib,
