@@ -1,6 +1,13 @@
 # In-Graph Weight Streaming — Full Implementation Plan
 
 > Durable plan. Status lives in a git-bug ticket, not here.
+> Architecture amendment (2026-07-10):
+> `IMMUTABLE_TRANSFER_ARENA_PLAN.md` supersedes component 1's mutable
+> arena/residency ownership boundary. Keep attach-time persistent block-flat
+> storage and the fetch/checkpoint machinery, but host-arena validity must no
+> longer depend on live Parameter storage or promotion/demotion. The amendment
+> is authoritative for new arena, sidecar-residency, and phase-lifecycle work.
+
 > Parent: `COMPILE_STREAMED_OFFLOAD_PLAN.md` ("Theoretical endpoint" section —
 > this plan is that endpoint, made concrete). Shared prerequisites live in that
 > plan's Slice 1 (grad-safe FP8 linear) and Slice 2 (LoRA compile-clean path).

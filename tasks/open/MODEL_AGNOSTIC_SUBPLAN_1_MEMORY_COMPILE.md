@@ -1,5 +1,13 @@
 # Subplan 1 of 4 -- Model-Agnostic Memory + Compile + Linux
 
+> Sequencing amendment (2026-07-10): the broad adapter/compile extraction is
+> paused behind `IMMUTABLE_TRANSFER_ARENA_PLAN.md` (ticket `628b0cb`). The
+> independent Linux pin-headroom and block-name hardcode fixes may proceed, but
+> do not extract the current arena generation/restoration boundary into shared
+> APIs. Resume the model adapters after the immutable arena, sidecar residency,
+> and execution-plan interfaces stabilize.
+
+
 Part of the "model-agnostic memory/compile layer" effort. Independent of the FP8/quant
 subplans (4a, 2, 3); it can start now against today's FP8 functions. See sibling docs
 `MODEL_AGNOSTIC_SUBPLAN_4A_QUANT_SEAM.md`, `..._2_FP8_FORWARD.md`, `..._3_FP8_BACKWARD.md`,

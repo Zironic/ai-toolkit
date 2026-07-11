@@ -47,9 +47,17 @@ before relying on details.
 
 ## Known state (verify before trusting -- this section rots fastest)
 
-As of 2026-07: in-graph weight streaming Phases 0-3 done (all-28
-fully-streamed smoke passed); next was Phase 4-pre resident training
-compile. Pinned packs draw from the pin manager with a spill floor; the
-direction of travel is a persistent pinned block-flat arena shared by all
-consumers (tickets `534ea49`, `763bb75`) because unpin/repin is never
-instant (0.6-2 GB/s).
+As of 2026-07-10: in-graph weight streaming Phases 0-3 done (all-28
+fully-streamed smoke passed). The pin-assumption measurement campaign
+(`scripts/bench_pin_assumptions.py`) killed two beliefs: registration of
+RAM-resident pages is ms-scale (~150 GiB/s, NOT 0.6-2 GB/s), and
+**Dynamo is indifferent to pinnedness and host-flat identity** -- swapping
+a same-shaped host flat, even via a fresh closure per boundary, causes zero
+recompiles, so the production sampling-boundary recompiles have an
+undiagnosed guard cause (task I2 in the plan; diagnose with
+`TORCH_LOGS=recompiles,guards` before designing around it). The settled
+direction is the canonical host arena + manager-owned GPU sidecar
+residency plan in `tasks/open/IMMUTABLE_TRANSFER_ARENA_PLAN.md` (ticket
+`628b0cb`): one-time Parameter canonicalization, no runtime repointing,
+per-Linear residency via static multi-range compact transfers (Python
+submission, ~11 us/copy), compile keyed by residency/layout fingerprint.

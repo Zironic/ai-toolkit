@@ -39,9 +39,22 @@ model onto the card, where the uncapped run crashed somewhere downstream.
 
 ## Pinned host memory economics
 
-- Page-locking is per-page kernel work: **0.6-2 GB/s** on consumer Windows.
-  Large pin/unpin is seconds, never free. Design accordingly: persistent
-  pinned arenas that get repointed beat phase-boundary repinning.
+- MEASURED 2026-07-10 (scripts/bench_pin_assumptions.py): `cudaHostRegister`
+  on **RAM-resident (populated) pages is ms-scale, ~150 GiB/s** (3 ms/600 MiB,
+  27 ms/4 GiB); untouched demand-zero pages ~9 GiB/s; unregister ~33 ms/600
+  MiB; per-call overhead ~100-145 us; threading does not help. The old
+  "0.6-2 GB/s, pin/unpin is seconds" figure was an artifact of per-tensor
+  churn, multi-GiB copies, settle waits, and (plausibly) pagefile faults
+  after unpinning under RAM pressure -- the ONE regime where repin is slow.
+  Persistent pinned arenas remain the right default as **pagefile
+  protection**, not because registration is expensive. Always populate a
+  buffer BEFORE registering it (20x cheaper than register-then-populate).
+- Also measured: Dynamo/compile is completely indifferent to pinnedness and
+  to host-flat identity (same-shape swaps, even via fresh closures, cause
+  zero recompiles). Pinnedness gates in compile paths are our policy code.
+- Multi-range H2D submission from Python costs ~11 us/copy (24 ranges on a
+  384 MiB block = 0.39 ms submit, GPU bandwidth unaffected) -- no native
+  transfer runtime is justified.
 - Anything pinned through torch's caching host allocator (`pin_memory=True`,
   every `non_blocking=True` D2H staging buffer) is **retained page-locked for
   process lifetime** on free -- it keeps committing against the DXGI budget
