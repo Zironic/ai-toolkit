@@ -1510,16 +1510,36 @@ class MemoryManager:
 
             setattr(container, attribute, _fp8_forward)
             child._memory_management_training_compile_fp8 = True
-            restores.append((container, attribute, original_forward, child))
+            restores.append(
+                (
+                    container,
+                    attribute,
+                    original_forward,
+                    _fp8_forward,
+                    child,
+                )
+            )
             resident_layers += 1
         return restores, resident_layers
 
     @staticmethod
     def _disable_fp8_training_compile(module, restores):
-        for container, attribute, original_forward, child in reversed(restores):
-            setattr(container, attribute, original_forward)
+        for (
+            container,
+            attribute,
+            original_forward,
+            installed_forward,
+            child,
+        ) in reversed(restores):
+            current_forward = getattr(container, attribute, None)
+
+            # Restore only if our compiled wrapper still owns the slot.
+            if current_forward is installed_forward:
+                setattr(container, attribute, original_forward)
+
             if hasattr(child, "_memory_management_training_compile_fp8"):
                 del child._memory_management_training_compile_fp8
+
         for child in module.modules():
             if hasattr(child, "_memory_management_training_compile_fp8"):
                 del child._memory_management_training_compile_fp8
@@ -1901,7 +1921,11 @@ class MemoryManager:
         non_candidate_bytes = max(0, total_model_bytes - candidate_resident_bytes)
         must_tokens = tuple(must_resident_keys or ())
         pinned_keys = set(pinned_resident_keys or ())
-
+        must_resident_layer_keys = {
+            item["key"]
+            for item in candidates
+            if any(token and token in item["key"] for token in must_tokens)
+        }
         # Block-only streaming: in ``block_stream_only`` mode every layer that is
         # NOT part of a repeated transformer block (a ModuleList of indexed
         # entries, e.g. ``blocks.0`` .. ``blocks.37``) is forced resident, so the
@@ -1931,7 +1955,7 @@ class MemoryManager:
             if (
                 item["pinned_resident"]
                 or item["block_stream_resident"]
-                or any(token and token in item["key"] for token in must_tokens)
+                or item["key"] in must_resident_layer_keys
             ):
                 resident.append(item)
             else:
@@ -2035,6 +2059,7 @@ class MemoryManager:
             "model_bytes": total_model_bytes,
             "resident_bytes": resident_bytes,
             "must_resident_bytes": must_resident_bytes,
+            "must_resident_layer_keys": set(must_resident_layer_keys),
             "pinned_resident_bytes": pinned_resident_bytes,
             "pinned_resident_keys": set(pinned_keys),
             "block_stream_only": bool(block_stream_only),
@@ -2622,15 +2647,13 @@ class MemoryManager:
 
     @classmethod
     def demote_layer(cls, child, manager, layer_key=None):
-        """Stream one resident layer, in place (resident -> offloaded).
-
-        Reuses the per-layer manager attach, which moves ``param.data`` to
-        pinned CPU and installs the streaming forward without replacing the
-        Parameter — again preserving identity for the optimizer. Returns True
-        if a transition happened.
-        """
         if child is None or hasattr(child, "_layer_memory_manager"):
             return False
+
+        # Remove resident/compiled forward wrappers before installing the
+        # streaming forward. Otherwise compile teardown can overwrite it.
+        cls._invalidate_compiled_blocks(manager.module)
+
         name = child.__class__.__name__
         if name in LINEAR_MODULES:
             LinearLayerMemoryManager.attach(child, manager)
@@ -2638,9 +2661,13 @@ class MemoryManager:
             ConvLayerMemoryManager.attach(child, manager)
         else:
             return False
-        child._mm_layer_key = layer_key or getattr(child, "_mm_layer_key", None) or name
+
+        child._mm_layer_key = (
+            layer_key
+            or getattr(child, "_mm_layer_key", None)
+            or name
+        )
         cls._refresh_resident_trace_hooks(manager.module, manager)
-        cls._invalidate_compiled_blocks(manager.module)
         return True
 
     @staticmethod
@@ -2815,6 +2842,9 @@ class MemoryManager:
             use_pinned_arena=use_pinned_arena,
         )
         module._memory_manager._smart_training_plan = plan
+        module._memory_manager._training_must_resident_keys = set(
+            plan.get("must_resident_layer_keys", ())
+        )
         module._memory_manager._training_pinned_resident_keys = set(pinned_resident_keys)
         module._memory_manager._training_block_stream_only = bool(block_stream_only)
         # Slice 2 (per-block GPU forward staging) is OFF by default and gated
@@ -2979,6 +3009,9 @@ class MemoryManager:
         )
         mm = module._memory_manager
         mm._smart_training_plan = plan
+        mm._training_must_resident_keys = set(
+            plan.get("must_resident_layer_keys", ())
+        )
         mm._training_pinned_resident_keys = pinned_resident_keys
         mm._training_block_stream_only = bool(block_stream_only)
         mm._training_autotune_enabled = False
@@ -3026,8 +3059,14 @@ class MemoryManager:
     def _refresh_training_plan_from_layout(cls, module, mm, working_reserve_gib=None):
         old_plan = getattr(mm, "_smart_training_plan", {}) or {}
         args = getattr(mm, "_attach_args", {}) or {}
-        ignore = args.get("ignore_modules", [])
         pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
+        must_resident_keys = set(
+            getattr(mm, "_training_must_resident_keys", set())
+        )
+
+        layout = list(cls._training_layout_candidates(
+            module, args.get("ignore_modules", []), pinned_keys
+        ))
         device = torch.device(args.get("device", mm.process_device))
         gib = 1024 ** 3
         if working_reserve_gib is None:
@@ -3174,9 +3213,11 @@ class MemoryManager:
             return cls._block_parent_of(item["group_key"]) in block_parents
 
         candidates = [
-            item for item in layout
+            item
+            for item in layout
             if not item["managed"]
             and not item.get("pinned_resident")
+            and item["name"] not in must_resident_keys
             and _streamable(item)
         ]
         candidates.sort(

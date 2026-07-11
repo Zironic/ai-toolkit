@@ -84,144 +84,7 @@ def _resident_args(sidecar, kind: str):
         f"resident_sidecar_layout_mismatch:{sidecar.key[0]}.{sidecar.key[1]}"
     )
 
-def activate_sampling_image(
-    self,
-    *,
-    shape_key: tuple,
-    cold_working_bytes: int,
-    fixed_working_bytes: int | None,
-    cold_floor_bytes: int,
-    hot_floor_bytes: int,
-    measured_pad_bytes: int = 256 * 1024**2,
-    measured_floor_bytes: int = 512 * 1024**2,
-) -> KreaPlanProgram:
-    """Choose and activate the sampling layout for one image.
 
-    The cold image uses the shape estimate and planning margin. Once this
-    shape has a measurement, subsequent images use the measured peak and
-    defend only the WDDM hard floor plus hysteresis.
-    """
-    device = self.residency.device
-    if device.type != "cuda":
-        return self.activate(self.SAMPLE, self.sampling_fallback_plan)
-
-    learned = int(self._sampling_working_bytes.get(shape_key, 0))
-
-    if fixed_working_bytes is not None:
-        working_bytes = max(0, int(fixed_working_bytes))
-        floor_bytes = max(0, int(cold_floor_bytes))
-        reserve_source = "fixed"
-    elif learned > 0:
-        working_bytes = max(
-            int(measured_floor_bytes),
-            learned + int(measured_pad_bytes),
-        )
-        floor_bytes = max(0, int(hot_floor_bytes))
-        reserve_source = "measured"
-    else:
-        working_bytes = max(0, int(cold_working_bytes))
-        floor_bytes = max(0, int(cold_floor_bytes))
-        reserve_source = "cold"
-
-    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
-    allocated_bytes = torch.cuda.memory_allocated(device)
-    reserved_bytes = torch.cuda.memory_reserved(device)
-    reclaimable_cache = max(0, reserved_bytes - allocated_bytes)
-
-    current_sidecars = self.residency.resident_bytes()
-
-    # If target sidecars occupy T bytes, peak free is approximately:
-    #
-    #   current_free
-    #   + current_sidecars
-    #   + reclaimable allocator cache
-    #   - T
-    #   - sampling working set
-    #
-    # Solve for T while preserving the selected WDDM floor.
-    resident_budget = max(
-        0,
-        current_sidecars
-        + int(free_bytes)
-        + reclaimable_cache
-        - working_bytes
-        - floor_bytes,
-    )
-
-    plan = ResidencyPlan.fit_whole_blocks(
-        self.residency.arena,
-        resident_budget,
-        phase=self.SAMPLE,
-        prefer_resident_keys=self.residency.plan.resident_leaf_keys,
-    )
-
-    program = self.activate(self.SAMPLE, plan)
-
-    torch.cuda.synchronize(device)
-
-    baseline_allocated = torch.cuda.memory_allocated(device)
-    baseline_reserved = torch.cuda.memory_reserved(device)
-    torch.cuda.reset_peak_memory_stats(device)
-
-    self._sampling_baseline = {
-        "shape_key": shape_key,
-        "allocated": baseline_allocated,
-        "reserved": baseline_reserved,
-        "working_bytes": working_bytes,
-        "floor_bytes": floor_bytes,
-        "source": reserve_source,
-    }
-
-    print(
-        "[MemoryManager] immutable sampling layout: "
-        f"source={reserve_source} "
-        f"working={working_bytes / 1024**3:.2f} GiB "
-        f"floor={floor_bytes / 1024**3:.2f} GiB "
-        f"sidecars={self.residency.resident_bytes() / 1024**3:.2f} GiB "
-        f"device_free={torch.cuda.mem_get_info(device)[0] / 1024**3:.2f} GiB "
-        f"plan={plan.fingerprint}"
-    )
-
-    return program
-
-
-def finish_sampling_image(self, *, shape_key: tuple) -> int:
-    """Record the real non-sidecar peak for this sampling shape."""
-    baseline = self._sampling_baseline
-    if baseline is None or baseline["shape_key"] != shape_key:
-        return 0
-
-    device = self.residency.device
-    torch.cuda.synchronize(device)
-
-    allocated_peak = torch.cuda.max_memory_allocated(device)
-    reserved_peak = torch.cuda.max_memory_reserved(device)
-
-    allocated_growth = max(
-        0,
-        allocated_peak - int(baseline["allocated"]),
-    )
-    reserved_growth = max(
-        0,
-        reserved_peak - int(baseline["reserved"]),
-    )
-
-    # Allocated growth catches work that reused existing allocator cache.
-    # Reserved growth catches newly committed allocator high-water.
-    observed = max(allocated_growth, reserved_growth)
-
-    previous = int(self._sampling_working_bytes.get(shape_key, 0))
-    self._sampling_working_bytes[shape_key] = max(previous, observed)
-    self._sampling_baseline = None
-
-    print(
-        "[MemoryManager] immutable sampling measurement: "
-        f"shape={shape_key} "
-        f"observed_working={observed / 1024**3:.2f} GiB "
-        f"learned={self._sampling_working_bytes[shape_key] / 1024**3:.2f} GiB"
-    )
-
-    return observed
 class KreaImmutableArenaAdapter:
     """Run Krea2 blocks from resident sidecars or compact fetched views.
 
@@ -474,7 +337,144 @@ class KreaImmutablePlanExecutor:
         self.sampling_fallback_plan = ResidencyPlan.build("sample_fallback", ())
         self._arena_signature = self._capture_arena_signature()
         configure_fetch_runtime(depth=self.depth)
+    def activate_sampling_image(
+        self,
+        *,
+        shape_key: tuple,
+        cold_working_bytes: int,
+        fixed_working_bytes: int | None,
+        cold_floor_bytes: int,
+        hot_floor_bytes: int,
+        measured_pad_bytes: int = 256 * 1024**2,
+        measured_floor_bytes: int = 512 * 1024**2,
+    ) -> KreaPlanProgram:
+        """Choose and activate the sampling layout for one image.
 
+        The cold image uses the shape estimate and planning margin. Once this
+        shape has a measurement, subsequent images use the measured peak and
+        defend only the WDDM hard floor plus hysteresis.
+        """
+        device = self.residency.device
+        if device.type != "cuda":
+            return self.activate(self.SAMPLE, self.sampling_fallback_plan)
+
+        learned = int(self._sampling_working_bytes.get(shape_key, 0))
+
+        if fixed_working_bytes is not None:
+            working_bytes = max(0, int(fixed_working_bytes))
+            floor_bytes = max(0, int(cold_floor_bytes))
+            reserve_source = "fixed"
+        elif learned > 0:
+            working_bytes = max(
+                int(measured_floor_bytes),
+                learned + int(measured_pad_bytes),
+            )
+            floor_bytes = max(0, int(hot_floor_bytes))
+            reserve_source = "measured"
+        else:
+            working_bytes = max(0, int(cold_working_bytes))
+            floor_bytes = max(0, int(cold_floor_bytes))
+            reserve_source = "cold"
+
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+        allocated_bytes = torch.cuda.memory_allocated(device)
+        reserved_bytes = torch.cuda.memory_reserved(device)
+        reclaimable_cache = max(0, reserved_bytes - allocated_bytes)
+
+        current_sidecars = self.residency.resident_bytes()
+
+        # If target sidecars occupy T bytes, peak free is approximately:
+        #
+        #   current_free
+        #   + current_sidecars
+        #   + reclaimable allocator cache
+        #   - T
+        #   - sampling working set
+        #
+        # Solve for T while preserving the selected WDDM floor.
+        resident_budget = max(
+            0,
+            current_sidecars
+            + int(free_bytes)
+            + reclaimable_cache
+            - working_bytes
+            - floor_bytes,
+        )
+
+        plan = ResidencyPlan.fit_whole_blocks(
+            self.residency.arena,
+            resident_budget,
+            phase=self.SAMPLE,
+            prefer_resident_keys=self.residency.plan.resident_leaf_keys,
+        )
+
+        program = self.activate(self.SAMPLE, plan)
+
+        torch.cuda.synchronize(device)
+
+        baseline_allocated = torch.cuda.memory_allocated(device)
+        baseline_reserved = torch.cuda.memory_reserved(device)
+        torch.cuda.reset_peak_memory_stats(device)
+
+        self._sampling_baseline = {
+            "shape_key": shape_key,
+            "allocated": baseline_allocated,
+            "reserved": baseline_reserved,
+            "working_bytes": working_bytes,
+            "floor_bytes": floor_bytes,
+            "source": reserve_source,
+        }
+
+        print(
+            "[MemoryManager] immutable sampling layout: "
+            f"source={reserve_source} "
+            f"working={working_bytes / 1024**3:.2f} GiB "
+            f"floor={floor_bytes / 1024**3:.2f} GiB "
+            f"sidecars={self.residency.resident_bytes() / 1024**3:.2f} GiB "
+            f"device_free={torch.cuda.mem_get_info(device)[0] / 1024**3:.2f} GiB "
+            f"plan={plan.fingerprint}"
+        )
+
+        return program
+
+
+    def finish_sampling_image(self, *, shape_key: tuple) -> int:
+        """Record the real non-sidecar peak for this sampling shape."""
+        baseline = self._sampling_baseline
+        if baseline is None or baseline["shape_key"] != shape_key:
+            return 0
+
+        device = self.residency.device
+        torch.cuda.synchronize(device)
+
+        allocated_peak = torch.cuda.max_memory_allocated(device)
+        reserved_peak = torch.cuda.max_memory_reserved(device)
+
+        allocated_growth = max(
+            0,
+            allocated_peak - int(baseline["allocated"]),
+        )
+        reserved_growth = max(
+            0,
+            reserved_peak - int(baseline["reserved"]),
+        )
+
+        # Allocated growth catches work that reused existing allocator cache.
+        # Reserved growth catches newly committed allocator high-water.
+        observed = max(allocated_growth, reserved_growth)
+
+        previous = int(self._sampling_working_bytes.get(shape_key, 0))
+        self._sampling_working_bytes[shape_key] = max(previous, observed)
+        self._sampling_baseline = None
+
+        print(
+            "[MemoryManager] immutable sampling measurement: "
+            f"shape={shape_key} "
+            f"observed_working={observed / 1024**3:.2f} GiB "
+            f"learned={self._sampling_working_bytes[shape_key] / 1024**3:.2f} GiB"
+        )
+
+        return observed
     # -- arena stability (Endpoint Acceptance Criteria) ---------------------
     def _get_block_kernel(self, index: int, mode: str, fp8_flags):
         """Compiled pure-math block kernel.
