@@ -3056,17 +3056,18 @@ class MemoryManager:
             }
 
     @classmethod
-    def _refresh_training_plan_from_layout(cls, module, mm, working_reserve_gib=None):
+    def _refresh_training_plan_from_layout(
+        cls,
+        module,
+        mm,
+        working_reserve_gib=None,
+    ):
         old_plan = getattr(mm, "_smart_training_plan", {}) or {}
         args = getattr(mm, "_attach_args", {}) or {}
-        pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
-        must_resident_keys = set(
-            getattr(mm, "_training_must_resident_keys", set())
+        ignore = args.get("ignore_modules", [])
+        pinned_keys = set(
+            getattr(mm, "_training_pinned_resident_keys", set())
         )
-
-        layout = list(cls._training_layout_candidates(
-            module, args.get("ignore_modules", []), pinned_keys
-        ))
         device = torch.device(args.get("device", mm.process_device))
         gib = 1024 ** 3
         if working_reserve_gib is None:
@@ -3192,12 +3193,29 @@ class MemoryManager:
             for key, child in sources:
                 pool.register_source(key, child)
     @classmethod
-    def _demote_training_layers(cls, module, mm, count, *, largest=True):
+    def _demote_training_layers(
+        cls,
+        module,
+        mm,
+        count,
+        *,
+        largest=True,
+    ):
         args = getattr(mm, "_attach_args", {}) or {}
-        pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
-        layout = list(cls._training_layout_candidates(
-            module, args.get("ignore_modules", []), pinned_keys
-        ))
+        pinned_keys = set(
+            getattr(mm, "_training_pinned_resident_keys", set())
+        )
+        must_resident_keys = set(
+            getattr(mm, "_training_must_resident_keys", set())
+        )
+
+        layout = list(
+            cls._training_layout_candidates(
+                module,
+                args.get("ignore_modules", []),
+                pinned_keys,
+            )
+        )
         # In block_stream_only mode, non-block resident layers are kept resident
         # by design — the live controller must not demote them back to streaming,
         # which would reintroduce the scattered small transfers this mode avoids.

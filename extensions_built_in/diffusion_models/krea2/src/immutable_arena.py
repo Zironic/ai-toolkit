@@ -318,6 +318,8 @@ class KreaImmutablePlanExecutor:
         depth: int = 2,
         compile_blocks: bool = True,
     ) -> None:
+        self._sampling_working_bytes: dict[tuple, int] = {}
+        self._sampling_baseline = None
         self.model = model
         self.residency = residency
         self.loras_by_block = dict(loras_by_block or {})
