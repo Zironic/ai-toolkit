@@ -122,6 +122,14 @@ and the cap are coupled. Evidence: `scripts/bench_gc_threshold_allowance.py`.
 - **Sampling** is forward-only, uses a separate manager, and trusts the
   learned peak + 0.5 GiB pad instead of a flat 2 GiB floor. The
   conservative-vs-paging caution is a training concern; do not port it back.
+- **Sampling residency budgets on the allocated side**: the planner free
+  input is max(driver-free, `0.95*cap - allocated + hard`) via
+  `vram_budget.sampling_allocator_budget_free_bytes` -- driver-free counts
+  torch's reclaimable idle cache as used and would under-promote. GC health
+  per training window is in the perf log (`alloc_retries_delta`,
+  `cuda_free_count_delta`); the digest prints an "Allocator GC" summary and
+  per-window `reclaimable_at_peak`. `scripts/smoke_krea2_ingraph_cuda.py
+  --cap-descent` measures a phase's true footprint floor empirically.
 - Every ring/reserve resize destroys prefetch state. Aim for a no-resize
   stable band, not continuous adaptation.
 

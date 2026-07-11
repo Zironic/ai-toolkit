@@ -315,6 +315,33 @@ def summarize_records(records: list[dict]) -> list[str]:
                 conf=" ".join(f"{k}={v}" for k, v in sorted(confidence.items())),
             )
         )
+    gc_rows = [
+        r.get("smart_training_offload") or {}
+        for r in records
+        if (r.get("smart_training_offload") or {}).get("alloc_retries_delta") is not None
+    ]
+    if gc_rows:
+        retries = [int(row.get("alloc_retries_delta") or 0) for row in gc_rows]
+        frees = [int(row.get("cuda_free_count_delta") or 0) for row in gc_rows]
+        mallocs = [int(row.get("cuda_malloc_count_delta") or 0) for row in gc_rows]
+        reclaimables = [
+            max(0.0, float(row["peak_reserved_gb"]) - float(row["peak_allocated_gb"]))
+            for row in gc_rows
+            if row.get("peak_reserved_gb") is not None
+            and row.get("peak_allocated_gb") is not None
+        ]
+        lines.append(
+            "Allocator GC: windows={n} retries={r} (windows_with_retries={rw}) "
+            "cudaFree={f} cudaMalloc={m} reclaimable_at_peak avg={ra} max={rx} GiB".format(
+                n=len(gc_rows),
+                r=sum(retries),
+                rw=sum(1 for v in retries if v > 0),
+                f=sum(frees),
+                m=sum(mallocs),
+                ra=g(sum(reclaimables) / len(reclaimables)) if reclaimables else "-",
+                rx=g(max(reclaimables)) if reclaimables else "-",
+            )
+        )
     dxgi_rows = [
         r.get("smart_training_offload") or {}
         for r in records
@@ -477,6 +504,26 @@ def summarize_record(record: dict, full: bool) -> list[str]:
                 fp8=offload.get("fp8_training_forward_layers"),
             )
         )
+        if offload.get("alloc_retries_delta") is not None:
+            reclaimable = None
+            if (
+                offload.get("peak_reserved_gb") is not None
+                and offload.get("peak_allocated_gb") is not None
+            ):
+                reclaimable = max(
+                    0.0,
+                    float(offload["peak_reserved_gb"])
+                    - float(offload["peak_allocated_gb"]),
+                )
+            lines.append(
+                "  alloc_gc: retries=+{r} cudaMalloc=+{m} cudaFree=+{f} "
+                "reclaimable_at_peak={rec} GiB".format(
+                    r=offload.get("alloc_retries_delta"),
+                    m=offload.get("cuda_malloc_count_delta"),
+                    f=offload.get("cuda_free_count_delta"),
+                    rec=g(reclaimable),
+                )
+            )
         if offload.get("bounce_fill_batches") is not None:
             # Worker-side request count (the "small requests by the workers").
             # fill_batches = worker lock-cycles; group>1 means block-batched.

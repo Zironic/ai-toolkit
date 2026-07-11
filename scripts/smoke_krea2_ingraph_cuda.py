@@ -527,6 +527,19 @@ def _parse_args():
             "trainer uses via ModelConfig.compile_cache_dir)."
         ),
     )
+    parser.add_argument(
+        "--cap-descent", action="store_true",
+        help=(
+            "After the measured sample, probe torch's true sampling footprint: "
+            "lower the allocator fraction cap one notch at a time and re-sample "
+            "until GC churn/retries/slowdown appear. Reports the minimum viable "
+            "cap (true need incl. fragmentation) vs the unrestricted footprint. "
+            "Run with PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.95 for "
+            "production parity (run.py sets it on real jobs)."
+        ),
+    )
+    parser.add_argument("--cap-descent-step-gib", type=float, default=0.25)
+    parser.add_argument("--cap-descent-max-notches", type=int, default=16)
     parser.add_argument("--strict-ingraph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ingraph-depth", type=int, default=2)
     parser.add_argument("--ingraph-stream-all", action="store_true")
@@ -741,6 +754,150 @@ def main():
         }
         return image, result
 
+    def _run_cap_descent():
+        """Measure true sampling need vs unrestricted use via cap descent.
+
+        Lowers the allocator fraction cap one notch per round and re-samples.
+        Each notch runs a settle pass (absorbs the one-time stale-cache sweep
+        the tighter cap forces on its first fresh malloc) and then a measured
+        pass. A notch is dirty when the measured pass shows OOM-retry
+        reclaims, sustained cudaFree churn, or a big slowdown -- the previous
+        notch's cap is then the minimum viable footprint (peak live
+        allocations + fragmentation slack). The manager's cap is restored
+        afterwards.
+        """
+        gib = 1024 ** 3
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        total_b = torch.cuda.get_device_properties(index).total_memory
+        base_fraction = MemoryManager._wddm_hard_cap_applied.get(index)
+        if base_fraction is None:
+            base_fraction = 1.0
+        base_cap_b = base_fraction * total_b
+        alloc_conf = os.environ.get(
+            "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        )
+        gc_threshold_active = "garbage_collection_threshold" in alloc_conf
+
+        def _gc_counters():
+            stats = torch.cuda.memory_stats(index)
+            return {
+                "retries": int(stats.get("num_alloc_retries", 0)),
+                "frees": int(stats.get("num_device_free", 0)),
+                "mallocs": int(stats.get("num_device_alloc", 0)),
+            }
+
+        def _measured_pass(label):
+            torch.cuda.synchronize(index)
+            torch.cuda.reset_peak_memory_stats(index)
+            before = _gc_counters()
+            started = time.perf_counter()
+            _image, _res = _run_sample(
+                label,
+                args.steps,
+                ".codex/krea2_cap_descent.png",
+                keep_ingraph=False,
+            )
+            torch.cuda.synchronize(index)
+            after = _gc_counters()
+            return {
+                "seconds": time.perf_counter() - started,
+                "retries_delta": after["retries"] - before["retries"],
+                "cuda_free_delta": after["frees"] - before["frees"],
+                "cuda_malloc_delta": after["mallocs"] - before["mallocs"],
+                "peak_alloc_gib": _gib(torch.cuda.max_memory_allocated(index)),
+                "peak_reserved_gib": _gib(torch.cuda.max_memory_reserved(index)),
+            }
+
+        notches = []
+        baseline_seconds = None
+        floor_cap_b = None
+        stop_reason = "max_notches"
+        step_b = int(args.cap_descent_step_gib * gib)
+        try:
+            for notch in range(int(args.cap_descent_max_notches)):
+                cap_b = base_cap_b - notch * step_b
+                if cap_b <= 0:
+                    stop_reason = "cap_exhausted"
+                    break
+                torch.cuda.set_per_process_memory_fraction(cap_b / total_b, index)
+                try:
+                    if notch > 0:
+                        # Settle pass: absorb the one-time sweep at the new cap.
+                        _run_sample(
+                            f"cap_descent_settle_{notch}",
+                            args.steps,
+                            ".codex/krea2_cap_descent.png",
+                            keep_ingraph=False,
+                        )
+                    measured = _measured_pass(f"cap_descent_measure_{notch}")
+                except torch.cuda.OutOfMemoryError as error:
+                    notches.append(
+                        {"cap_gib": _gib(cap_b), "oom": repr(error)[:200]}
+                    )
+                    stop_reason = "oom"
+                    break
+                measured["cap_gib"] = _gib(cap_b)
+                notches.append(measured)
+                if baseline_seconds is None:
+                    baseline_seconds = measured["seconds"]
+                dirty = (
+                    measured["retries_delta"] > 0
+                    or measured["cuda_free_delta"] > 2
+                    or measured["seconds"] > 1.5 * baseline_seconds
+                )
+                measured["dirty"] = dirty
+                print(
+                    f"[smoke] cap descent notch {notch}: cap={cap_b / gib:.2f} GiB "
+                    f"seconds={measured['seconds']:.2f} "
+                    f"retries=+{measured['retries_delta']} "
+                    f"cudaFree=+{measured['cuda_free_delta']} "
+                    f"peak_alloc={measured['peak_alloc_gib']:.2f} "
+                    f"peak_reserved={measured['peak_reserved_gib']:.2f} "
+                    f"{'DIRTY' if dirty else 'clean'}"
+                )
+                if dirty:
+                    stop_reason = "dirty_notch"
+                    break
+                floor_cap_b = cap_b
+        finally:
+            torch.cuda.set_per_process_memory_fraction(base_fraction, index)
+
+        clean = [n for n in notches if n.get("dirty") is False]
+        peak_alloc_max = max(
+            (n["peak_alloc_gib"] for n in clean), default=None
+        )
+        summary = {
+            "event": "cap_descent",
+            "base_cap_gib": _gib(base_cap_b),
+            "floor_cap_gib": None if floor_cap_b is None else _gib(floor_cap_b),
+            "stop_reason": stop_reason,
+            "gc_threshold_active": gc_threshold_active,
+            "peak_alloc_max_gib": peak_alloc_max,
+            # Fragmentation slack: what the minimum viable footprint carries
+            # beyond peak live allocations. With gc_threshold the effective
+            # reserve ceiling is threshold*cap, without it the cap itself.
+            "slack_gib": (
+                None
+                if floor_cap_b is None or peak_alloc_max is None
+                else max(
+                    0.0,
+                    _gib(floor_cap_b) * (0.95 if gc_threshold_active else 1.0)
+                    - peak_alloc_max,
+                )
+            ),
+            "reclaimable_vs_base_gib": (
+                None
+                if floor_cap_b is None
+                else max(0.0, _gib(base_cap_b) - _gib(floor_cap_b))
+            ),
+            "notches": notches,
+        }
+        rows.append(summary)
+        _print_json(summary)
+        return summary
+
     compile_label = "compile_sample" if config.compile_sample else "compile disabled"
     print(f"[smoke] sampling with MemoryManager.inference_resident and {compile_label}")
     transformer._ingraph_sampling_measure = False
@@ -840,6 +997,9 @@ def main():
                 args.output,
                 keep_ingraph=False,
             )
+            if args.cap_descent:
+                print("[smoke] cap descent probe: true need vs unrestricted use")
+                _run_cap_descent()
         sampling_context_seconds = time.perf_counter() - sampling_context_started
         compile_state = measured_result["compile"]
         ingraph_timing = measured_result["ingraph_timing"]

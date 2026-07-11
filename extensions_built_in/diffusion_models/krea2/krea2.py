@@ -814,6 +814,18 @@ class Krea2Model(BaseModel):
         transformer._mm_canonical_arena = arena
         transformer._mm_residency_state = residency
         transformer._mm_immutable_training_plan = training_plan
+        must_resident_names = set(
+            smart_plan.get("must_resident_layer_keys", ())
+        )
+        pinned_resident_blocks = set(
+            smart_plan.get("pinned_resident_keys", ())
+        )
+        transformer._mm_immutable_protected_training_leaf_keys = frozenset(
+            key
+            for key in training_plan.resident_leaf_keys
+            if key[0] in pinned_resident_blocks
+            or f"{key[0]}.{key[1]}" in must_resident_names
+        )
         transformer._mm_immutable_smart_plan = smart_plan
         transformer._mm_immutable_canonical_modules = tuple(canonical_modules)
         transformer._mm_immutable_backend = True

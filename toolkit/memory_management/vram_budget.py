@@ -174,6 +174,41 @@ def cap_fraction(total_bytes, free_bytes, reserved_bytes, hard_gib) -> float:
     return max(0.1, min(1.0, cap_bytes / total))
 
 
+def sampling_allocator_budget_free_bytes(
+    total_bytes,
+    allocated_bytes,
+    cap_fraction,
+    hard_bytes,
+    *,
+    gc_threshold=0.95,
+):
+    """Allocated-side equivalent of driver-free for the sampling planner (pure).
+
+    Driver-free counts torch's idle cached segments as *used*, so a plan built
+    from it refuses residency that the allocator cap's GC would reclaim on
+    demand. The allocator-side capacity is governed by the gc target
+    (``gc_threshold * cap``): live allocations may safely grow to it, and the
+    planner's margin beyond the hard floor (which is already inside the cap)
+    stays free below the target as the fragmentation/allowance pad.
+
+    Returned in the same units/meaning as ``mem_get_info`` free so the
+    downstream ``usable = free - working_reserve - margin`` keeps its shape:
+
+        usable = threshold*cap - allocated - working_reserve - (margin - hard)
+
+    Returns ``None`` when no cap fraction is known (non-Windows / cap not
+    applied); callers should then stay on the driver-free number.
+    """
+    if cap_fraction is None:
+        return None
+    cap_bytes = float(cap_fraction) * float(max(1, int(total_bytes)))
+    return int(
+        float(gc_threshold) * cap_bytes
+        - float(max(0, int(allocated_bytes)))
+        + float(max(0, int(hard_bytes)))
+    )
+
+
 def sampling_guard_predicted_peak_free(total_b, free_b, reserved_b, peak_reserved_b):
     """Predicted free VRAM at the next forward's peak (pure).
 
@@ -293,3 +328,217 @@ def training_guard_pressure(dxgi: dict, physical: dict) -> dict:
         src["source"] for src in (dxgi, physical) if src.get("pressure")
     ]
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Two-timescale residency control (see tasks/open/RESIDENCY_TWO_TIMESCALE_PLAN.md)
+#
+# Allowance lives in *target-space* (0.95*cap - live); the allocator cap is set
+# in *cap-space*. The two differ by the gc_threshold factor: a cap raise of ``d``
+# only adds ``gc_threshold * d`` of GC target / allowance. Every conversion below
+# carries the ``/ gc_threshold`` so no call site open-codes it (that missing
+# divisor silently under-reserves and licenses a promotion that immediately binds).
+#
+# All functions here are pure/CPU-testable. The cap and residency levers both act
+# only at phase boundaries, and a cap change is realized lazily -- on the next
+# fresh cudaMalloc, i.e. the next forward()/step -- so the controller reads
+# counters that lag its move by one window (the FSM's verify phases absorb this).
+# ---------------------------------------------------------------------------
+
+GC_THRESHOLD = 0.95
+
+
+def allocator_allowance_bytes(cap_bytes, live_bytes, *, gc_threshold=GC_THRESHOLD) -> int:
+    """Idle-cache allowance under the cap: ``gc_threshold*cap - live`` (pure).
+
+    The caching allocator sweeps idle segments when reserved would cross the GC
+    target ``gc_threshold * cap``; live bytes (residents + ring + activations)
+    count against that target but cannot be freed. So the room left for reusable
+    idle cache -- the buffer between smooth reuse and a fresh-cudaMalloc sweep --
+    is ``gc_threshold*cap - live``. Negative means live alone exceeds the target:
+    every sweep dumps all cache and every reuse re-mallocs (self-sustaining
+    thrash), so callers must keep this positive at the live peak.
+    """
+    return int(float(gc_threshold) * float(max(0, int(cap_bytes))) - float(max(0, int(live_bytes))))
+
+
+def cap_bytes_for_live(
+    planned_live_bytes,
+    cache_budget_bytes,
+    cliff_cap_bytes,
+    *,
+    floor_cap_bytes=0,
+    gc_threshold=GC_THRESHOLD,
+) -> int:
+    """Cap that hosts ``planned_live`` plus an idle-cache budget (pure).
+
+    Inverse of :func:`allocator_allowance_bytes`: to let live grow to
+    ``planned_live`` while keeping ``cache_budget`` of reusable idle cache under
+    the GC target, the cap must be ``(planned_live + cache_budget) / gc_threshold``.
+    Clamped to the WDDM cliff bound above (never license silent paging; see
+    :func:`cap_fraction`) and an optional floor below.
+    """
+    want = (float(max(0, int(planned_live_bytes))) + float(max(0, int(cache_budget_bytes)))) / float(gc_threshold)
+    want = min(want, float(int(cliff_cap_bytes)))
+    want = max(want, float(max(0, int(floor_cap_bytes))))
+    return int(want)
+
+
+def cap_can_host_promotion(
+    live_bytes,
+    block_bytes,
+    slack_pad_bytes,
+    cliff_cap_bytes,
+    *,
+    gc_threshold=GC_THRESHOLD,
+) -> bool:
+    """Can the cheap cap lever (tier 1) absorb one more resident block? (pure).
+
+    Promoting a streamed block to resident raises live by ``block_bytes``. To
+    keep ``slack_pad_bytes`` of allowance afterward, the GC target must reach
+    ``live + block + slack``, i.e. the cap must reach
+    ``(live + block + slack) / gc_threshold``. The cap lever can do this only if
+    that target cap is still under the WDDM cliff bound; otherwise the cap is
+    pinned at the cliff and the allowance must come from lowering live -- an
+    expensive resident demote (tier 2).
+
+    The ``/ gc_threshold`` is load-bearing: a naive ``cliff - cap >= block`` test
+    under-reserves by the 0.95 factor.
+    """
+    need_cap = (
+        float(max(0, int(live_bytes)))
+        + float(max(0, int(block_bytes)))
+        + float(max(0, int(slack_pad_bytes)))
+    ) / float(gc_threshold)
+    return need_cap <= float(int(cliff_cap_bytes))
+
+
+def residency_promote_ok(
+    num_alloc_retries,
+    reclaimable_at_peak_bytes,
+    block_bytes,
+    slack_pad_bytes,
+) -> bool:
+    """Sampling climb gate: convert one streamed block to resident? (pure).
+
+    Approach residency from below (undershoot-and-climb): only add a block when
+    the telemetry proves the room is really there --
+
+      * ``num_alloc_retries == 0`` over the window (nothing cap-binding), AND
+      * ``reclaimable_at_peak`` (= peak_reserved - peak_alloc, idle cache still
+        held AT the allocation peak) exceeds one block plus the pad, so the
+        promotion still leaves ``slack_pad`` of allowance.
+
+    Both must hold: retries can be zero simply because residency is too low, so
+    the reclaimable-at-peak test is what proves there is slack to spend.
+    """
+    if int(num_alloc_retries or 0) > 0:
+        return False
+    return float(reclaimable_at_peak_bytes or 0) > float(block_bytes) + float(slack_pad_bytes)
+
+
+# --- Hysteresis FSM (one transition per phase boundary) ---------------------
+#
+# States mirror the plan's state machine. DEMOTE_REQUIRED is folded into the
+# transition (emit "demote" and land in COLD) since the ring resize is a
+# synchronous boundary transaction, not a state that waits a window.
+
+FSM_COLD = "cold"                          # measurements invalid (post-compile/retrace/demote)
+FSM_STABLE = "stable"                      # clean + eligible for the from-below climb
+FSM_CAP_VERIFY = "cap_verify"              # cap raised, confirming it took
+FSM_PROMOTION_VERIFY = "promotion_verify"  # one block promoted, confirming clean
+FSM_COOLDOWN = "cooldown"                  # re-promotion barred N windows after a rollback
+
+ACT_HOLD = "hold"
+ACT_RAISE_CAP = "raise_cap"
+ACT_PROMOTE = "promote"
+ACT_DEMOTE = "demote"
+ACT_ROLLBACK = "rollback"
+
+
+@dataclass(frozen=True)
+class ResidencyFsmState:
+    name: str = FSM_COLD
+    windows_in_state: int = 0
+
+
+def residency_fsm_step(
+    state: ResidencyFsmState,
+    signals: dict,
+    *,
+    k_clean: int = 2,
+    k_verify: int = 2,
+    cooldown_n: int = 4,
+) -> tuple[ResidencyFsmState, str]:
+    """Advance the residency controller one phase boundary (pure, CPU-testable).
+
+    ``signals`` (all read as bools unless noted):
+      * ``measurements_invalid`` -- a recompile / retrace / layout change happened;
+        every counter read across it is meaningless -> force COLD.
+      * ``binding`` -- retries or external pressure this window (allowance too low).
+      * ``cap_can_relieve`` -- a cap raise can restore the pad at current live
+        (cliff has room); if False under pressure, only a demote can.
+      * ``promote_gate`` -- :func:`residency_promote_ok` verdict (there is slack).
+      * ``cap_covers_promo`` -- the cliff already hosts the promotion with no raise
+        (:func:`cap_can_host_promotion` at the current cap headroom).
+
+    Returns ``(next_state, action)`` with ``action`` in the ``ACT_*`` set. The
+    verify phases each span ``k_verify`` windows because a cap/residency move only
+    shows its signal on the *next* step (the one-window GC lag).
+    """
+    name = state.name
+    w = state.windows_in_state + 1
+
+    invalid = bool(signals.get("measurements_invalid"))
+    binding = bool(signals.get("binding"))
+    cap_relieve = bool(signals.get("cap_can_relieve"))
+    promote_gate = bool(signals.get("promote_gate"))
+    cap_covers = bool(signals.get("cap_covers_promo"))
+
+    def stay(action=ACT_HOLD):
+        return ResidencyFsmState(name, w), action
+
+    def enter(new_name, action=ACT_HOLD):
+        return ResidencyFsmState(new_name, 0), action
+
+    # A demote is a synchronous transaction that invalidates the layout -> COLD.
+    def demote():
+        return ResidencyFsmState(FSM_COLD, 0), ACT_DEMOTE
+
+    if invalid and name not in (FSM_COLD,):
+        return enter(FSM_COLD)
+
+    if name == FSM_COLD:
+        if invalid or binding:
+            return ResidencyFsmState(FSM_COLD, 0 if invalid else w), ACT_HOLD
+        return enter(FSM_STABLE) if w >= k_clean else stay()
+
+    if name == FSM_STABLE:
+        if binding:
+            return enter(FSM_CAP_VERIFY, ACT_RAISE_CAP) if cap_relieve else demote()
+        # Eligible to climb only once the state has held clean for k_clean windows.
+        if promote_gate and w >= k_clean:
+            if cap_covers:
+                return enter(FSM_PROMOTION_VERIFY, ACT_PROMOTE)
+            return enter(FSM_CAP_VERIFY, ACT_RAISE_CAP)  # pre-fund, promote after verify
+        return stay()
+
+    if name == FSM_CAP_VERIFY:
+        if binding:
+            return demote()  # the raise didn't relieve -> shed live
+        return enter(FSM_STABLE) if w >= k_verify else stay()
+
+    if name == FSM_PROMOTION_VERIFY:
+        if w == 1:
+            return stay()  # ignore the first (cold) window: new layout re-primes
+        if binding:
+            return enter(FSM_COOLDOWN, ACT_ROLLBACK)
+        return enter(FSM_STABLE) if w >= k_verify + 1 else stay()
+
+    if name == FSM_COOLDOWN:
+        if binding:
+            return demote()  # demote still allowed during cooldown
+        return enter(FSM_STABLE) if w >= cooldown_n else stay()
+
+    # Unknown state: fail safe to COLD.
+    return enter(FSM_COLD)

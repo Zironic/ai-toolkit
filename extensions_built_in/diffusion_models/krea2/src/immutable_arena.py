@@ -338,6 +338,70 @@ class KreaImmutablePlanExecutor:
         self.sampling_fallback_plan = ResidencyPlan.build("sample_fallback", ())
         self._arena_signature = self.residency.arena.immutable_signature()
         configure_fetch_runtime(depth=self.depth)
+
+    def reduce_training_residency(self, required_relief_bytes: int) -> dict:
+        """Remove adjustable canonical sidecars before singleton fallback.
+
+        Reduction is subset-only and per-Linear: it never promotes a leaf and
+        never touches canonical host Parameters. The normal TRAIN activation
+        path reconciles sidecars, drops stale bindings, and rebuilds the
+        lightweight program over the persistent compiled block kernels.
+        """
+        requested = max(0, int(required_relief_bytes))
+        current = self.residency.plan
+        if current.phase != self.TRAIN:
+            raise KreaImmutableArenaError(
+                f"training_residency_reduction_requires_train:{current.phase}"
+            )
+
+        protected = frozenset(
+            (str(block), str(leaf))
+            for block, leaf in getattr(
+                self.model,
+                "_mm_immutable_protected_training_leaf_keys",
+                (),
+            )
+        )
+        adjustable = set(current.resident_leaf_keys) - set(protected)
+        candidates = sorted(
+            (
+                (self.residency.resident_leaf_bytes(key), key)
+                for key in adjustable
+            ),
+            key=lambda item: (-item[0], item[1]),
+        )
+        removed = []
+        relieved = 0
+        if requested > 0:
+            for nbytes, key in candidates:
+                removed.append(key)
+                relieved += nbytes
+                if relieved >= requested:
+                    break
+
+        if removed:
+            next_keys = set(current.resident_leaf_keys) - set(removed)
+            next_plan = ResidencyPlan.build(self.TRAIN, next_keys)
+            self.activate(self.TRAIN, next_plan)
+            self.model._mm_immutable_training_plan = next_plan
+        else:
+            next_plan = current
+
+        remaining_adjustable = sum(
+            self.residency.resident_leaf_bytes(key)
+            for key in next_plan.resident_leaf_keys
+            if key not in protected
+        )
+        return {
+            "requested_relief_bytes": requested,
+            "relieved_bytes": int(relieved),
+            "removed_leaf_keys": tuple(sorted(removed)),
+            "removed_blocks": tuple(sorted({key[0] for key in removed})),
+            "remaining_adjustable_bytes": int(remaining_adjustable),
+            "remaining_resident_bytes": self.residency.resident_bytes(),
+            "plan": next_plan,
+        }
+
     def activate_sampling_image(
         self,
         *,

@@ -322,6 +322,11 @@ class ResidencyState:
         resident = self._plan.resident_in_block(block_key)
         return tuple(name for name in block.leaf_names if name not in resident)
 
+    def resident_leaf_bytes(self, key: LeafKey) -> int:
+        """Return published sidecar bytes without synchronizing its copy event."""
+        sidecar = self._sidecars.get((str(key[0]), str(key[1])))
+        return 0 if sidecar is None else int(sidecar.nbytes)
+
     def resident_bytes(self) -> int:
         return sum(sidecar.nbytes for sidecar in self._sidecars.values())
 

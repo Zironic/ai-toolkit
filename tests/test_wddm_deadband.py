@@ -257,6 +257,105 @@ class DxgiLocalPrestepGuardTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+    def test_pre_step_guard_reduces_canonical_before_singleton(self):
+        import torch
+        import toolkit.memory_management.manager as manager_mod
+
+        gib = 1024 ** 3
+
+        class FakeManager:
+            process_device = torch.device("cuda:0")
+            _smart_training_plan = {
+                "resident_bytes": 4 * gib,
+                "generic_resident_bytes": 4 * gib,
+                "offloaded_layers": 0,
+                "wddm_margin_bytes": 1 * gib,
+                "wddm_hard_bytes": 1 * gib,
+            }
+            _training_autotune_enabled = True
+
+        class FakeExecutor:
+            def __init__(self):
+                self.calls = []
+
+            def reduce_training_residency(self, required_relief_bytes):
+                self.calls.append(required_relief_bytes)
+                return {
+                    "relieved_bytes": required_relief_bytes,
+                    "removed_leaf_keys": (("blocks.0", "mlp.down"),),
+                    "remaining_adjustable_bytes": 0,
+                }
+
+        class FakeModule:
+            pass
+
+        module = FakeModule()
+        module._memory_manager = FakeManager()
+        module._immutable_plan_executor = FakeExecutor()
+        MemoryManager._record_manual_training_shape_peak(
+            module._memory_manager,
+            (512, 512),
+            peak_allocated_gib=20.0,
+            peak_reserved_gib=20.0,
+        )
+        MemoryManager._record_manual_training_shape_peak(
+            module._memory_manager,
+            (512, 512),
+            peak_allocated_gib=8.0,
+            peak_reserved_gib=20.0,
+        )
+
+        singleton_calls = []
+        old_is_available = manager_mod.torch.cuda.is_available
+        old_reserved = manager_mod.torch.cuda.memory_reserved
+        old_allocated = manager_mod.torch.cuda.memory_allocated
+        old_info = manager_mod.torch.cuda.mem_get_info
+        old_local = MemoryManager._dxgi_local_budget_snapshot_bytes
+        old_demote = MemoryManager._demote_training_layers
+        try:
+            manager_mod.torch.cuda.is_available = lambda: True
+            manager_mod.torch.cuda.memory_reserved = lambda _device: 4 * gib
+            manager_mod.torch.cuda.memory_allocated = lambda _device: 4 * gib
+            manager_mod.torch.cuda.mem_get_info = lambda _device: (4 * gib, 12 * gib)
+            MemoryManager._dxgi_local_budget_snapshot_bytes = staticmethod(
+                lambda _device: {
+                    "budget_bytes": 10 * gib,
+                    "usage_bytes": 8 * gib,
+                    "raw_headroom_bytes": 2 * gib,
+                }
+            )
+            MemoryManager._demote_training_layers = classmethod(
+                lambda cls, *_args, **_kwargs: singleton_calls.append(True) or 1
+            )
+
+            result = MemoryManager.prepare_training_memory_for_shape(
+                module, torch.device("cuda:0"), shape_key=(512, 512)
+            )
+        finally:
+            manager_mod.torch.cuda.is_available = old_is_available
+            manager_mod.torch.cuda.memory_reserved = old_reserved
+            manager_mod.torch.cuda.memory_allocated = old_allocated
+            manager_mod.torch.cuda.mem_get_info = old_info
+            MemoryManager._dxgi_local_budget_snapshot_bytes = old_local
+            MemoryManager._demote_training_layers = old_demote
+
+        self.assertEqual(result["action"], "prestep_reduce_canonical")
+        self.assertEqual(result["demoted_layers"], 0)
+        self.assertEqual(singleton_calls, [])
+        self.assertEqual(len(module._immutable_plan_executor.calls), 1)
+        self.assertEqual(
+            result["canonical_relief"]["relieved_bytes"],
+            result["required_relief_bytes"],
+        )
+        self.assertEqual(
+            module._memory_manager._smart_training_plan["resident_bytes"],
+            1 * gib,
+        )
+        self.assertEqual(
+            result["after"]["reason"],
+            "canonical_layout_changed_relearn_required",
+        )
+
     def test_pre_step_guard_uses_live_peak_then_invalidates_layout(self):
         import torch
         import toolkit.memory_management.manager as manager_mod
@@ -336,12 +435,14 @@ class DxgiLocalPrestepGuardTests(unittest.TestCase):
             MemoryManager._demote_training_layers = old_demote
 
         self.assertEqual(result["source"], "dxgi_local")
+        self.assertEqual(result["action"], "prestep_demote_singleton")
         self.assertEqual(result["before"]["predicted_local_usage_gib"], 12.0)
         self.assertEqual(result["demoted_layers"], 1)
         self.assertEqual(len(calls), 1)
         self.assertFalse(result["after"]["prediction_valid"])
         self.assertEqual(
-            result["after"]["reason"], "layout_changed_relearn_required"
+            result["after"]["reason"],
+            "singleton_layout_changed_relearn_required",
         )
         self.assertTrue(result["shape_peak_invalidated"])
         self.assertIsNone(

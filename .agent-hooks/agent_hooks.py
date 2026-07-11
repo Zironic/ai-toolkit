@@ -577,11 +577,15 @@ def mode_pre_bash() -> int:
             deny_pre_tool(event, f"{bounded_read_hint(path)} Reason: {why}.")
             return 0
 
-    # Claude Code's dedicated PowerShell tool passes a native PS script; it only
-    # needs the output cap, not the PS-in-Bash rewrite (and the rewritten command
-    # must itself be valid PowerShell).
+    # Claude Code's dedicated PowerShell tool and Codex's Windows command tools
+    # pass a native PS script. They only need the output cap, not the PS-in-Bash
+    # rewrite (and the rewritten command must itself be valid PowerShell). Keep
+    # Claude's explicit Bash tool on the POSIX path.
     tool_name = str(event.get("tool_name") or "")
-    if tool_name.lower() == "powershell":
+    native_powershell_tool = tool_name.lower() == "powershell" or (
+        os.name == "nt" and tool_name.lower() != "bash"
+    )
+    if native_powershell_tool:
         if likely_noisy(command):
             payload = json.dumps({"exe": "powershell", "script": command}, ensure_ascii=False)
             updated = dict(ti)

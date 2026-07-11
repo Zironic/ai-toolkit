@@ -2257,6 +2257,24 @@ class MemoryManager:
             return "up"
         return "hold"
 
+    @staticmethod
+    def _gc_counter_deltas(prev, current):
+        """Per-window deltas of allocator GC counters (pure, CPU-testable).
+
+        ``num_alloc_retries`` ticks once per OOM-retry reclaim (the
+        gc_threshold proactive sweep does not tick it); ``num_device_free`` /
+        ``num_device_alloc`` count cudaFree/cudaMalloc calls and expose GC
+        churn. Counters are monotonic per process; a smaller current value
+        means the stats were reset externally, in which case the current
+        value is the best available delta.
+        """
+        deltas = {}
+        for key in ("num_alloc_retries", "num_device_alloc", "num_device_free"):
+            cur = int((current or {}).get(key, 0) or 0)
+            prv = int((prev or {}).get(key, 0) or 0)
+            deltas[key] = cur - prv if cur >= prv else cur
+        return deltas
+
     @classmethod
     def _training_layout_move(
         cls,
@@ -3614,47 +3632,176 @@ class MemoryManager:
         if not before.get("pressure"):
             return None
 
-        demoted = 0
+        # First relief rung: return idle allocator cache. This never changes the
+        # residency layout and therefore does not invalidate the learned peak.
+        cached_before = max(
+            0,
+            int(torch.cuda.memory_reserved(device))
+            - int(torch.cuda.memory_allocated(device)),
+        )
+        cache_reclaimed = 0
         pressure = before
+        if cached_before:
+            torch.cuda.empty_cache()
+            cache_reclaimed = max(
+                0,
+                cached_before
+                - max(
+                    0,
+                    int(torch.cuda.memory_reserved(device))
+                    - int(torch.cuda.memory_allocated(device)),
+                ),
+            )
+            pressure = _pressure()
+            if not pressure.get("pressure"):
+                return {
+                    "manual_safety": not bool(
+                        getattr(mm, "_training_autotune_enabled", False)
+                    ),
+                    "action": "prestep_empty_cache",
+                    "demoted_layers": 0,
+                    "source": before.get("source"),
+                    "before": before,
+                    "after": pressure,
+                    "allocator_cache_reclaimed_bytes": cache_reclaimed,
+                    "canonical_relief": None,
+                    "shape_peak_invalidated": False,
+                }
+
+        dxgi_gap_gib = max(
+            0.0,
+            float(pressure.get("predicted_local_usage_gib", 0.0) or 0.0)
+            - float(pressure.get("target_local_usage_gib", 0.0) or 0.0),
+        )
+        if pressure.get("source") == "cuda_free":
+            physical_peak_free = pressure.get("predicted_peak_free_gib")
+            physical_target_free = pressure.get("target_free_gib")
+        else:
+            physical_peak_free = pressure.get("physical_predicted_peak_free_gib")
+            physical_target_free = pressure.get("physical_target_free_gib")
+        physical_gap_gib = max(
+            0.0,
+            float(physical_target_free or 0.0)
+            - float(physical_peak_free or 0.0),
+        )
+        required_relief_bytes = max(
+            1,
+            int(max(dxgi_gap_gib, physical_gap_gib) * gib),
+        )
+
+        # Second relief rung: immutable canonical sidecars. The extension-owned
+        # executor reconciles a subset-only TRAIN plan and rebuilds its program;
+        # legacy demote_layer must never touch canonical host Parameters.
+        canonical_relief = None
+        canonical_relieved_bytes = 0
+        executor = getattr(module, "_immutable_plan_executor", None)
+        reduce_canonical = getattr(
+            executor, "reduce_training_residency", None
+        )
+        if reduce_canonical is not None and required_relief_bytes > 0:
+            canonical_relief = reduce_canonical(required_relief_bytes)
+            relieved_bytes = int(
+                canonical_relief.get("relieved_bytes", 0) or 0
+            )
+            canonical_relieved_bytes = relieved_bytes
+            if relieved_bytes:
+                cls._invalidate_manual_training_shape_peaks(mm)
+                updated_plan = dict(plan)
+                updated_plan["resident_bytes"] = max(
+                    0,
+                    int(updated_plan.get("resident_bytes", 0))
+                    - relieved_bytes,
+                )
+                updated_plan["generic_resident_bytes"] = max(
+                    0,
+                    int(updated_plan.get("generic_resident_bytes", 0))
+                    - relieved_bytes,
+                )
+                updated_plan["offloaded_layers"] = int(
+                    updated_plan.get("offloaded_layers", 0)
+                ) + len(canonical_relief.get("removed_leaf_keys", ()))
+                mm._smart_training_plan = updated_plan
+                plan = updated_plan
+
+                remaining_gap = max(
+                    0, required_relief_bytes - relieved_bytes
+                )
+                remaining_adjustable = int(
+                    canonical_relief.get(
+                        "remaining_adjustable_bytes", 0
+                    )
+                    or 0
+                )
+                if remaining_gap == 0 or remaining_adjustable > 0:
+                    pressure = {
+                        "source": before.get("source"),
+                        "pressure": None,
+                        "prediction_valid": False,
+                        "reason": "canonical_layout_changed_relearn_required",
+                    }
+                    return {
+                        "manual_safety": not bool(
+                            getattr(mm, "_training_autotune_enabled", False)
+                        ),
+                        "action": "prestep_reduce_canonical",
+                        "demoted_layers": 0,
+                        "source": before.get("source"),
+                        "before": before,
+                        "after": pressure,
+                        "allocator_cache_reclaimed_bytes": cache_reclaimed,
+                        "required_relief_bytes": required_relief_bytes,
+                        "canonical_relief": canonical_relief,
+                        "learned_peak_allocated_gib": learned_peak_gib,
+                        "learned_peak_reserved_gib": learned_peak_reserved_gib,
+                        "shape_peak_invalidated": True,
+                    }
+
+        # Final emergency rung: only non-canonical singleton leaves are eligible
+        # for the legacy manager. This runs only when canonical relief is absent
+        # or exhausted while a predicted hard-floor deficit remains.
+        demoted = 0
         if max_demote > 0:
-            changed = cls._demote_training_layers(
+            demoted = cls._demote_training_layers(
                 module, mm, retreat_layers, largest=True
             )
-            demoted += changed
-            if changed:
+            if demoted:
                 cls._invalidate_manual_training_shape_peaks(mm)
                 pressure = {
                     "source": before.get("source"),
                     "pressure": None,
                     "prediction_valid": False,
-                    "reason": "layout_changed_relearn_required",
+                    "reason": "singleton_layout_changed_relearn_required",
                 }
 
-        if demoted and cls._diagnostics_enabled():
-            if before.get("source") == "dxgi_local":
-                print(
-                    f"[MemoryManager] pre-step DXGI local guard: demoted_layers={demoted} "
-                    f"predicted_local={before.get('predicted_local_usage_gib'):.2f} GiB "
-                    f"budget={before.get('local_budget_gib'):.2f} GiB "
-                    f"target_usage={before.get('target_local_usage_gib'):.2f} GiB "
-                    f"margin={margin_gib:.2f} GiB; layout changed, relearning"
+        if cls._diagnostics_enabled():
+            print(
+                "[MemoryManager] pre-step training guard: "
+                f"cache_reclaimed={cache_reclaimed / gib:.2f} GiB "
+                f"canonical_relieved={canonical_relieved_bytes / gib:.2f} GiB "
+                f"singleton_demoted={demoted}; "
+                + (
+                    "layout changed, relearning"
+                    if demoted or canonical_relieved_bytes
+                    else "no relief available"
                 )
-            else:
-                print(
-                    f"[MemoryManager] pre-step CUDA free guard: demoted_layers={demoted} "
-                    f"peak_free={before.get('predicted_peak_free_gib'):.2f} GiB "
-                    f"target={fallback_target_gib:.2f} GiB; layout changed, relearning"
-                )
+            )
         return {
             "manual_safety": not bool(getattr(mm, "_training_autotune_enabled", False)),
-            "action": "prestep_demote" if demoted else "prestep_unavailable",
+            "action": (
+                "prestep_reduce_canonical_and_demote_singleton"
+                if demoted and canonical_relieved_bytes
+                else ("prestep_demote_singleton" if demoted else "prestep_unavailable")
+            ),
             "demoted_layers": demoted,
             "source": before.get("source"),
             "before": before,
             "after": pressure,
+            "allocator_cache_reclaimed_bytes": cache_reclaimed,
+            "required_relief_bytes": required_relief_bytes,
+            "canonical_relief": canonical_relief,
             "learned_peak_allocated_gib": learned_peak_gib,
             "learned_peak_reserved_gib": learned_peak_reserved_gib,
-            "shape_peak_invalidated": bool(demoted),
+            "shape_peak_invalidated": bool(demoted or canonical_relieved_bytes),
         }
 
     @classmethod
@@ -4614,6 +4761,19 @@ class MemoryManager:
             return None
 
         state = _DEVICE_STATE.get(device, {})
+        # Allocator GC health: retries = OOM-retry reclaims (must stay ~0 in
+        # steady state), device alloc/free counts = cudaMalloc/cudaFree churn
+        # from cap- or gc_threshold-triggered sweeps.
+        try:
+            alloc_stats = torch.cuda.memory_stats(device)
+        except Exception:
+            alloc_stats = {}
+        gc_now = {
+            key: int(alloc_stats.get(key, 0) or 0)
+            for key in ("num_alloc_retries", "num_device_alloc", "num_device_free")
+        }
+        gc_deltas = cls._gc_counter_deltas(state.get("gc_counters_prev"), gc_now)
+        _DEVICE_STATE.setdefault(device, {})["gc_counters_prev"] = gc_now
         ring_live_bytes = int(state.get("ring_live_bytes", 0) or 0)
         if ring_live_bytes <= 0:
             seen = set()
@@ -4918,6 +5078,11 @@ class MemoryManager:
                 "danger_working_reserve_gib"
             ),
             "peak_reserved_gb": peak_reserved_gb,
+            # Named *_count_* to avoid confusion with device_free_gb (VRAM).
+            "alloc_retries_delta": gc_deltas["num_alloc_retries"],
+            "alloc_retries_total": gc_now["num_alloc_retries"],
+            "cuda_malloc_count_delta": gc_deltas["num_device_alloc"],
+            "cuda_free_count_delta": gc_deltas["num_device_free"],
         }
 
     @staticmethod
@@ -5567,6 +5732,27 @@ class MemoryManager:
         )
         plan_snapshot = vram_budget.DeviceSnapshot.capture(target)
         free_bytes = plan_snapshot.free if plan_snapshot is not None else 0
+        # Driver-free counts torch's own idle cache as used; the allocator cap
+        # (just re-applied above, on a settled measurement) GCs that cache on
+        # demand, so the allocated-side budget is the truer capacity. Take the
+        # larger of the two so a stale/absent cap can only fall back to the
+        # legacy driver-free behavior, never below it.
+        budget_source = "driver-free"
+        if plan_snapshot is not None:
+            cap_index = (
+                torch.device(target).index
+                if torch.device(target).index is not None
+                else torch.cuda.current_device()
+            )
+            alloc_side_free = vram_budget.sampling_allocator_budget_free_bytes(
+                plan_snapshot.total,
+                plan_snapshot.torch_allocated,
+                cls._wddm_hard_cap_applied.get(cap_index),
+                wddm_hard_bytes,
+            )
+            if alloc_side_free is not None and alloc_side_free > free_bytes:
+                free_bytes = alloc_side_free
+                budget_source = "allocator-cap"
         plan = cls._smart_sampling_plan(
             module,
             free_bytes,
@@ -5587,7 +5773,7 @@ class MemoryManager:
                 f"({working_reserve_source}) "
                 f"wddm_margin={plan['wddm_margin_bytes'] / gib:.2f} GiB "
                 f"wddm_hard={plan.get('wddm_hard_bytes', 0) / gib:.2f} GiB "
-                f"free={free_bytes / gib:.2f} GiB"
+                f"free={free_bytes / gib:.2f} GiB ({budget_source})"
             )
 
         move_started = time.perf_counter()
