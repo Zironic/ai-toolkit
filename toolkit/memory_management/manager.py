@@ -2650,17 +2650,6 @@ class MemoryManager:
         if child is None or hasattr(child, "_layer_memory_manager"):
             return False
 
-        # Remove resident/compiled forward wrappers before installing the
-        # streaming forward. Otherwise compile teardown can overwrite it.
-        cls._invalidate_compiled_blocks(manager.module)
-
-        name = child.__class__.__name__
-        if name in LINEAR_MODULES:
-            LinearLayerMemoryManager.attach(child, manager)
-        elif name in CONV_MODULES:
-            ConvLayerMemoryManager.attach(child, manager)
-        else:
-            return False
         if (
             getattr(manager, "_attach_args", {}).get("training_strategy")
             == "smart_immutable"
@@ -2673,6 +2662,16 @@ class MemoryManager:
                 "immutable training attempted to demote a trainable module: "
                 f"{layer_key or child.__class__.__name__}"
             )
+
+        cls._invalidate_compiled_blocks(manager.module)
+
+        name = child.__class__.__name__
+        if name in LINEAR_MODULES:
+            LinearLayerMemoryManager.attach(child, manager)
+        elif name in CONV_MODULES:
+            ConvLayerMemoryManager.attach(child, manager)
+        else:
+            return False
         child._mm_layer_key = (
             layer_key
             or getattr(child, "_mm_layer_key", None)
@@ -3004,6 +3003,9 @@ class MemoryManager:
             cold_growth=not auto_working_reserve,
             block_stream_only=block_stream_only,
         )
+        legacy_ignore = list(
+            dict.fromkeys(planner_ignore + canonical_modules)
+        )
         legacy_ignore_ids = {id(child) for child in legacy_ignore}
 
         runtime_candidate_ids = {
@@ -3034,11 +3036,7 @@ class MemoryManager:
         mm._training_must_resident_keys = set(
             plan.get("must_resident_layer_keys", ())
         )
-        runtime_candidate_ids = getattr(
-            mm,
-            "_training_runtime_candidate_ids",
-            None,
-        )
+
         mm._training_pinned_resident_keys = pinned_resident_keys
         mm._training_block_stream_only = bool(block_stream_only)
         mm._training_autotune_enabled = False
@@ -3235,7 +3233,11 @@ class MemoryManager:
         must_resident_keys = set(
             getattr(mm, "_training_must_resident_keys", set())
         )
-
+        runtime_candidate_ids = getattr(
+            mm,
+            "_training_runtime_candidate_ids",
+            None,
+        )
         layout = list(
             cls._training_layout_candidates(
                 module,
@@ -3277,16 +3279,6 @@ class MemoryManager:
             key=lambda item: item["resident_bytes"], reverse=bool(largest)
         )
         changed = 0
-        for item in candidates[: max(0, int(count))]:
-            if cls.demote_layer(item["module"], mm, layer_key=item["name"]):
-                changed += 1
-        if changed:
-            cls._register_training_prefetch_sources(module, mm)
-            cls._refresh_training_fp8_flags(module, mm)
-            cls._refresh_training_plan_from_layout(module, mm)
-            cls.reset_trace_due_to_execution_shape_change()
-            cls._clear_cuda_pipeline_state()
-
         demoted_names = []
 
         for item in candidates[: max(0, int(count))]:
@@ -3297,11 +3289,20 @@ class MemoryManager:
             ):
                 changed += 1
                 demoted_names.append(item["name"])
+
+        if changed:
+            cls._register_training_prefetch_sources(module, mm)
+            cls._refresh_training_fp8_flags(module, mm)
+            cls._refresh_training_plan_from_layout(module, mm)
+            cls.reset_trace_due_to_execution_shape_change()
+            cls._clear_cuda_pipeline_state()
+
         if demoted_names and cls._diagnostics_enabled():
             print(
                 "[MemoryManager] training demoted modules: "
                 + ", ".join(demoted_names)
             )
+
         return changed
 
     @classmethod
