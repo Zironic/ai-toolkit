@@ -638,6 +638,29 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # re-enable BORROWS the persistent flats rather than re-pinning ~12 GiB.
         inner_unet = None
         ingraph_depth = None
+        # Immutable canonical-arena backend (Slice 6): the compiled executor
+        # owns residency across the train<->sample boundary over ONE arena --
+        # no trunk teardown/re-pin like ingraph training needs. Switch the
+        # executor to its SAMPLE program (same resident sidecars, sample-mode
+        # callables: no checkpointing, forward-only streaming) and restore the
+        # TRAIN program afterward. Because the executor owns residency, the
+        # legacy inference_resident sampling context must NOT also re-plan the
+        # transformer here -- force it to a nullcontext for this backend.
+        immutable_executor = None
+        immutable_train_plan = None
+        if getattr(self, '_immutable_arena_enabled', False):
+            inner_unet = unwrap_model(self.sd.unet)
+            immutable_executor = getattr(inner_unet, '_immutable_plan_executor', None)
+            if immutable_executor is not None:
+                immutable_train_plan = inner_unet._mm_immutable_training_plan
+                sampling_context = contextlib.nullcontext()
+                # Reuse the training residency plan for sampling: same resident
+                # leaf set (sampling needs no more than training), zero sidecar
+                # churn at the boundary. A sampling-specialized (more-resident)
+                # plan is a later optimization, not a correctness requirement.
+                immutable_executor.activate(
+                    immutable_executor.SAMPLE, immutable_train_plan
+                )
         if getattr(self, '_ingraph_training_enabled', False):
             inner_unet = unwrap_model(self.sd.unet)
             disable_ingraph_training = getattr(
@@ -662,6 +685,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # adapters enter the compiled graph as ordinary trainable inputs.
             if ingraph_depth is not None:
                 inner_unet.enable_ingraph_training(depth=ingraph_depth, compile=True)
+            # Immutable backend: switch the executor back to its TRAIN program
+            # (same resident sidecars, checkpointed backward-capable callables)
+            # so the next training step runs the training graph, not the
+            # forward-only sampling one.
+            if immutable_executor is not None:
+                immutable_executor.activate(
+                    immutable_executor.TRAIN, immutable_train_plan
+                )
 
 
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
@@ -3248,6 +3279,49 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"packs borrowed={getattr(inner_unet, '_ingraph_training_borrowed_count', 0)} "
                 f"owned={getattr(inner_unet, '_ingraph_training_owned_count', 0)}; "
                 f"depth={depth}. First training step will compile."
+            )
+
+        if getattr(self.model_config, 'layer_offloading_immutable_arena', False):
+            # Immutable canonical-arena backend (Slice 6,
+            # tasks/open/IMMUTABLE_TRANSFER_ARENA_PLAN.md). The arena +
+            # residency + training ResidencyPlan were built in load_model
+            # (Krea2Model._attach_immutable_training_memory) BEFORE LoRA; the
+            # compiled train/sample executor must be stood up HERE, after the
+            # LoRA network is applied, so it captures the adapter leaves --
+            # exactly the sequencing reason enable_ingraph_training also lives
+            # in setup, not load_model. Fail closed and loud: silently running
+            # eager would make every perf/parity number mean the wrong thing.
+            inner_unet = unwrap_model(self.sd.unet)
+            if not getattr(inner_unet, '_mm_immutable_backend', False):
+                raise RuntimeError(
+                    "layer_offloading_immutable_arena requested, but the model "
+                    "did not build a canonical arena during load_model "
+                    "(_mm_immutable_backend is unset)."
+                )
+            enable_immutable = getattr(
+                inner_unet, 'enable_immutable_arena_compiled', None
+            )
+            if enable_immutable is None:
+                raise RuntimeError(
+                    "layer_offloading_immutable_arena requested, but this model "
+                    "does not expose enable_immutable_arena_compiled."
+                )
+            arena = inner_unet._mm_canonical_arena
+            residency = inner_unet._mm_residency_state
+            training_plan = inner_unet._mm_immutable_training_plan
+            depth = int(getattr(self.model_config, 'layer_offloading_ingraph_depth', 2))
+            executor = enable_immutable(
+                arena, residency, depth=depth, compile_trunks=True
+            )
+            executor.activate(executor.TRAIN, training_plan)
+            self._immutable_arena_enabled = True
+            self._immutable_arena_depth = depth
+            print_acc(
+                "Immutable canonical arena training enabled: "
+                f"{len(arena.block_keys())} block(s), "
+                f"{residency.resident_bytes() / (1024 ** 3):.2f} GiB resident "
+                f"sidecars; plan={training_plan.fingerprint}; depth={depth}. "
+                "First training step will compile."
             )
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:

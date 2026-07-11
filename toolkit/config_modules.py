@@ -889,6 +889,18 @@ class ModelConfig:
         self.layer_offloading_pinned_arena = kwargs.get(
             "layer_offloading_pinned_arena", False
         )
+        # Canonical immutable host arena + manager-owned GPU sidecars. This is
+        # the Slice 6 developer gate; Slice 7 aliases the established pinned-
+        # arena option to it after A/B validation. Explicit legacy rollback is
+        # retained for one release and always wins when both are present.
+        self.layer_offloading_immutable_arena = kwargs.get(
+            "layer_offloading_immutable_arena", False
+        )
+        self.layer_offloading_legacy_pinned_arena = kwargs.get(
+            "layer_offloading_legacy_pinned_arena", False
+        )
+        if self.layer_offloading_legacy_pinned_arena:
+            self.layer_offloading_immutable_arena = False
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for

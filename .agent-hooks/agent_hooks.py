@@ -7,8 +7,7 @@ Implements four practical policies:
   2. Rewrite raw PowerShell-in-Bash invocations through a stable UTF-8/no-progress/plain-output wrapper.
   3. Cap likely-huge command output (Bash and PowerShell tools) by re-running the
      command through this wrapper in its original shell and saving raw logs under .agent/logs/.
-  4. Report ruff lint findings after Python edits (check-only by default; set
-     AGENT_HOOK_RUFF_FIX=1 to also apply ruff's --fix-only fixes first).
+  4. Report Ruff findings that intersect lines changed relative to HEAD.
   5. Silently ASCII-fy edit/write payloads for source files: typographic
      punctuation is transliterated (smart quotes, em dash, arrows, ellipsis)
      and emoji/symbols are dropped. Letters (accented, CJK) and Markdown
@@ -33,8 +32,9 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 # ----------------------------- policy knobs -----------------------------
 
@@ -671,48 +671,301 @@ def mode_post_output(agent: str = "auto") -> int:
     return 0
 
 
-def mode_format_after_edit() -> int:
-    """Check-only ruff report for edited Python files.
+DIFF_HUNK_RE = re.compile(
+    r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@"
+)
 
-    Auto-rewriting whole files after every edit creates huge diffs against
-    upstream in fork repos, so this reports instead of formats. Opt in to
-    ruff's autofixes (scoped by the repo ruff.toml `fixable` list) with
-    AGENT_HOOK_RUFF_FIX=1.
+
+def repo_relative_path(path: Path, root: Path) -> str | None:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def whole_file_line_ranges(path: Path) -> list[tuple[int, int]]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            line_count = sum(1 for _ in f)
+    except OSError:
+        return []
+
+    if line_count == 0:
+        return []
+
+    return [(1, line_count)]
+
+
+def merge_line_ranges(
+    ranges: Iterable[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1] + 1:
+            merged.append((start, end))
+            continue
+
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+
+    return merged
+
+
+def git_changed_line_ranges(
+    root: Path,
+    path: Path,
+) -> list[tuple[int, int]] | None:
+    """Return current-file line ranges changed relative to HEAD.
+
+    Returns:
+        A list of inclusive line ranges.
+        An empty list when the file has no changes.
+        None when Git could not determine the ranges.
     """
+    rel = repo_relative_path(path, root)
+    if rel is None:
+        return None
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", rel],
+        cwd=str(root),
+        text=True,
+        capture_output=True,
+        errors="replace",
+    )
+
+    # New/untracked files have no HEAD version, so all their lines are new.
+    if tracked.returncode != 0:
+        return whole_file_line_ranges(path)
+
+    diff = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--unified=0",
+            "HEAD",
+            "--",
+            rel,
+        ],
+        cwd=str(root),
+        text=True,
+        capture_output=True,
+        errors="replace",
+    )
+
+    if diff.returncode != 0:
+        return None
+
+    ranges: list[tuple[int, int]] = []
+
+    for line in diff.stdout.splitlines():
+        match = DIFF_HUNK_RE.match(line)
+        if match is None:
+            continue
+
+        start = int(match.group(1))
+        count = int(match.group(2) or "1")
+
+        # A deletion-only hunk has no corresponding lines in the current file.
+        if count > 0:
+            ranges.append((start, start + count - 1))
+
+    return merge_line_ranges(ranges)
+
+
+def json_location_span(
+    value: dict[str, Any],
+) -> tuple[int, int] | None:
+    location = value.get("location")
+    end_location = value.get("end_location")
+
+    if not isinstance(location, dict):
+        return None
+
+    start_row = location.get("row")
+    if not isinstance(start_row, int) or start_row < 1:
+        return None
+
+    end_row = start_row
+    end_column = None
+
+    if isinstance(end_location, dict):
+        candidate_row = end_location.get("row")
+        if isinstance(candidate_row, int) and candidate_row >= start_row:
+            end_row = candidate_row
+
+        candidate_column = end_location.get("column")
+        if isinstance(candidate_column, int):
+            end_column = candidate_column
+
+    # Ruff locations are end-exclusive. A range ending at column 1 of the
+    # following row does not actually cover that following row.
+    if end_row > start_row and end_column == 1:
+        end_row -= 1
+
+    return start_row, max(start_row, end_row)
+
+
+def spans_overlap(
+    left: tuple[int, int],
+    right: tuple[int, int],
+) -> bool:
+    return left[0] <= right[1] and right[0] <= left[1]
+
+
+def diagnostic_touches_changed_lines(
+    diagnostic: dict[str, Any],
+    changed_ranges: list[tuple[int, int]],
+) -> bool:
+    spans: list[tuple[int, int]] = []
+
+    primary_span = json_location_span(diagnostic)
+    if primary_span is not None:
+        spans.append(primary_span)
+
+    # Import sorting and some structural diagnostics are located at the start
+    # of a block. Their fix range often covers the actual edited lines.
+    fix = diagnostic.get("fix")
+    if isinstance(fix, dict):
+        edits = fix.get("edits")
+        if isinstance(edits, list):
+            for edit in edits:
+                if isinstance(edit, dict):
+                    edit_span = json_location_span(edit)
+                    if edit_span is not None:
+                        spans.append(edit_span)
+
+    return any(
+        spans_overlap(span, changed)
+        for span in spans
+        for changed in changed_ranges
+    )
+
+
+def format_ruff_diagnostic(
+    rel: str,
+    diagnostic: dict[str, Any],
+) -> str:
+    location = diagnostic.get("location")
+    if not isinstance(location, dict):
+        location = {}
+
+    row = location.get("row", 1)
+    column = location.get("column", 1)
+    code = diagnostic.get("code") or "unknown"
+    message = diagnostic.get("message") or "Ruff diagnostic"
+
+    return f"{rel}:{row}:{column}: {code} {message}"
+
+
+def mode_format_after_edit() -> int:
+    """Report Ruff findings that intersect lines changed relative to HEAD."""
     event = read_event()
     cwd = cwd_from_event(event)
     root = project_root(cwd)
-    files = sorted({p for p in extract_changed_files(event, cwd) if p.exists() and p.is_file()})
-    py_files = [p for p in files if p.suffix.lower() == ".py"]
+
+    files = sorted({
+        path
+        for path in extract_changed_files(event, cwd)
+        if path.exists() and path.is_file()
+    })
+    py_files = [path for path in files if path.suffix.lower() == ".py"]
+
     if not py_files or len(py_files) > 20:
         return 0
-    # The hook runs under whatever python the config names; that venv's Scripts
-    # dir is usually not on PATH, so look next to the interpreter first.
+
     exe_dir = Path(sys.executable).parent
-    ruff = next((str(c) for c in (exe_dir / "ruff.exe", exe_dir / "ruff") if c.exists()), None) or shutil.which("ruff")
+    ruff = next(
+        (
+            str(candidate)
+            for candidate in (exe_dir / "ruff.exe", exe_dir / "ruff")
+            if candidate.exists()
+        ),
+        None,
+    ) or shutil.which("ruff")
+
     if not ruff:
         return 0
 
-    rels = []
-    for p in py_files:
+    findings: list[str] = []
+    failures: list[str] = []
+
+    for path in py_files:
+        rel = repo_relative_path(path, root)
+        if rel is None:
+            continue
+
+        changed_ranges = git_changed_line_ranges(root, path)
+        if changed_ranges is None:
+            failures.append(f"{rel}: could not determine changed-line ranges")
+            continue
+
+        if not changed_ranges:
+            continue
+
+        proc = subprocess.run(
+            [
+                ruff,
+                "check",
+                "--output-format",
+                "json",
+                rel,
+            ],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            errors="replace",
+        )
+
+        # Ruff uses 1 for normal lint findings and 2 for execution/config errors.
+        if proc.returncode not in (0, 1):
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            suffix = f": {detail[0]}" if detail else ""
+            failures.append(f"{rel}: Ruff failed{suffix}")
+            continue
+
         try:
-            rels.append(str(p.resolve().relative_to(root.resolve())))
-        except Exception:
-            rels.append(str(p))
+            diagnostics = json.loads(proc.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            failures.append(f"{rel}: invalid Ruff JSON: {exc}")
+            continue
 
-    if os.environ.get("AGENT_HOOK_RUFF_FIX") == "1":
-        subprocess.run([ruff, "check", "--fix-only", *rels], cwd=str(root), text=True, capture_output=True, errors="replace")
+        if not isinstance(diagnostics, list):
+            failures.append(f"{rel}: unexpected Ruff JSON result")
+            continue
 
-    proc = subprocess.run(
-        [ruff, "check", "--output-format", "concise", *rels],
-        cwd=str(root), text=True, capture_output=True, errors="replace",
-    )
-    if proc.returncode == 0:
-        return 0
-    lines = (proc.stdout or proc.stderr or "").strip().splitlines()
-    shown = lines[:40]
-    more = f"\n... {len(lines) - 40} more lines" if len(lines) > 40 else ""
-    add_context(event, "ruff check on edited files:\n" + "\n".join(shown) + more)
+        for diagnostic in diagnostics:
+            if not isinstance(diagnostic, dict):
+                continue
+
+            if diagnostic_touches_changed_lines(
+                diagnostic,
+                changed_ranges,
+            ):
+                findings.append(format_ruff_diagnostic(rel, diagnostic))
+
+    output: list[str] = []
+
+    if findings:
+        shown = findings[:40]
+        output.append(
+            "ruff findings on changed lines:\n" + "\n".join(shown)
+        )
+
+        if len(findings) > 40:
+            output.append(f"... {len(findings) - 40} more findings")
+
+    if failures:
+        output.append(
+            "ruff hook errors:\n" + "\n".join(failures[:10])
+        )
+
+    if output:
+        add_context(event, "\n".join(output))
+
     return 0
 
 # ----------------------------- runner modes -----------------------------

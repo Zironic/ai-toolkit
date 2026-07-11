@@ -92,6 +92,58 @@ def _arena_summary(transformer):
     }
 
 
+def _immutable_arena_summary(transformer):
+    """Slice 6 diagnostics for the canonical immutable-arena backend: arena
+    identity, host bytes, GPU sidecar bytes, the active residency-plan
+    fingerprint, transfer-plan range/copy counts, and the pin-ledger 'weights'
+    tier. Reports ``{"present": False}`` when the transformer never built one,
+    so it can sit alongside ``_arena_summary`` (only one is present per run)."""
+    arena = getattr(transformer, "_mm_canonical_arena", None)
+    if arena is None:
+        return {"present": False}
+    stats = arena.stats()
+    residency = getattr(transformer, "_mm_residency_state", None)
+    executor = getattr(transformer, "_immutable_plan_executor", None)
+    summary = {
+        "present": True,
+        "id": id(arena),
+        "blocks": stats.blocks,
+        "pinned_gib": _gib(stats.pinned_bytes),
+        "ledger_weights_gib": _gib(
+            pin_manager.pinned_bytes_by_kind().get("weights", 0)
+        ),
+    }
+    if residency is not None:
+        summary["resident_sidecar_gib"] = _gib(residency.resident_bytes())
+        summary["active_plan_fingerprint"] = residency.plan.fingerprint
+    train_plan = getattr(transformer, "_mm_immutable_training_plan", None)
+    if train_plan is not None:
+        summary["training_plan_fingerprint"] = train_plan.fingerprint
+    # Transfer-plan (compact multi-range) span/copy accounting per Invariant 8.
+    if residency is not None:
+        from extensions_built_in.diffusion_models.krea2.src.immutable_arena import (
+            build_block_source_plan,
+        )
+
+        streamed_blocks = 0
+        total_ranges = 0
+        streamed_bytes = 0
+        for index in range(len(transformer.blocks)):
+            block_plan = build_block_source_plan(transformer, residency, index)
+            if block_plan.transfer is None:
+                continue
+            streamed_blocks += 1
+            total_ranges += block_plan.transfer.num_ranges
+            streamed_bytes += int(block_plan.transfer.compact_nbytes)
+        summary["streamed_blocks"] = streamed_blocks
+        # One coalesced copy per range; the runtime submits ranges as copies.
+        summary["transfer_ranges"] = total_ranges
+        summary["transfer_compact_gib"] = _gib(streamed_bytes)
+    if executor is not None:
+        summary["executor_stats"] = dict(executor.stats)
+    return summary
+
+
 def _dxgi_snapshot(label, device_index=0):
     info = dxgi_meminfo.query_non_local_video_memory_info(
         cuda_device_index=device_index,
@@ -172,6 +224,7 @@ def _build_model_config(args):
         layer_offloading_block_stream_only=args.block_stream_only,
         layer_offloading_fp8_forward=args.fp8_training_forward,
         layer_offloading_pinned_arena=args.pinned_arena,
+        layer_offloading_immutable_arena=getattr(args, "use_immutable_arena", False),
         model_kwargs=model_kwargs,
     )
 
@@ -400,6 +453,16 @@ def _parse_args():
             "frozen base instead of pinning a second copy."
         ),
     )
+    parser.add_argument(
+        "--use-immutable-arena", action="store_true",
+        help=(
+            "Slice 6 (IMMUTABLE_TRANSFER_ARENA_PLAN.md): build the canonical "
+            "immutable host arena + manager-owned GPU residency sidecars and "
+            "run the compiled train/sample plan executor instead of the legacy "
+            "pinned arena. Mutually exclusive with --pinned-arena / "
+            "--ingraph-training."
+        ),
+    )
     parser.add_argument("--checkpoint-keep-last", type=int, default=0)
     parser.add_argument("--block-stream-only", action="store_true")
     parser.add_argument("--fp8-training-forward", action="store_true")
@@ -521,15 +584,33 @@ def main():
 
     print("[smoke] attaching smart training memory manager")
     t0 = time.perf_counter()
-    _attach_training_memory(
-        transformer, config, device, ingraph_training=bool(args.ingraph_training)
-    )
+    if args.use_immutable_arena:
+        # Mirror Krea2Model.load_model()'s immutable path: canonicalize the
+        # frozen base into the arena + build residency/plan. The compiled
+        # executor is stood up AFTER LoRA apply (below), exactly like the
+        # trainer does with enable_ingraph_training.
+        ignore_modules = [
+            module
+            for module in transformer.modules()
+            if isinstance(module, (SimpleModulation, DoubleSharedModulation))
+        ]
+        model._attach_immutable_training_memory(transformer, ignore_modules)
+        transformer.enable_gradient_checkpointing(
+            keep_last=max(0, config.layer_offloading_checkpoint_keep_last)
+        )
+        if getattr(transformer, "_memory_manager", None) is not None:
+            MemoryManager._attach_prefetch_pool(transformer, device)
+    else:
+        _attach_training_memory(
+            transformer, config, device, ingraph_training=bool(args.ingraph_training)
+        )
     model.model = transformer
     rows.append(
         {
             "event": "attached_training_memory",
             "seconds": time.perf_counter() - t0,
             "arena": _arena_summary(transformer),
+            "immutable_arena": _immutable_arena_summary(transformer),
             "cuda": _cuda_snapshot("attached_training_memory", device),
             "dxgi": _dxgi_snapshot("attached_training_memory"),
         }
@@ -612,6 +693,33 @@ def main():
                 f"pack(s) (expected all {borrowed + owned} borrowed); arena did "
                 "not cover the streamed leaves"
             )
+
+    if args.use_immutable_arena:
+        # Mirror BaseSDTrainProcess's layer_offloading_immutable_arena hook:
+        # stand up the compiled executor and activate its TRAIN plan AFTER LoRA
+        # apply, so it captures the adapter leaves.
+        print("[smoke] enabling immutable-arena compiled plan executor")
+        t0 = time.perf_counter()
+        arena = transformer._mm_canonical_arena
+        residency = transformer._mm_residency_state
+        training_plan = transformer._mm_immutable_training_plan
+        executor = transformer.enable_immutable_arena_compiled(
+            arena, residency, depth=args.ingraph_depth,
+            compile_trunks=not args.no_ingraph_compile,
+        )
+        executor.activate(executor.TRAIN, training_plan)
+        rows.append(
+            {
+                "event": "immutable_arena_enabled",
+                "seconds": time.perf_counter() - t0,
+                "depth": args.ingraph_depth,
+                "compiled": not args.no_ingraph_compile,
+                "immutable_arena": _immutable_arena_summary(transformer),
+                "cuda": _cuda_snapshot("immutable_arena_enabled", device),
+                "dxgi": _dxgi_snapshot("immutable_arena_enabled"),
+            }
+        )
+        _print_json(rows[-1])
 
     if args.train_compile_blocks:
         # Mirror BaseSDTrainProcess's train_compile_blocks wiring: compile the
@@ -826,6 +934,24 @@ def main():
             "ledger_weights_gib_after": _gib(ledger_after_destroy),
             "arena_present_after": getattr(transformer, "_mm_weight_arena", None)
             is not None,
+        }
+        rows.append(teardown_row)
+        _print_json(teardown_row)
+
+    if args.use_immutable_arena:
+        # Slice 6 true-unload (genuine model unload, not a phase boundary): the
+        # canonical Parameters are cloned off the arena and every pinned byte
+        # returns to the pre-arena "weights" baseline.
+        ledger_before_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+        MemoryManager._destroy_immutable_arena(transformer)
+        ledger_after_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+        teardown_row = {
+            "event": "immutable_arena_destroyed",
+            "ledger_weights_gib_before": _gib(ledger_before_destroy),
+            "ledger_weights_gib_after": _gib(ledger_after_destroy),
+            "arena_present_after": getattr(transformer, "_mm_canonical_arena", None)
+            is not None,
+            "backend_flag_after": getattr(transformer, "_mm_immutable_backend", False),
         }
         rows.append(teardown_row)
         _print_json(teardown_row)

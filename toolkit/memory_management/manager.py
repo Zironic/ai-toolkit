@@ -929,6 +929,89 @@ class MemoryManager:
         del module._mm_weight_arena
 
     @classmethod
+    def _destroy_immutable_arena(cls, module: torch.nn.Module) -> None:
+        """Genuine true-unload of a canonical immutable arena (Slice 6,
+        tasks/open/IMMUTABLE_TRANSFER_ARENA_PLAN.md).
+
+        This is the TRUE-UNLOAD path, distinct from a mere "disable" (which
+        only stops compiled sidecar residency and returns to eager streaming
+        WITHOUT releasing host storage or repointing Parameters -- that lives
+        in the model's ``disable_immutable_arena_compiled``/``_eager`` seams).
+        Like ``_destroy_pinned_arena`` it is NOT called from
+        ``detach``/sampling boundaries -- the canonical arena persists across
+        those by design; only genuine model unload or test/smoke teardown
+        should call it. Safe (no-op) on a module that never built one.
+
+        Order matters exactly as in ``_destroy_pinned_arena``: every canonical
+        leaf's frozen Parameter is a CPU view over an arena host flat, so each
+        is first cloned onto standalone storage; only THEN are the GPU
+        residency sidecars dropped and the host flats unregistered/unpinned.
+        Releasing pinned bytes while a live Parameter still views that storage
+        would decrement the pin ledger for memory that is still page-locked
+        and referenced -- a real leak dressed up as a clean teardown.
+        """
+        arena = getattr(module, "_mm_canonical_arena", None)
+        if arena is None:
+            return
+        # 1) Stop the compiled/eager execution seams first so no closure keeps
+        #    a demoted sidecar (or a soon-to-be-released host flat) alive.
+        for disabler in (
+            "disable_immutable_arena_compiled",
+            "disable_immutable_arena_eager",
+        ):
+            fn = getattr(module, disabler, None)
+            if callable(fn):
+                fn()
+        # 2) Clone every canonical Parameter off its arena flat BEFORE release.
+        for child in module.modules():
+            if not getattr(child, "_mm_canonical_leaf", False):
+                continue
+            for name in ("weight", "bias"):
+                param = getattr(child, name, None)
+                if not isinstance(param, torch.nn.Parameter):
+                    continue
+                data = param.data
+                if _is_quantized_tensor(data) or hasattr(data, "__tensor_flatten__"):
+                    cloned = _rebuild_from_leaves(
+                        data, (leaf.clone() for leaf in _flatten_leaves(data))
+                    )
+                else:
+                    cloned = data.clone()
+                setattr(
+                    child, name,
+                    torch.nn.Parameter(cloned, requires_grad=param.requires_grad),
+                )
+            del child._mm_canonical_leaf
+        # 3) Drop GPU residency sidecars (independent of host storage), then
+        #    release host flats (unregister + unpin every committed byte).
+        residency = getattr(module, "_mm_residency_state", None)
+        if residency is not None:
+            try:
+                residency.clear(phase="unload")
+            except Exception:
+                # A best-effort demote failure must not block host release;
+                # the sidecars are plain device tensors that GC will reclaim.
+                pass
+        arena.release()
+        # 4) Drop every immutable-backend marker so the module reads as a
+        #    plain (un-offloaded) model again.
+        from toolkit.memory_management.canonical_arena import CanonicalArena
+
+        CanonicalArena.unguard_whole_model_to(module)
+        for attr in (
+            "_mm_canonical_arena",
+            "_mm_residency_state",
+            "_mm_immutable_training_plan",
+            "_mm_immutable_smart_plan",
+            "_mm_immutable_canonical_modules",
+            "_mm_immutable_backend",
+            "_mm_canonical_leaf_ids",
+            "_mm_immutable_planner_ignore_modules",
+        ):
+            if hasattr(module, attr):
+                delattr(module, attr)
+
+    @classmethod
     def detach(cls, module: torch.nn.Module):
         """
         Reverse of attach(). Moves unmanaged modules back to CPU, restores the
@@ -1052,6 +1135,8 @@ class MemoryManager:
         """Move tensor-subclass weights by replacing each complete Parameter."""
         target = torch.device(device)
         for child in module.modules():
+            if getattr(child, "_mm_canonical_leaf", False):
+                continue
             for name, param in list(child._parameters.items()):
                 if param is None or not _is_quantized_tensor(param.data):
                     continue
@@ -1079,6 +1164,8 @@ class MemoryManager:
         target = torch.device(device)
         MemoryManager._move_quantized_parameters(module, target)
         for child in module.modules():
+            if getattr(child, "_mm_canonical_leaf", False):
+                continue
             for param in child._parameters.values():
                 if param is None or _is_quantized_tensor(param.data):
                     continue
@@ -1094,6 +1181,11 @@ class MemoryManager:
         target = torch.device(device)
         for child in module.modules():
             if hasattr(child, "_layer_memory_manager"):
+                continue
+            if getattr(child, "_mm_canonical_leaf", False):
+                # Immutable-arena leaves are permanent CPU views. Device
+                # residency lives in manager-owned sidecars; every whole-model
+                # movement path must leave the canonical Parameter untouched.
                 continue
             if getattr(child, "_mm_ingraph_pack_source", False):
                 # Ingraph-streamed linear: its manager hijack was stripped for
@@ -2625,6 +2717,11 @@ class MemoryManager:
         wddm_spill_reserve_pct=None,
         use_pinned_arena=False,
     ):
+        if getattr(module, "_mm_immutable_backend", False):
+            mm = getattr(module, "_memory_manager", None)
+            if mm is None or getattr(mm, "_smart_training_plan", None) is None:
+                raise RuntimeError("immutable backend is missing its smart plan")
+            return mm._smart_training_plan
         cls._apply_wddm_hard_allocator_cap(device, wddm_hard_gib)
         ignore_modules = list(ignore_modules or [])
         pinned_resident_keys = set(pinned_resident_keys or ())
@@ -2806,6 +2903,99 @@ class MemoryManager:
                 f"{'enabled' if fp8_training_layers else 'unavailable'} "
                 f"({fp8_training_layers} streamed linear layers)"
             )
+        if _OFFLOAD_PREFETCH_ENABLED and torch.device(device).type == "cuda":
+            cls._attach_prefetch_pool(module, device)
+        return plan
+
+
+    @classmethod
+    def attach_smart_training_immutable(
+        cls,
+        module,
+        device,
+        *,
+        canonical_modules,
+        working_reserve_gib=2.0,
+        ignore_modules=None,
+        wddm_margin_gib=None,
+        wddm_hard_gib=None,
+        fp8_training_forward=False,
+        pinned_resident_keys=None,
+        block_stream_only=False,
+        wddm_spill_reserve_pct=None,
+    ):
+        """Attach the legacy manager only to non-canonical singleton leaves.
+
+        The planner still sees every Linear, so its per-Linear residency
+        decision feeds ``ResidencyPlan.from_smart_plan`` for canonical block
+        sidecars. The mutation mechanism is split: canonical leaves are ignored
+        by legacy attach/move paths, while singleton layers keep the established
+        manager behavior. Compiled canonical layouts are fixed after this cold
+        plan, so live legacy autotune is deliberately disabled for this backend.
+        """
+        cls._apply_wddm_hard_allocator_cap(device, wddm_hard_gib)
+        planner_ignore = list(ignore_modules or [])
+        canonical_modules = list(canonical_modules or [])
+        canonical_ids = {id(child) for child in canonical_modules}
+        pinned_resident_keys = set(pinned_resident_keys or ())
+        try:
+            auto_working_reserve = float(working_reserve_gib) < 0
+        except (TypeError, ValueError):
+            auto_working_reserve = str(working_reserve_gib).lower() == "auto"
+        if auto_working_reserve:
+            working_reserve_gib = cls._training_auto_seed_working_reserve_gib()
+        resolved_hard = (
+            float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0"))
+            if wddm_hard_gib is None
+            else float(wddm_hard_gib)
+        )
+        resolved_margin = cls._resolve_wddm_margin_gib(
+            device, wddm_margin_gib, hard_gib=resolved_hard
+        )
+        bounce_pool.set_spill_reserve_policy(
+            floor_gib=resolved_margin, pct=wddm_spill_reserve_pct
+        )
+        plan = cls.smart_training_plan(
+            module,
+            device,
+            working_reserve_gib,
+            planner_ignore,
+            wddm_margin_gib=resolved_margin,
+            wddm_hard_gib=resolved_hard,
+            pinned_resident_keys=pinned_resident_keys,
+            cold_growth=not auto_working_reserve,
+            block_stream_only=block_stream_only,
+        )
+        legacy_ignore = list(dict.fromkeys(planner_ignore + canonical_modules))
+        legacy_offload_ids = set(plan["offload_ids"]) - canonical_ids
+        cls.attach(
+            module,
+            device,
+            offload_percent=0.0,
+            ignore_modules=legacy_ignore,
+            _offload_module_ids=legacy_offload_ids,
+            training_strategy="smart_immutable",
+            # Canonical registrations own the persistent weight tier. The few
+            # streamed singleton leaves use the existing bounce mechanism.
+            pinned_weight_gib=0.0,
+            use_pinned_arena=False,
+        )
+        mm = module._memory_manager
+        mm._smart_training_plan = plan
+        mm._training_pinned_resident_keys = pinned_resident_keys
+        mm._training_block_stream_only = bool(block_stream_only)
+        mm._training_autotune_enabled = False
+        mm._immutable_planner_ignore_modules = planner_ignore
+        mm._canonical_leaf_ids = canonical_ids
+        module._mm_canonical_leaf_ids = canonical_ids
+        module._mm_immutable_planner_ignore_modules = planner_ignore
+        fp8_requested = bool(
+            fp8_training_forward
+            and torch.device(device).type == "cuda"
+            and torch.cuda.get_device_capability(device) >= (8, 9)
+        )
+        mm._fp8_training_requested = fp8_requested
+        cls._refresh_training_fp8_flags(module, mm)
         if _OFFLOAD_PREFETCH_ENABLED and torch.device(device).type == "cuda":
             cls._attach_prefetch_pool(module, device)
         return plan

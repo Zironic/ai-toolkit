@@ -743,6 +743,82 @@ class Krea2Model(BaseModel):
         # tell the model to invert assistant on inference since we want remove lora effects
         self.invert_assistant_lora = True
 
+    def _attach_immutable_training_memory(self, transformer, ignore_modules):
+        """Build Krea's canonical block arena and attach singleton streaming.
+
+        Sequencing is strict: load/quantize -> freeze -> canonicalize -> legacy
+        singleton attach. LoRA/optimizer construction happens later in the
+        trainer, after all frozen base Parameter identities are final.
+        """
+        from toolkit.memory_management.canonical_arena import CanonicalArena
+        from toolkit.memory_management.residency import ResidencyPlan, ResidencyState
+
+        transformer.requires_grad_(False)
+        entries_by_block = {
+            f"blocks.{index}": list(
+                transformer._block_linear_entries(transformer.blocks[index])
+            )
+            for index in range(len(transformer.blocks))
+        }
+        arena = CanonicalArena()
+        arena.canonicalize(entries_by_block)
+        canonical_modules = []
+        for entries in entries_by_block.values():
+            for _name, child in entries:
+                child._mm_canonical_leaf = True
+                canonical_modules.append(child)
+
+        keep_last = self.model_config.layer_offloading_checkpoint_keep_last
+        pinned_keys = MemoryManager.training_pinned_keys_for_keep_last(
+            transformer, max(0, keep_last)
+        )
+        try:
+            smart_plan = MemoryManager.attach_smart_training_immutable(
+                transformer,
+                self.device_torch,
+                canonical_modules=canonical_modules,
+                working_reserve_gib=(
+                    self.model_config.layer_offloading_smart_working_reserve_gb
+                ),
+                wddm_margin_gib=(
+                    self.model_config.layer_offloading_smart_wddm_margin_gb
+                ),
+                wddm_hard_gib=(
+                    self.model_config.layer_offloading_smart_wddm_hard_gb
+                ),
+                ignore_modules=ignore_modules,
+                pinned_resident_keys=pinned_keys,
+                block_stream_only=(
+                    self.model_config.layer_offloading_block_stream_only
+                ),
+                wddm_spill_reserve_pct=(
+                    self.model_config.layer_offloading_wddm_spill_reserve_pct
+                ),
+                fp8_training_forward=(
+                    self.model_config.quantize
+                    and self.model_config.qtype in ("qfloat8", "float8")
+                    and self.model_config.layer_offloading_fp8_forward
+                ),
+            )
+        except Exception:
+            arena.release()
+            for child in canonical_modules:
+                if hasattr(child, "_mm_canonical_leaf"):
+                    del child._mm_canonical_leaf
+            raise
+
+        residency = ResidencyState(arena, self.device_torch)
+        training_plan = ResidencyPlan.from_smart_plan(
+            arena, smart_plan, phase="train"
+        )
+        transformer._mm_canonical_arena = arena
+        transformer._mm_residency_state = residency
+        transformer._mm_immutable_training_plan = training_plan
+        transformer._mm_immutable_smart_plan = smart_plan
+        transformer._mm_immutable_canonical_modules = tuple(canonical_modules)
+        transformer._mm_immutable_backend = True
+        return smart_plan
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Krea 2 model")
@@ -781,6 +857,10 @@ class Krea2Model(BaseModel):
                     pinned_resident_keys = MemoryManager.training_pinned_keys_for_keep_last(
                         transformer, max(0, keep_last)
                     )
+                    if self.model_config.layer_offloading_immutable_arena:
+                        self._attach_immutable_training_memory(
+                            transformer, ignore_modules
+                        )
                     if self.model_config.layer_offloading_pinned_arena:
                         # Phase 3 Slice B: the pinned arena covers FROZEN base
                         # weights only and is built inside attach. The trainer
@@ -1015,8 +1095,17 @@ class Krea2Model(BaseModel):
                     f"Loaded torch.compile cache from {compile_cache_dir}"
                 )
 
+        # Immutable canonical-arena backend owns the whole sampling trunk via
+        # its compiled SAMPLE program (_blocks_trunk routes to it first). Its
+        # residency plan was activated at the sampling boundary by the trainer,
+        # so the legacy in-graph / regional sampling-compile enablement below
+        # must NOT run -- it would mutate block forwards the executor bypasses.
+        immutable_sampling = (
+            getattr(self.model, '_immutable_plan_executor', None) is not None
+        )
         ingraph_requested = (
-            self.model_config.compile_sample
+            not immutable_sampling
+            and self.model_config.compile_sample
             and (
                 getattr(self.model_config, 'layer_offloading_compile_streamed', False)
                 or getattr(self.model_config, 'layer_offloading_ingraph_sampling', False)
@@ -1081,7 +1170,11 @@ class Krea2Model(BaseModel):
                     )
                     self._ingraph_compile_sample_reported = True
 
-        if self.model_config.compile_sample and self.model._compiled_ingraph_sampling is None:
+        if (
+            not immutable_sampling
+            and self.model_config.compile_sample
+            and self.model._compiled_ingraph_sampling is None
+        ):
             # Regional (per-block) compilation. We are inside the sampling
             # context (inference_resident) here, so residency is already
             # decided: blocks the manager made GPU-resident have NO offload
