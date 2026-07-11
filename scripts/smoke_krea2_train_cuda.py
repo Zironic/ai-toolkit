@@ -67,6 +67,7 @@ def _cuda_snapshot(label, device):
             "free_gib": _gib(free_b),
             "total_gib": _gib(total_b),
             "torch_allocated_gib": _gib(torch.cuda.memory_allocated(device)),
+            "torch_max_allocated_gib": _gib(torch.cuda.max_memory_allocated(device)),
             "torch_reserved_gib": _gib(torch.cuda.memory_reserved(device)),
             "pinned_ledger_gib": _gib(bounce_pool._pinned_bytes_total),
         }
@@ -232,6 +233,7 @@ def _attach_training_memory(transformer, model_config, device, *, ingraph_traini
         MemoryManager._attach_prefetch_pool(transformer, device)
 
 
+
 def _apply_lora(model, transformer, device, rank, alpha):
     # Mirror BaseSDTrainProcess's network setup order: freeze the base first
     # (streamed backward computes + stages base grads for any param that still
@@ -265,6 +267,97 @@ def _apply_lora(model, transformer, device, rank, alpha):
     network.prepare_grad_etc(None, transformer)
     network.enable_gradient_checkpointing()
     return network
+
+
+def _named_trainable(network):
+    """LoRA params in native fp32, keyed by their qualified names.
+
+    Divergence dumps (ticket fce0b45) must bypass save_weights entirely: it
+    casts to save_dtype (typically bf16) and would put a rounding floor under
+    every metric.
+    """
+    return [(n, p) for n, p in network.named_parameters() if p.requires_grad]
+
+
+def _clone_cpu(named):
+    return {n: p.detach().float().cpu().clone() for n, p in named}
+
+
+def _clone_grads_cpu(named):
+    return {
+        n: p.grad.detach().float().cpu().clone()
+        for n, p in named
+        if p.grad is not None
+    }
+
+
+def _optim_state_cpu(optimizer):
+    def to_cpu(obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().clone()
+        if isinstance(obj, dict):
+            return {k: to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [to_cpu(v) for v in obj]
+        return obj
+
+    return to_cpu(optimizer.state_dict())
+
+
+def _make_fixed_batch(seed, args, device, torch_dtype):
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    lat_h, lat_w = args.height // 8, args.width // 8
+    latents = torch.randn(
+        args.batch_size, 16, lat_h, lat_w, generator=gen
+    ).to(device, torch_dtype)
+    noise = torch.randn(
+        args.batch_size, 16, lat_h, lat_w, generator=gen
+    ).to(device, torch_dtype)
+    timestep = (torch.rand(args.batch_size, generator=gen) * 1000.0).to(device)
+    t_frac = (timestep.float() / 1000.0).view(-1, 1, 1, 1).to(device)
+    noisy = ((1.0 - t_frac) * latents.float() + t_frac * noise.float()).to(torch_dtype)
+    return noisy, timestep
+
+
+def _run_fixed_eval(model, transformer, network, embeds, noisy, timestep, device):
+    """One no-grad forward on the fixed eval batch, in BOTH eval-forward modes.
+
+    bf16 eval isolates accumulated weight divergence (forward arm-invariant
+    given the weights); fp8 eval answers the train/inference-consistency
+    question. Forward mode is flipped by toggling the manager's
+    _fp8_training_requested flag and refreshing the per-linear markers -- the
+    exact seam _restore_offload uses -- then restored to the arm's own mode.
+    """
+    mm = getattr(transformer, "_memory_manager", None)
+    if mm is None:
+        raise SystemExit("fixed eval requires the smart memory manager attached")
+    fp8_capable = torch.cuda.get_device_capability(device) >= (8, 9)
+    original = bool(getattr(mm, "_fp8_training_requested", False))
+    outs = {}
+    try:
+        for mode in ("bf16", "fp8"):
+            mm._fp8_training_requested = (mode == "fp8") and fp8_capable
+            MemoryManager._refresh_training_fp8_flags(transformer, mm)
+            with torch.no_grad(), network:
+                pred = model.get_noise_prediction(noisy, timestep, embeds)
+            outs[mode] = pred.detach().float().cpu().clone()
+    finally:
+        mm._fp8_training_requested = original
+        MemoryManager._refresh_training_fp8_flags(transformer, mm)
+    return outs
+
+
+def _dump_horizon(dump_dir, completed_steps, named, optimizer, grads, eval_outs):
+    payload = {
+        "step": completed_steps,
+        "lora": _clone_cpu(named),
+        "grads": grads if grads is not None else {},
+        "optim": _optim_state_cpu(optimizer),
+        "eval": eval_outs,
+    }
+    path = Path(dump_dir) / f"horizon_{completed_steps:04d}.pt"
+    torch.save(payload, path)
+    print(f"[smoke] dumped horizon {completed_steps} -> {path}")
 
 
 def _parse_args():
@@ -310,6 +403,33 @@ def _parse_args():
     parser.add_argument("--checkpoint-keep-last", type=int, default=0)
     parser.add_argument("--block-stream-only", action="store_true")
     parser.add_argument("--fp8-training-forward", action="store_true")
+    parser.add_argument(
+        "--fp8-grad-input", action="store_true",
+        help="enable the fp8 grad-input backward gate "
+        "(mirrors ModelConfig.layer_offloading_fp8_grad_input); ticket fce0b45",
+    )
+    parser.add_argument(
+        "--dump-dir", default=None,
+        help="divergence-experiment dump dir (ticket fce0b45): writes meta.json, "
+        "horizon_NNNN.pt (LoRA/optim/grads/fixed-eval, native fp32), loss_series.json",
+    )
+    parser.add_argument(
+        "--dump-horizons", default="0,1,5,10,25,50,100",
+        help="comma-separated step counts at which to dump state (0 = pre-training)",
+    )
+    parser.add_argument(
+        "--eval-seed", type=int, default=1234,
+        help="seed for the fixed eval batch (identical across arms, distinct from --seed)",
+    )
+    parser.add_argument(
+        "--init-lora", default=None,
+        help="torch.save'd {name: tensor} dict to load into the LoRA before step 0 "
+        "(warm-branch arms); names must match network.named_parameters()",
+    )
+    parser.add_argument(
+        "--init-optim", default=None,
+        help="torch.save'd optimizer state_dict to load before step 0",
+    )
     parser.add_argument(
         "--ingraph-training",
         action="store_true",
@@ -524,6 +644,70 @@ def main():
                 "use --checkpoint-keep-last N so pinned resident blocks exist"
             )
 
+    # --- fp8 backward divergence experiment wiring (ticket fce0b45) ---
+    named = _named_trainable(network)
+    if args.init_lora:
+        init_state = torch.load(args.init_lora, map_location="cpu", weights_only=True)
+        loaded = 0
+        with torch.no_grad():
+            for n, p in named:
+                if n not in init_state:
+                    raise SystemExit(f"--init-lora missing param {n}")
+                p.copy_(init_state[n].to(p.device, p.dtype))
+                loaded += 1
+        print(f"[smoke] loaded {loaded} LoRA tensors from {args.init_lora}")
+    if args.init_optim:
+        optim_state = torch.load(args.init_optim, map_location="cpu", weights_only=True)
+        optimizer.load_state_dict(optim_state)
+        print(f"[smoke] loaded optimizer state from {args.init_optim}")
+
+    MemoryManager.set_fp8_grad_input_enabled(bool(args.fp8_grad_input))
+    rows.append(
+        {
+            "event": "fp8_gates",
+            "fp8_forward": bool(args.fp8_training_forward),
+            "fp8_grad_input": bool(args.fp8_grad_input),
+        }
+    )
+    _print_json(rows[-1])
+
+    dump_dir = None
+    horizons = set()
+    eval_batch = None
+    if args.dump_dir:
+        dump_dir = Path(args.dump_dir)
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        horizons = {int(h) for h in args.dump_horizons.split(",") if h.strip() != ""}
+        meta = {
+            "arm": {
+                "fp8_forward": bool(args.fp8_training_forward),
+                "fp8_grad_input": bool(args.fp8_grad_input),
+            },
+            "seed": args.seed,
+            "eval_seed": args.eval_seed,
+            "steps": args.steps,
+            "horizons": sorted(horizons),
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "lr": args.lr,
+            "width": args.width,
+            "height": args.height,
+            "batch_size": args.batch_size,
+            "qtype": args.qtype,
+            "init_lora": args.init_lora,
+            "init_optim": args.init_optim,
+            "param_names": [n for n, _ in named],
+        }
+        (dump_dir / "meta.json").write_text(
+            json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        eval_batch = _make_fixed_batch(args.eval_seed, args, device, model.torch_dtype)
+        if 0 in horizons:
+            eval_outs = _run_fixed_eval(
+                model, transformer, network, embeds, *eval_batch, device
+            )
+            _dump_horizon(dump_dir, 0, named, optimizer, None, eval_outs)
+
     lat_h, lat_w = args.height // 8, args.width // 8
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
@@ -562,10 +746,23 @@ def main():
             )
         ).item()
         grads_present = sum(1 for p in trainable if p.grad is not None)
+        completed = step + 1
+        horizon_grads = None
+        if dump_dir is not None and completed in horizons:
+            # Grads captured pre-step: the raw fp32 LoRA gradients the fp8
+            # grad-input hops contaminated, before Adam integrates them.
+            horizon_grads = _clone_grads_cpu(named)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - t0
+        if dump_dir is not None and completed in horizons:
+            eval_outs = _run_fixed_eval(
+                model, transformer, network, embeds, *eval_batch, device
+            )
+            _dump_horizon(
+                dump_dir, completed, named, optimizer, horizon_grads, eval_outs
+            )
 
         row = {
             "event": "train_step",
@@ -589,6 +786,16 @@ def main():
                 print(f"[smoke] saved torch.compile mega-cache ({compile_cache_key})")
         if grads_present == 0:
             raise SystemExit("no LoRA gradients produced -- training path is broken")
+
+    if dump_dir is not None:
+        loss_series = [
+            {"step": r["step"] + 1, "loss": r["loss"], "grad_norm": r["grad_norm"]}
+            for r in step_rows
+        ]
+        (dump_dir / "loss_series.json").write_text(
+            json.dumps(loss_series, indent=2), encoding="utf-8"
+        )
+        print(f"[smoke] wrote {dump_dir / 'loss_series.json'}")
 
     rows.extend(step_rows)
     steady = [r["seconds"] for r in step_rows[1:]] or [step_rows[0]["seconds"]]

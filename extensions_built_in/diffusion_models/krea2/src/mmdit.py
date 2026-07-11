@@ -44,6 +44,7 @@ from toolkit.memory_management.ingraph_stream import (
     free_on_backward,
     in_recompute,
     is_streamed_module,
+    raise_dynamo_recompile_limit,
     release_pack,
     streamed_linear,
     streamed_linear_tensors,
@@ -766,6 +767,14 @@ class SingleStreamDiT(nn.Module):
         self._compiled_ingraph_training = None
         self._ingraph_sampling_timing = None
         self._last_ingraph_sampling_timing = None
+        # Slice 4 eager-only immutable-arena functional execution. Compile and
+        # train/sample phase-callable caching are intentionally deferred to
+        # Slice 5; this adapter captures exactly one residency fingerprint.
+        self._immutable_arena_adapter = None
+        # Slice 5 (IMMUTABLE_TRANSFER_ARENA_PLAN.md): compiled train/sample
+        # plan executor over one canonical arena. Takes precedence over the
+        # eager adapter in _blocks_trunk when both exist.
+        self._immutable_plan_executor = None
 
         headdim = config.features // config.heads
         axes = [
@@ -1317,6 +1326,7 @@ class SingleStreamDiT(nn.Module):
         fingerprint = tuple(sorted(plans))
         self._compiled_ingraph_fingerprint = fingerprint
         if compile and plans:
+            raise_dynamo_recompile_limit()
             if len(plans) != len(self.blocks):
                 self._compiled_ingraph_sampling_blocks = {
                     index: torch.compile(
@@ -1802,6 +1812,72 @@ class SingleStreamDiT(nn.Module):
             )
         return combined
 
+    def enable_immutable_arena_eager(self, arena, residency, depth: int = 2):
+        """Enable Slice 4 eager functional execution for one residency plan.
+
+        LoRA leaves are collected before any forward wrapper could be removed;
+        unlike the legacy boundary path, there is no global previous-layout
+        leaf-count guard. A changed residency fingerprint requires calling this
+        method again to build the next phase adapter.
+        """
+        self.disable_immutable_arena_eager()
+        if residency.arena is not arena:
+            raise ValueError("immutable arena/residency ownership mismatch")
+        block_indices = tuple(range(len(self.blocks)))
+        loras, network = self._collect_block_loras(block_indices)
+        self._ensure_ingraph_lora_multiplier(network, loras)
+        from .immutable_arena import KreaImmutableArenaAdapter
+
+        self._immutable_arena_adapter = KreaImmutableArenaAdapter(
+            self,
+            residency,
+            loras_by_block=loras,
+            lora_multiplier=self._ingraph_lora_multiplier,
+            depth=depth,
+        )
+        return self._immutable_arena_adapter
+
+    def disable_immutable_arena_eager(self):
+        if self._immutable_arena_adapter is not None:
+            from toolkit.memory_management.ingraph_stream import drain_fetch_runtime
+
+            drain_fetch_runtime()
+        self._immutable_arena_adapter = None
+
+    def enable_immutable_arena_compiled(
+        self, arena, residency, depth: int = 2, compile_trunks: bool = True
+    ):
+        """Enable the Slice 5 compiled plan executor (train + sample phases).
+
+        Builds the executor only; call ``executor.activate(mode, plan)`` at
+        each phase boundary to select/build that phase's callable. LoRA
+        leaves are collected here, before any forward wrapper could be
+        stripped, exactly like the eager enable."""
+        self.disable_immutable_arena_compiled()
+        if residency.arena is not arena:
+            raise ValueError("immutable arena/residency ownership mismatch")
+        block_indices = tuple(range(len(self.blocks)))
+        loras, network = self._collect_block_loras(block_indices)
+        self._ensure_ingraph_lora_multiplier(network, loras)
+        from .immutable_arena import KreaImmutablePlanExecutor
+
+        self._immutable_plan_executor = KreaImmutablePlanExecutor(
+            self,
+            residency,
+            loras_by_block=loras,
+            lora_multiplier=self._ingraph_lora_multiplier,
+            depth=depth,
+            compile_trunks=compile_trunks,
+        )
+        return self._immutable_plan_executor
+
+    def disable_immutable_arena_compiled(self):
+        if self._immutable_plan_executor is not None:
+            from toolkit.memory_management.ingraph_stream import drain_fetch_runtime
+
+            drain_fetch_runtime()
+        self._immutable_plan_executor = None
+
     def enable_ingraph_training(self, depth: int = 2, compile: bool = True):
         """Phase 4a: compiled fully-streamed TRAINING trunk (all blocks).
 
@@ -1973,6 +2049,10 @@ class SingleStreamDiT(nn.Module):
             )
 
             install_ordering_pass()
+            # Bucketed resolutions and per-boundary trunk rebuilds each add a
+            # dynamo cache entry on this one code object; the default cap of 8
+            # hard-crashes (fullgraph=True) at the third sampling boundary.
+            raise_dynamo_recompile_limit()
             self._compiled_ingraph_training = torch.compile(
                 self._ingraph_training_trunk,
                 fullgraph=True,
@@ -2162,7 +2242,10 @@ class SingleStreamDiT(nn.Module):
         # Pad the combined sequence to a multiple of 256 when a compiled block
         # region will run. The pad slots are appended after the image tokens,
         # masked False, and sliced off below, so this is numerically identical.
-        if use_compiled or use_ingraph or use_ingraph_train:
+        use_immutable_executor = (
+            self._immutable_plan_executor is not None and not reference_mode
+        )
+        if use_compiled or use_ingraph or use_ingraph_train or use_immutable_executor:
             fulllen = combined.shape[1]
             _padlen = (-fulllen) % 256
             if _padlen > 0:
@@ -2195,7 +2278,14 @@ class SingleStreamDiT(nn.Module):
                 combined.shape[1], dtype=torch.bool, device=combined.device
             )
             is_ref[split : split + reflen] = True
-            mask = mask & (~is_ref[:, None] | is_ref[None, :])
+            # _mask() deliberately returns None for an all-valid sequence and a
+            # key-only (B, 1, 1, L) mask otherwise. Reference isolation is
+            # query-dependent, so materialize the live query rows only here.
+            if mask is None:
+                mask = padmask[:, None, None, :]
+            mask = mask.expand(-1, 1, combined.shape[1], -1)
+            isolation_mask = ~is_ref[:, None] | is_ref[None, :]
+            mask = mask & isolation_mask[None, None, :, :]
 
         ref_span = None
         if ref_kv_capture is not None and reflen > 0:
@@ -2207,6 +2297,12 @@ class SingleStreamDiT(nn.Module):
         blockcaches = None
         if ref_kv_cache is not None:
             blockcaches, refmask = ref_kv_cache
+            # Cached reference keys add an (R) key span to every live query.
+            # Expand the local key-only/None mask to (B, 1, L, L) before
+            # concatenating the reference-key mask (B, 1, L, R).
+            if mask is None:
+                mask = padmask[:, None, None, :]
+            mask = mask.expand(-1, 1, combined.shape[1], -1)
             extra = padmask.unsqueeze(1).unsqueeze(3) & refmask.unsqueeze(1).unsqueeze(2)
             mask = torch.cat((mask, extra), dim=3)
         freqs = self.posemb(pos)
@@ -2266,6 +2362,22 @@ class SingleStreamDiT(nn.Module):
             or ref_kv_capture is not None
             or blockcaches is not None
         )
+        immutable_executor = self._immutable_plan_executor
+        if immutable_executor is not None and not reference_mode:
+            # Slice 5 compiled plans: run() picks the train/sample callable
+            # from grad mode and fails closed if that phase was not activated
+            # for the live residency plan. Pull the current network multiplier
+            # into the trunk's live scalar first (identity-stable; no
+            # recompile), same as the ingraph paths.
+            self._refresh_ingraph_lora_multiplier()
+            return immutable_executor.run(combined, tvec, freqs, mask)
+        immutable_adapter = self._immutable_arena_adapter
+        if (
+            immutable_adapter is not None
+            and torch.is_grad_enabled()
+            and not reference_mode
+        ):
+            return immutable_adapter.forward_blocks(combined, tvec, freqs, mask)
         use_compiled = (
             self._compiled_blocks is not None
             and not torch.is_grad_enabled()

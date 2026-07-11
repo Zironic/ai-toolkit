@@ -24,12 +24,34 @@ import torch
 # Longest-first: several names are prefixes of others and matching is by
 # substring (e.g. "mm.fetch_start" would shadow "mm.fetch_start_after").
 _FETCH_OPS = (
+    "mm.fetch_start_multi_gated",
+    "mm.fetch_start_multi_after",
+    "mm.fetch_start_multi",
     "mm.fetch_start_gated",
     "mm.fetch_start_after",
     "mm.fetch_free_after",
     "mm.fetch_start",
     "mm.fetch_wait",
     "mm.fetch_free",
+)
+
+# fetch-start variants with a declared guard mutation -> their gated
+# counterpart (a REAL data input the scheduler cannot drop) plus the
+# positional args, besides the guard, that must be forwarded to it.
+_GATED_REWRITES = {
+    "mm.fetch_start_after": (
+        torch.ops.mm.fetch_start_gated.default,
+        ("host_flat",),
+    ),
+    "mm.fetch_start_multi_after": (
+        torch.ops.mm.fetch_start_multi_gated.default,
+        ("host_flat", "ranges", "compact_nbytes"),
+    ),
+}
+
+_GATED_TARGETS = (
+    torch.ops.mm.fetch_start_gated.default,
+    torch.ops.mm.fetch_start_multi_gated.default,
 )
 
 
@@ -65,15 +87,20 @@ def order_fetch_ops_pass(graph: torch.fx.Graph) -> None:
         if matched is None:
             continue
         op_name, is_auto = matched
-        if op_name == "mm.fetch_start_after" and is_auto and prev_auto is not None:
-            # Replace the functionalized fetch_start_after with a direct
-            # fetch_start_gated whose gate is the previous fetch-op's updated
-            # base -- a real data input, not mutation bookkeeping.
-            host = node.kwargs.get("host_flat")
-            if host is None and node.args:
-                host = node.args[1] if len(node.args) > 1 else None
-            if host is not None:
-                if prev_auto.target is torch.ops.mm.fetch_start_gated.default:
+        rewrite = _GATED_REWRITES.get(op_name)
+        if rewrite is not None and is_auto and prev_auto is not None:
+            gated_target, arg_names = rewrite
+            # Replace the functionalized fetch_start(_multi)_after with its
+            # direct gated counterpart whose gate is the previous fetch-op's
+            # updated base -- a real data input, not mutation bookkeeping.
+            forwarded = []
+            for position, arg_name in enumerate(arg_names):
+                value = node.kwargs.get(arg_name)
+                if value is None and len(node.args) > position + 1:
+                    value = node.args[position + 1]
+                forwarded.append(value)
+            if all(value is not None for value in forwarded):
+                if prev_auto.target in _GATED_TARGETS:
                     gate = prev_auto  # token tensor, already a plain output
                 else:
                     # Gate on the wrapped op's RETURN (tuple element 0, the
@@ -87,7 +114,7 @@ def order_fetch_ops_pass(graph: torch.fx.Graph) -> None:
                         )
                 with graph.inserting_after(node):
                     gated = graph.call_function(
-                        torch.ops.mm.fetch_start_gated.default, (host, gate)
+                        gated_target, (*forwarded, gate)
                     )
                 # The old node's users are getitems: index 0 is the token,
                 # index >=1 are updated guard bases (pass-through of the
@@ -109,7 +136,7 @@ def order_fetch_ops_pass(graph: torch.fx.Graph) -> None:
                 graph.erase_node(node)
                 node = gated
                 rewired += 1
-        if is_auto or node.target is torch.ops.mm.fetch_start_gated.default:
+        if is_auto or node.target in _GATED_TARGETS:
             prev_auto = node
     if rewired:
         graph.lint()
