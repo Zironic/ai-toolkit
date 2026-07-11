@@ -170,3 +170,51 @@ def test_no_oscillation_rollback_then_cooldown_holds():
         s, a = drive(s, {"binding": False, "promote_gate": True, "cap_covers_promo": True}, cooldown_n=4)
         promotes += a == vb.ACT_PROMOTE
     assert promotes == 0
+
+
+# --- Training worst-resolution promotion guard -----------------------------
+
+def test_worst_shape_free_subtracts_all_cohabitants_plus_block():
+    # resident 5.0 + block 0.375 + ring 0.5 + worst reserve 2.5 + other 1.15
+    # = 9.525 used; on a 12 GiB card that leaves 2.475 free.
+    free = vb.training_promotion_worst_shape_free_gib(
+        resident_gib=5.0,
+        added_block_gib=0.375,
+        ring_gib=0.5,
+        worst_working_reserve_gib=2.5,
+        other_gib=1.15,
+        total_gib=12.0,
+    )
+    assert free == pytest.approx(2.475, abs=1e-6)
+
+
+def test_worst_shape_gate_vetoes_when_high_res_reserve_would_page():
+    # Same layout, but the worst measured resolution needs a 3.6 GiB reserve.
+    # A promotion decided on a roomy low-res step (that only needed ~1.7) would
+    # push the high-res cohabitation peak past the promote floor -> veto.
+    hold_high = 2.0
+    roomy_lowres = vb.training_promotion_worst_shape_free_gib(
+        resident_gib=5.0, added_block_gib=0.375, ring_gib=0.5,
+        worst_working_reserve_gib=1.7, other_gib=1.15, total_gib=12.0,
+    )
+    worst_highres = vb.training_promotion_worst_shape_free_gib(
+        resident_gib=5.0, added_block_gib=0.375, ring_gib=0.5,
+        worst_working_reserve_gib=3.6, other_gib=1.15, total_gib=12.0,
+    )
+    # The current (low-res) step looks safe; the worst measured shape does not.
+    assert roomy_lowres >= hold_high
+    assert worst_highres < hold_high
+
+
+def test_worst_shape_free_is_conservative_about_the_block():
+    # Adding the block can only lower the predicted free (never hidden by a
+    # shrinking ring) -- the from-below assumption.
+    without_block = vb.training_promotion_worst_shape_free_gib(
+        resident_gib=5.0, added_block_gib=0.0, ring_gib=0.5,
+        worst_working_reserve_gib=2.5, other_gib=1.15, total_gib=12.0,
+    )
+    with_block = vb.training_promotion_worst_shape_free_gib(
+        resident_gib=5.0, added_block_gib=0.375, ring_gib=0.5,
+        worst_working_reserve_gib=2.5, other_gib=1.15, total_gib=12.0,
+    )
+    assert with_block == pytest.approx(without_block - 0.375, abs=1e-6)

@@ -1,8 +1,11 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from toolkit.memory_management import pin_manager
 from toolkit.memory_management.canonical_arena import CanonicalArena
+from toolkit.memory_management.immutable_runtime import ImmutableTransformerRuntime
 from toolkit.memory_management.residency import (
     ResidencyError,
     ResidencyPlan,
@@ -32,10 +35,65 @@ def test_phase_plan_and_existing_planner_seam(arena_layers):
     arena, layers = arena_layers
     smart = {"offload_ids": {id(layers["a"]), id(layers["c"])}}
     plan = ResidencyPlan.from_smart_plan(arena, smart, phase="train")
-    assert plan.resident_leaf_keys == frozenset({("blocks.0", "b")})
+    # Immutable policy normalizes any partially offloaded canonical block to
+    # fully streamed. Source snapshots may still represent mixed layouts, but
+    # controller/planner output is whole-block.
+    assert plan.resident_leaf_keys == frozenset()
     assert plan == ResidencyPlan.from_smart_plan(arena, smart, phase="train")
     assert plan.fingerprint != ResidencyPlan.build("sample", plan.resident_leaf_keys).fingerprint
 
+
+class _LinearBlockAdapter:
+    architecture_key = "test_linear_block"
+
+    def execution_blocks(self, transformer):
+        return tuple(transformer.blocks)
+
+    def block_key(self, transformer, index):
+        return f"blocks.{index}"
+
+    def leaf_entries(self, block):
+        return tuple(block.entries)
+
+    def build_lora_args(self, index, loras_by_block, multiplier=None):
+        return None
+
+    def can_run_current_call(self, block_args, **kwargs):
+        return True
+
+    def forward_block(self, *args, **kwargs):
+        raise AssertionError("not used by residency policy test")
+
+
+def test_runtime_training_transitions_are_whole_block(arena_layers):
+    arena, layers = arena_layers
+    block = SimpleNamespace(entries=tuple(layers.items()))
+    model = SimpleNamespace(
+        blocks=(block,),
+        _mm_immutable_protected_training_leaf_keys=frozenset(),
+    )
+    state = ResidencyState(arena, "cpu")
+    state.reconcile(ResidencyPlan.build("train", ()))
+    runtime = ImmutableTransformerRuntime(
+        model,
+        state,
+        architecture_adapter=_LinearBlockAdapter(),
+        compile_blocks=False,
+    )
+    runtime.finalize_execution()
+
+    growth = runtime.increase_training_residency(
+        arena.block_record("blocks.0").committed_bytes,
+    )
+    expected = frozenset(
+        ("blocks.0", leaf_name) for leaf_name in layers
+    )
+    assert state.plan.resident_leaf_keys == expected
+    assert growth["added_blocks"] == ("blocks.0",)
+
+    relief = runtime.reduce_training_residency(1)
+    assert relief["removed_blocks"] == ("blocks.0",)
+    assert state.plan.resident_leaf_keys == frozenset()
 
 def test_cpu_reconcile_never_mutates_parameters_or_pin_ledger(arena_layers):
     arena, layers = arena_layers

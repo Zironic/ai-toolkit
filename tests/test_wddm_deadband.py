@@ -15,6 +15,88 @@ class WddmDeadbandTests(unittest.TestCase):
         return MemoryManager._training_layout_action(
             free, wddm_hard_gib=1.0, wddm_hold_high_gib=2.0, **kw
         )
+    def test_immutable_promotion_uses_runtime_without_trace_reset(self):
+        import torch
+        import toolkit.memory_management.manager as manager_mod
+
+        gib = 1024 ** 3
+
+        class FakeRuntime:
+            def __init__(self):
+                self.calls = []
+
+            def increase_training_residency(
+                self,
+                available_growth_bytes,
+                *,
+                max_blocks,
+            ):
+                self.calls.append((available_growth_bytes, max_blocks))
+                return {
+                    "added_blocks": ("blocks.0",),
+                    "added_leaf_keys": (
+                        ("blocks.0", "attn.wq"),
+                        ("blocks.0", "attn.wk"),
+                    ),
+                    "actual_growth_bytes": 256,
+                    "previous_plan": object(),
+                }
+
+        class FakeManager:
+            _smart_training_plan = {
+                "resident_bytes": 1024,
+                "generic_resident_bytes": 1024,
+                "offloaded_layers": 8,
+            }
+
+        class FakeModule:
+            pass
+
+        runtime = FakeRuntime()
+        module = FakeModule()
+        module._immutable_runtime = runtime
+        mm = FakeManager()
+        trace_resets = []
+
+        old_device_free = manager_mod.vram_budget.device_free_bytes
+        old_sync = manager_mod.torch.cuda.synchronize
+        old_allocatable = MemoryManager._torch_allocatable_bytes
+        old_invalidate = MemoryManager._invalidate_manual_training_shape_peaks
+        old_reset = MemoryManager.reset_trace_due_to_execution_shape_change
+        try:
+            manager_mod.vram_budget.device_free_bytes = (
+                lambda _device: 4 * gib
+            )
+            manager_mod.torch.cuda.synchronize = lambda _device: None
+            MemoryManager._torch_allocatable_bytes = classmethod(
+                lambda cls, _device: 5 * gib
+            )
+            MemoryManager._invalidate_manual_training_shape_peaks = classmethod(
+                lambda cls, _mm: None
+            )
+            MemoryManager.reset_trace_due_to_execution_shape_change = classmethod(
+                lambda cls: trace_resets.append(True)
+            )
+
+            changed, action = MemoryManager._promote_training_layer(
+                module,
+                mm,
+                torch.device("cuda:0"),
+                cache_pad_gib=0.5,
+                wddm_stop_gib=1.0,
+            )
+        finally:
+            manager_mod.vram_budget.device_free_bytes = old_device_free
+            manager_mod.torch.cuda.synchronize = old_sync
+            MemoryManager._torch_allocatable_bytes = old_allocatable
+            MemoryManager._invalidate_manual_training_shape_peaks = old_invalidate
+            MemoryManager.reset_trace_due_to_execution_shape_change = old_reset
+
+        self.assertEqual((changed, action), (1, "promote_immutable_block"))
+        self.assertEqual(runtime.calls, [(int(3.5 * gib), 1)])
+        self.assertEqual(trace_resets, [])
+        self.assertEqual(mm._smart_training_plan["resident_bytes"], 1280)
+        self.assertEqual(mm._smart_training_plan["offloaded_layers"], 6)
 
     def test_below_hard_floor_demotes(self):
         self.assertEqual(self._act(0.5), "down")
@@ -162,6 +244,55 @@ class SharedCliffReliefTests(unittest.TestCase):
         self.assertEqual(calls, [large])
 
 
+class NextPromotionLayerTests(unittest.TestCase):
+    """The worst-shape promotion guard must size the next promotion off the same
+    block ``_promote_training_layer`` will actually convert first -- pinned-
+    resident candidates first, then ascending by resident size."""
+
+    def _drive(self, rows):
+        class FakeManager:
+            _attach_args = {"ignore_modules": []}
+            _training_pinned_resident_keys = set()
+
+        def fake_candidates(*_args, **_kwargs):
+            return list(rows)
+
+        old = MemoryManager._training_layout_candidates
+        try:
+            MemoryManager._training_layout_candidates = staticmethod(fake_candidates)
+            return MemoryManager._next_promotion_layer_bytes(object(), FakeManager())
+        finally:
+            MemoryManager._training_layout_candidates = old
+
+    def test_picks_smallest_managed_layer(self):
+        rows = [
+            {"module": object(), "managed": True, "resident_bytes": 30},
+            {"module": object(), "managed": True, "resident_bytes": 10},
+            {"module": object(), "managed": False, "resident_bytes": 5},  # resident, skip
+        ]
+        self.assertEqual(self._drive(rows), 10)
+
+    def test_pinned_resident_is_promoted_before_a_smaller_unpinned(self):
+        rows = [
+            {"module": object(), "managed": True, "resident_bytes": 10},
+            {
+                "module": object(),
+                "managed": True,
+                "resident_bytes": 30,
+                "pinned_resident": True,
+            },
+        ]
+        # The 30-byte pinned block sorts first, so the guard must predict with 30.
+        self.assertEqual(self._drive(rows), 30)
+
+    def test_zero_when_nothing_streamed(self):
+        rows = [
+            {"module": object(), "managed": False, "resident_bytes": 5},
+            {"module": object(), "managed": False, "resident_bytes": 8},
+        ]
+        self.assertEqual(self._drive(rows), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -291,7 +422,7 @@ class DxgiLocalPrestepGuardTests(unittest.TestCase):
 
         module = FakeModule()
         module._memory_manager = FakeManager()
-        module._immutable_plan_executor = FakeExecutor()
+        module._immutable_runtime = FakeExecutor()
         MemoryManager._record_manual_training_shape_peak(
             module._memory_manager,
             (512, 512),
@@ -342,7 +473,7 @@ class DxgiLocalPrestepGuardTests(unittest.TestCase):
         self.assertEqual(result["action"], "prestep_reduce_canonical")
         self.assertEqual(result["demoted_layers"], 0)
         self.assertEqual(singleton_calls, [])
-        self.assertEqual(len(module._immutable_plan_executor.calls), 1)
+        self.assertEqual(len(module._immutable_runtime.calls), 1)
         self.assertEqual(
             result["canonical_relief"]["relieved_bytes"],
             result["required_relief_bytes"],

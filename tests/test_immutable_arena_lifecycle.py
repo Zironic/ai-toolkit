@@ -160,8 +160,10 @@ class ImmutableBackendCudaTests(unittest.TestCase):
             self.assertEqual(module._mm_canonical_leaf_ids, {id(module.canon)})
             # Legacy autotune is deliberately disabled for this backend.
             self.assertFalse(mm._training_autotune_enabled)
-            # A canonical leaf must never receive a legacy streaming manager.
+            # Structurally exclusive immutable attach creates no per-layer
+            # manager for either canonical blocks or singleton modules.
             self.assertFalse(hasattr(module.canon, "_layer_memory_manager"))
+            self.assertFalse(hasattr(module.keep, "_layer_memory_manager"))
         finally:
             MemoryManager.detach(module)
 

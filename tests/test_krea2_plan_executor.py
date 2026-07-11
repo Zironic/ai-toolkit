@@ -11,15 +11,16 @@ checks run with compile_blocks=False (same mechanism, no compile cost).
 import pytest
 import torch
 
-from extensions_built_in.diffusion_models.krea2.src.immutable_arena import (
-    KreaImmutableArenaError,
-    KreaImmutablePlanExecutor,
+from toolkit.memory_management.immutable_runtime import (
+    ImmutableRuntimeError,
+    ImmutableTransformerRuntime,
 )
 from extensions_built_in.diffusion_models.krea2.src.mmdit import (
     SingleMMDiTConfig,
     SingleStreamDiT,
 )
 from toolkit.memory_management import ingraph_stream, pin_manager
+from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
 from toolkit.memory_management.canonical_arena import CanonicalArena
 from toolkit.memory_management.ingraph_stream import LoraEntry
 from toolkit.memory_management.residency import ResidencyPlan, ResidencyState
@@ -28,6 +29,19 @@ pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA req
 
 LAYERS = 2
 
+
+def _runtime(model, state, **kwargs):
+    return ImmutableTransformerRuntime(
+        model,
+        state,
+        architecture_adapter=SingleStreamMMDiTAdapter(),
+        **kwargs,
+    )
+
+def _run(executor, *args):
+    mode = executor.TRAIN if torch.is_grad_enabled() else executor.SAMPLE
+    with executor.execution(mode):
+        return executor.run(*args)
 
 def _model():
     torch.manual_seed(123)
@@ -139,7 +153,7 @@ def test_compiled_train_parity_lora_grads_and_zero_graph_breaks():
     torch._dynamo.reset()
     model, arena, state, reference_args = _fixture()
     loras, trainable = _loras(model)
-    executor = KreaImmutablePlanExecutor(
+    executor = _runtime(
         model,
         state,
         loras_by_block=loras,
@@ -148,7 +162,7 @@ def test_compiled_train_parity_lora_grads_and_zero_graph_breaks():
     try:
         executor.activate(executor.TRAIN, _train_plan())
         inputs = _inputs(model, requires_grad=True)
-        out = executor.run(*inputs)
+        out = _run(executor, *inputs)
         out.square().mean().backward()
         torch.cuda.synchronize()
 
@@ -186,7 +200,7 @@ def test_phase_cycles_reuse_graphs_and_arena_fixed_across_boundaries():
     torch._dynamo.reset()
     model, arena, state, _reference_args = _fixture()
     loras, _trainable = _loras(model)
-    executor = KreaImmutablePlanExecutor(
+    executor = _runtime(
         model,
         state,
         loras_by_block=loras,
@@ -199,10 +213,10 @@ def test_phase_cycles_reuse_graphs_and_arena_fixed_across_boundaries():
     def cycle():
         executor.activate(executor.TRAIN, train_plan)
         inputs = _inputs(model, requires_grad=True)
-        executor.run(*inputs).square().mean().backward()
+        _run(executor, *inputs).square().mean().backward()
         executor.activate(executor.SAMPLE, sample_plan)
         with torch.no_grad():
-            executor.run(*_inputs(model))
+            _run(executor, *_inputs(model))
         torch.cuda.synchronize()
 
     try:
@@ -230,7 +244,7 @@ def test_phase_cycles_reuse_graphs_and_arena_fixed_across_boundaries():
 
 def test_bounce_pin_churn_does_not_invalidate_phase_transitions(monkeypatch):
     model, arena, state, _reference_args = _fixture()
-    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
+    executor = _runtime(model, state, compile_blocks=False)
     during_handle = None
     original_build_sidecar = state._build_sidecar
 
@@ -256,13 +270,13 @@ def test_bounce_pin_churn_does_not_invalidate_phase_transitions(monkeypatch):
         monkeypatch.setattr(state, "_build_sidecar", build_sidecar_with_bounce)
         executor.activate(executor.SAMPLE, _sample_plan())
         with torch.no_grad():
-            assert executor.run(*_inputs(model)).shape == (1, 5, 32)
+            assert _run(executor,*_inputs(model)).shape == (1, 5, 32)
         pin_manager.release(during_handle)
         during_handle = None
         monkeypatch.setattr(state, "_build_sidecar", original_build_sidecar)
 
         executor.activate(executor.TRAIN, _train_plan())
-        assert executor.run(
+        assert _run(executor,
             *_inputs(model, requires_grad=True)
         ).shape == (1, 5, 32)
     finally:
@@ -274,12 +288,12 @@ def test_bounce_pin_churn_does_not_invalidate_phase_transitions(monkeypatch):
 
 def test_actual_arena_flat_unregistration_still_fails_closed():
     model, arena, state, _reference_args = _fixture()
-    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
+    executor = _runtime(model, state, compile_blocks=False)
     flat = arena.block_record("blocks.0").host_flat
     try:
         assert pin_manager.unpin_tensor_in_place(flat, "weights")
         with pytest.raises(
-            KreaImmutableArenaError, match="arena_mutated_at_boundary"
+            ImmutableRuntimeError, match="arena_mutated_at_boundary"
         ):
             executor.activate(executor.SAMPLE, _sample_plan())
     finally:
@@ -289,7 +303,7 @@ def test_actual_arena_flat_unregistration_still_fails_closed():
 
 def test_training_residency_reduction_is_subset_only_and_preserves_protected():
     model, arena, state, _reference_args = _fixture()
-    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
+    executor = _runtime(model, state, compile_blocks=False)
     train_plan = _train_plan()
     protected = ("blocks.0", "attn.wq")
     model._mm_immutable_protected_training_leaf_keys = frozenset({protected})
@@ -323,13 +337,13 @@ def test_training_residency_reduction_is_subset_only_and_preserves_protected():
 
 def test_all_streamed_sampling_fallback_needs_no_host_rebuild():
     model, arena, state, _reference_args = _fixture()
-    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
+    executor = _runtime(model, state, compile_blocks=False)
     signature = _arena_signature(arena)
     try:
         # Simulate mid-run state: a partially resident sampling plan.
         executor.activate(executor.SAMPLE, _sample_plan())
         with torch.no_grad():
-            executor.run(*_inputs(model))
+            _run(executor, *_inputs(model))
 
         # Emergency demotion: prebuilt all-streamed plan, no host-side work.
         program = executor.activate_sampling_fallback()
@@ -342,7 +356,7 @@ def test_all_streamed_sampling_fallback_needs_no_host_rebuild():
 
         ingraph_stream.fetch_stats(reset=True)
         with torch.no_grad():
-            out = executor.run(*_inputs(model))
+            out = _run(executor, *_inputs(model))
         torch.cuda.synchronize()
         assert out.shape == (1, 5, 32)
         stats = ingraph_stream.fetch_stats()
@@ -356,20 +370,20 @@ def test_all_streamed_sampling_fallback_needs_no_host_rebuild():
 
 def test_run_fails_closed_without_activation_and_on_stale_plan():
     model, arena, state, _reference_args = _fixture()
-    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
+    executor = _runtime(model, state, compile_blocks=False)
     try:
         with torch.no_grad(), pytest.raises(
-            KreaImmutableArenaError, match="no_active_plan:sample"
+            ImmutableRuntimeError, match="no_active_plan:sample"
         ):
-            executor.run(*_inputs(model))
+            _run(executor, *_inputs(model))
 
         executor.activate(executor.SAMPLE, _sample_plan())
         # A residency change behind the executor's back must fail closed.
         state.reconcile(ResidencyPlan.build("rogue", (("blocks.0", "attn.wk"),)))
         with torch.no_grad(), pytest.raises(
-            KreaImmutableArenaError, match="residency_plan_changed:sample"
+            ImmutableRuntimeError, match="residency_plan_changed:sample"
         ):
-            executor.run(*_inputs(model))
+            _run(executor, *_inputs(model))
     finally:
         ingraph_stream.drain_fetch_runtime()
         arena.release()

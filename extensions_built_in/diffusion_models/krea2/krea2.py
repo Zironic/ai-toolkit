@@ -538,9 +538,9 @@ class Krea2Model(BaseModel):
         """Shape-aware cold-start hint for MemoryManager.inference_resident.
 
         Sized from the LARGEST pending sample so the residency plan streams
-        enough blocks up front -- a mid-denoise OOM demote invalidates
-        compiled state and (under strict ingraph) changes the pack set, so
-        planning for the worst sample beats reacting per image. Returns None
+        enough blocks up front -- a mid-denoise OOM demote republishes residency
+        under an active execution, so planning for the worst sample beats
+        reacting per image. Returns None
         when there is nothing to estimate; the manager then keeps its flat
         cold-start default. A learned measured reserve replaces the estimate
         after the first sample either way.
@@ -744,21 +744,27 @@ class Krea2Model(BaseModel):
         self.invert_assistant_lora = True
 
     def _attach_immutable_training_memory(self, transformer, ignore_modules):
-        """Build Krea's canonical block arena and attach singleton streaming.
+        """Build Krea's canonical block arena and prepare the immutable runtime.
 
-        Sequencing is strict: load/quantize -> freeze -> canonicalize -> legacy
-        singleton attach. LoRA/optimizer construction happens later in the
-        trainer, after all frozen base Parameter identities are final.
+        Sequencing is strict: load/quantize -> freeze -> canonicalize -> build
+        arena/residency -> prepare (unfinalized) immutable runtime. Singleton
+        (non-canonical) modules stay resident; only the canonical blocks stream
+        through the arena. LoRA/optimizer construction and runtime finalization
+        happen later in the trainer, after all frozen base Parameter identities
+        are final.
         """
+        from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
         from toolkit.memory_management.canonical_arena import CanonicalArena
         from toolkit.memory_management.residency import ResidencyPlan, ResidencyState
 
         transformer.requires_grad_(False)
+        architecture_adapter = SingleStreamMMDiTAdapter()
+        blocks = architecture_adapter.execution_blocks(transformer)
         entries_by_block = {
-            f"blocks.{index}": list(
-                transformer._block_linear_entries(transformer.blocks[index])
+            architecture_adapter.block_key(transformer, index): list(
+                architecture_adapter.leaf_entries(block)
             )
-            for index in range(len(transformer.blocks))
+            for index, block in enumerate(blocks)
         }
         arena = CanonicalArena()
         arena.canonicalize(entries_by_block)
@@ -811,6 +817,7 @@ class Krea2Model(BaseModel):
         training_plan = ResidencyPlan.from_smart_plan(
             arena, smart_plan, phase="train"
         )
+        residency.reconcile(training_plan)
         transformer._mm_canonical_arena = arena
         transformer._mm_residency_state = residency
         transformer._mm_immutable_training_plan = training_plan
@@ -829,6 +836,32 @@ class Krea2Model(BaseModel):
         transformer._mm_immutable_smart_plan = smart_plan
         transformer._mm_immutable_canonical_modules = tuple(canonical_modules)
         transformer._mm_immutable_backend = True
+
+        from toolkit.memory_management.immutable_runtime import (
+            prepare_immutable_runtime,
+        )
+
+        prepare_immutable_runtime(
+            transformer,
+            residency,
+            architecture_adapter=architecture_adapter,
+            depth=int(
+                getattr(
+                    self.model_config,
+                    "layer_offloading_prefetch_depth",
+                    2,
+                )
+            ),
+            compile_blocks=bool(
+                self.model_config.compile
+                or self.model_config.compile_sample
+                or getattr(
+                    self.model_config,
+                    "train_compile_blocks",
+                    False,
+                )
+            ),
+        )
         return smart_plan
 
     def load_model(self):
@@ -865,88 +898,15 @@ class Krea2Model(BaseModel):
                     if isinstance(module, (SimpleModulation, DoubleSharedModulation))
                 ]
                 if self.model_config.layer_offloading_smart:
-                    keep_last = self.model_config.layer_offloading_checkpoint_keep_last
-                    pinned_resident_keys = MemoryManager.training_pinned_keys_for_keep_last(
-                        transformer, max(0, keep_last)
+                    # The compile-neutral immutable runtime is the SOLE smart
+                    # memory/compile backend for Krea2. It streams the repeated
+                    # blocks through the canonical arena and keeps every
+                    # singleton module resident. It also checkpoints each block
+                    # in its own train trunk, so the model's gradient
+                    # checkpointing stays off here.
+                    self._attach_immutable_training_memory(
+                        transformer, ignore_modules
                     )
-                    if self.model_config.layer_offloading_immutable_arena:
-                        self._attach_immutable_training_memory(
-                            transformer, ignore_modules
-                        )
-                    if self.model_config.layer_offloading_pinned_arena:
-                        # Phase 3 Slice B: the pinned arena covers FROZEN base
-                        # weights only and is built inside attach. The trainer
-                        # freezes the base (BaseSDTrainProcess:2524) only AFTER
-                        # this load_model runs, so freeze here to satisfy the
-                        # "frozen before attach" invariant. Safe: the base is
-                        # fp8-quantized (never genuinely trainable) and LoRA
-                        # trains separate adapters, so an early freeze is
-                        # behavior-neutral for adapter training.
-                        transformer.requires_grad_(False)
-                    MemoryManager.attach_smart_training(
-                        transformer,
-                        self.device_torch,
-                        working_reserve_gib=self.model_config.layer_offloading_smart_working_reserve_gb,
-                        wddm_margin_gib=self.model_config.layer_offloading_smart_wddm_margin_gb,
-                        wddm_hard_gib=self.model_config.layer_offloading_smart_wddm_hard_gb,
-                        ignore_modules=ignore_modules,
-                        pinned_resident_keys=pinned_resident_keys,
-                        block_stream_only=self.model_config.layer_offloading_block_stream_only,
-                        # Ingraph training WITHOUT the arena pins its own block
-                        # packs (repoint=False duplicates); per-tensor attach
-                        # pins for the same weights would double-commit the
-                        # shared WDDM pinned budget, so zero the attach budget.
-                        # WITH the arena, the arena IS the pin authority and
-                        # must be sized (auto/config value) to cover the whole
-                        # streamed set -- zeroing it would make every block
-                        # pageable and fail the borrow.
-                        pinned_weight_gib=(
-                            0.0
-                            if (
-                                self.model_config.layer_offloading_ingraph_training
-                                and not self.model_config.layer_offloading_pinned_arena
-                            )
-                            else self.model_config.layer_offloading_pinned_weight_gb
-                        ),
-                        wddm_spill_reserve_pct=self.model_config.layer_offloading_wddm_spill_reserve_pct,
-                        fp8_training_forward=(
-                            self.model_config.quantize
-                            and self.model_config.qtype in ('qfloat8', 'float8')
-                            and self.model_config.layer_offloading_fp8_forward
-                        ),
-                        # Phase 3 (Slice B): the arena and ingraph training now
-                        # coexist -- enable_ingraph_training BORROWS the arena
-                        # flats for the frozen base (see mmdit.enable_ingraph_-
-                        # training) instead of pinning a second, independent copy.
-                        # The arena is the single pin authority for the base
-                        # weights across both train and sample.
-                        use_pinned_arena=self.model_config.layer_offloading_pinned_arena,
-                    )
-                    # Smart offload budgets weights, but an uncheckpointed Krea
-                    # graph retains every block's activations (~16 GiB at the
-                    # observed training shape). On low-VRAM cards that defeats
-                    # offloading before backward can begin. Checkpointing is a
-                    # requirement for this mode; it is gated by grad-enabled in
-                    # SingleStreamDiT.forward, so inference/sampling is unchanged.
-                    # -1 = auto: start fully checkpointed; the trainer hill-climbs
-                    # elapsed time per resolution under a hard spill guard.
-                    transformer.enable_gradient_checkpointing(
-                        keep_last=max(0, keep_last)
-                    )
-                    if keep_last == -1:
-                        self.print_and_status_update(
-                            "  - gradient checkpointing enabled; auto-tuning "
-                            "uncheckpointed trailing blocks"
-                        )
-                    elif keep_last:
-                        self.print_and_status_update(
-                            "  - selective gradient checkpointing enabled "
-                            f"(last {keep_last} blocks kept resident)"
-                        )
-                    else:
-                        self.print_and_status_update(
-                            "  - gradient checkpointing enabled for smart training offload"
-                        )
                 else:
                     MemoryManager.attach(
                         transformer,
@@ -1047,9 +1007,7 @@ class Krea2Model(BaseModel):
         extra: dict,
     ):
         extra = extra or {}
-        keep_ingraph_sampling = bool(extra.get("keep_ingraph_sampling", False))
         skip_sampling_guard = bool(extra.get("skip_sampling_guard", False))
-        sample_ok = False
         if self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
 
@@ -1085,21 +1043,18 @@ class Krea2Model(BaseModel):
         # Reactive cohabitation guard: if external VRAM growth (Windows desktop,
         # another app) since the last image would push this forward's peak within
         # the WDDM spill margin, stream one resident block back to CPU first.
-        # Runs before compile so enable_compiled_sampling() rebuilds for the new
-        # resident set. Paging is silent (not an OOM), so this must be proactive.
+        # Paging is silent (not an OOM), so this must be proactive.
         guard = getattr(self.model, "_mm_sampling_guard", None)
         if guard is not None and not skip_sampling_guard:
             try:
                 guard()
             except Exception as error:
                 print(f"[MemoryManager] sampling cohabitation guard failed: {error}")
-        immutable_before = getattr(
+        immutable_context_factory = getattr(
             self.model,
-            "_mm_immutable_sampling_before_image",
+            "_mm_immutable_sampling_context",
             None,
         )
-        if immutable_before is not None:
-            immutable_before(gen_config)
         compile_cache_dir = getattr(self.model_config, 'compile_cache_dir', None)
         compile_cache_key = _compile_cache_key(self)
         if (
@@ -1113,111 +1068,10 @@ class Krea2Model(BaseModel):
                     f"Loaded torch.compile cache from {compile_cache_dir}"
                 )
 
-        # Immutable canonical-arena backend owns the whole sampling trunk via
-        # its compiled SAMPLE program (_blocks_trunk routes to it first). Its
-        # residency plan was activated at the sampling boundary by the trainer,
-        # so the legacy in-graph / regional sampling-compile enablement below
-        # must NOT run -- it would mutate block forwards the executor bypasses.
-        immutable_sampling = (
-            getattr(self.model, '_immutable_plan_executor', None) is not None
-        )
-        ingraph_requested = (
-            not immutable_sampling
-            and self.model_config.compile_sample
-            and (
-                getattr(self.model_config, 'layer_offloading_compile_streamed', False)
-                or getattr(self.model_config, 'layer_offloading_ingraph_sampling', False)
-            )
-        )
-        strict_ingraph = bool(getattr(self.model_config, 'layer_offloading_ingraph_sampling', False))
-        if ingraph_requested:
-            self.model._last_ingraph_sampling_compile_state = None
-            try:
-                if getattr(self.model_config, 'layer_offloading_ingraph_stream_all', False):
-                    streamed_blocks = tuple(range(len(self.model.blocks)))
-                else:
-                    # enable_ingraph_sampling() strips the legacy streaming
-                    # markers that ingraph_streamed_block_indices() detects, so
-                    # on a layout retained across calls (keep_ingraph_sampling)
-                    # the live plans are the source of truth for the streamed
-                    # set; markers only reappear if the layout changed since.
-                    retained_plans = getattr(self.model, "_ingraph_sampling_plans", {}) or {}
-                    streamed_blocks = tuple(sorted(
-                        {int(i) for i in self.model.ingraph_streamed_block_indices()}
-                        | {int(i) for i in retained_plans}
-                    ))
-                if strict_ingraph and not streamed_blocks:
-                    raise RuntimeError("in-graph sampling unavailable: dynamic_streamed_block_set")
-                requested_streamed = tuple(sorted(int(index) for index in streamed_blocks))
-                current_plans = getattr(self.model, "_ingraph_sampling_plans", {}) or {}
-                current_streamed = tuple(sorted(int(index) for index in current_plans))
-                compiled_ingraph_blocks = getattr(
-                    self.model, "_compiled_ingraph_sampling_blocks", {}
-                ) or {}
-                reuse_ingraph = bool(
-                    current_streamed
-                    and current_streamed == requested_streamed
-                    and (
-                        self.model._compiled_ingraph_sampling is not None
-                        or len(compiled_ingraph_blocks) == len(current_streamed)
-                    )
-                )
-                if reuse_ingraph:
-                    packed = len(current_streamed)
-                else:
-                    packed = self.model.enable_ingraph_sampling(
-                        streamed_blocks=streamed_blocks if streamed_blocks else None,
-                        depth=getattr(self.model_config, 'layer_offloading_ingraph_depth', 2),
-                        compile=True,
-                    )
-                if not getattr(self, '_ingraph_compile_sample_reported', False):
-                    self.print_and_status_update(
-                        f"Compiling transformer trunk for in-graph sampling: "
-                        f"{packed} streamed block pack(s). First preview will be slow."
-                    )
-                    self._ingraph_compile_sample_reported = True
-            except Exception as error:
-                if not (keep_ingraph_sampling and sample_ok):
-                    self.model.disable_ingraph_sampling()
-                if strict_ingraph:
-                    raise RuntimeError(f"strict in-graph sampling failed: {error}") from error
-                if not getattr(self, '_ingraph_compile_sample_reported', False):
-                    self.print_and_status_update(
-                        "In-graph sampling compile unavailable for this layout "
-                        f"({error}); falling back to regional compile."
-                    )
-                    self._ingraph_compile_sample_reported = True
-
-        if (
-            not immutable_sampling
-            and self.model_config.compile_sample
-            and self.model._compiled_ingraph_sampling is None
-        ):
-            # Regional (per-block) compilation. We are inside the sampling
-            # context (inference_resident) here, so residency is already
-            # decided: blocks the manager made GPU-resident have NO offload
-            # hooks and are compile-clean; any block still streaming weights
-            # carries _BouncingLinearFn (a device-mutating custom autograd fn)
-            # and must stay eager. enable_compiled_sampling() inspects each
-            # block and selects accordingly, so this is safe even with
-            # layer_offloading=True — fully-resident sampling gets the full
-            # win, partial offload compiles whatever is resident.
-            compiled_count, eager_count = self.model.enable_compiled_sampling()
-            if not getattr(self, '_compile_sample_reported', False):
-                if compiled_count == 0:
-                    self.print_and_status_update(
-                        "compile_sample=True but every transformer block still "
-                        "streams weights (offload hooks present); nothing to "
-                        "compile. Reduce offload (or sampling working reserve) so whole "
-                        "blocks fit resident."
-                    )
-                else:
-                    self.print_and_status_update(
-                        f"Compiling transformer blocks for sampling (regional): "
-                        f"{compiled_count} compiled, {eager_count} left eager "
-                        f"(still streaming). First preview will be slow."
-                    )
-                self._compile_sample_reported = True
+        # The immutable runtime owns the whole sampling trunk via its permanent
+        # SAMPLE program (_blocks_trunk routes to it first) and compiles the
+        # block kernels itself. Its residency plan was activated at the sampling
+        # boundary by the trainer.
 
         # Sampling compiles are static-shape (dynamic=False); running the
         # call under eager_then_compile defers each compile to the second
@@ -1227,13 +1081,18 @@ class Krea2Model(BaseModel):
         frames_before = None
         if compile_cache_dir and self.model_config.compile_sample:
             frames_before = torch._dynamo.utils.counters["frames"].get("total", 0)
-        
-        try:
-            compile_stance = (
-                torch.compiler.set_stance("eager_then_compile")
-                if self.model_config.compile_sample
-                else contextlib.nullcontext()
-            )
+
+        compile_stance = (
+            torch.compiler.set_stance("eager_then_compile")
+            if self.model_config.compile_sample
+            else contextlib.nullcontext()
+        )
+        immutable_context = (
+            immutable_context_factory(gen_config)
+            if immutable_context_factory is not None
+            else contextlib.nullcontext()
+        )
+        with immutable_context:
             with compile_stance:
                 img = pipeline(
                     conditional_embeds=conditional_embeds,
@@ -1247,41 +1106,15 @@ class Krea2Model(BaseModel):
                     batch_cfg=getattr(gen_config, "batch_cfg", False),
                     ref_latents=ref_latents,
                 )[0]
-            if frames_before is not None:
-                frames_after = torch._dynamo.utils.counters["frames"].get("total", 0)
-                if frames_after > frames_before and save_compile_cache(compile_cache_dir, compile_cache_key):
-                    self.print_and_status_update(
-                        f"Saved torch.compile cache to {compile_cache_dir}"
-                    )
-            sample_ok = True
-            immutable_after = getattr(
-                self.model,
-                "_mm_immutable_sampling_after_image",
-                None,
-            )
-            if immutable_after is not None:
-                immutable_after(gen_config)
-
-            sample_ok = True
-            return img
-        finally:
-            if ingraph_requested:
-                self.model._last_ingraph_sampling_compile_state = {
-                    "ingraph_compiled": self.model._compiled_ingraph_sampling is not None,
-                    "ingraph_compiled_blocks": len(
-                        getattr(self.model, "_compiled_ingraph_sampling_blocks", {}) or {}
-                    ),
-                    "ingraph_packs": len(getattr(self.model, "_ingraph_sampling_packs", {}) or {}),
-                    "regional_compiled_blocks": sum(
-                        1 for block in (getattr(self.model, "_compiled_blocks", None) or [])
-                        if block is not None
-                    ),
-                    "unavailable_reasons": tuple(
-                        getattr(self.model, "_ingraph_unavailable_reasons", ()) or ()
-                    ),
-                }
-                if not (keep_ingraph_sampling and sample_ok):
-                    self.model.disable_ingraph_sampling()
+        if frames_before is not None:
+            frames_after = torch._dynamo.utils.counters["frames"].get("total", 0)
+            if frames_after > frames_before and save_compile_cache(
+                compile_cache_dir, compile_cache_key
+            ):
+                self.print_and_status_update(
+                    f"Saved torch.compile cache to {compile_cache_dir}"
+                )
+        return img
 
     # ------------------------------------------------------------------
     # Reference-image helpers

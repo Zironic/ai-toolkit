@@ -49,7 +49,7 @@ class ResidencyPlan:
         *,
         phase: str,
         prefer_resident_keys=(),
-    ) -> "ResidencyPlan":
+    ) -> ResidencyPlan:
         """Select complete canonical blocks within a sidecar-only byte budget.
 
         Existing fully resident blocks are preferred to avoid needless sidecar
@@ -122,11 +122,16 @@ class ResidencyPlan:
         resident = []
         for block_key in arena.block_keys():
             block = arena.block_record(block_key)
-            for leaf_name, module in zip(
-                block.leaf_names, block.modules, strict=True
-            ):
-                if id(module) not in offload_ids:
-                    resident.append((block_key, leaf_name))
+            block_is_fully_resident = all(
+                id(module) not in offload_ids
+                for module in block.modules
+            )
+            if not block_is_fully_resident:
+                continue
+            resident.extend(
+                (block_key, leaf_name)
+                for leaf_name in block.leaf_names
+            )
         return cls.build(phase, resident)
 
     def resident_in_block(self, block_key: str) -> frozenset[str]:

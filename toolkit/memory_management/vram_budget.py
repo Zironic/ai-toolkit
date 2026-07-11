@@ -5,24 +5,44 @@ memory cliffs with different failure modes:
 
 * **Dedicated ceiling** (this module): crossing the card's physical VRAM makes
   WDDM silently page GPU memory to system RAM -- catastrophic slowdown, no
-  error. Governed by ``torch.cuda.mem_get_info`` (driver-level, sees every
-  process). Quantities: ``hard_gib`` (the never-cross device-free floor,
-  default 1.0), ``margin_gib`` (the planning headroom, >= hard).
+  error. Governed by ``device_free_bytes`` below -- NOT by
+  ``torch.cuda.mem_get_info``, which does *not* see other processes (see the
+  note on the free signal). Quantities: ``hard_gib`` (the never-cross
+  device-free floor, default 1.0), ``margin_gib`` (the planning headroom,
+  >= hard).
 * **Shared / DXGI NON_LOCAL budget** (NOT this module): pinned host memory
   commits against it and exhausting it is a hard cudaErrorMemoryAllocation.
   That reserve lives in ``pin_manager`` / ``bounce_pool``
   (``dxgi_spill_reserve_bytes``); do not conflate the two.
 
+The free signal (do not regress this)
+-------------------------------------
+``torch.cuda.mem_get_info`` free is NOT physical availability. It is what the
+driver will promise *this process*; on WDDM that promise is backed by paging
+other processes out. Measured on the 4070 with a second process holding 9 GiB:
+
+    NVML physical free              : 0.55 GiB   <- the truth
+    torch.cuda.mem_get_info free    : 4.70 GiB   <- over-reports ~8x
+    DXGI LOCAL Budget - CurrentUsage: 4.58 GiB   <- also over-reports
+
+Planning against the optimistic number is precisely how a run silently crosses
+the dedicated cliff (a 73 s/it job ran at 304 s/it with an orphan process on the
+card, and no allocator retry fired). So ``free`` here means NVML physical free
+whenever NVML is available -- see ``device_free_bytes``. DXGI stays where it
+belongs: the *shared* NON_LOCAL pin budget, not the dedicated cliff.
+
 Vocabulary (each quantity has exactly one name):
 
-* ``total`` / ``free`` -- physical card bytes, from ``mem_get_info``.
+* ``total`` / ``free`` -- physical card bytes, via ``device_free_bytes``
+  (NVML-backed; sees every process on the GPU).
 * ``torch_reserved`` / ``torch_allocated`` -- torch's caching allocator.
 * ``non_torch`` -- ``(total - free) - torch_reserved``: CUDA context, VAE/TE,
   the Windows desktop, other processes. Torch is never the card's only tenant.
 * ``hard`` -- device-free floor the card must keep (WDDM spill guard).
 * ``margin`` -- planning headroom subtracted from budgets; ``>= hard``.
 
-Everything here is pure (CPU-testable) except ``DeviceSnapshot.capture``.
+Everything here is pure (CPU-testable) except ``DeviceSnapshot.capture`` and
+``device_free_bytes``.
 """
 
 from __future__ import annotations
@@ -33,12 +53,204 @@ from typing import Optional
 
 import torch
 
+from . import nvml_meminfo
+
 GIB = 1024 ** 3
 
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+def reconcile_free_bytes(driver_free_bytes, physical_free_bytes) -> int:
+    """Pick the governing device-free value (pure; CPU-testable).
+
+    ``physical_free_bytes`` is NVML's device-wide free (None when NVML is
+    unavailable). We take the MIN of the two signals rather than trusting NVML
+    blindly: the driver number is a real constraint too, and whichever sensor is
+    more pessimistic is the one that keeps us off the cliff. In the uncontended
+    single-process case the two agree, so this does not cost residency.
+    """
+    driver = max(0, int(driver_free_bytes))
+    if physical_free_bytes is None:
+        return driver
+    return min(driver, max(0, int(physical_free_bytes)))
+
+
+def device_free_bytes(device) -> int:
+    """Governing physical free bytes on ``device``, across ALL processes.
+
+    Prefer this over ``torch.cuda.mem_get_info(...)[0]`` anywhere a decision is
+    made (residency, promotion, reserve, cap). ``mem_get_info`` alone is blind to
+    other GPU tenants and will happily plan a run onto memory that is not there.
+    Delta/probe loops that measure this process's *own* allocation deltas may
+    keep using the raw driver number -- they are measuring differences, not
+    availability.
+    """
+    driver_free = int(torch.cuda.mem_get_info(device)[0])
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    return reconcile_free_bytes(driver_free, nvml_meminfo.physical_free_bytes(index))
+
+
+# A quiet box still has non-torch bytes on the card: the CUDA context, cuDNN /
+# cuBLAS workspaces, and the Windows desktop compositor. Measured ~1.15 GiB on
+# the 4070 with a bare context, so treat everything under this as the cost of
+# doing business rather than "contention".
+FOREIGN_NOMINAL_BYTES = int(1.5 * GIB)
+# Do not cry about a browser tab. Only excess above this is worth a line in the
+# log; below it, the residency we lose is not what makes or breaks a run.
+FOREIGN_WARN_FLOOR_BYTES = int(1.0 * GIB)
+# Above this, a foreign tenant is doing real damage even if the model could
+# never have been fully resident anyway: every GiB it holds is a GiB we stream
+# from the CPU on every single step. Big models (Krea2 on a 12 GB card) never
+# fit fully, so "would it have fit?" must NOT be the thing that decides whether
+# we raise our voice -- lost residency is.
+FOREIGN_SEVERE_BYTES = int(2.0 * GIB)
+
+
+@dataclass(frozen=True)
+class ForeignVramReport:
+    """Is someone ELSE on this GPU, and is that why we cannot fit?
+
+    ``foreign`` is every byte on the card that is not our torch allocator --
+    other processes, plus our own context/desktop baseline. ``excess`` is what
+    remains after allowing a nominal baseline, i.e. the part plausibly caused by
+    another tenant (a game, a ComfyUI server, an orphaned training job).
+    """
+
+    foreign_bytes: int
+    excess_bytes: int
+    want_bytes: int
+    have_bytes: int
+    fits_now: bool
+    fits_without_excess: bool
+    severity: str  # "none" | "benign" | "contributing" | "blocking"
+
+    @property
+    def is_blocking(self) -> bool:
+        """The model would have fit; another tenant is the reason it does not."""
+        return self.severity == "blocking"
+
+    def format(self) -> str:
+        return (
+            f"foreign={self.foreign_bytes / GIB:.2f} GiB "
+            f"(excess={self.excess_bytes / GIB:.2f} GiB) "
+            f"want={self.want_bytes / GIB:.2f} GiB "
+            f"have={self.have_bytes / GIB:.2f} GiB "
+            f"severity={self.severity}"
+        )
+
+
+def assess_foreign_vram(
+    *,
+    total_bytes,
+    free_bytes,
+    torch_reserved_bytes,
+    want_bytes,
+    have_bytes,
+    nominal_bytes: int = FOREIGN_NOMINAL_BYTES,
+    warn_floor_bytes: int = FOREIGN_WARN_FLOOR_BYTES,
+) -> ForeignVramReport:
+    """Classify external VRAM pressure at a phase boundary (pure, CPU-testable).
+
+    ``want_bytes``  -- bytes to hold the model fully resident.
+    ``have_bytes``  -- residency budget we actually got.
+    ``free_bytes``  -- must be the NVML-backed physical free (``device_free_bytes``);
+                       with ``mem_get_info`` the foreign bytes are invisible, which
+                       is the whole reason this check exists.
+
+    The verdict is a counterfactual, not a threshold on usage alone: contention
+    only earns a warning when it *changed the outcome*.
+
+      blocking     -- we are streaming, but would have fit without the excess.
+                      Someone else's memory is costing us real throughput.
+      contributing -- the excess costs residency, but the model would not have
+                      fit anyway. Worth a note; not the root cause.
+      benign       -- another tenant is present, but we fit regardless.
+      none         -- nothing meaningful beyond our own baseline.
+    """
+    used = max(0, int(total_bytes) - int(free_bytes))
+    foreign = max(0, used - max(0, int(torch_reserved_bytes)))
+    excess = max(0, foreign - max(0, int(nominal_bytes)))
+
+    want = max(0, int(want_bytes))
+    have = max(0, int(have_bytes))
+    fits_now = have >= want
+    fits_without_excess = (have + excess) >= want
+
+    if excess < max(0, int(warn_floor_bytes)):
+        severity = "none"
+    elif fits_now:
+        severity = "benign"
+    elif fits_without_excess:
+        severity = "blocking"
+    else:
+        severity = "contributing"
+
+    return ForeignVramReport(
+        foreign_bytes=foreign,
+        excess_bytes=excess,
+        want_bytes=want,
+        have_bytes=have,
+        fits_now=fits_now,
+        fits_without_excess=fits_without_excess,
+        severity=severity,
+    )
+
+
+def format_foreign_vram_warning(report: ForeignVramReport, *, phase: str) -> str | None:
+    """Operator-facing line for a phase boundary. None when there is nothing to say.
+
+    Volume is set by HARM, not by the fit counterfactual: a model too big to ever
+    be fully resident (Krea2 on 12 GB) still loses a GiB of residency for every
+    GiB a foreign tenant holds, and streams it from the CPU every step.
+    """
+    if report.severity in ("none", "benign"):
+        return None
+
+    gib = GIB
+    excess = report.excess_bytes / gib
+    culprits = (
+        "Check for another training job, a leftover/orphaned run of this same job, "
+        "a ComfyUI server, or a game."
+    )
+    head = (
+        f"{excess:.2f} GiB of this card is held outside this process "
+        f"({report.foreign_bytes / gib:.2f} GiB total non-torch), costing an equal "
+        f"amount of resident weights during {phase} -- those are streamed from the "
+        f"CPU on every step instead."
+    )
+
+    if report.severity == "blocking":
+        return (
+            f"[MemoryManager] WARNING: VRAM contention is why {phase} is streaming. "
+            f"{head} The model needs {report.want_bytes / gib:.2f} GiB resident and "
+            f"only {report.have_bytes / gib:.2f} GiB is available -- it WOULD fit "
+            f"entirely if that memory were free. {culprits}"
+        )
+    if report.excess_bytes >= FOREIGN_SEVERE_BYTES:
+        return (
+            f"[MemoryManager] WARNING: heavy VRAM contention during {phase}. {head} "
+            f"(The model, {report.want_bytes / gib:.2f} GiB, would not be fully "
+            f"resident even on an idle card, but this is still costing real "
+            f"throughput.) {culprits}"
+        )
+    return (
+        f"[MemoryManager] note: {head} {culprits}"
+    )
+
+
+def device_mem_info(device) -> tuple[int, int]:
+    """Drop-in for ``torch.cuda.mem_get_info``: ``(free, total)`` in bytes.
+
+    Identical shape to the torch call, but ``free`` is the NVML-backed physical
+    free (sees other processes). ``total`` is the card size either way.
+    """
+    total = int(torch.cuda.mem_get_info(device)[1])
+    return device_free_bytes(device), total
 
 
 @dataclass(frozen=True)
@@ -66,10 +278,12 @@ class DeviceSnapshot:
         dev = torch.device(device)
         if dev.type != "cuda":
             return None
-        free, total = torch.cuda.mem_get_info(dev)
+        _driver_free, total = torch.cuda.mem_get_info(dev)
         return DeviceSnapshot(
             total=int(total),
-            free=int(free),
+            # NVML-backed: sees other processes on the card. See the module
+            # docstring -- mem_get_info free would over-report here.
+            free=device_free_bytes(dev),
             torch_reserved=int(torch.cuda.memory_reserved(dev)),
             torch_allocated=int(torch.cuda.memory_allocated(dev)),
         )
@@ -237,6 +451,43 @@ def training_cliff_predicted_peak_free_gib(
     return total_gib - (max(0.0, peak_allocated_gib) + non_torch_gib)
 
 
+def training_promotion_worst_shape_free_gib(
+    *,
+    resident_gib,
+    added_block_gib,
+    ring_gib,
+    worst_working_reserve_gib,
+    other_gib,
+    total_gib,
+):
+    """Predicted device-free margin on the WORST measured resolution after
+    promoting one resident block (pure, CPU-testable).
+
+    Residency is global -- a block promoted to resident stays resident for every
+    resolution bucket -- but the activation working set is not: the largest
+    measured resolution defines the tightest cohabitation peak. A promotion
+    decided on a roomy low-res step still has to leave room for the worst measured
+    resolution's working set, or that high-res step silently pages across the WDDM
+    dedicated cliff (which no allocator retry counter catches). So gate the
+    promotion on the worst measured working reserve, not the current step's free.
+
+    ``worst_working_reserve_gib`` is the reserve the plan actually applies to every
+    shape (already the max across measured buckets in the training controller).
+    Conservative / from-below: assumes the promoted block adds its full size to the
+    resident baseline and the ring does not shrink to compensate. Returns the
+    predicted worst-case device-free GiB; the caller vetoes the promotion when it
+    would fall below the promote floor.
+    """
+    predicted_used = (
+        max(0.0, float(resident_gib))
+        + max(0.0, float(added_block_gib))
+        + max(0.0, float(ring_gib))
+        + max(0.0, float(worst_working_reserve_gib))
+        + max(0.0, float(other_gib))
+    )
+    return float(total_gib) - predicted_used
+
+
 def sampling_step_should_trim(free_before_b, trim_margin_b) -> bool:
     """Whether realized device-free warrants a per-step cache trim (pure).
 
@@ -307,6 +558,30 @@ def estimate_sampling_working_reserve_bytes(
     if not fp8_native:
         estimate += int(dequant_pad_bytes)
     return int(estimate * float(safety)) + int(headroom_bytes)
+
+
+def sampling_overshoot_margin_bytes(
+    overshoot_gib: float = 0.86,
+    safety_gib: float = 0.375,
+    hard_bytes: int = 0,
+) -> int:
+    """Auto sampling margin in the allocator-cap era (pure, CPU-testable).
+
+    With the reclaim allocator cap guarding the WDDM cliff (a capped allocation
+    recycles cache or raises a loud OOM, it never silently pages), the sampling
+    margin's only remaining job is to cover the caching allocator's
+    reserved-over-allocated overshoot. Measured on Krea2 fp8 512px that overshoot
+    is ~0.86 GiB and rock-steady (std ~0.05 GiB across 8 seeds), so the auto
+    margin is that measured overshoot plus one safety block -- NOT the old
+    ``0.10 * card`` cushion, which was sized for a chaotic allocator that kept
+    jumping over the limit and no longer misbehaves. Narrowing it hands the
+    difference straight to resident weights (fewer streamed blocks). Floored at
+    the hard margin so it can never drop below the WDDM device-free floor.
+    """
+    return int(
+        max(float(overshoot_gib) + float(safety_gib), float(max(0, int(hard_bytes))) / GIB)
+        * GIB
+    )
 
 
 def training_guard_pressure(dxgi: dict, physical: dict) -> dict:

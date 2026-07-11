@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 import torch
 import torch.backends.cuda
 from huggingface_hub import HfApi, interpreter_login
-from toolkit.memory_management import MemoryManager
+from toolkit.memory_management import MemoryManager, vram_budget
 
 from toolkit.basic import value_map
 from toolkit.clip_vision_adapter import ClipVisionAdapter
@@ -208,7 +208,7 @@ class _CudaDriverFreeMonitor:
         if not torch.cuda.is_available():
             return self
         try:
-            free_b, total_b = torch.cuda.mem_get_info(self.device)
+            free_b, total_b = vram_budget.device_mem_info(self.device)
         except Exception:
             return self
         self.min_free_bytes = int(free_b)
@@ -221,7 +221,7 @@ class _CudaDriverFreeMonitor:
     def _run(self):
         while not self._stop.wait(self.interval_s):
             try:
-                free_b, total_b = torch.cuda.mem_get_info(self.device)
+                free_b, total_b = vram_budget.device_mem_info(self.device)
             except Exception:
                 continue
             free_b = int(free_b)
@@ -648,14 +648,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # transformer here -- force it to a nullcontext for this backend.
         immutable_executor = None
         immutable_train_plan = None
-        immutable_before_attr = "_mm_immutable_sampling_before_image"
-        immutable_after_attr = "_mm_immutable_sampling_after_image"
+        immutable_context_attr = "_mm_immutable_sampling_context"
 
         if getattr(self, "_immutable_arena_enabled", False):
             inner_unet = unwrap_model(self.sd.unet)
             immutable_executor = getattr(
                 inner_unet,
-                "_immutable_plan_executor",
+                "_immutable_runtime",
                 None,
             )
 
@@ -723,15 +722,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         int(reference_count),
                     )
 
-                def immutable_before_image(config):
+                def immutable_sampling_context(config):
                     shape_key = immutable_shape_key(config)
                     cold_bytes = (
                         int(estimate_fn([config]))
                         if estimate_fn is not None
                         else int(3.0 * gib)
                     )
-
-                    return immutable_executor.activate_sampling_image(
+                    return immutable_executor.sampling(
                         shape_key=shape_key,
                         cold_working_bytes=cold_bytes,
                         fixed_working_bytes=fixed_working_bytes,
@@ -739,21 +737,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         hot_floor_bytes=hot_floor_bytes,
                     )
 
-                def immutable_after_image(config):
-                    return immutable_executor.finish_sampling_image(
-                        shape_key=immutable_shape_key(config)
-                    )
+                setattr(
+                    inner_unet,
+                    immutable_context_attr,
+                    immutable_sampling_context,
+                )
 
-                setattr(
-                    inner_unet,
-                    immutable_before_attr,
-                    immutable_before_image,
-                )
-                setattr(
-                    inner_unet,
-                    immutable_after_attr,
-                    immutable_after_image,
-                )
         if getattr(self, '_ingraph_training_enabled', False):
             inner_unet = unwrap_model(self.sd.unet)
             disable_ingraph_training = getattr(
@@ -783,12 +772,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # so the next training step runs the training graph, not the
             # forward-only sampling one.
             if immutable_executor is not None:
-                for attr in (
-                    immutable_before_attr,
-                    immutable_after_attr,
-                ):
-                    if hasattr(inner_unet, attr):
-                        delattr(inner_unet, attr)
+                if hasattr(inner_unet, immutable_context_attr):
+                    delattr(inner_unet, immutable_context_attr)
 
                 immutable_executor.activate(
                     immutable_executor.TRAIN,
@@ -3338,110 +3323,40 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
-        if getattr(self.model_config, "train_compile_blocks", False):
-            inner_unet = unwrap_model(self.sd.unet)
-
-            if getattr(inner_unet, "_mm_immutable_backend", False):
-                print_acc(
-                    "Immutable arena owns training block compilation; "
-                    "skipping legacy resident-block compiler."
-                )
-            else:
-                if getattr(self.model_config, 'train_compile_blocks', False):
-                    try:
-                        inner_unet = unwrap_model(self.sd.unet)
-                        enable_training_compile = getattr(inner_unet, 'enable_compiled_training', None)
-                        if enable_training_compile is None:
-                            print_acc("Training block compile requested, but this model does not expose resident-block compile.")
-                        else:
-                            pinned_keys = set()
-                            mm = getattr(inner_unet, '_memory_manager', None)
-                            if mm is not None:
-                                pinned_keys = set(getattr(mm, '_training_pinned_resident_keys', set()))
-                            compiled_count, blocked_count = enable_training_compile(pinned_keys)
-                            print_acc(
-                                f"Compiled {compiled_count} resident training block(s); "
-                                f"{blocked_count} pinned block(s) left eager."
-                            )
-                            if getattr(self.model_config, 'layer_offloading_compile_streamed', False):
-                                print_acc(
-                                    "Compile Streamed Blocks is not active yet; streamed blocks remain eager in this slice."
-                                )
-                    except Exception as e:
-                        print_acc(f"Failed to compile resident training blocks: {e}")
-                        print_acc("Continuing without resident training block compile.")
-
-        if getattr(self.model_config, 'layer_offloading_ingraph_training', False):
-            inner_unet = unwrap_model(self.sd.unet)
-            enable_ingraph_training = getattr(inner_unet, 'enable_ingraph_training', None)
-            if enable_ingraph_training is None:
+        inner_unet = unwrap_model(self.sd.unet)
+        if getattr(inner_unet, '_mm_immutable_backend', False):
+            # Generic compile-neutral immutable runtime
+            # (revised_combined_compile_neutral_krea2_refactor_plan.md).
+            # Two-phase lifecycle: the arena + residency + training
+            # ResidencyPlan were built in load_model, which also called
+            # prepare_immutable_runtime() to attach an unfinalized
+            # transformer._immutable_runtime -- BEFORE LoRA. The permanent
+            # train/sample programs must be FINALIZED HERE, after the LoRA
+            # network is applied, so they capture the installed adapter leaves.
+            # That is exactly why finalization lives in setup, not load_model.
+            # Fail closed and loud: silently running eager would make every
+            # perf/parity number mean the wrong thing.
+            runtime = getattr(inner_unet, '_immutable_runtime', None)
+            if runtime is None:
                 raise RuntimeError(
-                    "layer_offloading_ingraph_training requested, but this model "
-                    "does not expose enable_ingraph_training."
+                    "the model built a canonical arena but did not prepare an "
+                    "immutable runtime during load_model "
+                    "(_immutable_runtime is unset)."
                 )
-            # Fail closed and loud (no try/except fallback): silently training
-            # eager would make every perf/parity number mean the wrong thing.
-            depth = int(getattr(self.model_config, 'layer_offloading_ingraph_depth', 2))
-            block_count = enable_ingraph_training(depth=depth, compile=True)
-            # sample() takes the trunk down and stands it back up around every
-            # sampling boundary (see the pack-source note there).
-            self._ingraph_training_enabled = True
-            self._ingraph_training_depth = depth
-            print_acc(
-                f"In-graph streamed training enabled: {block_count} block(s), "
-                f"{getattr(inner_unet, '_ingraph_training_resident_blocks', 0)} fully "
-                "resident; leaves streamed/resident="
-                f"{getattr(inner_unet, '_ingraph_training_streamed_leaves', 0)}/"
-                f"{getattr(inner_unet, '_ingraph_training_resident_leaves', 0)}; "
-                f"packs borrowed={getattr(inner_unet, '_ingraph_training_borrowed_count', 0)} "
-                f"owned={getattr(inner_unet, '_ingraph_training_owned_count', 0)}; "
-                f"depth={depth}. First training step will compile."
-            )
-
-        if getattr(self.model_config, 'layer_offloading_immutable_arena', False):
-            # Immutable canonical-arena backend (Slice 6,
-            # tasks/open/IMMUTABLE_TRANSFER_ARENA_PLAN.md). The arena +
-            # residency + training ResidencyPlan were built in load_model
-            # (Krea2Model._attach_immutable_training_memory) BEFORE LoRA; the
-            # compiled train/sample executor must be stood up HERE, after the
-            # LoRA network is applied, so it captures the adapter leaves --
-            # exactly the sequencing reason enable_ingraph_training also lives
-            # in setup, not load_model. Fail closed and loud: silently running
-            # eager would make every perf/parity number mean the wrong thing.
-            inner_unet = unwrap_model(self.sd.unet)
-            if not getattr(inner_unet, '_mm_immutable_backend', False):
+            finalize = getattr(inner_unet, 'finalize_immutable_runtime', None)
+            if finalize is None:
                 raise RuntimeError(
-                    "layer_offloading_immutable_arena requested, but the model "
-                    "did not build a canonical arena during load_model "
-                    "(_mm_immutable_backend is unset)."
-                )
-            enable_immutable = getattr(
-                inner_unet, 'enable_immutable_arena_compiled', None
-            )
-            if enable_immutable is None:
-                raise RuntimeError(
-                    "layer_offloading_immutable_arena requested, but this model "
-                    "does not expose enable_immutable_arena_compiled."
+                    "the model built an immutable runtime but does not expose "
+                    "finalize_immutable_runtime."
                 )
             arena = inner_unet._mm_canonical_arena
             residency = inner_unet._mm_residency_state
             training_plan = inner_unet._mm_immutable_training_plan
-            depth = int(getattr(self.model_config, 'layer_offloading_ingraph_depth', 2))
-            executor = enable_immutable(
-                arena,
-                residency,
-                depth=depth,
-                compile_blocks=bool(
-                    self.model_config.compile
-                    or self.model_config.compile_sample
-                    or getattr(
-                        self.model_config,
-                        "train_compile_blocks",
-                        False,
-                    )
-                ),
-            )
-            executor.activate(executor.TRAIN, training_plan)
+            # Phase B: build permanent LoRA-aware programs, then select the
+            # initial training residency plan for the TRAIN program.
+            finalize()
+            runtime.activate(runtime.TRAIN, training_plan)
+            depth = int(getattr(runtime, 'depth', 2))
             self._immutable_arena_enabled = True
             self._immutable_arena_depth = depth
             print_acc(
@@ -3450,6 +3365,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"{residency.resident_bytes() / (1024 ** 3):.2f} GiB resident "
                 f"sidecars; plan={training_plan.fingerprint}; depth={depth}. "
                 "First training step will compile."
+            )
+            # Before step 1: if another tenant on the GPU is the reason we are
+            # streaming rather than resident, say so. Otherwise the symptom is
+            # just a mysteriously slow run.
+            mm = getattr(inner_unet, '_memory_manager', None)
+            plan = getattr(mm, '_smart_training_plan', None) or {}
+            runtime.report_foreign_vram_once(
+                residency.device,
+                phase="training",
+                working_reserve_bytes=int(plan.get("working_reserve_bytes", 0)),
             )
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
@@ -3661,8 +3586,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
             MemoryManager.offload_step_begin(shape_key=offload_shape_key)
             offload_step_completed = False
             try:
-                with self.accelerator.accumulate(self.modules_being_trained):
-                    loss_dict = self.hook_train_loop(batch_list)
+                inner_unet = unwrap_model(self.sd.unet)
+                immutable_runtime = getattr(
+                    inner_unet,
+                    "_immutable_runtime",
+                    None,
+                )
+                execution_context = (
+                    immutable_runtime.execution(immutable_runtime.TRAIN)
+                    if immutable_runtime is not None
+                    else contextlib.nullcontext()
+                )
+                with execution_context:
+                    with self.accelerator.accumulate(self.modules_being_trained):
+                        loss_dict = self.hook_train_loop(batch_list)
                 offload_step_completed = True
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
@@ -3808,7 +3745,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     reserved = torch.cuda.memory_reserved(dev) / gb
                     max_alloc = torch.cuda.max_memory_allocated(dev) / gb
                     max_reserved = torch.cuda.max_memory_reserved(dev) / gb
-                    free_b, total_b = torch.cuda.mem_get_info(dev)
+                    free_b, total_b = vram_budget.device_mem_info(dev)
                     used_total = (total_b - free_b) / gb  # process + everything else on the device
                     print_acc("")
                     print_acc("================ CUDA memory @ first train step ================")

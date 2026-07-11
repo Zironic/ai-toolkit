@@ -1875,7 +1875,7 @@ class MemoryManager:
         See ``ingraph_stream.build_block_leaf_plans``."""
         ignore_modules = list(ignore_modules or [])
         device = torch.device(device)
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_bytes, total_bytes = vram_budget.device_mem_info(device)
         # Measure the uncontrolled (not-ours) VRAM already on the card: CUDA
         # context, cuDNN/cublas workspaces, cudagraph constants, Windows/WDDM/
         # display, and other processes. This is the system_reserve bucket. The
@@ -2731,7 +2731,9 @@ class MemoryManager:
     _wddm_cap_fraction = staticmethod(vram_budget.cap_fraction)
 
     @classmethod
-    def _apply_wddm_hard_allocator_cap(cls, device, wddm_hard_gib=None):
+    def _apply_wddm_hard_allocator_cap(
+        cls, device, wddm_hard_gib=None, *, target_cap_bytes=None
+    ):
         """Hard-cap torch's allocator below the WDDM dedicated ceiling.
 
         Crossing the dedicated-VRAM ceiling on Windows does not OOM -- WDDM
@@ -2743,7 +2745,15 @@ class MemoryManager:
         30x slowdown. The cap accounts for non-torch device usage (see
         _wddm_cap_fraction); it is re-measured at every call, and each call
         site is a phase boundary (training attach / sampling start), so the
-        latest measurement wins."""
+        latest measurement wins.
+
+        ``target_cap_bytes`` optionally requests a *reclaim* cap below the cliff
+        bound: the caller has planned its live footprint and wants the cap to sit
+        just above it (banking the unused dedicated VRAM as the DXGI overflow
+        valve + tier-1 climb headroom) rather than at the ceiling. It is clamped
+        to the cliff bound above, so the worst case is exactly the default
+        behavior; the reclaim only ever tightens, never loosens past the ceiling.
+        """
         if sys.platform != "win32" or not torch.cuda.is_available():
             return
         dev = torch.device(device if device is not None else "cuda")
@@ -2757,9 +2767,16 @@ class MemoryManager:
         if hard_gib <= 0:
             hard_gib = 1.0
         total = torch.cuda.get_device_properties(index).total_memory
-        free_bytes, _mgi_total = torch.cuda.mem_get_info(index)
+        free_bytes, _mgi_total = vram_budget.device_mem_info(index)
         reserved_bytes = torch.cuda.memory_reserved(index)
-        fraction = cls._wddm_cap_fraction(total, free_bytes, reserved_bytes, hard_gib)
+        cliff_fraction = cls._wddm_cap_fraction(total, free_bytes, reserved_bytes, hard_gib)
+        fraction = cliff_fraction
+        reclaimed = False
+        if target_cap_bytes is not None:
+            target_fraction = float(target_cap_bytes) / float(total)
+            # Never loosen past the cliff, never collapse below a sane floor.
+            fraction = max(0.1, min(cliff_fraction, target_fraction))
+            reclaimed = fraction < cliff_fraction - 1e-9
         previous = cls._wddm_hard_cap_applied.get(index)
         # 64 MiB tolerance: non_torch jitters a little every step (the per-step
         # trim re-measures); only real shifts (phase changes, kernel-code
@@ -2770,10 +2787,15 @@ class MemoryManager:
         cls._wddm_hard_cap_applied[index] = fraction
         gib = 1024 ** 3
         non_torch = max(0, (total - free_bytes) - reserved_bytes)
+        source = (
+            f"reclaim target, cliff {cliff_fraction * total / gib:.2f} GiB"
+            if reclaimed
+            else "cliff bound"
+        )
         print(
             "[MemoryManager] WDDM hard allocator cap: "
             f"{fraction * total / gib:.2f}/{total / gib:.2f} GiB "
-            f"(margin {hard_gib:.2f} GiB, non_torch {non_torch / gib:.2f} GiB; "
+            f"({source}; margin {hard_gib:.2f} GiB, non_torch {non_torch / gib:.2f} GiB; "
             "allocation beyond this recycles cache or raises OOM "
             "instead of silently paging)"
         )
@@ -3056,20 +3078,31 @@ class MemoryManager:
                 or child.__class__.__name__ in CONV_MODULES
             )
         }
-        legacy_offload_ids = set(plan["offload_ids"]) - canonical_ids
-        cls.attach(
-            module,
-            device,
-            offload_percent=0.0,
-            ignore_modules=legacy_ignore,
-            _offload_module_ids=legacy_offload_ids,
-            training_strategy="smart_immutable",
-            # Canonical registrations own the persistent weight tier. The few
-            # streamed singleton leaves use the existing bounce mechanism.
-            pinned_weight_gib=0.0,
-            use_pinned_arena=False,
-        )
-        mm = module._memory_manager
+        # The immutable runtime is the sole backend: the canonical blocks
+        # stream through the arena, and every non-canonical singleton module
+        # (tmlp, tproj, first/last projections, text fusion, ...) stays
+        # resident. Offloading singletons would install per-Linear streaming
+        # forwards (LinearLayerMemoryManager._mm_forward) that both defeat the
+        # resident-singleton design and crash compiled sampling. Keep them
+        # resident by streaming nothing here; the planner output still drives
+        # canonical block sidecars via ResidencyPlan.from_smart_plan.
+        if hasattr(module, "_memory_manager"):
+            raise RuntimeError(
+                "immutable backend requires exclusive memory-manager attachment"
+            )
+        mm = cls(module, device, pinned_weight_gib=0.0)
+        module._memory_manager = mm
+        mm._attach_args = {
+            "device": device,
+            "offload_percent": 0.0,
+            "ignore_modules": list(legacy_ignore),
+            "training_strategy": "smart_immutable",
+            "pinned_weight_gib": 0.0,
+            "use_pinned_arena": False,
+        }
+        module._mm_to = module.to
+        module.to = mm.memory_managed_to
+        mm.unmanaged_modules.extend(legacy_ignore)
         mm._training_runtime_candidate_ids = set(runtime_candidate_ids)
         mm._smart_training_plan = plan
         mm._training_must_resident_keys = set(
@@ -3078,7 +3111,7 @@ class MemoryManager:
 
         mm._training_pinned_resident_keys = pinned_resident_keys
         mm._training_block_stream_only = bool(block_stream_only)
-        mm._training_autotune_enabled = False
+        mm._training_autotune_enabled = bool(auto_working_reserve)
         mm._immutable_planner_ignore_modules = planner_ignore
         mm._canonical_leaf_ids = canonical_ids
         module._mm_canonical_leaf_ids = canonical_ids
@@ -3346,7 +3379,105 @@ class MemoryManager:
         return changed
 
     @classmethod
+    def _next_promotion_layer_bytes(cls, module, mm):
+        """Return resident bytes for the next runtime block or legacy layer."""
+        runtime = getattr(module, "_immutable_runtime", None)
+        next_runtime_block = getattr(
+            runtime,
+            "next_training_promotion_bytes",
+            None,
+        )
+        if next_runtime_block is not None:
+            return int(next_runtime_block())
+
+        args = getattr(mm, "_attach_args", {}) or {}
+        pinned_keys = set(
+            getattr(mm, "_training_pinned_resident_keys", set())
+        )
+        candidates = [
+            item
+            for item in cls._training_layout_candidates(
+                module,
+                args.get("ignore_modules", []),
+                pinned_keys,
+            )
+            if item["managed"]
+        ]
+        if not candidates:
+            return 0
+        candidates.sort(
+            key=lambda item: (
+                0 if item.get("pinned_resident") else 1,
+                item["resident_bytes"],
+            )
+        )
+        return int(candidates[0]["resident_bytes"])
+
+    @classmethod
     def _promote_training_layer(cls, module, mm, device, *, cache_pad_gib, wddm_stop_gib):
+        runtime = getattr(module, "_immutable_runtime", None)
+        promote_runtime = getattr(
+            runtime,
+            "increase_training_residency",
+            None,
+        )
+        if promote_runtime is not None:
+            driver_free_bytes = vram_budget.device_free_bytes(device)
+            allocatable_bytes = cls._torch_allocatable_bytes(device)
+            allocator_cached_bytes = max(
+                0,
+                allocatable_bytes - driver_free_bytes,
+            )
+            gib = 1024 ** 3
+            cache_pad_bytes = int(float(cache_pad_gib) * gib)
+            stop_bytes = int(float(wddm_stop_gib) * gib)
+            available_growth_bytes = max(
+                0,
+                allocator_cached_bytes
+                + max(0, driver_free_bytes - stop_bytes)
+                - cache_pad_bytes,
+            )
+            result = promote_runtime(
+                available_growth_bytes,
+                max_blocks=1,
+            )
+            if not result.get("added_blocks"):
+                return 0, "no_immutable_block_fits"
+
+            try:
+                torch.cuda.synchronize(device)
+                free_after = vram_budget.device_free_bytes(device)
+            except Exception:
+                free_after = stop_bytes
+            if free_after < stop_bytes:
+                previous_plan = result["previous_plan"]
+                runtime.set_residency_plan(previous_plan)
+                module._mm_immutable_training_plan = previous_plan
+                return 0, "validated_low_free"
+
+            actual_growth = int(
+                result.get("actual_growth_bytes", 0) or 0
+            )
+            updated_plan = dict(
+                getattr(mm, "_smart_training_plan", {}) or {}
+            )
+            updated_plan["resident_bytes"] = (
+                int(updated_plan.get("resident_bytes", 0))
+                + actual_growth
+            )
+            updated_plan["generic_resident_bytes"] = (
+                int(updated_plan.get("generic_resident_bytes", 0))
+                + actual_growth
+            )
+            updated_plan["offloaded_layers"] = max(
+                0,
+                int(updated_plan.get("offloaded_layers", 0))
+                - len(result.get("added_leaf_keys", ())),
+            )
+            mm._smart_training_plan = updated_plan
+            cls._invalidate_manual_training_shape_peaks(mm)
+            return len(result["added_blocks"]), "promote_immutable_block"
+
         args = getattr(mm, "_attach_args", {}) or {}
         pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
         candidates = [
@@ -3363,7 +3494,7 @@ class MemoryManager:
         )
         if not candidates:
             return 0, "no_offloaded_layers"
-        driver_free_bytes = torch.cuda.mem_get_info(device)[0]
+        driver_free_bytes = vram_budget.device_free_bytes(device)
         allocatable_bytes = cls._torch_allocatable_bytes(device)
         allocator_cached_bytes = max(0, allocatable_bytes - driver_free_bytes)
         gib = 1024 ** 3
@@ -3381,7 +3512,7 @@ class MemoryManager:
                 continue
             try:
                 torch.cuda.synchronize(device)
-                free_after = torch.cuda.mem_get_info(device)[0]
+                free_after = vram_budget.device_free_bytes(device)
             except Exception:
                 free_after = stop_bytes
             if free_after < stop_bytes:
@@ -3503,7 +3634,7 @@ class MemoryManager:
             need = int(item["resident_bytes"] + cache_pad_bytes)
             if need > allocatable_bytes:
                 continue
-            driver_free_bytes = torch.cuda.mem_get_info(device)[0]
+            driver_free_bytes = vram_budget.device_free_bytes(device)
             allocator_cached_bytes = max(0, allocatable_bytes - driver_free_bytes)
             driver_bytes_needed = max(0, need - allocator_cached_bytes)
             if driver_free_bytes - driver_bytes_needed < stop_bytes:
@@ -3513,7 +3644,7 @@ class MemoryManager:
                 continue
             try:
                 torch.cuda.synchronize(device)
-                free_after = torch.cuda.mem_get_info(device)[0]
+                free_after = vram_budget.device_free_bytes(device)
             except Exception:
                 free_after = stop_bytes
             if free_after < stop_bytes:
@@ -3534,7 +3665,7 @@ class MemoryManager:
     @staticmethod
     def _torch_allocatable_bytes(device):
         """Driver-free plus allocator cache that PyTorch can reuse directly."""
-        free_bytes = torch.cuda.mem_get_info(device)[0]
+        free_bytes = vram_budget.device_free_bytes(device)
         reserved_bytes = torch.cuda.memory_reserved(device)
         allocated_bytes = torch.cuda.memory_allocated(device)
         return int(free_bytes + max(0, reserved_bytes - allocated_bytes))
@@ -3596,11 +3727,14 @@ class MemoryManager:
                 peak_reserved_bytes=int(max(0.0, learned_peak_reserved_gib) * gib),
                 peak_allocated_bytes=peak_allocated,
             )
-            # The physical (mem_get_info) signal ALWAYS participates: the DXGI
-            # LOCAL budget is a per-process OS grant that can exceed what the
-            # dedicated cliff tolerates once other processes' usage is counted,
-            # so DXGI alone can bless a residency that overfills the card.
-            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            # The physical (NVML) signal ALWAYS participates: the DXGI LOCAL
+            # budget is a per-process OS grant that can exceed what the dedicated
+            # cliff tolerates once other processes' usage is counted, so DXGI
+            # alone can bless a residency that overfills the card. Note
+            # mem_get_info is NOT that physical signal -- it is a per-process
+            # promise and over-reports just like DXGI (see vram_budget's module
+            # docstring); device_mem_info is NVML-backed.
+            free_bytes, total_bytes = vram_budget.device_mem_info(device)
             free_gib = free_bytes / gib
             total_gib = total_bytes / gib
             reserved_gib = current_reserved / gib
@@ -3694,7 +3828,7 @@ class MemoryManager:
         # legacy demote_layer must never touch canonical host Parameters.
         canonical_relief = None
         canonical_relieved_bytes = 0
-        executor = getattr(module, "_immutable_plan_executor", None)
+        executor = getattr(module, "_immutable_runtime", None)
         reduce_canonical = getattr(
             executor, "reduce_training_residency", None
         )
@@ -4124,11 +4258,55 @@ class MemoryManager:
         # cliff before ordinary prefetch repair or resident growth. Default relief
         # is unpin-to-pageable; promotion is allowed only with roomy dedicated VRAM.
         if move == "down":
-            changed_layers = cls._demote_training_layers(
-                module, mm, retreat_layers, largest=True
+            runtime = getattr(module, "_immutable_runtime", None)
+            reduce_runtime = getattr(
+                runtime,
+                "reduce_training_residency",
+                None,
             )
+            if reduce_runtime is not None:
+                relief = reduce_runtime(
+                    max(1, int(float(retreat_gib) * gib))
+                )
+                changed_layers = len(relief.get("removed_blocks", ()))
+                relieved_bytes = int(
+                    relief.get("relieved_bytes", 0) or 0
+                )
+                if relieved_bytes:
+                    updated_plan = dict(
+                        getattr(mm, "_smart_training_plan", {}) or {}
+                    )
+                    updated_plan["resident_bytes"] = max(
+                        0,
+                        int(updated_plan.get("resident_bytes", 0))
+                        - relieved_bytes,
+                    )
+                    updated_plan["generic_resident_bytes"] = max(
+                        0,
+                        int(updated_plan.get("generic_resident_bytes", 0))
+                        - relieved_bytes,
+                    )
+                    updated_plan["offloaded_layers"] = (
+                        int(updated_plan.get("offloaded_layers", 0))
+                        + len(relief.get("removed_leaf_keys", ()))
+                    )
+                    mm._smart_training_plan = updated_plan
+                    cls._invalidate_manual_training_shape_peaks(mm)
+                layout_action = (
+                    "demote_immutable_block"
+                    if changed_layers
+                    else "demote_unavailable"
+                )
+            else:
+                changed_layers = cls._demote_training_layers(
+                    module, mm, retreat_layers, largest=True
+                )
+                layout_action = (
+                    "demote"
+                    if changed_layers
+                    else "demote_unavailable"
+                )
             state["stopped"] = False
-            layout_action = "demote" if changed_layers else "demote_unavailable"
         elif shared_relief != "hold":
             changed_layers, layout_action, released_bytes = cls._relieve_shared_cliff(
                 module,
@@ -4151,7 +4329,10 @@ class MemoryManager:
                     f"shared_margin={(shared_snapshot or {}).get('margin_gib')} GiB "
                     f"dedicated_free={min_device_free_gib:.2f} GiB"
                 )
-        elif prefetch_recovery_action is not None:
+        elif (
+            prefetch_recovery_action is not None
+            and getattr(module, "_immutable_runtime", None) is None
+        ):
             cls._invalidate_manual_training_shape_peaks(mm)
             if prefetch_invalid:
                 invalidate_offload_trace_for_shape(shape_key)
@@ -4176,6 +4357,34 @@ class MemoryManager:
             # hysteresis stop thrash; the trace is re-seeded after each promote.
             measured = bucket["steps"] >= stable_windows
             promoting = cadence_ready and measured
+            # Worst-resolution guard: a block promoted here stays resident for
+            # EVERY resolution bucket, but the deadband above only proved headroom
+            # for the CURRENT step. Predict the cohabitation peak on the worst
+            # measured resolution (its working reserve is what the plan already
+            # applies to all shapes) and veto the promotion if it would not leave
+            # the promote floor there -- otherwise a roomy low-res step promotes a
+            # block that silently pages the next high-res step. Unmeasured
+            # resolutions are handled by demote-on-arrival, not this gate.
+            worst_case_veto = False
+            predicted_worst_free_gib = None
+            if promoting:
+                promote_block_bytes = cls._next_promotion_layer_bytes(module, mm)
+                if promote_block_bytes > 0:
+                    predicted_worst_free_gib = (
+                        vram_budget.training_promotion_worst_shape_free_gib(
+                            resident_gib=diagnostics.get("planned_resident_gb", 0.0),
+                            added_block_gib=promote_block_bytes / gib,
+                            ring_gib=diagnostics.get(
+                                "ring_peak_gb", diagnostics.get("planned_ring_gb", 0.0)
+                            ),
+                            worst_working_reserve_gib=new_working_reserve,
+                            other_gib=other_gib,
+                            total_gib=diagnostics["device_total_gb"],
+                        )
+                    )
+                    if predicted_worst_free_gib < wddm_hold_high_gib:
+                        promoting = False
+                        worst_case_veto = True
             if pool is not None and not prefetch_ok and not promoting:
                 # Not promoting this step (still measuring, or off-cadence) and the
                 # trace is unhealthy: spend the move improving prefetch coverage so
@@ -4221,6 +4430,11 @@ class MemoryManager:
                     state["stopped"] = True
             elif grew_prefetch:
                 pass
+            elif worst_case_veto:
+                layout_action = (
+                    "worst_shape_hold:"
+                    f"{predicted_worst_free_gib:.2f}<{wddm_hold_high_gib:.2f}"
+                )
             elif not measured:
                 layout_action = f"measuring_working_set:{bucket['steps']}/{stable_windows}"
             else:
@@ -4310,7 +4524,7 @@ class MemoryManager:
             float(_env("AI_TOOLKIT_TRAINING_WDDM_STOP_GIB", str(hard_gib + 0.5))),
         )
 
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_bytes, total_bytes = vram_budget.device_mem_info(device)
         before_gib = free_bytes / gib
         needs_reclaim = (
             cls._training_cliff_guard_action(
@@ -4360,7 +4574,7 @@ class MemoryManager:
                 torch.cuda.empty_cache()
             except RuntimeError:
                 pass
-            free_gib = torch.cuda.mem_get_info(device)[0] / gib
+            free_gib = vram_budget.device_free_bytes(device) / gib
 
         demoted = 0
         if peak_pressure and max_demote > 0:
@@ -4369,7 +4583,7 @@ class MemoryManager:
             )
             if demoted:
                 cls._invalidate_manual_training_shape_peaks(mm)
-                free_gib = torch.cuda.mem_get_info(device)[0] / gib
+                free_gib = vram_budget.device_free_bytes(device) / gib
 
         action = "demote" if demoted else ("empty_cache" if needs_reclaim else "peak_pressure_unavailable")
         if cls._diagnostics_enabled():
@@ -4451,7 +4665,7 @@ class MemoryManager:
                 if item["managed"] and item.get("pinned_resident")
             ]
             for item in sorted(candidates, key=lambda row: row["resident_bytes"]):
-                free_bytes = torch.cuda.mem_get_info(device)[0]
+                free_bytes = vram_budget.device_free_bytes(device)
                 if free_bytes - item["resident_bytes"] < stop_bytes:
                     skipped += 1
                     continue
@@ -5307,11 +5521,12 @@ class MemoryManager:
         if device.type != "cuda" or not torch.cuda.is_available():
             return None
         gib = 1024 ** 3
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_bytes, total_bytes = vram_budget.device_mem_info(device)
         try:
             driver_used = torch.cuda.device_memory_used(device)
         except Exception:
-            # mem_get_info is still driver-level and includes non-PyTorch users.
+            # free_bytes is NVML-backed, so this includes every non-PyTorch
+            # user on the card (other processes included).
             driver_used = total_bytes - free_bytes
         return (
             torch.cuda.memory_allocated(device) / gib,
@@ -5711,25 +5926,47 @@ class MemoryManager:
             )
             * gib
         )
-        wddm_margin_bytes = int(
-            cls._resolve_wddm_margin_gib(
-                target,
-                wddm_margin_gib,
-                hard_gib=wddm_hard_bytes / gib,
-                env_name="AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB",
+        # The sampling margin's only remaining job is the caching allocator's
+        # reserved-over-allocated overshoot -- the WDDM cliff itself is now
+        # guarded by the reclaim allocator cap (loud OOM/GC, never silent
+        # paging). Measured on this class of run the overshoot is ~0.86 GiB and
+        # rock-steady (std ~0.05 across 8 seeds), so the AUTO margin is that
+        # measured overshoot + one safety block, NOT the old 0.10*card cushion
+        # sized for a chaotic allocator that no longer jumps. Narrowing it hands
+        # the difference to resident weights. An explicit config/env margin still
+        # takes the legacy resolve + churn-pad path.
+        def _margin_is_auto(value):
+            if value is None:
+                return True
+            try:
+                return float(value) < 0
+            except (TypeError, ValueError):
+                return str(value).strip().lower() == "auto"
+
+        if os.environ.get("AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB") in (None, "") and _margin_is_auto(
+            wddm_margin_gib
+        ):
+            wddm_margin_bytes = vram_budget.sampling_overshoot_margin_bytes(
+                hard_bytes=wddm_hard_bytes
             )
-            * gib
-        )
-        # Reserved-churn pad: streaming FP8 forwards leave the caching
-        # allocator's reserved pool ~0.5-1.3 GiB above allocated (transient
-        # buffers + fragmentation), and the device-aware allocator cap now
-        # turns that overshoot into an OOM/demote instead of silent paging.
-        # Budget for it up front (one more streamed block) so a well-planned
-        # run never has to demote mid-denoise -- a mid-run demote also grows
-        # the ingraph pack set, which strict ingraph compilation rejects.
-        wddm_margin_bytes += int(
-            float(_env("AI_TOOLKIT_SAMPLING_RESERVED_CHURN_PAD_GIB", "0.5")) * gib
-        )
+        else:
+            wddm_margin_bytes = int(
+                cls._resolve_wddm_margin_gib(
+                    target,
+                    wddm_margin_gib,
+                    hard_gib=wddm_hard_bytes / gib,
+                    env_name="AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB",
+                )
+                * gib
+            )
+            # Reserved-churn pad on the explicit path: streaming FP8 forwards
+            # leave the reserved pool ~0.5-1.3 GiB above allocated; budget for it
+            # up front so a well-planned run never has to demote mid-denoise (a
+            # mid-run demote grows the ingraph pack set, which strict ingraph
+            # compilation rejects).
+            wddm_margin_bytes += int(
+                float(_env("AI_TOOLKIT_SAMPLING_RESERVED_CHURN_PAD_GIB", "0.5")) * gib
+            )
         plan_snapshot = vram_budget.DeviceSnapshot.capture(target)
         free_bytes = plan_snapshot.free if plan_snapshot is not None else 0
         # Driver-free counts torch's own idle cache as used; the allocator cap
@@ -5774,6 +6011,38 @@ class MemoryManager:
                 f"wddm_margin={plan['wddm_margin_bytes'] / gib:.2f} GiB "
                 f"wddm_hard={plan.get('wddm_hard_bytes', 0) / gib:.2f} GiB "
                 f"free={free_bytes / gib:.2f} GiB ({budget_source})"
+            )
+
+        # Bank the measured reclaimable. The entry cap was the cliff bound, but
+        # the plan now tells us the true live footprint (resident + ring +
+        # activation reserve). Tighten the cap to sit just above it, so the
+        # allowance (0.95*cap - live) equals the reserved-churn pad and the
+        # unused dedicated VRAM is handed back as the DXGI overflow valve and
+        # tier-1 climb headroom -- exactly the floor the manual --cap-descent
+        # probe finds. Clamped to the cliff inside the setter, so a tight
+        # high-res plan is a no-op. The GC is lazy: this cap change is realized
+        # on the resident move's first fresh malloc just below, not here.
+        if (
+            plan.get("fits")
+            and plan_snapshot is not None
+            and target is not None
+            and torch.device(target).type == "cuda"
+        ):
+            planned_live_bytes = (
+                int(plan.get("resident_bytes", 0))
+                + int(plan.get("ring_bytes", 0))
+                + int(plan.get("working_reserve_bytes", 0))
+            )
+            cache_budget_bytes = int(
+                float(_env("AI_TOOLKIT_SAMPLING_RESERVED_CHURN_PAD_GIB", "0.5")) * gib
+            )
+            reclaim_cap_bytes = vram_budget.cap_bytes_for_live(
+                planned_live_bytes,
+                cache_budget_bytes,
+                cliff_cap_bytes=plan_snapshot.total,
+            )
+            cls._apply_wddm_hard_allocator_cap(
+                target, wddm_hard_gib, target_cap_bytes=reclaim_cap_bytes
             )
 
         move_started = time.perf_counter()
@@ -5865,7 +6134,7 @@ class MemoryManager:
                 max(working_reserve_floor, working_reserve_bytes - reserve_buffer_bytes)
                 + wddm_hard_bytes
             )
-            free_now = torch.cuda.mem_get_info(target)[0]
+            free_now = vram_budget.device_free_bytes(target)
             if free_now < post_move_floor_bytes:
                 if not hasattr(module, "_memory_manager"):
                     cls.attach(
@@ -5891,7 +6160,7 @@ class MemoryManager:
                     )
                     if not freed:
                         break
-                    free_now = torch.cuda.mem_get_info(target)[0]
+                    free_now = vram_budget.device_free_bytes(target)
                     demoted_blocks += 1
                 if demoted_blocks and diagnostics:
                     floor_status = (
@@ -6163,7 +6432,7 @@ class MemoryManager:
             """
             if not cuda_target or sampling_state["fully_streamed"]:
                 return 0
-            free_b, total_b = torch.cuda.mem_get_info(target)
+            free_b, total_b = vram_budget.device_mem_info(target)
             reserved_b = torch.cuda.memory_reserved(target)
             peak_reserved_b = torch.cuda.max_memory_reserved(target)
             # Predicted device-free at the next forward's peak. (peak stats are
@@ -6236,11 +6505,11 @@ class MemoryManager:
             # cap so torch's share shrinks in step and the hard device-free
             # floor survives the growth. Cheap + idempotent when unchanged.
             cls._apply_wddm_hard_allocator_cap(target, hard_floor / gib)
-            before = torch.cuda.mem_get_info(target)[0]
+            before = vram_budget.device_free_bytes(target)
             if not cls._sampling_step_should_trim(before, trim_margin):
                 return 0
             torch.cuda.empty_cache()
-            free_b = torch.cuda.mem_get_info(target)[0]
+            free_b = vram_budget.device_free_bytes(target)
             freed = max(0, free_b - before)
             sampling_state["trim_count"] += 1
             sampling_state["trim_freed_bytes"] += freed
@@ -6263,7 +6532,7 @@ class MemoryManager:
                     demoted_blocks = 1
                     sampling_state["trim_demotes"] += 1
                     if diagnostics:
-                        free_b = torch.cuda.mem_get_info(target)[0]
+                        free_b = vram_budget.device_free_bytes(target)
                         print(
                             f"[MemoryManager] step trim: cache trim left "
                             f"{(before + freed) / gib:.2f} GiB free (< hard floor "

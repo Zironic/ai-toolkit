@@ -540,6 +540,33 @@ def _parse_args():
     )
     parser.add_argument("--cap-descent-step-gib", type=float, default=0.25)
     parser.add_argument("--cap-descent-max-notches", type=int, default=16)
+    parser.add_argument(
+        "--margin-probe", action="store_true",
+        help=(
+            "After the measured sample, measure the sampling reserved-pool "
+            "overshoot and its run-to-run spread: each pass empties the idle "
+            "cache (forcing the transient pool to rebuild), varies the seed, and "
+            "records peak_alloc vs peak_reserved. The reserved-over-alloc gap and "
+            "its spread are the empirical basis for narrowing wddm_margin now that "
+            "the allocator no longer jumps chaotically."
+        ),
+    )
+    parser.add_argument(
+        "--resample", type=int, default=0,
+        help=(
+            "After the first sampling cycle, re-enter inference_resident this "
+            "many more times and run one measured sample each, printing where "
+            "device_used/free land. This exercises the learn->consume climb: "
+            "pass 1 is cold-conservative and records the activation peak; the "
+            "next entries plan more residency from the learned reserve and "
+            "should settle into the target device_free band."
+        ),
+    )
+    parser.add_argument("--margin-probe-passes", type=int, default=8)
+    parser.add_argument(
+        "--margin-probe-safety-gib", type=float, default=0.375,
+        help="Safety block added to the max measured overshoot for the recommended margin.",
+    )
     parser.add_argument("--strict-ingraph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ingraph-depth", type=int, default=2)
     parser.add_argument("--ingraph-stream-all", action="store_true")
@@ -898,6 +925,111 @@ def main():
         _print_json(summary)
         return summary
 
+    def _run_margin_probe():
+        """Measure the sampling reserved-pool overshoot + its run-to-run spread.
+
+        wddm_margin was historically wide because the caching allocator's
+        reserved pool jumped chaotically above the planned footprint. This probe
+        measures the *current* behaviour at the plan's own layout: each pass
+        empties the idle cache (forcing the transient ring/activation pool to
+        rebuild -- resident weights are live and stay), varies the seed, and
+        records peak_alloc vs peak_reserved. The reserved-over-alloc gap is what
+        the margin must cover; its spread across passes says how tight we can
+        safely make it now.
+        """
+        import statistics
+
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+
+        def _gc_counters():
+            stats = torch.cuda.memory_stats(index)
+            return {
+                "retries": int(stats.get("num_alloc_retries", 0)),
+                "frees": int(stats.get("num_device_free", 0)),
+            }
+
+        passes = []
+        base_seed = args.seed
+        try:
+            for i in range(int(args.margin_probe_passes)):
+                args.seed = base_seed + i
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize(index)
+                torch.cuda.reset_peak_memory_stats(index)
+                before = _gc_counters()
+                started = time.perf_counter()
+                _run_sample(
+                    f"margin_probe_{i}",
+                    args.steps,
+                    ".codex/krea2_margin_probe.png",
+                    keep_ingraph=False,
+                )
+                torch.cuda.synchronize(index)
+                after = _gc_counters()
+                peak_alloc = _gib(torch.cuda.max_memory_allocated(index))
+                peak_reserved = _gib(torch.cuda.max_memory_reserved(index))
+                row = {
+                    "pass": i,
+                    "seed": args.seed,
+                    "seconds": time.perf_counter() - started,
+                    "peak_alloc_gib": peak_alloc,
+                    "peak_reserved_gib": peak_reserved,
+                    "reserved_over_alloc_gib": peak_reserved - peak_alloc,
+                    "retries_delta": after["retries"] - before["retries"],
+                    "cuda_free_delta": after["frees"] - before["frees"],
+                }
+                passes.append(row)
+                print(
+                    f"[smoke] margin probe pass {i}: seed={args.seed} "
+                    f"peak_alloc={peak_alloc:.2f} peak_reserved={peak_reserved:.2f} "
+                    f"reserved_over_alloc={row['reserved_over_alloc_gib']:.3f} "
+                    f"retries=+{row['retries_delta']} cudaFree=+{row['cuda_free_delta']} "
+                    f"seconds={row['seconds']:.2f}"
+                )
+        finally:
+            args.seed = base_seed
+
+        def _stat(key):
+            xs = [p[key] for p in passes] or [0.0]
+            return {
+                "min": min(xs),
+                "max": max(xs),
+                "mean": statistics.fmean(xs),
+                "std": statistics.pstdev(xs) if len(xs) > 1 else 0.0,
+            }
+
+        over = _stat("reserved_over_alloc_gib")
+        reserved = _stat("peak_reserved_gib")
+        alloc = _stat("peak_alloc_gib")
+        safety = float(args.margin_probe_safety_gib)
+        recommended_margin_gib = over["max"] + safety
+        summary = {
+            "event": "margin_probe",
+            "passes": passes,
+            "reserved_over_alloc_gib": over,
+            "peak_reserved_gib": reserved,
+            "peak_alloc_gib": alloc,
+            "safety_block_gib": safety,
+            # The margin only has to cover the worst reserved overshoot beyond
+            # planned live plus one safety block; the cap backstops the WDDM
+            # cliff, so the old fat cushion is no longer the paging guard.
+            "recommended_margin_gib": recommended_margin_gib,
+            "any_retries": any(p["retries_delta"] > 0 for p in passes),
+        }
+        rows.append(summary)
+        _print_json(summary)
+        print(
+            "[smoke] margin probe summary: reserved_over_alloc "
+            f"min/mean/max/std={over['min']:.3f}/{over['mean']:.3f}/"
+            f"{over['max']:.3f}/{over['std']:.3f} GiB; peak_reserved spread="
+            f"{reserved['max'] - reserved['min']:.3f} GiB (std {reserved['std']:.3f}); "
+            f"recommended margin ~{recommended_margin_gib:.2f} GiB "
+            f"(max overshoot {over['max']:.3f} + safety {safety:.2f})"
+        )
+        return summary
+
     compile_label = "compile_sample" if config.compile_sample else "compile disabled"
     print(f"[smoke] sampling with MemoryManager.inference_resident and {compile_label}")
     transformer._ingraph_sampling_measure = False
@@ -1000,6 +1132,51 @@ def main():
             if args.cap_descent:
                 print("[smoke] cap descent probe: true need vs unrestricted use")
                 _run_cap_descent()
+            if args.margin_probe:
+                print("[smoke] margin probe: reserved-pool overshoot + spread")
+                _run_margin_probe()
+        # Re-enter inference_resident to exercise the learn->consume climb: the
+        # first cycle above recorded the activation peak, so these passes plan
+        # more residency from the learned reserve and should settle into the
+        # target device_free band. Each is a fresh plan (re-entry re-runs the
+        # smart budget), unlike the margin probe which reuses one fixed layout.
+        for extra in range(int(args.resample)):
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            total_b = torch.cuda.get_device_properties(index).total_memory
+            with MemoryManager.inference_resident(
+                transformer,
+                device=device,
+                fp8_sampling=bool(config.layer_offloading_fp8_sampling),
+                working_reserve_gib=config.layer_offloading_smart_sampling_working_reserve_gb,
+                wddm_margin_gib=config.layer_offloading_smart_sampling_wddm_margin_gb,
+                wddm_hard_gib=config.layer_offloading_smart_sampling_wddm_hard_gb,
+                reserve_pin_for_ingraph=bool(
+                    config.layer_offloading_compile_streamed
+                    or config.layer_offloading_ingraph_sampling
+                ),
+                cold_start_hint_bytes=cold_start_hint,
+            ):
+                torch.cuda.synchronize(index)
+                torch.cuda.reset_peak_memory_stats(index)
+                _img, _res = _run_sample(
+                    f"resample_{extra + 1}",
+                    args.steps,
+                    args.output,
+                    keep_ingraph=False,
+                )
+                torch.cuda.synchronize(index)
+                peak_reserved_b = torch.cuda.max_memory_reserved(index)
+                peak_alloc_b = torch.cuda.max_memory_allocated(index)
+                free_b, _tot = torch.cuda.mem_get_info(index)
+                device_used_b = total_b - free_b
+                print(
+                    f"[smoke] resample {extra + 1}: "
+                    f"peak_alloc={_gib(peak_alloc_b):.2f} "
+                    f"peak_reserved={_gib(peak_reserved_b):.2f} "
+                    f"device_used={_gib(device_used_b):.2f} "
+                    f"device_free={_gib(free_b):.2f} GiB "
+                    f"seconds={_res['seconds']:.2f}"
+                )
         sampling_context_seconds = time.perf_counter() - sampling_context_started
         compile_state = measured_result["compile"]
         ingraph_timing = measured_result["ingraph_timing"]

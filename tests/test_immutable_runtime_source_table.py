@@ -1,11 +1,16 @@
 """CPU-only tests for compile-neutral immutable residency publication."""
 
+import inspect
 import unittest
 
-from extensions_built_in.diffusion_models.krea2.src.immutable_arena import (
-    KreaImmutableArenaError,
-    KreaImmutablePlanExecutor,
-    build_execution_fingerprint,
+import torch
+
+from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
+from toolkit.memory_management.immutable_runtime import (
+    ImmutableRuntimeError,
+    ImmutableRuntimeSourceTable,
+    ImmutableTransformerRuntime,
+    build_program_fingerprint,
 )
 from toolkit.memory_management.residency import ResidencyDelta, ResidencyPlan
 
@@ -41,14 +46,21 @@ class _EmptyModel:
 
 class ImmutableRuntimeSourceTableTests(unittest.TestCase):
     def _executor(self):
-        return KreaImmutablePlanExecutor(
+        # Two-phase lifecycle: construct (prepare), then finalize permanent
+        # programs before any execution/publication. An empty model finalizes
+        # with no LoRA state.
+        executor = ImmutableTransformerRuntime(
             _EmptyModel(),
             _FakeResidency(),
+            architecture_adapter=SingleStreamMMDiTAdapter(),
             compile_blocks=False,
         )
+        executor.finalize_execution()
+        return executor
 
     def test_residency_publication_preserves_program_objects(self):
         executor = self._executor()
+        self.assertIsInstance(executor._sources, ImmutableRuntimeSourceTable)
         train = executor.program(executor.TRAIN)
         sample = executor.program(executor.SAMPLE)
         train_trunk = train.trunk
@@ -65,34 +77,114 @@ class ImmutableRuntimeSourceTableTests(unittest.TestCase):
         self.assertEqual(executor._block_kernels, kernels)
         self.assertEqual(executor.stats["residency_transitions"], 2)
 
-    def test_transition_is_rejected_while_execution_is_active(self):
+    def test_execution_context_rejects_overlap_and_releases_on_exception(self):
         executor = self._executor()
-        generation = executor.begin_execution()
-        try:
+
+        with executor.execution(executor.TRAIN):
+            self.assertEqual(executor.active_executions, 1)
             with self.assertRaisesRegex(
-                KreaImmutableArenaError,
+                ImmutableRuntimeError,
                 "residency_transition_during_execution",
             ):
                 executor.set_residency_plan(ResidencyPlan.build("sample", ()))
-        finally:
-            executor.end_execution(generation)
+            with self.assertRaisesRegex(
+                ImmutableRuntimeError,
+                "immutable_execution_already_active:train",
+            ):
+                with executor.execution(executor.SAMPLE):
+                    pass
+            with self.assertRaisesRegex(
+                ImmutableRuntimeError,
+                "cannot_close_during_execution",
+            ):
+                executor.close()
 
-    def test_structural_fingerprint_ignores_residency(self):
-        train = ResidencyPlan.build("train", ())
-        sample = ResidencyPlan.build("sample", ())
-        kwargs = {
-            "mode": "train",
-            "block_plans": (),
-            "depth": 2,
-            "checkpoint_mode": "full",
-        }
-        first = build_execution_fingerprint(
-            residency_plan=train,
-            **kwargs,
+        self.assertEqual(executor.active_executions, 0)
+        with self.assertRaisesRegex(ValueError, "expected"):
+            with executor.execution(executor.TRAIN):
+                raise ValueError("expected")
+        self.assertEqual(executor.active_executions, 0)
+
+        executor.set_residency_plan(ResidencyPlan.build("sample", ()))
+        with executor.execution(executor.SAMPLE):
+            self.assertEqual(executor.active_executions, 1)
+
+    def test_sampling_context_measures_success_and_clears_failure_state(self):
+        executor = self._executor()
+        calls = []
+
+        def activate_sampling_image(**kwargs):
+            calls.append(("activate", kwargs))
+            executor._sampling_baseline = {"shape_key": kwargs["shape_key"]}
+
+        def finish_sampling_image(*, shape_key):
+            calls.append(("finish", shape_key))
+            executor._sampling_baseline = None
+
+        executor.activate_sampling_image = activate_sampling_image
+        executor.finish_sampling_image = finish_sampling_image
+
+        with executor.sampling(shape_key=(1, 2), cold_working_bytes=3):
+            self.assertEqual(executor.active_executions, 1)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "activate",
+                    {
+                        "shape_key": (1, 2),
+                        "cold_working_bytes": 3,
+                    },
+                ),
+                ("finish", (1, 2)),
+            ],
         )
-        second = build_execution_fingerprint(
-            residency_plan=sample,
-            **kwargs,
+
+        with self.assertRaisesRegex(ValueError, "sample failed"):
+            with executor.sampling(shape_key=(3, 4)):
+                raise ValueError("sample failed")
+        self.assertIsNone(executor._sampling_baseline)
+        self.assertEqual(executor.active_executions, 0)
+
+    def test_run_requires_matching_execution_context(self):
+        executor = self._executor()
+
+        with self.assertRaisesRegex(
+            ImmutableRuntimeError,
+            "immutable_execution_not_active",
+        ):
+            executor.run("hidden", None, None, None)
+
+        with executor.execution(executor.TRAIN):
+            self.assertEqual(
+                executor.run("hidden", None, None, None),
+                "hidden",
+            )
+
+        with executor.execution(executor.TRAIN):
+            with torch.no_grad(), self.assertRaisesRegex(
+                ImmutableRuntimeError,
+                "immutable_execution_mode_mismatch:active=train:call=sample",
+            ):
+                executor.run("hidden", None, None, None)
+    def test_structural_fingerprint_has_no_residency_input(self):
+        parameters = inspect.signature(build_program_fingerprint).parameters
+        self.assertNotIn("residency", parameters)
+        self.assertNotIn("residency_plan", parameters)
+
+        first = build_program_fingerprint(
+            "train",
+            (),
+            architecture_key="single_stream_mmdit",
+            depth=2,
+            checkpoint_mode="full",
+        )
+        second = build_program_fingerprint(
+            "train",
+            (),
+            architecture_key="single_stream_mmdit",
+            depth=2,
+            checkpoint_mode="full",
         )
         self.assertEqual(first, second)
 
