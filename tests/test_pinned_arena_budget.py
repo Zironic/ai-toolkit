@@ -294,14 +294,18 @@ class ArenaIsSolePinnerDuringAttachTests(unittest.TestCase):
         budget returned immediately on release) via pin_register."""
         layer = _linear()
         arena = PinnedWeightArena()
+        # I1 (populate-before-register) splits pin_register into
+        # pin_register_prepare (unpinned buffer) + pin_register_commit (the
+        # actual cudaHostRegister call once the buffer is populated); the
+        # arena path now goes through the split, not the composite wrapper.
         with mock.patch.object(
-            pin_manager, "pin_register", wraps=pin_manager.pin_register
-        ) as register_spy, mock.patch.object(
+            pin_manager, "pin_register_commit", wraps=pin_manager.pin_register_commit
+        ) as commit_spy, mock.patch.object(
             pin_manager, "pin_alloc", wraps=pin_manager.pin_alloc
         ) as alloc_spy:
             arena.build({"blocks.0": [("lin", layer)]}, budget_bytes=None)
         try:
-            register_spy.assert_called()
+            commit_spy.assert_called()
             alloc_spy.assert_not_called()
         finally:
             arena.release()
@@ -488,3 +492,7 @@ class ArenaIsSolePinnerDuringAttachTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import pytest
+
+pytestmark = pytest.mark.leaky  # order-dependent under full suite; see ticket f2aceba

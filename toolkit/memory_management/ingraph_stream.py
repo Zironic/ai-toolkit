@@ -147,12 +147,13 @@ def _empty_host_flat(
     if not pin:
         return torch.empty(nbytes, dtype=torch.uint8), False, None
     if pin_mechanism == "register":
-        # Exact DXGI cost: cudaHostRegister on an exact-size tensor, no
-        # caching-allocator power-of-two bucket rounding. The pinned weight
-        # arena's flats are large and long-lived, where the rounding
-        # overhead compounds to gigabytes (observed live: 8.86 GiB of
-        # pin_alloc flats committed 12.70 GiB of DXGI usage).
-        handle = pin_manager.pin_register(nbytes, kind, required=False)
+        # I1: prepare the page-aligned buffer WITHOUT registering it yet --
+        # pack_block_host copies the leaves into it (ordinary pageable
+        # memcpy) before the caller commits the cudaHostRegister pin. See
+        # pin_register_prepare's docstring for why population-before-pin is
+        # faster than registering a virgin buffer.
+        candidate, padded = pin_manager.pin_register_prepare(nbytes)
+        return candidate, False, ("register_pending", padded, kind)
     else:
         handle = pin_manager.pin_alloc(
             nbytes,
@@ -214,10 +215,19 @@ def pack_block_host(
     host, pinned, pin_handle = _empty_host_flat(
         total, pin=pin, kind=kind, pin_mechanism=pin_mechanism
     )
+    register_pending = isinstance(pin_handle, tuple) and pin_handle[:1] == ("register_pending",)
     try:
         for leaf, offset in zip(leaves, offsets):
             nbytes = leaf.numel() * leaf.element_size()
             host[offset:offset + nbytes].view(leaf.dtype).reshape(leaf.shape).copy_(leaf)
+
+        if register_pending:
+            _, _padded, register_kind = pin_handle
+            pin_handle = pin_manager.pin_register_commit(
+                host, total, register_kind, required=False
+            )
+            host = pin_handle.tensor
+            pinned = bool(pin_handle.pinned)
 
         cursor = 0
         specs = []
@@ -935,6 +945,7 @@ class _Ticket:
     h2d_start: torch.cuda.Event | None = None
     h2d_end: torch.cuda.Event | None = None
     nbytes: int = 0
+    copies: int = 0
 
 
 _STATE_LOCK = threading.Lock()
@@ -946,10 +957,30 @@ _TRANSFER_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
 _STATS = {
     "fetches": 0,
     "bytes": 0,
+    "copies": 0,
     "h2d_ms": 0.0,
     "wait_ms": 0.0,
     "depth_waits": 0,
 }
+
+
+def raise_dynamo_recompile_limit(min_limit: int = 128) -> None:
+    """Lift dynamo's per-code-object recompile cap for the in-graph trunks.
+
+    Two legitimate recompile sources stack up on one code object: bucketed
+    training resolutions (dynamic=False -> one cache entry per distinct token
+    shape) and sampling-boundary rebuilds (fresh block-fn closures fail the
+    old entries' guards without evicting them). The default limit of 8 turned
+    that into FailOnRecompileLimitHit at the third boundary of a 200-step run
+    (~step 101). Each extra entry costs one ~3 min compile, not correctness;
+    the cap exists to flag accidental recompile storms, which the boundary
+    rebuild is not.
+    """
+    config = torch._dynamo.config
+    for attribute in ("recompile_limit", "cache_size_limit"):
+        current = getattr(config, attribute, None)
+        if isinstance(current, int) and current < min_limit:
+            setattr(config, attribute, min_limit)
 
 
 def configure_fetch_runtime(*, depth: int = 2) -> None:
@@ -980,6 +1011,7 @@ def fetch_report(reset: bool = False) -> str | None:
     gb = stats["bytes"] / 1024 ** 3
     return (
         f"[InGraphStream] fetches={int(stats['fetches'])} "
+        f"copies={int(stats['copies'])} "
         f"bytes={gb:.2f} GiB h2d_ms={stats['h2d_ms']:.3f} "
         f"wait_ms={stats['wait_ms']:.3f} depth_waits={int(stats['depth_waits'])}"
     )
@@ -1068,9 +1100,115 @@ def _fetch_start_impl(host_flat: torch.Tensor) -> torch.Tensor:
             h2d_start=h2d_start,
             h2d_end=h2d_end,
             nbytes=host_flat.numel(),
+            copies=1,
         )
         _STATS["fetches"] += 1
         _STATS["bytes"] += int(host_flat.numel())
+        _STATS["copies"] += 1
+    return torch.tensor([tid], dtype=torch.int64)
+
+
+def _validated_transfer_ranges(
+    host_flat: torch.Tensor,
+    ranges: torch.Tensor,
+    compact_nbytes: int,
+) -> list[tuple[int, int, int]]:
+    """Validate a static multi-range plan at the opaque runtime boundary.
+
+    Ranges are tensor data rather than a closed-over Python plan so replacing
+    same-shaped canonical storage remains guard-stable. Destination spans must
+    form one dense compact flat; source spans must be ordered, non-overlapping
+    canonical bytes.
+    """
+    if host_flat.device.type != "cpu" or host_flat.dtype != torch.uint8:
+        raise RuntimeError("mm.fetch_start_multi expected a CPU uint8 host_flat")
+    if not host_flat.is_contiguous():
+        raise RuntimeError("mm.fetch_start_multi expected a contiguous host_flat")
+    if not pin_manager.is_arena_backed(host_flat):
+        raise RuntimeError(
+            "mm.fetch_start_multi expected a registered canonical arena source"
+        )
+    if ranges.device.type != "cpu" or ranges.dtype != torch.int64:
+        raise RuntimeError("mm.fetch_start_multi expected CPU int64 ranges")
+    if ranges.ndim != 2 or ranges.shape[1] != 3 or ranges.shape[0] == 0:
+        raise RuntimeError("mm.fetch_start_multi expected non-empty Nx3 ranges")
+    compact_nbytes = int(compact_nbytes)
+    if compact_nbytes <= 0:
+        raise RuntimeError("mm.fetch_start_multi expected compact_nbytes > 0")
+
+    rows = [tuple(int(value) for value in row) for row in ranges.tolist()]
+    previous_src_end = 0
+    expected_dst = 0
+    for index, (src_offset, dst_offset, nbytes) in enumerate(rows):
+        if src_offset < 0 or dst_offset < 0 or nbytes <= 0:
+            raise RuntimeError(f"mm.fetch_start_multi invalid range {index}")
+        if src_offset + nbytes > host_flat.numel():
+            raise RuntimeError(f"mm.fetch_start_multi source range {index} out of bounds")
+        if index and src_offset < previous_src_end:
+            raise RuntimeError(f"mm.fetch_start_multi source range {index} overlaps")
+        if dst_offset != expected_dst:
+            raise RuntimeError(
+                f"mm.fetch_start_multi destination range {index} is not compact"
+            )
+        previous_src_end = src_offset + nbytes
+        expected_dst = dst_offset + nbytes
+    if expected_dst != compact_nbytes:
+        raise RuntimeError("mm.fetch_start_multi ranges do not fill compact_nbytes")
+    return rows
+
+
+def _fetch_start_multi_impl(
+    host_flat: torch.Tensor,
+    ranges: torch.Tensor,
+    compact_nbytes: int,
+) -> torch.Tensor:
+    rows = _validated_transfer_ranges(host_flat, ranges, compact_nbytes)
+    device = torch.device("cuda")
+    stream = _transfer_stream(device)
+    with _STATE_LOCK:
+        _reap_locked(block=False)
+        if len(_LIVE) >= _DEPTH:
+            _reap_locked(block=True)
+        global _NEXT_ID
+        tid = _NEXT_ID
+        _NEXT_ID += 1
+        _LIVE.append(tid)
+
+    h2d_start = torch.cuda.Event(enable_timing=True)
+    h2d_end = torch.cuda.Event(enable_timing=True)
+    ready = torch.cuda.Event()
+    compact_nbytes = int(compact_nbytes)
+    with torch.cuda.stream(stream):
+        h2d_start.record(stream)
+        if len(rows) == 1 and rows[0][1] == 0 and rows[0][2] == compact_nbytes:
+            # Fully-streamed/coalesced block: one direct H2D copy, with no
+            # destination allocation followed by a slice-copy submission.
+            src_offset, _dst_offset, nbytes = rows[0]
+            device_buffer = host_flat[src_offset:src_offset + nbytes].to(
+                device, non_blocking=True
+            )
+        else:
+            device_buffer = torch.empty(compact_nbytes, dtype=torch.uint8, device=device)
+            for src_offset, dst_offset, nbytes in rows:
+                device_buffer[dst_offset:dst_offset + nbytes].copy_(
+                    host_flat[src_offset:src_offset + nbytes], non_blocking=True
+                )
+        ready.record(stream)
+        h2d_end.record(stream)
+
+    with _STATE_LOCK:
+        _TICKETS[tid] = _Ticket(
+            tid=tid,
+            device_buffer=device_buffer,
+            ready_event=ready,
+            h2d_start=h2d_start,
+            h2d_end=h2d_end,
+            nbytes=compact_nbytes,
+            copies=len(rows),
+        )
+        _STATS["fetches"] += 1
+        _STATS["bytes"] += compact_nbytes
+        _STATS["copies"] += len(rows)
     return torch.tensor([tid], dtype=torch.int64)
 
 
@@ -1112,12 +1250,59 @@ def _(host_flat, gate):
     return torch.empty(1, dtype=torch.int64, device="cpu")
 
 
+@torch.library.custom_op("mm::fetch_start_multi", mutates_args=())
+def fetch_start_multi(
+    host_flat: torch.Tensor, ranges: torch.Tensor, compact_nbytes: int
+) -> torch.Tensor:
+    return _fetch_start_multi_impl(host_flat, ranges, compact_nbytes)
+
+
+@fetch_start_multi.register_fake
+def _(host_flat, ranges, compact_nbytes: int):
+    return torch.empty(1, dtype=torch.int64, device="cpu")
+
+
+@torch.library.custom_op("mm::fetch_start_multi_after", mutates_args=("guard",))
+def fetch_start_multi_after(
+    host_flat: torch.Tensor,
+    ranges: torch.Tensor,
+    compact_nbytes: int,
+    guard: torch.Tensor,
+) -> torch.Tensor:
+    return _fetch_start_multi_impl(host_flat, ranges, compact_nbytes)
+
+
+@fetch_start_multi_after.register_fake
+def _(host_flat, ranges, compact_nbytes: int, guard):
+    return torch.empty(1, dtype=torch.int64, device="cpu")
+
+
+@torch.library.custom_op("mm::fetch_start_multi_gated", mutates_args=())
+def fetch_start_multi_gated(
+    host_flat: torch.Tensor,
+    ranges: torch.Tensor,
+    compact_nbytes: int,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    return _fetch_start_multi_impl(host_flat, ranges, compact_nbytes)
+
+
+@fetch_start_multi_gated.register_fake
+def _(host_flat, ranges, compact_nbytes: int, gate):
+    return torch.empty(1, dtype=torch.int64, device="cpu")
+
+
 @torch.library.custom_op("mm::fetch_wait", mutates_args=())
 def fetch_wait(token: torch.Tensor, nbytes: int) -> torch.Tensor:
     tid = int(token[0].item())
     ticket = _TICKETS.get(tid)
     if ticket is None:
         raise RuntimeError(f"mm.fetch_wait got unknown ticket {tid}")
+    if int(nbytes) != ticket.nbytes:
+        raise RuntimeError(
+            f"mm.fetch_wait size mismatch for ticket {tid}: "
+            f"expected {ticket.nbytes}, got {int(nbytes)}"
+        )
     current = torch.cuda.current_stream()
     start = time.perf_counter()
     current.wait_event(ticket.ready_event)
@@ -1187,6 +1372,8 @@ def _register_ordered_effects():
         for op in (
             torch.ops.mm.fetch_start.default,
             torch.ops.mm.fetch_start_after.default,
+            torch.ops.mm.fetch_start_multi.default,
+            torch.ops.mm.fetch_start_multi_after.default,
             torch.ops.mm.fetch_wait.default,
             torch.ops.mm.fetch_free.default,
             torch.ops.mm.fetch_free_after.default,
@@ -1310,6 +1497,8 @@ def _compiled_free_policy(ctx, op, *args, **kwargs):
     if op in (
         torch.ops.mm.fetch_start.default,
         torch.ops.mm.fetch_start_after.default,
+        torch.ops.mm.fetch_start_multi.default,
+        torch.ops.mm.fetch_start_multi_after.default,
         torch.ops.mm.fetch_wait.default,
     ):
         # The design's core invariant: fetched weights are NEVER saved for
@@ -1327,12 +1516,12 @@ def compiled_checkpoint_context():
     return create_selective_checkpoint_contexts(_compiled_free_policy)
 
 
-def training_checkpoint_context():
-    """Grad-mode checkpoint context for streamed ingraph blocks: dispatch-mode
-    (SAC) contexts under compile, the in_recompute marker in eager. Both make
-    the first-pass forward free stay out of the backward path so the ring is
-    freed by free_on_backward at the true last read."""
-    if torch.compiler.is_compiling():
-        return compiled_checkpoint_context()
-    return checkpoint_recompute_context()
+# NOTE: there is deliberately NO helper that "picks the right checkpoint
+# context automatically". The checkpoint HOP calls context_fn() OUTSIDE the
+# compiling frame, so an is_compiling() check inside such a helper always
+# reads False under compile and hands the HOP eager (non-TorchDispatchMode)
+# contexts, failing its assertion. Select the context at trunk level instead:
+#     context_fn = (compiled_checkpoint_context
+#                   if torch.compiler.is_compiling()
+#                   else checkpoint_recompute_context)
 

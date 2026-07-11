@@ -94,12 +94,12 @@ class ArenaBuildTests(unittest.TestCase):
     def test_pageable_fallback_when_pin_refuses(self):
         layer = _linear()
         arena = PinnedWeightArena()
-        # Arena flats pin via pin_register (cudaHostRegister, exact DXGI
-        # cost) -- refuse that to force the pageable path.
+        # Arena flats pin via pin_register_prepare/commit (cudaHostRegister,
+        # exact DXGI cost) -- refuse the commit to force the pageable path.
         with mock.patch(
-            "toolkit.memory_management.ingraph_stream.pin_manager.pin_register",
-            side_effect=lambda nbytes, kind, **kw: pin_manager.PinHandle(
-                tensor=torch.empty(nbytes, dtype=torch.uint8), nbytes=nbytes,
+            "toolkit.memory_management.ingraph_stream.pin_manager.pin_register_commit",
+            side_effect=lambda candidate, nbytes, kind, **kw: pin_manager.PinHandle(
+                tensor=candidate, nbytes=nbytes,
                 kind=kind, pinned=False, mechanism="register",
             ),
         ):

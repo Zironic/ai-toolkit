@@ -530,34 +530,24 @@ def pin_alloc(
     return PinHandle(tensor=tensor, nbytes=nbytes, kind=kind, pinned=True)
 
 
-def pin_register(
-    nbytes: int,
-    kind: str,
-    *,
-    device=None,
-    required: bool = False,
-) -> PinHandle:
-    """Exact-size host buffer pinned with cudaHostRegister.
+def pin_register_prepare(nbytes: int) -> tuple[torch.Tensor, int]:
+    """Allocate the page-aligned pageable buffer a register-mechanism pin
+    will need, WITHOUT pinning it yet.
 
-    Unlike pin_alloc, this never touches torch's caching host allocator, so
-    the DXGI shared-budget cost is exactly ``nbytes`` (the caching allocator
-    rounds up to power-of-two buckets: observed live, 8.86 GiB of pin_alloc
-    flats committed 12.70 GiB of DXGI usage -- ~40% invisible overhead) and
-    release returns the budget immediately. Intended for large long-lived
-    buffers (the pinned weight arena); small/churny consumers should keep
-    using pin_alloc.
+    Split out of ``pin_register`` so callers who need to populate the buffer
+    (e.g. copying leaf tensors into a block flat) can do so on ordinary
+    pageable memory -- a plain memcpy that faults in pages at normal RAM
+    bandwidth -- before ``cudaHostRegister`` runs. Registering a virgin,
+    never-touched buffer forces the OS to commit+pin every page during the
+    syscall itself, which is measurably slower than registering pages that
+    are already resident (I1, ~1-1.5s per full arena build).
+
+    Returns ``(candidate, padded_nbytes)``; ``candidate`` is an untouched
+    pageable view, exactly the layout ``pin_register`` used to build inline.
     """
     nbytes = int(nbytes)
-    kind = str(kind or "unknown")
-    if nbytes <= 0 or not torch.cuda.is_available():
-        tensor = torch.empty(max(0, nbytes), dtype=torch.uint8)
-        return PinHandle(tensor=tensor, nbytes=max(0, nbytes) if nbytes > 0 else 0,
-                         kind=kind, pinned=False, mechanism="register")
-    # cudaHostRegister needs a page-aligned, page-rounded range on Windows
-    # (small torch.empty buffers are only 64B-aligned and fail); carve an
-    # aligned view out of a slightly larger pageable base. The view keeps
-    # the base storage alive, and its data_ptr is what the registered-pin
-    # bookkeeping keys on.
+    if nbytes <= 0:
+        return torch.empty(0, dtype=torch.uint8), 0
     page = 4096
     padded = (nbytes + page - 1) // page * page
     # cudaHostRegister works at PAGE granularity: it registers every 4096-byte
@@ -575,12 +565,30 @@ def pin_register(
     aligned_start = ((base_ptr + page + page - 1) // page) * page
     offset = aligned_start - base_ptr
     candidate = base[offset:offset + padded]
+    return candidate, padded
+
+
+def pin_register_commit(
+    candidate: torch.Tensor,
+    nbytes: int,
+    kind: str,
+    *,
+    device=None,
+    required: bool = False,
+) -> PinHandle:
+    """Pin an already-prepared (and optionally already-populated) buffer
+    from :func:`pin_register_prepare` with cudaHostRegister."""
+    nbytes = int(nbytes)
+    kind = str(kind or "unknown")
+    if nbytes <= 0 or not torch.cuda.is_available():
+        return PinHandle(tensor=candidate, nbytes=0, kind=kind,
+                         pinned=False, mechanism="register")
+    padded = candidate.numel() * candidate.element_size()
     # pin_tensor_in_place budget-checks (with reconcile) and does the ledger
     # accounting (of the padded size -- the true DXGI cost).
     if pin_tensor_in_place(candidate, kind, device=device):
         return PinHandle(tensor=candidate, nbytes=padded, kind=kind,
                          pinned=True, mechanism="register")
-    tensor = candidate
     if required:
         raise PinBudgetExceeded(
             _budget_message(
@@ -593,8 +601,41 @@ def pin_register(
         f"[PinManager] pin refused ({kind}): {nbytes / GIB:.2f} GiB "
         "cudaHostRegister denied (ledger/DXGI budget); returning pageable"
     )
-    return PinHandle(tensor=tensor, nbytes=nbytes, kind=kind, pinned=False,
+    return PinHandle(tensor=candidate, nbytes=nbytes, kind=kind, pinned=False,
                      mechanism="register")
+
+
+def pin_register(
+    nbytes: int,
+    kind: str,
+    *,
+    device=None,
+    required: bool = False,
+) -> PinHandle:
+    """Exact-size host buffer pinned with cudaHostRegister.
+
+    Unlike pin_alloc, this never touches torch's caching host allocator, so
+    the DXGI shared-budget cost is exactly ``nbytes`` (the caching allocator
+    rounds up to power-of-two buckets: observed live, 8.86 GiB of pin_alloc
+    flats committed 12.70 GiB of DXGI usage -- ~40% invisible overhead) and
+    release returns the budget immediately. Intended for large long-lived
+    buffers (the pinned weight arena); small/churny consumers should keep
+    using pin_alloc.
+
+    Convenience wrapper over :func:`pin_register_prepare` +
+    :func:`pin_register_commit` for callers with no data to populate before
+    pinning (e.g. tests). Callers that populate a leaf-carrying flat should
+    call the two steps directly with the copy in between (see
+    ``ingraph_stream.pack_block_host``).
+    """
+    nbytes = int(nbytes)
+    kind = str(kind or "unknown")
+    if nbytes <= 0 or not torch.cuda.is_available():
+        tensor = torch.empty(max(0, nbytes), dtype=torch.uint8)
+        return PinHandle(tensor=tensor, nbytes=max(0, nbytes) if nbytes > 0 else 0,
+                         kind=kind, pinned=False, mechanism="register")
+    candidate, _padded = pin_register_prepare(nbytes)
+    return pin_register_commit(candidate, nbytes, kind, device=device, required=required)
 
 
 def pin_empty(shape, dtype, kind: str, *, device=None, required: bool = False):
