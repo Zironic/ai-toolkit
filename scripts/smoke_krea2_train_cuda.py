@@ -20,6 +20,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -103,7 +104,7 @@ def _immutable_arena_summary(transformer):
         return {"present": False}
     stats = arena.stats()
     residency = getattr(transformer, "_mm_residency_state", None)
-    executor = getattr(transformer, "_immutable_plan_executor", None)
+    runtime = getattr(transformer, "_immutable_runtime", None)
     summary = {
         "present": True,
         "id": id(arena),
@@ -120,27 +121,25 @@ def _immutable_arena_summary(transformer):
     if train_plan is not None:
         summary["training_plan_fingerprint"] = train_plan.fingerprint
     # Transfer-plan (compact multi-range) span/copy accounting per Invariant 8.
-    if residency is not None:
-        from extensions_built_in.diffusion_models.krea2.src.immutable_arena import (
-            build_block_source_plan,
-        )
+    if residency is not None and runtime is not None and residency.plan is not None:
+        from toolkit.memory_management.immutable_runtime import build_source_snapshot
 
         streamed_blocks = 0
         total_ranges = 0
         streamed_bytes = 0
-        for index in range(len(transformer.blocks)):
-            block_plan = build_block_source_plan(transformer, residency, index)
-            if block_plan.transfer is None:
+        for abi in runtime._block_abis:
+            snapshot = build_source_snapshot(residency, residency.plan, abi)
+            if snapshot.transfer is None:
                 continue
             streamed_blocks += 1
-            total_ranges += block_plan.transfer.num_ranges
-            streamed_bytes += int(block_plan.transfer.compact_nbytes)
+            total_ranges += snapshot.transfer.num_ranges
+            streamed_bytes += int(snapshot.transfer.compact_nbytes)
         summary["streamed_blocks"] = streamed_blocks
         # One coalesced copy per range; the runtime submits ranges as copies.
         summary["transfer_ranges"] = total_ranges
         summary["transfer_compact_gib"] = _gib(streamed_bytes)
-    if executor is not None:
-        summary["executor_stats"] = dict(executor.stats)
+    if runtime is not None:
+        summary["runtime_stats"] = dict(runtime.stats)
     return summary
 
 
@@ -225,6 +224,14 @@ def _build_model_config(args):
         layer_offloading_fp8_forward=args.fp8_training_forward,
         layer_offloading_pinned_arena=args.pinned_arena,
         layer_offloading_immutable_arena=getattr(args, "use_immutable_arena", False),
+        # The immutable runtime is built during load_model, so its ring depth and
+        # compile gate have to arrive through the config -- not through the
+        # post-LoRA enable call the old ingraph path used.
+        layer_offloading_ingraph_depth=args.ingraph_depth,
+        compile=bool(
+            getattr(args, "use_immutable_arena", False)
+            and not args.no_ingraph_compile
+        ),
         model_kwargs=model_kwargs,
     )
 
@@ -501,6 +508,36 @@ def _parse_args():
     )
     parser.add_argument("--ingraph-depth", type=int, default=2)
     parser.add_argument(
+        "--blocking-h2d-timing",
+        action="store_true",
+        help="A/B control: settle each fetch's H2D timing inside fetch_wait "
+        "(the old behaviour, which pins the host to the transfer stream once "
+        "per fetch)",
+    )
+    parser.add_argument(
+        "--ab-h2d-parity",
+        action="store_true",
+        help="interleaved A/B: blocking H2D timing on even steps, lazy on odd, "
+        "within ONE run. Same clocks, same thermals, same allocator state -- "
+        "the only way to compare arms without run-to-run variance swamping the "
+        "effect. Reports a per-arm mean over the steady steps.",
+    )
+    parser.add_argument(
+        "--trace",
+        type=int,
+        default=0,
+        help="chrome-trace the last N steady steps (step 0 is the compile, never "
+        "traced). Profiling inflates host launch cost, so the summary reports "
+        "traced vs untraced step time -- read the timeline for structure and "
+        "distrust its absolute numbers if the inflation is large.",
+    )
+    parser.add_argument(
+        "--trace-out",
+        default=".codex/krea2_train_trace.json",
+        help="chrome-trace output path for --trace (open in chrome://tracing "
+        "or ui.perfetto.dev)",
+    )
+    parser.add_argument(
         "--compile-cache-dir",
         default="tmp/torch_compile_cache",
         help="mega-cache dir for torch.compile artifacts (warm start turns "
@@ -639,11 +676,12 @@ def main():
     _print_json(rows[-1])
 
     compile_cache_key = None
-    if args.ingraph_training and args.compile_cache_dir:
+    if (args.ingraph_training or args.use_immutable_arena) and args.compile_cache_dir:
         from extensions_built_in.diffusion_models.krea2.krea2 import _compile_cache_key
         from toolkit.compile_cache import load_compile_cache
 
-        compile_cache_key = _compile_cache_key(model) + "_ingraph_train"
+        suffix = "_immutable_train" if args.use_immutable_arena else "_ingraph_train"
+        compile_cache_key = _compile_cache_key(model) + suffix
         if load_compile_cache(args.compile_cache_dir, compile_cache_key):
             print(f"[smoke] loaded torch.compile mega-cache ({compile_cache_key})")
 
@@ -652,7 +690,14 @@ def main():
         # enable after LoRA apply so entries see the final module state.
         print("[smoke] enabling in-graph streamed training trunk")
         t0 = time.perf_counter()
-        block_count = transformer.enable_ingraph_training(
+        enable = getattr(transformer, "enable_ingraph_training", None)
+        if enable is None:
+            raise SystemExit(
+                "--ingraph-training: this model no longer exposes "
+                "enable_ingraph_training (the compile-neutral refactor replaced "
+                "it with the immutable runtime). Use --use-immutable-arena."
+            )
+        block_count = enable(
             depth=args.ingraph_depth, compile=not args.no_ingraph_compile
         )
         borrowed = int(getattr(transformer, "_ingraph_training_borrowed_count", 0))
@@ -698,22 +743,26 @@ def main():
         # Mirror BaseSDTrainProcess's layer_offloading_immutable_arena hook:
         # stand up the compiled executor and activate its TRAIN plan AFTER LoRA
         # apply, so it captures the adapter leaves.
-        print("[smoke] enabling immutable-arena compiled plan executor")
+        print("[smoke] enabling immutable-arena compiled runtime")
         t0 = time.perf_counter()
-        arena = transformer._mm_canonical_arena
-        residency = transformer._mm_residency_state
         training_plan = transformer._mm_immutable_training_plan
-        executor = transformer.enable_immutable_arena_compiled(
-            arena, residency, depth=args.ingraph_depth,
-            compile_trunks=not args.no_ingraph_compile,
-        )
-        executor.activate(executor.TRAIN, training_plan)
+        runtime = transformer._immutable_runtime
+        if runtime is None:
+            raise SystemExit(
+                "--use-immutable-arena: load_model did not prepare an immutable "
+                "runtime (_immutable_runtime is unset)"
+            )
+        # Two-phase, exactly as BaseSDTrainProcess does it: the runtime was
+        # prepared in load_model BEFORE LoRA; finalize here, AFTER LoRA apply,
+        # so the permanent programs capture the installed adapter leaves.
+        transformer.finalize_immutable_runtime()
+        runtime.activate(runtime.TRAIN, training_plan)
         rows.append(
             {
                 "event": "immutable_arena_enabled",
                 "seconds": time.perf_counter() - t0,
-                "depth": args.ingraph_depth,
-                "compiled": not args.no_ingraph_compile,
+                "depth": int(runtime.depth),
+                "compiled": bool(runtime.compile_blocks),
                 "immutable_arena": _immutable_arena_summary(transformer),
                 "cuda": _cuda_snapshot("immutable_arena_enabled", device),
                 "dxgi": _dxgi_snapshot("immutable_arena_enabled"),
@@ -769,6 +818,12 @@ def main():
         optimizer.load_state_dict(optim_state)
         print(f"[smoke] loaded optimizer state from {args.init_optim}")
 
+    if args.blocking_h2d_timing:
+        from toolkit.memory_management import ingraph_stream
+
+        ingraph_stream.set_h2d_timing_blocking(True)
+        print("[smoke] H2D timing: BLOCKING (old behaviour, A/B control)")
+
     MemoryManager.set_fp8_grad_input_enabled(bool(args.fp8_grad_input))
     rows.append(
         {
@@ -822,7 +877,29 @@ def main():
     print(f"[smoke] running {args.steps} fake training steps "
           f"(batch={args.batch_size}, latents {args.batch_size}x16x{lat_h}x{lat_w})")
     step_rows = []
+    # Trace only the tail steps: step 0 is the trunk compile, and the first
+    # steady step still faults fresh allocator segments, so neither is
+    # representative of the steady state we are trying to see inside.
+    profiler = None
+    trace_from = None
+    if args.trace > 0:
+        trace_from = max(1, args.steps - args.trace)
+        if trace_from >= args.steps:
+            raise SystemExit("--trace needs at least one steady step after step 0")
     for step in range(args.steps):
+        if args.ab_h2d_parity:
+            from toolkit.memory_management import ingraph_stream
+
+            ingraph_stream.set_h2d_timing_blocking(step % 2 == 0)
+        if trace_from is not None and step == trace_from:
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+            )
+            profiler.start()
+            print(f"[smoke] tracing steps {trace_from}..{args.steps - 1}")
         latents = torch.randn(
             args.batch_size, 16, lat_h, lat_w, generator=generator
         ).to(device, model.torch_dtype)
@@ -840,9 +917,17 @@ def main():
 
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
+        # Mirror BaseSDTrainProcess: the immutable runtime pins its source table
+        # for the duration of a step, and run() fails closed outside one.
+        immutable_runtime = getattr(transformer, "_immutable_runtime", None)
+        execution_context = (
+            immutable_runtime.execution(immutable_runtime.TRAIN)
+            if immutable_runtime is not None
+            else contextlib.nullcontext()
+        )
         # Backward MUST stay inside the network context (multiplier is zeroed on
         # exit; leaving before backward silently kills LoRA grads).
-        with network:
+        with execution_context, network:
             pred = model.get_noise_prediction(noisy, timestep, embeds)
             loss = torch.nn.functional.mse_loss(pred.float(), target)
             loss.backward()
@@ -895,6 +980,14 @@ def main():
         if grads_present == 0:
             raise SystemExit("no LoRA gradients produced -- training path is broken")
 
+    trace_path = None
+    if profiler is not None:
+        profiler.stop()
+        trace_path = Path(args.trace_out)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        profiler.export_chrome_trace(str(trace_path))
+        print(f"[smoke] wrote chrome trace {trace_path}")
+
     if dump_dir is not None:
         loss_series = [
             {"step": r["step"] + 1, "loss": r["loss"], "grad_norm": r["grad_norm"]}
@@ -907,9 +1000,53 @@ def main():
 
     rows.extend(step_rows)
     steady = [r["seconds"] for r in step_rows[1:]] or [step_rows[0]["seconds"]]
+    ab_summary = None
+    if args.ab_h2d_parity:
+        # Steady steps only; step 0 carries the compile and would land wholly in
+        # one arm and bias it.
+        blocking_arm = [
+            r["seconds"] for r in step_rows[1:] if r["step"] % 2 == 0
+        ]
+        lazy_arm = [r["seconds"] for r in step_rows[1:] if r["step"] % 2 == 1]
+        ab_summary = {
+            "blocking_steps": len(blocking_arm),
+            "blocking_mean_s": (
+                sum(blocking_arm) / len(blocking_arm) if blocking_arm else None
+            ),
+            "lazy_steps": len(lazy_arm),
+            "lazy_mean_s": sum(lazy_arm) / len(lazy_arm) if lazy_arm else None,
+        }
+        if blocking_arm and lazy_arm:
+            ab_summary["lazy_vs_blocking_pct"] = (
+                (ab_summary["lazy_mean_s"] - ab_summary["blocking_mean_s"])
+                / ab_summary["blocking_mean_s"]
+                * 100.0
+            )
+    trace_summary = None
+    if trace_path is not None:
+        # Quantify the observer effect: the same steady state, with and without
+        # the profiler attached. A small gap means the timeline's numbers can be
+        # trusted; a large one means read it for structure only.
+        untraced = [r["seconds"] for r in step_rows[1:trace_from]]
+        traced = [r["seconds"] for r in step_rows[trace_from:]]
+        trace_summary = {
+            "path": str(trace_path),
+            "traced_steps": len(traced),
+            "traced_step_avg_s": sum(traced) / len(traced),
+            "untraced_step_avg_s": (
+                sum(untraced) / len(untraced) if untraced else None
+            ),
+        }
+        if untraced:
+            base = trace_summary["untraced_step_avg_s"]
+            trace_summary["profiler_overhead_pct"] = (
+                (trace_summary["traced_step_avg_s"] - base) / base * 100.0
+            )
     summary = {
         "event": "done",
         "steps": args.steps,
+        "ab_h2d_parity": ab_summary,
+        "trace": trace_summary,
         "first_step_s": step_rows[0]["seconds"],
         "steady_step_avg_s": sum(steady) / len(steady),
         "dynamo": _dynamo_counters(),
@@ -943,7 +1080,7 @@ def main():
         # canonical Parameters are cloned off the arena and every pinned byte
         # returns to the pre-arena "weights" baseline.
         ledger_before_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
-        MemoryManager._destroy_immutable_arena(transformer)
+        transformer.disable_immutable_runtime()
         ledger_after_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
         teardown_row = {
             "event": "immutable_arena_destroyed",

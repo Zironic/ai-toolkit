@@ -941,11 +941,32 @@ class _Ticket:
     tid: int
     device_buffer: torch.Tensor
     ready_event: torch.cuda.Event | None
+    slot: int = -1
+    # The exact key the slot was acquired under: torch.device("cuda") and
+    # buffer.device (cuda:0) do not compare equal as dict keys.
+    slot_device: torch.device | None = None
     free_event: torch.cuda.Event | None = None
     h2d_start: torch.cuda.Event | None = None
     h2d_end: torch.cuda.Event | None = None
     nbytes: int = 0
     copies: int = 0
+
+
+class _Slot:
+    """One reusable device buffer in the fetch ring.
+
+    The buffer is allocated once and reused for every fetch that lands on this
+    slot. ``free_event`` is recorded on the COMPUTE stream by fetch_free, after
+    the last reader of the previous occupant; the transfer stream waits on it
+    device-side before overwriting the buffer. That ordering is what lets the
+    host submit ahead without ever blocking: the GPU enforces the recycle.
+    """
+
+    __slots__ = ("buffer", "free_event")
+
+    def __init__(self) -> None:
+        self.buffer: torch.Tensor | None = None
+        self.free_event: torch.cuda.Event | None = None
 
 
 _STATE_LOCK = threading.Lock()
@@ -954,6 +975,12 @@ _LIVE: collections.deque[int] = collections.deque()
 _NEXT_ID = 0
 _DEPTH = 2
 _TRANSFER_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
+# Per-device ring of reusable device buffers, plus the indices currently
+# available. A slot returns to _FREE_SLOTS when fetch_free SUBMITS (not when the
+# GPU reaches it) -- the device-side wait on its free_event is what keeps the
+# reuse correct, so the host never has to wait for compute to catch up.
+_SLOTS: dict[torch.device, list[_Slot]] = {}
+_FREE_SLOTS: dict[torch.device, collections.deque[int]] = {}
 _STATS = {
     "fetches": 0,
     "bytes": 0,
@@ -962,6 +989,42 @@ _STATS = {
     "wait_ms": 0.0,
     "depth_waits": 0,
 }
+# (h2d_start, h2d_end) pairs awaiting timing. Drained only when the events have
+# already completed, so accounting for a copy never blocks the host on it.
+_PENDING_H2D: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+# Harness-only: restore the old behaviour of settling each copy's timing inside
+# fetch_wait. Kept solely so a benchmark can A/B the cost of that host sync on
+# the same build; production always drains lazily.
+_BLOCKING_H2D_TIMING = False
+
+
+def set_h2d_timing_blocking(enabled: bool) -> None:
+    global _BLOCKING_H2D_TIMING
+    _BLOCKING_H2D_TIMING = bool(enabled)
+
+
+def _drain_h2d(block: bool = False) -> None:
+    """Accumulate h2d_ms for finished copies. Host-blocking only if block=True.
+
+    block=True is for the end-of-run report, where the in-flight copies are done
+    anyway; the hot path always calls this with block=False.
+    """
+    if not _PENDING_H2D:
+        return
+    pending = []
+    for h2d_start, h2d_end in _PENDING_H2D:
+        try:
+            if not block and not h2d_end.query():
+                pending.append((h2d_start, h2d_end))
+                continue
+            if block:
+                h2d_end.synchronize()
+            _STATS["h2d_ms"] += h2d_start.elapsed_time(h2d_end)
+        except RuntimeError:
+            # Event never recorded (abandoned fetch, e.g. OOM unwind): drop it.
+            pass
+    _PENDING_H2D[:] = pending
 
 
 def raise_dynamo_recompile_limit(min_limit: int = 128) -> None:
@@ -985,19 +1048,29 @@ def raise_dynamo_recompile_limit(min_limit: int = 128) -> None:
 
 def configure_fetch_runtime(*, depth: int = 2) -> None:
     global _DEPTH, _NEXT_ID
+    if torch.cuda.is_available() and _SLOTS:
+        # Slot buffers may still be in flight; settle before dropping them.
+        torch.cuda.synchronize()
     _DEPTH = max(1, int(depth))
     with _STATE_LOCK:
         _TICKETS.clear()
         _LIVE.clear()
+        _PENDING_H2D.clear()
+        _SLOTS.clear()
+        _FREE_SLOTS.clear()
         _NEXT_ID = 0
 
 
 def reset_fetch_stats() -> None:
+    _PENDING_H2D.clear()
     for key in _STATS:
         _STATS[key] = 0
 
 
 def fetch_stats(reset: bool = False) -> dict:
+    # Settle the copies still in flight so the reported h2d_ms covers every
+    # fetch, not just the ones that happened to finish before the last wait.
+    _drain_h2d(block=True)
     stats = dict(_STATS)
     if reset:
         reset_fetch_stats()
@@ -1025,25 +1098,48 @@ def _transfer_stream(device: torch.device):
     return stream
 
 
-def _reap_locked(block: bool = False):
-    while _LIVE:
-        ticket = _TICKETS.get(_LIVE[0])
-        if ticket is None:
-            _LIVE.popleft()
-            continue
-        if ticket.free_event is None:
-            if not block:
-                return
-            raise RuntimeError("mm.fetch_start depth exceeded before fetch_free")
-        if not ticket.free_event.query():
-            if not block:
-                return
-            start = time.perf_counter()
-            ticket.free_event.synchronize()
-            _STATS["depth_waits"] += 1
-            _STATS["wait_ms"] += (time.perf_counter() - start) * 1000.0
-        _TICKETS.pop(ticket.tid, None)
-        _LIVE.popleft()
+def _ring_locked(device: torch.device) -> tuple[list[_Slot], collections.deque]:
+    slots = _SLOTS.get(device)
+    if slots is None or len(slots) != _DEPTH:
+        slots = [_Slot() for _ in range(_DEPTH)]
+        _SLOTS[device] = slots
+        _FREE_SLOTS[device] = collections.deque(range(_DEPTH))
+    return slots, _FREE_SLOTS[device]
+
+
+def _acquire_slot(device: torch.device, nbytes: int) -> tuple[int, _Slot]:
+    """Take a ring slot and make sure its buffer holds nbytes.
+
+    Never blocks on GPU progress. An empty free list means the graph is holding
+    more than `depth` fetched buffers live at once -- the same condition the old
+    host-side reaper raised on, and still a bug rather than something to wait
+    out (waiting here would mean waiting on the compute stream, which only the
+    host can feed).
+    """
+    with _STATE_LOCK:
+        slots, free = _ring_locked(device)
+        if not free:
+            raise RuntimeError(
+                "mm.fetch_start depth exceeded before fetch_free "
+                f"(ring depth {_DEPTH}); the graph holds more fetched buffers "
+                "live than the ring has slots"
+            )
+        index = free.popleft()
+    slot = slots[index]
+    if slot.buffer is None or slot.buffer.numel() < nbytes:
+        # Growth happens during warmup, until every slot has seen the largest
+        # block. Settle the device first: the outgoing buffer may still be in
+        # flight, and dropping its last reference would hand the memory back to
+        # the caching allocator while a stream is still reading it.
+        if slot.buffer is not None:
+            torch.cuda.synchronize(device)
+        slot.buffer = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    return index, slot
+
+
+def _release_slot(device: torch.device, index: int) -> None:
+    with _STATE_LOCK:
+        _FREE_SLOTS.setdefault(device, collections.deque()).append(index)
 
 
 def drain_fetch_runtime() -> int:
@@ -1063,6 +1159,14 @@ def drain_fetch_runtime() -> int:
         abandoned = len(_LIVE)
         _LIVE.clear()
         _TICKETS.clear()
+        _PENDING_H2D.clear()
+        # The abandoned tickets never called fetch_free, so their slots were
+        # never returned. Rebuild the free list and clear the stale free_events
+        # (the recovery path has already unwound whatever would have read them).
+        for device, slots in _SLOTS.items():
+            for slot in slots:
+                slot.free_event = None
+            _FREE_SLOTS[device] = collections.deque(range(len(slots)))
     return abandoned
 
 
@@ -1076,10 +1180,9 @@ def _fetch_start_impl(host_flat: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("mm.fetch_start expected a pinned host_flat tensor")
     device = torch.device("cuda")
     stream = _transfer_stream(device)
+    nbytes = host_flat.numel()
+    index, slot = _acquire_slot(device, nbytes)
     with _STATE_LOCK:
-        _reap_locked(block=False)
-        if len(_LIVE) >= _DEPTH:
-            _reap_locked(block=True)
         global _NEXT_ID
         tid = _NEXT_ID
         _NEXT_ID += 1
@@ -1087,9 +1190,14 @@ def _fetch_start_impl(host_flat: torch.Tensor) -> torch.Tensor:
     h2d_start = torch.cuda.Event(enable_timing=True)
     h2d_end = torch.cuda.Event(enable_timing=True)
     ready = torch.cuda.Event()
+    device_buffer = slot.buffer[:nbytes]
     with torch.cuda.stream(stream):
+        if slot.free_event is not None:
+            # Device-side recycle: the copy waits for the previous occupant's
+            # last reader, so the host does not have to.
+            stream.wait_event(slot.free_event)
         h2d_start.record(stream)
-        device_buffer = host_flat.to(device, non_blocking=True)
+        device_buffer.copy_(host_flat, non_blocking=True)
         ready.record(stream)
         h2d_end.record(stream)
     with _STATE_LOCK:
@@ -1097,9 +1205,11 @@ def _fetch_start_impl(host_flat: torch.Tensor) -> torch.Tensor:
             tid=tid,
             device_buffer=device_buffer,
             ready_event=ready,
+            slot=index,
+            slot_device=device,
             h2d_start=h2d_start,
             h2d_end=h2d_end,
-            nbytes=host_flat.numel(),
+            nbytes=nbytes,
             copies=1,
         )
         _STATS["fetches"] += 1
@@ -1165,10 +1275,9 @@ def _fetch_start_multi_impl(
     rows = _validated_transfer_ranges(host_flat, ranges, compact_nbytes)
     device = torch.device("cuda")
     stream = _transfer_stream(device)
+    compact_nbytes = int(compact_nbytes)
+    index, slot = _acquire_slot(device, compact_nbytes)
     with _STATE_LOCK:
-        _reap_locked(block=False)
-        if len(_LIVE) >= _DEPTH:
-            _reap_locked(block=True)
         global _NEXT_ID
         tid = _NEXT_ID
         _NEXT_ID += 1
@@ -1177,22 +1286,15 @@ def _fetch_start_multi_impl(
     h2d_start = torch.cuda.Event(enable_timing=True)
     h2d_end = torch.cuda.Event(enable_timing=True)
     ready = torch.cuda.Event()
-    compact_nbytes = int(compact_nbytes)
+    device_buffer = slot.buffer[:compact_nbytes]
     with torch.cuda.stream(stream):
+        if slot.free_event is not None:
+            stream.wait_event(slot.free_event)
         h2d_start.record(stream)
-        if len(rows) == 1 and rows[0][1] == 0 and rows[0][2] == compact_nbytes:
-            # Fully-streamed/coalesced block: one direct H2D copy, with no
-            # destination allocation followed by a slice-copy submission.
-            src_offset, _dst_offset, nbytes = rows[0]
-            device_buffer = host_flat[src_offset:src_offset + nbytes].to(
-                device, non_blocking=True
+        for src_offset, dst_offset, nbytes in rows:
+            device_buffer[dst_offset:dst_offset + nbytes].copy_(
+                host_flat[src_offset:src_offset + nbytes], non_blocking=True
             )
-        else:
-            device_buffer = torch.empty(compact_nbytes, dtype=torch.uint8, device=device)
-            for src_offset, dst_offset, nbytes in rows:
-                device_buffer[dst_offset:dst_offset + nbytes].copy_(
-                    host_flat[src_offset:src_offset + nbytes], non_blocking=True
-                )
         ready.record(stream)
         h2d_end.record(stream)
 
@@ -1201,6 +1303,8 @@ def _fetch_start_multi_impl(
             tid=tid,
             device_buffer=device_buffer,
             ready_event=ready,
+            slot=index,
+            slot_device=device,
             h2d_start=h2d_start,
             h2d_end=h2d_end,
             nbytes=compact_nbytes,
@@ -1307,13 +1411,13 @@ def fetch_wait(token: torch.Tensor, nbytes: int) -> torch.Tensor:
     start = time.perf_counter()
     current.wait_event(ticket.ready_event)
     _STATS["wait_ms"] += (time.perf_counter() - start) * 1000.0
-    ticket.device_buffer.record_stream(current)
     if ticket.h2d_start is not None and ticket.h2d_end is not None:
-        try:
-            ticket.h2d_end.synchronize()
-            _STATS["h2d_ms"] += ticket.h2d_start.elapsed_time(ticket.h2d_end)
-        except RuntimeError:
-            pass
+        # Queue the pair for opportunistic draining; do NOT synchronize here.
+        # Blocking on h2d_end just to service a counter stalls the submit loop,
+        # and with the ring recycling device-side there is nothing to gain from
+        # the throttle it used to provide.
+        _PENDING_H2D.append((ticket.h2d_start, ticket.h2d_end))
+        _drain_h2d(block=_BLOCKING_H2D_TIMING)
     return ticket.device_buffer
 
 
@@ -1327,8 +1431,21 @@ def _fetch_free_impl(token: torch.Tensor) -> torch.Tensor:
     ticket = _TICKETS.get(tid)
     if ticket is None:
         raise RuntimeError(f"mm.fetch_free got unknown ticket {tid}")
-    ticket.free_event = torch.cuda.Event()
-    ticket.free_event.record(torch.cuda.current_stream())
+    free_event = torch.cuda.Event()
+    free_event.record(torch.cuda.current_stream())
+    ticket.free_event = free_event
+    if ticket.slot >= 0 and ticket.slot_device is not None:
+        # The slot's next occupant waits on this event device-side before it
+        # overwrites the buffer, so the slot can go back into circulation now,
+        # at SUBMIT time, without the host waiting for the GPU to reach it.
+        _SLOTS[ticket.slot_device][ticket.slot].free_event = free_event
+        _release_slot(ticket.slot_device, ticket.slot)
+    with _STATE_LOCK:
+        _TICKETS.pop(tid, None)
+        if _LIVE and _LIVE[0] == tid:
+            _LIVE.popleft()
+        elif tid in _LIVE:
+            _LIVE.remove(tid)
     return token.clone()
 
 

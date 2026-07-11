@@ -864,22 +864,13 @@ class ModelConfig:
         self.layer_offloading_checkpoint_keep_last = kwargs.get(
             "layer_offloading_checkpoint_keep_last", 0
         )
-        self.layer_offloading_compile_streamed = kwargs.get(
-            "layer_offloading_compile_streamed", False
-        )
-        self.layer_offloading_ingraph_sampling = kwargs.get(
-            "layer_offloading_ingraph_sampling", False
-        )
-        self.layer_offloading_ingraph_depth = kwargs.get(
-            "layer_offloading_ingraph_depth", 2
-        )
-        self.layer_offloading_ingraph_stream_all = kwargs.get(
-            "layer_offloading_ingraph_stream_all", False
-        )
-        # Phase 4a: compiled in-graph streamed TRAINING (checkpointed blocks
-        # trunk, grad-safe fp8 base, LoRA as graph inputs). Off by default.
-        self.layer_offloading_ingraph_training = kwargs.get(
-            "layer_offloading_ingraph_training", False
+        # How many blocks ahead the immutable runtime issues host->device
+        # weight fetches. Since the ring recycles slots device-side the host
+        # never waits on it (depth_waits=0 at depth 2), so deeper rings buy
+        # nothing measurable and only cost a slot buffer of VRAM each: 2/3/4
+        # measured 2.13/2.12/2.09 s per step on Krea2, inside run-to-run noise.
+        self.layer_offloading_prefetch_depth = kwargs.get(
+            "layer_offloading_prefetch_depth", 2
         )
         self.train_compile_blocks = kwargs.get("train_compile_blocks", False)
         # Ticket 534ea49: pin offloaded weights ONCE into persistent per-block
@@ -889,18 +880,6 @@ class ModelConfig:
         self.layer_offloading_pinned_arena = kwargs.get(
             "layer_offloading_pinned_arena", False
         )
-        # Canonical immutable host arena + manager-owned GPU sidecars. This is
-        # the Slice 6 developer gate; Slice 7 aliases the established pinned-
-        # arena option to it after A/B validation. Explicit legacy rollback is
-        # retained for one release and always wins when both are present.
-        self.layer_offloading_immutable_arena = kwargs.get(
-            "layer_offloading_immutable_arena", False
-        )
-        self.layer_offloading_legacy_pinned_arena = kwargs.get(
-            "layer_offloading_legacy_pinned_arena", False
-        )
-        if self.layer_offloading_legacy_pinned_arena:
-            self.layer_offloading_immutable_arena = False
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for
