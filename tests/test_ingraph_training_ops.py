@@ -175,3 +175,7 @@ class FreeOnBackwardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import pytest
+
+pytestmark = pytest.mark.leaky  # order-dependent under full suite; see ticket f2aceba
