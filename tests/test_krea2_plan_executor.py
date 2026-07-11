@@ -5,7 +5,7 @@ Covers the slice's test bullets: zero graph breaks in the compiled trunks,
 bounded unique graphs across repeated phase cycles, same-plan cycles reusing
 compiled artifacts, and arena pointers/registrations/ledger fixed across
 every boundary. The all-streamed sampling fallback and fail-closed staleness
-checks run with compile_trunks=False (same mechanism, no compile cost).
+checks run with compile_blocks=False (same mechanism, no compile cost).
 """
 
 import pytest
@@ -228,9 +228,68 @@ def test_phase_cycles_reuse_graphs_and_arena_fixed_across_boundaries():
         arena.release()
 
 
+def test_bounce_pin_churn_does_not_invalidate_phase_transitions(monkeypatch):
+    model, arena, state, _reference_args = _fixture()
+    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
+    during_handle = None
+    original_build_sidecar = state._build_sidecar
+
+    try:
+        executor.activate(executor.TRAIN, _train_plan())
+
+        # Unrelated bounce ownership may change between phase transitions.
+        between_handle = pin_manager.pin_alloc(4096, "bounce", required=True)
+        assert between_handle.pinned
+        pin_manager.release(between_handle)
+
+        # It may also change while reconcile is creating GPU sidecars. Keep
+        # this allocation live through both residency and executor post-checks.
+        def build_sidecar_with_bounce(key):
+            nonlocal during_handle
+            if during_handle is None:
+                during_handle = pin_manager.pin_alloc(
+                    4096, "bounce", required=True
+                )
+                assert during_handle.pinned
+            return original_build_sidecar(key)
+
+        monkeypatch.setattr(state, "_build_sidecar", build_sidecar_with_bounce)
+        executor.activate(executor.SAMPLE, _sample_plan())
+        with torch.no_grad():
+            assert executor.run(*_inputs(model)).shape == (1, 5, 32)
+        pin_manager.release(during_handle)
+        during_handle = None
+        monkeypatch.setattr(state, "_build_sidecar", original_build_sidecar)
+
+        executor.activate(executor.TRAIN, _train_plan())
+        assert executor.run(
+            *_inputs(model, requires_grad=True)
+        ).shape == (1, 5, 32)
+    finally:
+        if during_handle is not None:
+            pin_manager.release(during_handle)
+        ingraph_stream.drain_fetch_runtime()
+        arena.release()
+
+
+def test_actual_arena_flat_unregistration_still_fails_closed():
+    model, arena, state, _reference_args = _fixture()
+    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
+    flat = arena.block_record("blocks.0").host_flat
+    try:
+        assert pin_manager.unpin_tensor_in_place(flat, "weights")
+        with pytest.raises(
+            KreaImmutableArenaError, match="arena_mutated_at_boundary"
+        ):
+            executor.activate(executor.SAMPLE, _sample_plan())
+    finally:
+        ingraph_stream.drain_fetch_runtime()
+        arena.release()
+
+
 def test_all_streamed_sampling_fallback_needs_no_host_rebuild():
     model, arena, state, _reference_args = _fixture()
-    executor = KreaImmutablePlanExecutor(model, state, compile_trunks=False)
+    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
     signature = _arena_signature(arena)
     try:
         # Simulate mid-run state: a partially resident sampling plan.
@@ -263,7 +322,7 @@ def test_all_streamed_sampling_fallback_needs_no_host_rebuild():
 
 def test_run_fails_closed_without_activation_and_on_stale_plan():
     model, arena, state, _reference_args = _fixture()
-    executor = KreaImmutablePlanExecutor(model, state, compile_trunks=False)
+    executor = KreaImmutablePlanExecutor(model, state, compile_blocks=False)
     try:
         with torch.no_grad(), pytest.raises(
             KreaImmutableArenaError, match="no_active_plan:sample"

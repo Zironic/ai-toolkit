@@ -187,7 +187,18 @@ class AutoWddmMarginTests(unittest.TestCase):
             manager_mod.torch.cuda.get_device_properties = old_get_props
 
 class DxgiLocalPrestepGuardTests(unittest.TestCase):
-    def test_pre_step_guard_demotes_against_local_budget(self):
+    def test_dxgi_prediction_ignores_historical_reserved_peak(self):
+        gib = 1024 ** 3
+        predicted = MemoryManager._predict_dxgi_local_peak_bytes(
+            {"usage_bytes": 8 * gib},
+            current_reserved_bytes=4 * gib,
+            current_allocated_bytes=4 * gib,
+            peak_reserved_bytes=20 * gib,
+            peak_allocated_bytes=8 * gib,
+        )
+        self.assertEqual(predicted, 12 * gib)
+
+    def test_physical_prediction_ignores_historical_reserved_peak(self):
         import torch
         import toolkit.memory_management.manager as manager_mod
 
@@ -210,20 +221,91 @@ class DxgiLocalPrestepGuardTests(unittest.TestCase):
         MemoryManager._record_manual_training_shape_peak(
             module._memory_manager,
             (512, 512),
+            peak_allocated_gib=20.0,
+            peak_reserved_gib=20.0,
+        )
+        MemoryManager._record_manual_training_shape_peak(
+            module._memory_manager,
+            (512, 512),
+            peak_allocated_gib=5.0,
+            peak_reserved_gib=20.0,
+        )
+
+        old_is_available = manager_mod.torch.cuda.is_available
+        old_reserved = manager_mod.torch.cuda.memory_reserved
+        old_allocated = manager_mod.torch.cuda.memory_allocated
+        old_info = manager_mod.torch.cuda.mem_get_info
+        old_local = MemoryManager._dxgi_local_budget_snapshot_bytes
+        try:
+            manager_mod.torch.cuda.is_available = lambda: True
+            manager_mod.torch.cuda.memory_reserved = lambda _device: 4 * gib
+            manager_mod.torch.cuda.memory_allocated = lambda _device: 4 * gib
+            manager_mod.torch.cuda.mem_get_info = lambda _device: (6 * gib, 12 * gib)
+            MemoryManager._dxgi_local_budget_snapshot_bytes = staticmethod(
+                lambda _device: None
+            )
+            result = MemoryManager.prepare_training_memory_for_shape(
+                module, torch.device("cuda:0"), shape_key=(512, 512)
+            )
+        finally:
+            manager_mod.torch.cuda.is_available = old_is_available
+            manager_mod.torch.cuda.memory_reserved = old_reserved
+            manager_mod.torch.cuda.memory_allocated = old_allocated
+            manager_mod.torch.cuda.mem_get_info = old_info
+            MemoryManager._dxgi_local_budget_snapshot_bytes = old_local
+
+        self.assertIsNone(result)
+
+
+    def test_pre_step_guard_uses_live_peak_then_invalidates_layout(self):
+        import torch
+        import toolkit.memory_management.manager as manager_mod
+
+        gib = 1024 ** 3
+
+        class FakeManager:
+            process_device = torch.device("cuda:0")
+            _smart_training_plan = {
+                "resident_bytes": 4 * gib,
+                "wddm_margin_bytes": 1 * gib,
+                "wddm_hard_bytes": 1 * gib,
+            }
+            _training_autotune_enabled = True
+
+        class FakeModule:
+            pass
+
+        module = FakeModule()
+        module._memory_manager = FakeManager()
+        # Cold compile/retrace high-water is ignored. The second observation is
+        # the steady-state live peak; reserved remains diagnostic only.
+        self.assertIsNone(
+            MemoryManager._record_manual_training_shape_peak(
+                module._memory_manager,
+                (512, 512),
+                peak_allocated_gib=20.0,
+                peak_reserved_gib=20.0,
+            )
+        )
+        MemoryManager._record_manual_training_shape_peak(
+            module._memory_manager,
+            (512, 512),
             peak_allocated_gib=8.0,
-            peak_reserved_gib=8.0,
+            peak_reserved_gib=20.0,
         )
 
         calls = []
         old_is_available = manager_mod.torch.cuda.is_available
         old_reserved = manager_mod.torch.cuda.memory_reserved
         old_allocated = manager_mod.torch.cuda.memory_allocated
+        old_info = manager_mod.torch.cuda.mem_get_info
         old_local = MemoryManager._dxgi_local_budget_snapshot_bytes
         old_demote = MemoryManager._demote_training_layers
         try:
             manager_mod.torch.cuda.is_available = lambda: True
             manager_mod.torch.cuda.memory_reserved = lambda _device: 4 * gib
             manager_mod.torch.cuda.memory_allocated = lambda _device: 4 * gib
+            manager_mod.torch.cuda.mem_get_info = lambda _device: (4 * gib, 12 * gib)
             MemoryManager._dxgi_local_budget_snapshot_bytes = staticmethod(
                 lambda _device: {
                     "budget_bytes": 10 * gib,
@@ -234,9 +316,6 @@ class DxgiLocalPrestepGuardTests(unittest.TestCase):
 
             def fake_demote(_module, mm, count, largest=True):
                 calls.append((count, largest))
-                before = mm._smart_training_plan["resident_bytes"]
-                mm._smart_training_plan = dict(mm._smart_training_plan)
-                mm._smart_training_plan["resident_bytes"] = max(0, before - 4 * gib)
                 return 1
 
             MemoryManager._demote_training_layers = classmethod(
@@ -252,13 +331,21 @@ class DxgiLocalPrestepGuardTests(unittest.TestCase):
             manager_mod.torch.cuda.is_available = old_is_available
             manager_mod.torch.cuda.memory_reserved = old_reserved
             manager_mod.torch.cuda.memory_allocated = old_allocated
+            manager_mod.torch.cuda.mem_get_info = old_info
             MemoryManager._dxgi_local_budget_snapshot_bytes = old_local
             MemoryManager._demote_training_layers = old_demote
 
         self.assertEqual(result["source"], "dxgi_local")
+        self.assertEqual(result["before"]["predicted_local_usage_gib"], 12.0)
         self.assertEqual(result["demoted_layers"], 1)
         self.assertEqual(len(calls), 1)
-        self.assertLessEqual(
-            result["after"]["predicted_local_usage_gib"],
-            result["after"]["target_local_usage_gib"],
+        self.assertFalse(result["after"]["prediction_valid"])
+        self.assertEqual(
+            result["after"]["reason"], "layout_changed_relearn_required"
+        )
+        self.assertTrue(result["shape_peak_invalidated"])
+        self.assertIsNone(
+            MemoryManager._training_shape_peak_bucket(
+                module._memory_manager, (512, 512)
+            )
         )

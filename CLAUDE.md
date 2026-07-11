@@ -139,8 +139,15 @@ overrides that are not required for normal training.
   run** (`python run.py …`): minutes-to-hours, real datasets/checkpoints, and not
   something a unit test substitutes for.
 - **Windows/WDDM reality shapes the memory work.** ~500 MB WDDM churn cliff near
-  full VRAM; `expandable_segments` unsupported; `PYTORCH_CUDA_ALLOC_CONF`
-  tuning caused ~30× slowdowns. Don't reintroduce those knobs.
+  full VRAM. Never set `max_split_size_mb` (~30× slowdown near full VRAM);
+  `expandable_segments` is a warn-and-ignore no-op on Windows (torch 2.12).
+  `garbage_collection_threshold` is fixed at 0.95 (set by `run.py` on Windows);
+  steer the GC by moving the fraction cap, never the threshold. The GC target
+  `0.95 × cap` is measured against the whole torch footprint, so the idle-cache
+  allowance is `target − live` (residents + ring + activations) and must stay
+  positive at the live peak — if live alone exceeds the target, every sweep
+  dumps all idle cache and every reuse becomes a fresh malloc that sweeps
+  again (self-sustaining thrash).
   - **Two distinct memory cliffs, different failure modes.** Crossing the
     *dedicated* VRAM ceiling makes WDDM silently page GPU memory to system RAM —
     catastrophic slowdown, **no error** (governed by `torch.cuda.mem_get_info`).
@@ -162,6 +169,16 @@ overrides that are not required for normal training.
       OOMs at the *true culprit's* allocation line — it found a stray
       `model.to(cuda)` hauling the whole quantized model onto the card in one run,
       where the uncapped version had crashed somewhere downstream.
+    - **The cap is also the GC mechanism**: before OOMing, a capped allocator
+      frees its idle cached segments and retries, so torch `reserved` GCs down
+      toward the cap on demand — the reserved−allocated gap (typically 1–3 GiB)
+      is reclaimable. The GC is all-or-nothing (dumps every idle segment) and
+      costs ~80 ms/3 GiB (seconds under external VRAM pressure) — bind the cap
+      at phase boundaries, never per-step. Cache-hit allocations bypass both
+      the cap and gc_threshold (they act on the fresh-cudaMalloc path only).
+      `memory_stats()['num_alloc_retries']` ticks once per OOM-retry reclaim;
+      the gc_threshold sweep doesn't tick it (watch `num_device_free`). Keep
+      retries ~0/step in steady state.
     - **Pinned host memory grows/shrinks slowly, and torch never gives it back.**
       Page-locking is per-page kernel work (~0.6–2 GB/s on consumer Windows), so
       large pin/unpin is seconds, not free. Worse, anything pinned through torch's

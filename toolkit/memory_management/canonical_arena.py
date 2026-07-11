@@ -257,6 +257,27 @@ class CanonicalArena:
             blocks=len(self._blocks), pinned_bytes=self.committed_pinned_bytes()
         )
 
+    def immutable_signature(self) -> tuple:
+        """Return this arena's immutable host-storage commitment.
+
+        Process-wide pin-ledger state is deliberately excluded: unrelated
+        consumers such as the bounce pool may grow or shrink while residency
+        sidecars change without mutating canonical host storage.
+        """
+        return (
+            self._canonicalized,
+            tuple(
+                (
+                    block_key,
+                    record.host_flat.data_ptr(),
+                    record.committed_bytes,
+                    pin_manager.is_host_pinned(record.host_flat),
+                    pin_manager.is_arena_backed(record.host_flat),
+                )
+                for block_key, record in self._blocks.items()
+            ),
+        )
+
     # -- explicit unload ------------------------------------------------
 
     def release(self) -> None:

@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 import torch
 
-from toolkit.memory_management import pin_manager
 from toolkit.memory_management.canonical_arena import CanonicalArena
 from toolkit.memory_management.ingraph_stream import (
     _flatten_leaves,
@@ -188,10 +187,6 @@ class ResidencyState:
             for leaf_name in self.arena.block_record(block_key).leaf_names
         )
 
-    @staticmethod
-    def _pin_signature():
-        return pin_manager.total_pinned_bytes(), pin_manager.pinned_bytes_by_kind()
-
     def _canonical_leaf(self, key: LeafKey):
         block_key, leaf_name = key
         block = self.arena.block_record(block_key)
@@ -254,7 +249,7 @@ class ResidencyState:
             block, leaf = sorted(unknown)[0]
             raise ResidencyError(f"unknown_residency_leaf:{block}.{leaf}")
 
-        before_pins = self._pin_signature()
+        before_arena = self.arena.immutable_signature()
         current = set(self._sidecars)
         additions = tuple(sorted(desired - current))
         removals = tuple(sorted(current - desired))
@@ -269,7 +264,7 @@ class ResidencyState:
             if self._copy_stream is not None:
                 self._copy_stream.synchronize()
             pending.clear()
-            if self._pin_signature() != before_pins:
+            if self.arena.immutable_signature() != before_arena:
                 raise ResidencyError(
                     "pin_ledger_changed_during_failed_promotion"
                 ) from error
@@ -281,7 +276,7 @@ class ResidencyState:
         next_sidecars.update(pending)
         self._sidecars = next_sidecars
         self._plan = plan
-        if self._pin_signature() != before_pins:
+        if self.arena.immutable_signature() != before_arena:
             raise ResidencyError("pin_ledger_changed_during_residency_transition")
         return ResidencyDelta(additions, removals, self.resident_bytes())
 

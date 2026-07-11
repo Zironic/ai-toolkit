@@ -2404,12 +2404,21 @@ class MemoryManager:
         peak_reserved_bytes,
         peak_allocated_bytes,
     ):
+        """Predict required LOCAL usage from live allocation demand.
+
+        Historical allocator reservation is cache appetite, not required live
+        memory. Keep the currently observed non-allocator footprint and add
+        the learned live allocation peak. peak_reserved_bytes remains in the
+        signature for compatibility with callers and diagnostics only.
+        """
         if snapshot is None:
             return None
         usage = int(snapshot.get("usage_bytes", 0) or 0)
-        reserved_delta = max(0, int(peak_reserved_bytes or 0) - int(current_reserved_bytes or 0))
-        allocated_delta = max(0, int(peak_allocated_bytes or 0) - int(current_allocated_bytes or 0))
-        return usage + max(reserved_delta, allocated_delta)
+        current_reserved = max(0, int(current_reserved_bytes or 0))
+        current_allocated = max(0, int(current_allocated_bytes or 0))
+        peak_allocated = max(current_allocated, int(peak_allocated_bytes or 0))
+        non_torch = max(0, usage - current_reserved)
+        return non_torch + peak_allocated
 
     @staticmethod
     def _dxgi_sampling_settle_status(snapshot):
@@ -2530,7 +2539,13 @@ class MemoryManager:
         state = cls._manual_training_safety_state(mm)
         peaks = state.setdefault("shape_peaks", {})
         key = cls._training_shape_state_key(shape_key)
-        bucket = peaks.setdefault(key, {"steps": 0})
+        bucket = peaks.setdefault(key, {"steps": 0, "warmup_steps": 0})
+        if int(bucket.get("warmup_steps", 0)) < 1:
+            # The first execution of a shape, and the first execution after a
+            # residency/layout change, includes compile/retrace and pipeline
+            # warmup. It is not a steady-state safety requirement.
+            bucket["warmup_steps"] = int(bucket.get("warmup_steps", 0)) + 1
+            return None
         bucket["steps"] = int(bucket.get("steps", 0)) + 1
         bucket["peak_allocated_gib"] = max(
             float(bucket.get("peak_allocated_gib", 0.0)), float(peak_allocated_gib or 0.0)
@@ -2539,6 +2554,12 @@ class MemoryManager:
             float(bucket.get("peak_reserved_gib", 0.0)), float(peak_reserved_gib or 0.0)
         )
         return bucket
+
+    @classmethod
+    def _invalidate_manual_training_shape_peaks(cls, mm):
+        """Discard peaks learned for an obsolete residency/layout."""
+        state = cls._manual_training_safety_state(mm)
+        state["shape_peaks"] = {}
 
     @classmethod
     def _manual_training_shape_peak(cls, mm, shape_key):
@@ -3294,6 +3315,7 @@ class MemoryManager:
             cls._register_training_prefetch_sources(module, mm)
             cls._refresh_training_fp8_flags(module, mm)
             cls._refresh_training_plan_from_layout(module, mm)
+            cls._invalidate_manual_training_shape_peaks(mm)
             cls.reset_trace_due_to_execution_shape_change()
             cls._clear_cuda_pipeline_state()
 
@@ -3348,11 +3370,13 @@ class MemoryManager:
                 cls.demote_layer(child, mm, layer_key=item["name"])
                 cls._refresh_training_fp8_flags(module, mm)
                 cls._refresh_training_plan_from_layout(module, mm)
+                cls._invalidate_manual_training_shape_peaks(mm)
                 cls.reset_trace_due_to_execution_shape_change()
                 cls._clear_cuda_pipeline_state()
                 return 0, "validated_low_free"
             cls._refresh_training_fp8_flags(module, mm)
             cls._refresh_training_plan_from_layout(module, mm)
+            cls._invalidate_manual_training_shape_peaks(mm)
             cls.reset_trace_due_to_execution_shape_change()
             cls._clear_cuda_pipeline_state()
             return 1, "promote"
@@ -3484,6 +3508,7 @@ class MemoryManager:
             return 0, "stop_line"
         cls._refresh_training_fp8_flags(module, mm)
         cls._refresh_training_plan_from_layout(module, mm)
+        cls._invalidate_manual_training_shape_peaks(mm)
         cls.reset_trace_due_to_execution_shape_change()
         cls._clear_cuda_pipeline_state()
         return promoted, "promote_batch"
@@ -3522,7 +3547,7 @@ class MemoryManager:
             return None
         learned_peak_gib = float(bucket.get("peak_allocated_gib", 0.0) or 0.0)
         learned_peak_reserved_gib = float(bucket.get("peak_reserved_gib", 0.0) or 0.0)
-        if learned_peak_gib <= 0.0 and learned_peak_reserved_gib <= 0.0:
+        if learned_peak_gib <= 0.0:
             return None
 
         gib = 1024 ** 3
@@ -3546,12 +3571,11 @@ class MemoryManager:
             current_reserved = int(torch.cuda.memory_reserved(device))
             current_allocated = int(torch.cuda.memory_allocated(device))
             peak_allocated = int(max(0.0, learned_peak_gib) * gib)
-            peak_reserved = int(max(learned_peak_reserved_gib, learned_peak_gib) * gib)
             predicted_local = cls._predict_dxgi_local_peak_bytes(
                 local,
                 current_reserved_bytes=current_reserved,
                 current_allocated_bytes=current_allocated,
-                peak_reserved_bytes=peak_reserved,
+                peak_reserved_bytes=int(max(0.0, learned_peak_reserved_gib) * gib),
                 peak_allocated_bytes=peak_allocated,
             )
             # The physical (mem_get_info) signal ALWAYS participates: the DXGI
@@ -3563,7 +3587,7 @@ class MemoryManager:
             total_gib = total_bytes / gib
             reserved_gib = current_reserved / gib
             physical_predicted_peak_free_gib = cls._training_cliff_predicted_peak_free_gib(
-                total_gib, free_gib, reserved_gib, max(learned_peak_gib, learned_peak_reserved_gib)
+                total_gib, free_gib, reserved_gib, learned_peak_gib
             )
             physical = {
                 "source": "cuda_free",
@@ -3592,44 +3616,35 @@ class MemoryManager:
 
         demoted = 0
         pressure = before
-        peak_gib = learned_peak_gib
-        peak_reserved_gib = learned_peak_reserved_gib
-        while pressure.get("pressure") and demoted < max_demote:
-            before_plan = getattr(mm, "_smart_training_plan", plan) or plan
-            before_resident_gib = before_plan.get("resident_bytes", 0) / gib
+        if max_demote > 0:
             changed = cls._demote_training_layers(
                 module, mm, retreat_layers, largest=True
             )
-            if not changed:
-                break
             demoted += changed
-            plan = getattr(mm, "_smart_training_plan", before_plan) or before_plan
-            after_resident_gib = plan.get("resident_bytes", 0) / gib
-            resident_drop_gib = max(0.0, before_resident_gib - after_resident_gib)
-            peak_gib = max(0.0, peak_gib - resident_drop_gib)
-            peak_reserved_gib = max(0.0, peak_reserved_gib - resident_drop_gib)
-            learned_peak_gib = peak_gib
-            learned_peak_reserved_gib = peak_reserved_gib
-            pressure = _pressure()
+            if changed:
+                cls._invalidate_manual_training_shape_peaks(mm)
+                pressure = {
+                    "source": before.get("source"),
+                    "pressure": None,
+                    "prediction_valid": False,
+                    "reason": "layout_changed_relearn_required",
+                }
 
-        if demoted:
-            bucket["peak_allocated_gib"] = peak_gib
-            bucket["peak_reserved_gib"] = peak_reserved_gib
-            if cls._diagnostics_enabled():
-                if before.get("source") == "dxgi_local":
-                    print(
-                        f"[MemoryManager] pre-step DXGI local guard: demoted_layers={demoted} "
-                        f"predicted_local={before.get('predicted_local_usage_gib'):.2f}->{pressure.get('predicted_local_usage_gib', float('nan')):.2f} GiB "
-                        f"budget={before.get('local_budget_gib'):.2f} GiB "
-                        f"target_usage={before.get('target_local_usage_gib'):.2f} GiB "
-                        f"margin={margin_gib:.2f} GiB"
-                    )
-                else:
-                    print(
-                        f"[MemoryManager] pre-step CUDA free guard: demoted_layers={demoted} "
-                        f"peak_free={before.get('predicted_peak_free_gib'):.2f}->{pressure.get('predicted_peak_free_gib'):.2f} GiB "
-                        f"target={fallback_target_gib:.2f} GiB"
-                    )
+        if demoted and cls._diagnostics_enabled():
+            if before.get("source") == "dxgi_local":
+                print(
+                    f"[MemoryManager] pre-step DXGI local guard: demoted_layers={demoted} "
+                    f"predicted_local={before.get('predicted_local_usage_gib'):.2f} GiB "
+                    f"budget={before.get('local_budget_gib'):.2f} GiB "
+                    f"target_usage={before.get('target_local_usage_gib'):.2f} GiB "
+                    f"margin={margin_gib:.2f} GiB; layout changed, relearning"
+                )
+            else:
+                print(
+                    f"[MemoryManager] pre-step CUDA free guard: demoted_layers={demoted} "
+                    f"peak_free={before.get('predicted_peak_free_gib'):.2f} GiB "
+                    f"target={fallback_target_gib:.2f} GiB; layout changed, relearning"
+                )
         return {
             "manual_safety": not bool(getattr(mm, "_training_autotune_enabled", False)),
             "action": "prestep_demote" if demoted else "prestep_unavailable",
@@ -3637,8 +3652,9 @@ class MemoryManager:
             "source": before.get("source"),
             "before": before,
             "after": pressure,
-            "learned_peak_allocated_gib": peak_gib,
-            "learned_peak_reserved_gib": peak_reserved_gib,
+            "learned_peak_allocated_gib": learned_peak_gib,
+            "learned_peak_reserved_gib": learned_peak_reserved_gib,
+            "shape_peak_invalidated": bool(demoted),
         }
 
     @classmethod
@@ -3989,6 +4005,7 @@ class MemoryManager:
                     f"dedicated_free={min_device_free_gib:.2f} GiB"
                 )
         elif prefetch_recovery_action is not None:
+            cls._invalidate_manual_training_shape_peaks(mm)
             if prefetch_invalid:
                 invalidate_offload_trace_for_shape(shape_key)
             else:
@@ -4168,7 +4185,7 @@ class MemoryManager:
             if peak_reserved_override is not None
             else torch.cuda.max_memory_reserved(device)
         ) / gib
-        recorded_peak_bucket = cls._record_manual_training_shape_peak(
+        cls._record_manual_training_shape_peak(
             mm,
             shape_key,
             peak_allocated_gib=peak_allocated_gib,
@@ -4199,34 +4216,14 @@ class MemoryManager:
             free_gib = torch.cuda.mem_get_info(device)[0] / gib
 
         demoted = 0
-        while peak_pressure and demoted < max_demote:
-            before_plan = getattr(mm, "_smart_training_plan", plan) or plan
-            before_resident_gib = before_plan.get("resident_bytes", 0) / gib
-            changed = cls._demote_training_layers(
+        if peak_pressure and max_demote > 0:
+            demoted = cls._demote_training_layers(
                 module, mm, retreat_layers, largest=True
             )
-            if not changed:
-                break
-            demoted += changed
-            plan = getattr(mm, "_smart_training_plan", before_plan) or before_plan
-            after_resident_gib = plan.get("resident_bytes", 0) / gib
-            resident_drop_gib = max(0.0, before_resident_gib - after_resident_gib)
-            peak_allocated_gib = max(0.0, peak_allocated_gib - resident_drop_gib)
-            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-            free_gib = free_bytes / gib
-            total_gib = total_bytes / gib
-            current_reserved_gib = torch.cuda.memory_reserved(device) / gib
-            predicted_peak_free_gib = cls._training_cliff_predicted_peak_free_gib(
-                total_gib,
-                free_gib,
-                current_reserved_gib,
-                peak_allocated_gib,
-            )
-            did_oom = False
-            peak_pressure = predicted_peak_free_gib < target_gib
+            if demoted:
+                cls._invalidate_manual_training_shape_peaks(mm)
+                free_gib = torch.cuda.mem_get_info(device)[0] / gib
 
-        if demoted and recorded_peak_bucket is not None:
-            recorded_peak_bucket["peak_allocated_gib"] = peak_allocated_gib
         action = "demote" if demoted else ("empty_cache" if needs_reclaim else "peak_pressure_unavailable")
         if cls._diagnostics_enabled():
             print(
@@ -4316,6 +4313,7 @@ class MemoryManager:
         cls._refresh_training_fp8_flags(root, mm)
         plan = cls._refresh_training_plan_from_layout(root, mm)
         if promoted:
+            cls._invalidate_manual_training_shape_peaks(mm)
             cls.reset_trace_due_to_execution_shape_change()
             cls._clear_cuda_pipeline_state()
         return {
@@ -5443,6 +5441,9 @@ class MemoryManager:
                     # Sampling detach/restore replaces the streamed layout and
                     # destroys the old pool; any frozen positional trace from
                     # before sampling can now be stale against the restored set.
+                    cls._invalidate_manual_training_shape_peaks(
+                        module._memory_manager
+                    )
                     cls.reset_trace_due_to_execution_shape_change()
                 if args.get("device") is not None:
                     cls._move_unmanaged_parameters(module, args["device"])

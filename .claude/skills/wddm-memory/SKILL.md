@@ -37,6 +37,53 @@ Debugging value: a capped allocator OOMs at the *true culprit's* allocation
 line -- it once exposed a stray `model.to(cuda)` hauling a whole quantized
 model onto the card, where the uncapped run crashed somewhere downstream.
 
+### The cap is also the GC mechanism
+
+Before raising OOM, a capped allocator **frees its idle cached segments
+and retries** -- torch `reserved` GCs down toward the cap on demand, so
+the reserved-minus-allocated gap (typically 1-3 GiB) is **reclaimable**
+(evidence: `scripts/bench_allocator_cap_gc.py`).
+
+- The GC is **all-or-nothing**: one binding allocation dumps *every* idle
+  segment, on both the OOM-retry path and the gc_threshold path.
+- Reclaim costs tens of ms (~80 ms / 3.25 GiB); seconds under external
+  VRAM pressure. Bind the cap at phase boundaries, never per-step.
+- **Cache hits bypass both the cap and gc_threshold** -- they act only on
+  the fresh-cudaMalloc path; a cache-served allocation ignores the cap
+  even when reserved already exceeds it.
+- `memory_stats()['num_alloc_retries']` ticks once per OOM-retry reclaim;
+  the gc_threshold sweep does NOT tick it (watch `num_device_free`).
+  Steady state must hold retries/step at ~0; sustained retries mean the
+  cap or residency growth has bitten into fragmentation slack -- back off.
+- Minimum viable cap for a phase = within-step peak allocated +
+  fragmentation slack (workload-dependent; find it as the knee where a
+  cap sweep starts producing per-step retries).
+
+### garbage_collection_threshold: fixed at 0.95; steer with the cap
+
+`run.py` sets `garbage_collection_threshold:0.95` on Windows and it stays
+fixed -- the threshold is process-start env config, while the fraction cap
+is a runtime per-device API the manager already moves at phase boundaries.
+**Control policy: GC target = 0.95 * cap; steer by moving the cap, never
+the threshold.**
+
+The GC check runs on fresh cudaMallocs only (never cache hits): when total
+reserved exceeds the target it frees idle blocks toward it, *before* the
+allocation would fail -- avoiding the OOM-retry path's
+`synchronize_and_free_events` device sync, which stalls in-flight
+transfer-stream work mid-step.
+
+The target is measured against the WHOLE torch footprint; live allocations
+(residents + ring + activations) count against it but cannot be freed. The
+**idle-cache allowance is `0.95 * cap - live`**, so the planner can grant a
+cache budget via `cap = (planned_live + cache_budget) / 0.95`, clamped by
+the WDDM cliff bound. The allowance MUST stay positive at the live peak:
+if live alone exceeds the target, thrash self-sustains -- every sweep
+dumps ALL idle cache, every would-be reuse becomes a fresh cudaMalloc,
+which sweeps again (measured 10x per-alloc cost even in a mild synthetic).
+Residency growth eats the allowance 1:1: the layout controller's ceiling
+and the cap are coupled. Evidence: `scripts/bench_gc_threshold_allowance.py`.
+
 ## Pinned host memory economics
 
 - MEASURED 2026-07-10 (scripts/bench_pin_assumptions.py): `cudaHostRegister`
@@ -80,9 +127,12 @@ model onto the card, where the uncapped run crashed somewhere downstream.
 
 ## Forbidden knobs
 
-Never set `PYTORCH_CUDA_ALLOC_CONF` (max_split_size_mb, gc_threshold):
-~30x slowdown near full VRAM on this box. `expandable_segments` is
-unsupported on Windows. A pre-bash hook denies these; do not work around it.
+Never set `max_split_size_mb` (~30x slowdown near full VRAM on this box).
+`expandable_segments` is a warn-and-ignore no-op on Windows (torch 2.12).
+`garbage_collection_threshold` stays fixed at 0.95; steer the GC by moving
+the fraction cap (see above) -- lower thresholds thrash. Allocator config
+belongs in `run.py`'s `_configure_windows_torch_allocator`, not in user
+env vars.
 
 ## Pointers (source of truth for current behavior)
 

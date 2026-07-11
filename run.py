@@ -27,9 +27,12 @@ def _configure_windows_torch_allocator() -> None:
     if parsed.get("backend") == "cudaMallocAsync":
         return
 
-    # Respect an explicit user choice.
+    # Respect an explicit user choice. Kept high and fixed: the GC target is
+    # threshold * fraction_cap, and the memory manager steers by moving the
+    # cap, not this knob. Lower values put the target under the live
+    # footprint and thrash (sweep-all on every fresh cudaMalloc).
     if "garbage_collection_threshold" not in parsed:
-        options.append("garbage_collection_threshold:0.7")
+        options.append("garbage_collection_threshold:0.95")
 
     os.environ[key] = ",".join(options)
 

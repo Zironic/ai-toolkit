@@ -16,7 +16,6 @@ from dataclasses import dataclass
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from toolkit.memory_management import pin_manager
 from toolkit.memory_management.ingraph_stream import (
     _flatten_leaves,
     checkpoint_recompute_context,
@@ -337,7 +336,7 @@ class KreaImmutablePlanExecutor:
         # demotion never has to build host-side state (Invariant 8): zero
         # resident leaves, every block a single-copy fully-streamed fetch.
         self.sampling_fallback_plan = ResidencyPlan.build("sample_fallback", ())
-        self._arena_signature = self._capture_arena_signature()
+        self._arena_signature = self.residency.arena.immutable_signature()
         configure_fetch_runtime(depth=self.depth)
     def activate_sampling_image(
         self,
@@ -523,31 +522,14 @@ class KreaImmutablePlanExecutor:
 
         self._block_kernels[key] = kernel
         return kernel
-    def _capture_arena_signature(self):
-        arena = self.residency.arena
-        return (
-            arena.canonicalized,
-            tuple(
-                (
-                    block_key,
-                    record.host_flat.data_ptr(),
-                    record.committed_bytes,
-                    pin_manager.is_host_pinned(record.host_flat),
-                    pin_manager.is_arena_backed(record.host_flat),
-                )
-                for block_key in arena.block_keys()
-                for record in (arena.block_record(block_key),)
-            ),
-        )
-
     def _assert_arena_stable(self, where: str) -> None:
-        current = self._capture_arena_signature()
+        current = self.residency.arena.immutable_signature()
         if current != self._arena_signature:
             raise KreaImmutableArenaError(
-                f"arena_mutated_at_boundary:{where}: canonical host flats, "
-                "registrations, or the pin ledger changed across a phase "
-                "boundary -- residency transitions must never touch host "
-                f"storage (expected {self._arena_signature!r}, got {current!r})"
+                f"arena_mutated_at_boundary:{where}: canonical host flats "
+                "or registrations changed across a phase boundary -- "
+                "residency transitions must never touch host storage "
+                f"(expected {self._arena_signature!r}, got {current!r})"
             )
 
     # -- program construction ------------------------------------------------
