@@ -1081,7 +1081,13 @@ class Krea2Model(BaseModel):
                 guard()
             except Exception as error:
                 print(f"[MemoryManager] sampling cohabitation guard failed: {error}")
-
+        immutable_before = getattr(
+            self.model,
+            "_mm_immutable_sampling_before_image",
+            None,
+        )
+        if immutable_before is not None:
+            immutable_before(gen_config)
         compile_cache_dir = getattr(self.model_config, 'compile_cache_dir', None)
         compile_cache_key = _compile_cache_key(self)
         if (
@@ -1209,7 +1215,7 @@ class Krea2Model(BaseModel):
         frames_before = None
         if compile_cache_dir and self.model_config.compile_sample:
             frames_before = torch._dynamo.utils.counters["frames"].get("total", 0)
-
+        
         try:
             compile_stance = (
                 torch.compiler.set_stance("eager_then_compile")
@@ -1235,6 +1241,15 @@ class Krea2Model(BaseModel):
                     self.print_and_status_update(
                         f"Saved torch.compile cache to {compile_cache_dir}"
                     )
+            sample_ok = True
+            immutable_after = getattr(
+                self.model,
+                "_mm_immutable_sampling_after_image",
+                None,
+            )
+            if immutable_after is not None:
+                immutable_after(gen_config)
+
             sample_ok = True
             return img
         finally:

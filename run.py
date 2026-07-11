@@ -3,6 +3,38 @@ import sys
 from dotenv import load_dotenv
 # Load the .env file if it exists
 load_dotenv()
+def _configure_windows_torch_allocator() -> None:
+    if sys.platform != "win32":
+        return
+
+    preferred = "PYTORCH_ALLOC_CONF"
+    legacy = "PYTORCH_CUDA_ALLOC_CONF"
+
+    # Modify whichever spelling the user already selected. Otherwise use the
+    # current preferred spelling.
+    key = preferred if preferred in os.environ else legacy if legacy in os.environ else preferred
+    raw = os.environ.get(key, "")
+
+    options = [part.strip() for part in raw.split(",") if part.strip()]
+    parsed = {
+        part.split(":", 1)[0].strip(): part.split(":", 1)[1].strip()
+        for part in options
+        if ":" in part
+    }
+    options.append("pinned_use_background_threads:True")
+    options.append("expandable_segments:True")
+    # This option has no effect with cudaMallocAsync.
+    if parsed.get("backend") == "cudaMallocAsync":
+        return
+
+    # Respect an explicit user choice.
+    if "garbage_collection_threshold" not in parsed:
+        options.append("garbage_collection_threshold:0.95")
+
+    os.environ[key] = ",".join(options)
+
+
+_configure_windows_torch_allocator()
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
 # Be generous with the HF download read timeout (default 10s) so large/flaky model pulls
 # (e.g. Qwen3-VL) don't die on a transient ReadTimeout. Overridable via .env.

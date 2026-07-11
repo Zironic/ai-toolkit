@@ -648,18 +648,111 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # transformer here -- force it to a nullcontext for this backend.
         immutable_executor = None
         immutable_train_plan = None
-        if getattr(self, '_immutable_arena_enabled', False):
+        immutable_before_attr = "_mm_immutable_sampling_before_image"
+        immutable_after_attr = "_mm_immutable_sampling_after_image"
+
+        if getattr(self, "_immutable_arena_enabled", False):
             inner_unet = unwrap_model(self.sd.unet)
-            immutable_executor = getattr(inner_unet, '_immutable_plan_executor', None)
+            immutable_executor = getattr(
+                inner_unet,
+                "_immutable_plan_executor",
+                None,
+            )
+
             if immutable_executor is not None:
                 immutable_train_plan = inner_unet._mm_immutable_training_plan
                 sampling_context = contextlib.nullcontext()
-                # Reuse the training residency plan for sampling: same resident
-                # leaf set (sampling needs no more than training), zero sidecar
-                # churn at the boundary. A sampling-specialized (more-resident)
-                # plan is a later optimization, not a correctness requirement.
-                immutable_executor.activate(
-                    immutable_executor.SAMPLE, immutable_train_plan
+
+                gib = 1024**3
+
+                sampling_working_config = (
+                    self.model_config
+                    .layer_offloading_smart_sampling_working_reserve_gb
+                )
+
+                auto_sampling_working = sampling_working_config is None
+                if not auto_sampling_working:
+                    try:
+                        auto_sampling_working = (
+                            float(sampling_working_config) < 0
+                        )
+                    except (TypeError, ValueError):
+                        auto_sampling_working = (
+                            str(sampling_working_config).lower() == "auto"
+                        )
+
+                fixed_working_bytes = (
+                    None
+                    if auto_sampling_working
+                    else int(float(sampling_working_config) * gib)
+                )
+
+                hard_value = (
+                    self.model_config
+                    .layer_offloading_smart_sampling_wddm_hard_gb
+                )
+                hard_gib = 1.0 if hard_value is None else float(hard_value)
+
+                margin_gib = MemoryManager._resolve_wddm_margin_gib(
+                    self.device_torch,
+                    (
+                        self.model_config
+                        .layer_offloading_smart_sampling_wddm_margin_gb
+                    ),
+                    hard_gib=hard_gib,
+                    env_name="AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB",
+                )
+
+                cold_floor_bytes = int(margin_gib * gib)
+                hot_floor_bytes = int((hard_gib + 0.25) * gib)
+
+                def immutable_shape_key(config):
+                    reference_count = sum(
+                        value is not None
+                        for value in (
+                            getattr(config, "ctrl_img", None),
+                            getattr(config, "ctrl_img_1", None),
+                            getattr(config, "ctrl_img_2", None),
+                            getattr(config, "ctrl_img_3", None),
+                        )
+                    )
+                    return (
+                        int(config.width),
+                        int(config.height),
+                        bool(getattr(config, "batch_cfg", False)),
+                        int(reference_count),
+                    )
+
+                def immutable_before_image(config):
+                    shape_key = immutable_shape_key(config)
+                    cold_bytes = (
+                        int(estimate_fn([config]))
+                        if estimate_fn is not None
+                        else int(3.0 * gib)
+                    )
+
+                    return immutable_executor.activate_sampling_image(
+                        shape_key=shape_key,
+                        cold_working_bytes=cold_bytes,
+                        fixed_working_bytes=fixed_working_bytes,
+                        cold_floor_bytes=cold_floor_bytes,
+                        hot_floor_bytes=hot_floor_bytes,
+                    )
+
+                def immutable_after_image(config):
+                    return immutable_executor.finish_sampling_image(
+                        shape_key=immutable_shape_key(config)
+                    )
+
+                setattr(
+                    inner_unet,
+                    immutable_before_attr,
+                    immutable_before_image,
+                )
+                setattr(
+                    inner_unet,
+                    immutable_after_attr,
+                    immutable_after_image,
                 )
         if getattr(self, '_ingraph_training_enabled', False):
             inner_unet = unwrap_model(self.sd.unet)
@@ -690,8 +783,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # so the next training step runs the training graph, not the
             # forward-only sampling one.
             if immutable_executor is not None:
+                for attr in (
+                    immutable_before_attr,
+                    immutable_after_attr,
+                ):
+                    if hasattr(inner_unet, attr):
+                        delattr(inner_unet, attr)
+
                 immutable_executor.activate(
-                    immutable_executor.TRAIN, immutable_train_plan
+                    immutable_executor.TRAIN,
+                    immutable_train_plan,
                 )
 
 
@@ -2970,6 +3071,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             compiled_refs = []  # (block_list, index, original_block) for rollback on failure
             try:
                 inner_unet_check = unwrap_model(self.sd.unet)
+                immutable_compile_owner = bool(
+                    getattr(inner_unet_check, "_mm_immutable_backend", False)
+                )
                 is_unet_offloaded = hasattr(inner_unet_check, '_memory_manager')
 
                 text_encoder = getattr(self.sd, "text_encoder", None)
@@ -3075,7 +3179,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # ====================================================
                 # BLOCK COMPILE
                 # ====================================================
-                if block_compile:
+                if immutable_compile_owner:
+                    print_acc(
+                        "Immutable arena owns functional per-block compilation; "
+                        "skipping generic module block_compile/whole-model compile."
+                    )
+                elif block_compile:
                     BLOCK_LIST_ATTRS = self.sd.get_transformer_block_names()
 
                     if BLOCK_LIST_ATTRS is None or len(BLOCK_LIST_ATTRS) == 0:
@@ -3229,30 +3338,38 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
+        if getattr(self.model_config, "train_compile_blocks", False):
+            inner_unet = unwrap_model(self.sd.unet)
 
-        if getattr(self.model_config, 'train_compile_blocks', False):
-            try:
-                inner_unet = unwrap_model(self.sd.unet)
-                enable_training_compile = getattr(inner_unet, 'enable_compiled_training', None)
-                if enable_training_compile is None:
-                    print_acc("Training block compile requested, but this model does not expose resident-block compile.")
-                else:
-                    pinned_keys = set()
-                    mm = getattr(inner_unet, '_memory_manager', None)
-                    if mm is not None:
-                        pinned_keys = set(getattr(mm, '_training_pinned_resident_keys', set()))
-                    compiled_count, blocked_count = enable_training_compile(pinned_keys)
-                    print_acc(
-                        f"Compiled {compiled_count} resident training block(s); "
-                        f"{blocked_count} pinned block(s) left eager."
-                    )
-                    if getattr(self.model_config, 'layer_offloading_compile_streamed', False):
-                        print_acc(
-                            "Compile Streamed Blocks is not active yet; streamed blocks remain eager in this slice."
-                        )
-            except Exception as e:
-                print_acc(f"Failed to compile resident training blocks: {e}")
-                print_acc("Continuing without resident training block compile.")
+            if getattr(inner_unet, "_mm_immutable_backend", False):
+                print_acc(
+                    "Immutable arena owns training block compilation; "
+                    "skipping legacy resident-block compiler."
+                )
+            else:
+                if getattr(self.model_config, 'train_compile_blocks', False):
+                    try:
+                        inner_unet = unwrap_model(self.sd.unet)
+                        enable_training_compile = getattr(inner_unet, 'enable_compiled_training', None)
+                        if enable_training_compile is None:
+                            print_acc("Training block compile requested, but this model does not expose resident-block compile.")
+                        else:
+                            pinned_keys = set()
+                            mm = getattr(inner_unet, '_memory_manager', None)
+                            if mm is not None:
+                                pinned_keys = set(getattr(mm, '_training_pinned_resident_keys', set()))
+                            compiled_count, blocked_count = enable_training_compile(pinned_keys)
+                            print_acc(
+                                f"Compiled {compiled_count} resident training block(s); "
+                                f"{blocked_count} pinned block(s) left eager."
+                            )
+                            if getattr(self.model_config, 'layer_offloading_compile_streamed', False):
+                                print_acc(
+                                    "Compile Streamed Blocks is not active yet; streamed blocks remain eager in this slice."
+                                )
+                    except Exception as e:
+                        print_acc(f"Failed to compile resident training blocks: {e}")
+                        print_acc("Continuing without resident training block compile.")
 
         if getattr(self.model_config, 'layer_offloading_ingraph_training', False):
             inner_unet = unwrap_model(self.sd.unet)
@@ -3311,7 +3428,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
             training_plan = inner_unet._mm_immutable_training_plan
             depth = int(getattr(self.model_config, 'layer_offloading_ingraph_depth', 2))
             executor = enable_immutable(
-                arena, residency, depth=depth, compile_trunks=True
+                arena,
+                residency,
+                depth=depth,
+                compile_blocks=bool(
+                    self.model_config.compile
+                    or self.model_config.compile_sample
+                    or getattr(
+                        self.model_config,
+                        "train_compile_blocks",
+                        False,
+                    )
+                ),
             )
             executor.activate(executor.TRAIN, training_plan)
             self._immutable_arena_enabled = True

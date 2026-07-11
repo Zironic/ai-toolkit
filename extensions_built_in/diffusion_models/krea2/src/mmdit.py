@@ -1845,7 +1845,11 @@ class SingleStreamDiT(nn.Module):
         self._immutable_arena_adapter = None
 
     def enable_immutable_arena_compiled(
-        self, arena, residency, depth: int = 2, compile_trunks: bool = True
+            self,
+    arena,
+    residency,
+    depth: int = 2,
+    compile_blocks: bool = True,
     ):
         """Enable the Slice 5 compiled plan executor (train + sample phases).
 
@@ -1853,6 +1857,7 @@ class SingleStreamDiT(nn.Module):
         each phase boundary to select/build that phase's callable. LoRA
         leaves are collected here, before any forward wrapper could be
         stripped, exactly like the eager enable."""
+        
         self.disable_immutable_arena_compiled()
         if residency.arena is not arena:
             raise ValueError("immutable arena/residency ownership mismatch")
@@ -1860,14 +1865,14 @@ class SingleStreamDiT(nn.Module):
         loras, network = self._collect_block_loras(block_indices)
         self._ensure_ingraph_lora_multiplier(network, loras)
         from .immutable_arena import KreaImmutablePlanExecutor
-
+        
         self._immutable_plan_executor = KreaImmutablePlanExecutor(
             self,
             residency,
             loras_by_block=loras,
             lora_multiplier=self._ingraph_lora_multiplier,
             depth=depth,
-            compile_trunks=compile_trunks,
+            compile_blocks=compile_blocks,
         )
         return self._immutable_plan_executor
 

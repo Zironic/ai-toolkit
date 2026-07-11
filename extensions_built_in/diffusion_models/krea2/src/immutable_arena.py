@@ -84,7 +84,144 @@ def _resident_args(sidecar, kind: str):
         f"resident_sidecar_layout_mismatch:{sidecar.key[0]}.{sidecar.key[1]}"
     )
 
+def activate_sampling_image(
+    self,
+    *,
+    shape_key: tuple,
+    cold_working_bytes: int,
+    fixed_working_bytes: int | None,
+    cold_floor_bytes: int,
+    hot_floor_bytes: int,
+    measured_pad_bytes: int = 256 * 1024**2,
+    measured_floor_bytes: int = 512 * 1024**2,
+) -> KreaPlanProgram:
+    """Choose and activate the sampling layout for one image.
 
+    The cold image uses the shape estimate and planning margin. Once this
+    shape has a measurement, subsequent images use the measured peak and
+    defend only the WDDM hard floor plus hysteresis.
+    """
+    device = self.residency.device
+    if device.type != "cuda":
+        return self.activate(self.SAMPLE, self.sampling_fallback_plan)
+
+    learned = int(self._sampling_working_bytes.get(shape_key, 0))
+
+    if fixed_working_bytes is not None:
+        working_bytes = max(0, int(fixed_working_bytes))
+        floor_bytes = max(0, int(cold_floor_bytes))
+        reserve_source = "fixed"
+    elif learned > 0:
+        working_bytes = max(
+            int(measured_floor_bytes),
+            learned + int(measured_pad_bytes),
+        )
+        floor_bytes = max(0, int(hot_floor_bytes))
+        reserve_source = "measured"
+    else:
+        working_bytes = max(0, int(cold_working_bytes))
+        floor_bytes = max(0, int(cold_floor_bytes))
+        reserve_source = "cold"
+
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    allocated_bytes = torch.cuda.memory_allocated(device)
+    reserved_bytes = torch.cuda.memory_reserved(device)
+    reclaimable_cache = max(0, reserved_bytes - allocated_bytes)
+
+    current_sidecars = self.residency.resident_bytes()
+
+    # If target sidecars occupy T bytes, peak free is approximately:
+    #
+    #   current_free
+    #   + current_sidecars
+    #   + reclaimable allocator cache
+    #   - T
+    #   - sampling working set
+    #
+    # Solve for T while preserving the selected WDDM floor.
+    resident_budget = max(
+        0,
+        current_sidecars
+        + int(free_bytes)
+        + reclaimable_cache
+        - working_bytes
+        - floor_bytes,
+    )
+
+    plan = ResidencyPlan.fit_whole_blocks(
+        self.residency.arena,
+        resident_budget,
+        phase=self.SAMPLE,
+        prefer_resident_keys=self.residency.plan.resident_leaf_keys,
+    )
+
+    program = self.activate(self.SAMPLE, plan)
+
+    torch.cuda.synchronize(device)
+
+    baseline_allocated = torch.cuda.memory_allocated(device)
+    baseline_reserved = torch.cuda.memory_reserved(device)
+    torch.cuda.reset_peak_memory_stats(device)
+
+    self._sampling_baseline = {
+        "shape_key": shape_key,
+        "allocated": baseline_allocated,
+        "reserved": baseline_reserved,
+        "working_bytes": working_bytes,
+        "floor_bytes": floor_bytes,
+        "source": reserve_source,
+    }
+
+    print(
+        "[MemoryManager] immutable sampling layout: "
+        f"source={reserve_source} "
+        f"working={working_bytes / 1024**3:.2f} GiB "
+        f"floor={floor_bytes / 1024**3:.2f} GiB "
+        f"sidecars={self.residency.resident_bytes() / 1024**3:.2f} GiB "
+        f"device_free={torch.cuda.mem_get_info(device)[0] / 1024**3:.2f} GiB "
+        f"plan={plan.fingerprint}"
+    )
+
+    return program
+
+
+def finish_sampling_image(self, *, shape_key: tuple) -> int:
+    """Record the real non-sidecar peak for this sampling shape."""
+    baseline = self._sampling_baseline
+    if baseline is None or baseline["shape_key"] != shape_key:
+        return 0
+
+    device = self.residency.device
+    torch.cuda.synchronize(device)
+
+    allocated_peak = torch.cuda.max_memory_allocated(device)
+    reserved_peak = torch.cuda.max_memory_reserved(device)
+
+    allocated_growth = max(
+        0,
+        allocated_peak - int(baseline["allocated"]),
+    )
+    reserved_growth = max(
+        0,
+        reserved_peak - int(baseline["reserved"]),
+    )
+
+    # Allocated growth catches work that reused existing allocator cache.
+    # Reserved growth catches newly committed allocator high-water.
+    observed = max(allocated_growth, reserved_growth)
+
+    previous = int(self._sampling_working_bytes.get(shape_key, 0))
+    self._sampling_working_bytes[shape_key] = max(previous, observed)
+    self._sampling_baseline = None
+
+    print(
+        "[MemoryManager] immutable sampling measurement: "
+        f"shape={shape_key} "
+        f"observed_working={observed / 1024**3:.2f} GiB "
+        f"learned={self._sampling_working_bytes[shape_key] / 1024**3:.2f} GiB"
+    )
+
+    return observed
 class KreaImmutableArenaAdapter:
     """Run Krea2 blocks from resident sidecars or compact fetched views.
 
@@ -102,6 +239,8 @@ class KreaImmutableArenaAdapter:
         lora_multiplier=None,
         depth: int = 2,
     ) -> None:
+        self._sampling_working_bytes: dict[tuple, int] = {}
+        self._sampling_baseline = None
         self.model = model
         self.residency = residency
         self.plan_fingerprint = residency.plan.fingerprint
@@ -240,9 +379,9 @@ class KreaPlanProgram:
     mode: str
     fingerprint: str
     residency_fingerprint: str
+    resident_leaf_keys: frozenset
     trunk: object
     block_plans: tuple
-
 
 def build_execution_fingerprint(
     mode: str,
@@ -314,14 +453,15 @@ class KreaImmutablePlanExecutor:
         loras_by_block=None,
         lora_multiplier=None,
         depth: int = 2,
-        compile_trunks: bool = True,
+        compile_blocks: bool = True,
     ) -> None:
         self.model = model
         self.residency = residency
         self.loras_by_block = dict(loras_by_block or {})
         self.lora_multiplier = lora_multiplier
         self.depth = max(1, int(depth))
-        self.compile_trunks = bool(compile_trunks)
+        self.compile_blocks = bool(compile_blocks)
+        self._block_kernels: dict[tuple[str, int], object] = {}
         self._programs: dict[str, KreaPlanProgram | None] = {
             self.TRAIN: None,
             self.SAMPLE: None,
@@ -336,7 +476,52 @@ class KreaImmutablePlanExecutor:
         configure_fetch_runtime(depth=self.depth)
 
     # -- arena stability (Endpoint Acceptance Criteria) ---------------------
+    def _get_block_kernel(self, index: int, mode: str, fp8_flags):
+        """Compiled pure-math block kernel.
 
+        Weight sources, resident sidecars and LoRA tensors are explicit inputs.
+        The compiled wrapper therefore survives every residency transition.
+        """
+        key = (str(mode), int(index))
+        existing = self._block_kernels.get(key)
+        if existing is not None:
+            return existing
+
+        block = self.model.blocks[index]
+        training = mode == self.TRAIN
+        fp8_flags = tuple(fp8_flags)
+
+        def block_kernel(
+            x,
+            tvec,
+            freqs,
+            mask,
+            leaf_args,
+            lora_args,
+        ):
+            return block.forward_streamed(
+                x,
+                tvec,
+                freqs,
+                mask,
+                leaf_args,
+                fp8_flags,
+                training=training,
+                loras=lora_args,
+            )
+
+        kernel = block_kernel
+
+        if self.compile_blocks:
+            kernel = torch.compile(
+                kernel,
+                mode="default",
+                dynamic=False,
+                fullgraph=False,
+            )
+
+        self._block_kernels[key] = kernel
+        return kernel
     def _capture_arena_signature(self):
         arena = self.residency.arena
         return (
@@ -391,110 +576,139 @@ class KreaImmutablePlanExecutor:
             )
         return tuple(entries)
 
-    def _make_block_fn(self, index: int, mode: str, block_plan: KreaBlockSourcePlan):
-        block = self.model.blocks[index]
+    def _make_block_fn(
+        self,
+        index: int,
+        mode: str,
+        block_plan: KreaBlockSourcePlan,
+    ):
         entries = self._hoisted_leaf_entries(block_plan)
         transfer = block_plan.transfer
-        fp8_flags = block_plan.fp8_flags
         loras = self.loras_by_block.get(index, {})
         multiplier = self.lora_multiplier
         block_lora_tuple = type(self.model)._block_lora_tuple
         training = mode == self.TRAIN
 
+        kernel = self._get_block_kernel(
+            index,
+            mode,
+            block_plan.fp8_flags,
+        )
+
         def assemble(compact_flat):
             args = []
+
             for streamed, resident in entries:
                 if streamed is None:
                     args.append(resident)
                     continue
+
                 leaf_name, has_bias, has_scale = streamed
-                weight = transfer.compact_leaf_view(compact_flat, leaf_name, "weight")
+
+                weight = transfer.compact_leaf_view(
+                    compact_flat,
+                    leaf_name,
+                    "weight",
+                )
                 bias = (
-                    transfer.compact_leaf_view(compact_flat, leaf_name, "bias")
+                    transfer.compact_leaf_view(
+                        compact_flat,
+                        leaf_name,
+                        "bias",
+                    )
                     if has_bias
                     else None
                 )
                 scale = (
                     transfer.compact_leaf_view(
-                        compact_flat, leaf_name, "weight_scale"
+                        compact_flat,
+                        leaf_name,
+                        "weight_scale",
                     )
                     if has_scale
                     else None
                 )
+
                 args.append((weight, bias, scale))
+
             return tuple(args)
+
+        def current_lora_args():
+            return (
+                block_lora_tuple(loras, multiplier)
+                if loras
+                else None
+            )
 
         if transfer is None:
             leaf_args = assemble(None)
 
             def resident_fn(x, tvec, freqs, mask):
-                lora_args = block_lora_tuple(loras, multiplier) if loras else None
-                return block.forward_streamed(
+                return kernel(
                     x,
                     tvec,
                     freqs,
                     mask,
                     leaf_args,
-                    fp8_flags,
-                    training=training,
-                    loras=lora_args,
+                    current_lora_args(),
                 )
 
             return resident_fn
 
-        host = self.residency.arena.block_record(block_plan.block_key).host_flat
+        host = self.residency.arena.block_record(
+            block_plan.block_key
+        ).host_flat
         ranges = block_plan.ranges
         nbytes = int(transfer.compact_nbytes)
 
         if training:
-
             def train_fn(x, tvec, freqs, mask):
-                compiling = torch.compiler.is_compiling()
-                if compiling:
-                    token = torch.ops.mm.fetch_start_multi_after(
-                        host, ranges, nbytes, x
-                    )
-                else:
-                    token = torch.ops.mm.fetch_start_multi(host, ranges, nbytes)
+                token = torch.ops.mm.fetch_start_multi_after(
+                    host,
+                    ranges,
+                    nbytes,
+                    x,
+                )
                 flat = torch.ops.mm.fetch_wait(token, nbytes)
                 leaf_args = assemble(flat)
-                lora_args = block_lora_tuple(loras, multiplier) if loras else None
+
                 if torch.is_grad_enabled():
-                    # Saved-token swap: backward frees the recompute generation.
                     x = free_on_backward(x, token)
-                out = block.forward_streamed(
+
+                out = kernel(
                     x,
                     tvec,
                     freqs,
                     mask,
                     leaf_args,
-                    fp8_flags,
-                    training=True,
-                    loras=lora_args,
+                    current_lora_args(),
                 )
+
                 if not in_recompute():
-                    if compiling:
-                        torch.ops.mm.fetch_free_after(token, out)
-                    else:
-                        torch.ops.mm.fetch_free(token)
+                    torch.ops.mm.fetch_free_after(token, out)
+
                 return out
 
             return train_fn
 
         def sample_fn(x, tvec, freqs, mask):
-            token = torch.ops.mm.fetch_start_multi_after(host, ranges, nbytes, x)
+            token = torch.ops.mm.fetch_start_multi_after(
+                host,
+                ranges,
+                nbytes,
+                x,
+            )
             flat = torch.ops.mm.fetch_wait(token, nbytes)
-            leaf_args = assemble(flat)
-            lora_args = block_lora_tuple(loras, multiplier) if loras else None
-            out = block.forward_streamed(
+
+            out = kernel(
                 x,
                 tvec,
                 freqs,
                 mask,
-                leaf_args,
-                fp8_flags,
-                loras=lora_args,
+                assemble(flat),
+                current_lora_args(),
             )
+
             torch.ops.mm.fetch_free_after(token, out)
             return out
 
@@ -538,28 +752,52 @@ class KreaImmutablePlanExecutor:
 
     # -- phase switching -----------------------------------------------------
 
-    def activate(self, mode: str, plan: ResidencyPlan) -> KreaPlanProgram:
-        """Reconcile residency to ``plan`` and (re)build ``mode``'s callable.
-
-        Same-fingerprint reactivation rebuilds only the Python closures;
-        Dynamo reuses the previously compiled graphs (identity of host flats
-        and sidecar tensors is not guarded on -- measured). The opposite
-        mode's program is dropped when it no longer matches the live
-        residency plan, so its closures cannot keep demoted sidecars alive
-        or run against sidecars that were rebuilt since.
-        """
+    def activate(
+        self,
+        mode: str,
+        plan: ResidencyPlan,
+    ) -> KreaPlanProgram:
         if mode not in (self.TRAIN, self.SAMPLE):
-            raise KreaImmutableArenaError(f"unknown_execution_mode:{mode}")
+            raise KreaImmutableArenaError(
+                f"unknown_execution_mode:{mode}"
+            )
+
         self._assert_arena_stable(f"pre_activate:{mode}")
+
+        target_keys = plan.resident_leaf_keys
+        current_keys = self.residency.plan.resident_leaf_keys
+
+        if current_keys != target_keys:
+            # Drop only tensor bindings that refer to a residency set which is
+            # about to disappear. Do this BEFORE reconcile so those closures
+            # cannot keep demoted CUDA sidecars alive.
+            for program_mode, program in tuple(self._programs.items()):
+                if (
+                    program is not None
+                    and program.resident_leaf_keys != target_keys
+                ):
+                    self._programs[program_mode] = None
+
         if self.residency.plan.fingerprint != plan.fingerprint:
             self.residency.reconcile(plan)
+
         self._assert_arena_stable(f"post_reconcile:{mode}")
 
         block_plans = tuple(
-            build_block_source_plan(self.model, self.residency, index)
+            build_block_source_plan(
+                self.model,
+                self.residency,
+                index,
+            )
             for index in range(len(self.model.blocks))
         )
-        checkpoint_mode = "full" if mode == self.TRAIN else "none"
+
+        checkpoint_mode = (
+            "full"
+            if mode == self.TRAIN
+            else "none"
+        )
+
         fingerprint = build_execution_fingerprint(
             mode,
             plan,
@@ -569,45 +807,52 @@ class KreaImmutablePlanExecutor:
             loras_by_block=self.loras_by_block,
             has_multiplier=self.lora_multiplier is not None,
         )
+
+        existing = self._programs.get(mode)
+        if (
+            existing is not None
+            and existing.fingerprint == fingerprint
+            and existing.resident_leaf_keys == target_keys
+        ):
+            self.stats["activations"] += 1
+            self.stats["plan_reuse"] += 1
+            return existing
+
+        # These are lightweight bindings. They may capture current sidecars,
+        # but every compiled block kernel comes from _block_kernels and persists.
         block_fns = tuple(
-            self._make_block_fn(index, mode, block_plan)
+            self._make_block_fn(
+                index,
+                mode,
+                block_plan,
+            )
             for index, block_plan in enumerate(block_plans)
         )
+
         trunk = (
             self._train_trunk(block_fns)
             if mode == self.TRAIN
             else self._sample_trunk(block_fns)
         )
-        if self.compile_trunks:
-            from toolkit.memory_management.ingraph_stream_scheduling import (
-                install_ordering_pass,
-            )
 
-            install_ordering_pass()
-            trunk = torch.compile(
-                trunk, fullgraph=True, dynamic=False, mode="default"
-            )
         program = KreaPlanProgram(
             mode=mode,
             fingerprint=fingerprint,
             residency_fingerprint=plan.fingerprint,
+            resident_leaf_keys=target_keys,
             trunk=trunk,
             block_plans=block_plans,
         )
+
         self._programs[mode] = program
-        other = self.SAMPLE if mode == self.TRAIN else self.TRAIN
-        other_program = self._programs[other]
-        if (
-            other_program is not None
-            and other_program.residency_fingerprint != plan.fingerprint
-        ):
-            self._programs[other] = None
         self.stats["activations"] += 1
+
         if fingerprint in self._seen_fingerprints:
             self.stats["plan_reuse"] += 1
         else:
             self._seen_fingerprints.add(fingerprint)
             self.stats["plan_builds"] += 1
+
         return program
 
     def activate_sampling_fallback(self) -> KreaPlanProgram:

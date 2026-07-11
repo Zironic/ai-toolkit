@@ -465,25 +465,103 @@ class MemoryManager:
         return int(max(0.0, bounce_budget_gib) * gib)
 
     def memory_managed_to(self, *args, **kwargs):
-        # check for a dtype argument
-        dtype = None
-        if "dtype" in kwargs:
-            dtype = kwargs["dtype"]
-        elif len(args) > 0:
-            for i, arg in enumerate(args):
+        # Parse dtype from the supported Module.to(...) forms.
+        dtype = kwargs.get("dtype")
+        if dtype is None:
+            for arg in args:
                 if isinstance(arg, torch.dtype):
                     dtype = arg
                     break
+
+        # Parse target device.
         target_device = kwargs.get("device")
         if target_device is None:
             for arg in args:
                 if isinstance(arg, (torch.device, str)):
                     target_device = arg
                     break
+
+        immutable_backend = bool(
+            getattr(self.module, "_mm_immutable_backend", False)
+        )
+
+        if immutable_backend:
+            # Canonical Parameters are permanent CPU arena views. A whole-model
+            # dtype conversion would mutate or replace those views, so dtype is
+            # intentionally ignored here. The checkpoint was already loaded and
+            # quantized/cast to its canonical storage dtype before arena creation.
+            if target_device is None:
+                return self.module
+
+            target_device = torch.device(target_device)
+
+            # Move only noncanonical singleton state:
+            #
+            #   - norms, embeddings, modulation layers, buffers, etc.
+            #   - singleton leaves selected as resident by the legacy singleton
+            #     manager
+            #
+            # Canonical leaves and streamed singleton leaves are skipped by
+            # _move_unmanaged_parameters().
+            MemoryManager._move_unmanaged_parameters(
+                self.module,
+                target_device,
+            )
+
+            # The first CUDA placement realizes the immutable cold-start residency
+            # plan. That plan was already computed from:
+            #
+            #   free VRAM
+            #   - WDDM planning margin
+            #   - cold-start working reserve
+            #   - stream/ring requirement
+            #
+            # Do not recompute residency here and do not infer it from
+            # unmanaged_modules.
+            if (
+                target_device.type == "cuda"
+                and not getattr(
+                    self,
+                    "_immutable_initial_placement_done",
+                    False,
+                )
+            ):
+                residency = getattr(
+                    self.module,
+                    "_mm_residency_state",
+                    None,
+                )
+                training_plan = getattr(
+                    self.module,
+                    "_mm_immutable_training_plan",
+                    None,
+                )
+
+                if residency is None or training_plan is None:
+                    raise RuntimeError(
+                        "Immutable arena is active, but its residency state or "
+                        "cold-start training plan is missing"
+                    )
+
+                # Another explicit phase boundary may already have activated a
+                # training or sampling plan. Never overwrite such a phase merely
+                # because generic framework code called model.to(cuda).
+                if residency.plan.phase == "empty":
+                    residency.reconcile(training_plan)
+
+                self._immutable_initial_placement_done = True
+
+            return self.module
+
+        # ------------------------------------------------------------------
+        # Legacy offload backends
+        # ------------------------------------------------------------------
+
         # Device-only moves need special handling for TorchAO Parameters.
         if target_device is not None and dtype is None:
             MemoryManager._move_unmanaged_parameters(
-                self.module, target_device
+                self.module,
+                target_device,
             )
         else:
             for module in self.unmanaged_modules:
@@ -491,8 +569,10 @@ class MemoryManager:
                     module.data = module.data.to(*args, **kwargs)
                 else:
                     module.to(*args, **kwargs)
+
         if dtype is not None:
             return self.module._mm_to(dtype=dtype)
+
         return self.module
 
     @classmethod
@@ -927,89 +1007,6 @@ class MemoryManager:
                 del child._mm_arena_generation
         arena.release()
         del module._mm_weight_arena
-
-    @classmethod
-    def _destroy_immutable_arena(cls, module: torch.nn.Module) -> None:
-        """Genuine true-unload of a canonical immutable arena (Slice 6,
-        tasks/open/IMMUTABLE_TRANSFER_ARENA_PLAN.md).
-
-        This is the TRUE-UNLOAD path, distinct from a mere "disable" (which
-        only stops compiled sidecar residency and returns to eager streaming
-        WITHOUT releasing host storage or repointing Parameters -- that lives
-        in the model's ``disable_immutable_arena_compiled``/``_eager`` seams).
-        Like ``_destroy_pinned_arena`` it is NOT called from
-        ``detach``/sampling boundaries -- the canonical arena persists across
-        those by design; only genuine model unload or test/smoke teardown
-        should call it. Safe (no-op) on a module that never built one.
-
-        Order matters exactly as in ``_destroy_pinned_arena``: every canonical
-        leaf's frozen Parameter is a CPU view over an arena host flat, so each
-        is first cloned onto standalone storage; only THEN are the GPU
-        residency sidecars dropped and the host flats unregistered/unpinned.
-        Releasing pinned bytes while a live Parameter still views that storage
-        would decrement the pin ledger for memory that is still page-locked
-        and referenced -- a real leak dressed up as a clean teardown.
-        """
-        arena = getattr(module, "_mm_canonical_arena", None)
-        if arena is None:
-            return
-        # 1) Stop the compiled/eager execution seams first so no closure keeps
-        #    a demoted sidecar (or a soon-to-be-released host flat) alive.
-        for disabler in (
-            "disable_immutable_arena_compiled",
-            "disable_immutable_arena_eager",
-        ):
-            fn = getattr(module, disabler, None)
-            if callable(fn):
-                fn()
-        # 2) Clone every canonical Parameter off its arena flat BEFORE release.
-        for child in module.modules():
-            if not getattr(child, "_mm_canonical_leaf", False):
-                continue
-            for name in ("weight", "bias"):
-                param = getattr(child, name, None)
-                if not isinstance(param, torch.nn.Parameter):
-                    continue
-                data = param.data
-                if _is_quantized_tensor(data) or hasattr(data, "__tensor_flatten__"):
-                    cloned = _rebuild_from_leaves(
-                        data, (leaf.clone() for leaf in _flatten_leaves(data))
-                    )
-                else:
-                    cloned = data.clone()
-                setattr(
-                    child, name,
-                    torch.nn.Parameter(cloned, requires_grad=param.requires_grad),
-                )
-            del child._mm_canonical_leaf
-        # 3) Drop GPU residency sidecars (independent of host storage), then
-        #    release host flats (unregister + unpin every committed byte).
-        residency = getattr(module, "_mm_residency_state", None)
-        if residency is not None:
-            try:
-                residency.clear(phase="unload")
-            except Exception:
-                # A best-effort demote failure must not block host release;
-                # the sidecars are plain device tensors that GC will reclaim.
-                pass
-        arena.release()
-        # 4) Drop every immutable-backend marker so the module reads as a
-        #    plain (un-offloaded) model again.
-        from toolkit.memory_management.canonical_arena import CanonicalArena
-
-        CanonicalArena.unguard_whole_model_to(module)
-        for attr in (
-            "_mm_canonical_arena",
-            "_mm_residency_state",
-            "_mm_immutable_training_plan",
-            "_mm_immutable_smart_plan",
-            "_mm_immutable_canonical_modules",
-            "_mm_immutable_backend",
-            "_mm_canonical_leaf_ids",
-            "_mm_immutable_planner_ignore_modules",
-        ):
-            if hasattr(module, attr):
-                delattr(module, attr)
 
     @classmethod
     def detach(cls, module: torch.nn.Module):

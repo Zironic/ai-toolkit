@@ -23,7 +23,16 @@ from toolkit.memory_management.ingraph_stream import (
 
 LeafKey = tuple[str, str]
 
-
+def _interleave_priority(index: int, count: int) -> float:
+    if count <= 1:
+        return 0.0
+    bits = (count - 1).bit_length()
+    value = index
+    reversed_bits = 0
+    for _ in range(bits):
+        reversed_bits = (reversed_bits << 1) | (value & 1)
+        value >>= 1
+    return reversed_bits / float(1 << bits)
 class ResidencyError(RuntimeError):
     """A residency plan or transition violated an immutable-arena invariant."""
 
@@ -33,7 +42,67 @@ class ResidencyPlan:
     phase: str
     resident_leaf_keys: frozenset[LeafKey]
     fingerprint: str
+    @classmethod
+    def fit_whole_blocks(
+        cls,
+        arena: CanonicalArena,
+        resident_budget_bytes: int,
+        *,
+        phase: str,
+        prefer_resident_keys=(),
+    ) -> "ResidencyPlan":
+        """Select complete canonical blocks within a sidecar-only byte budget.
 
+        Existing fully resident blocks are preferred to avoid needless sidecar
+        churn when a sampling plan grows or shrinks between images.
+        """
+        budget = max(0, int(resident_budget_bytes))
+        preferred = frozenset(
+            (str(block), str(leaf))
+            for block, leaf in prefer_resident_keys
+        )
+
+        blocks = []
+        block_keys = arena.block_keys()
+
+        for order, block_key in enumerate(block_keys):
+            record = arena.block_record(block_key)
+            leaf_keys = tuple(
+                (block_key, leaf_name)
+                for leaf_name in record.leaf_names
+            )
+            already_full = all(key in preferred for key in leaf_keys)
+
+            blocks.append(
+                {
+                    "order": order,
+                    "block_key": block_key,
+                    # Slightly conservative because this includes page rounding.
+                    "nbytes": int(record.committed_bytes),
+                    "leaf_keys": leaf_keys,
+                    "already_full": already_full,
+                }
+            )
+
+        blocks.sort(
+            key=lambda item: (
+                not item["already_full"],
+                item["nbytes"],
+                _interleave_priority(item["order"], len(blocks)),
+            )
+        )
+
+        selected = []
+        used = 0
+
+        for item in blocks:
+            nbytes = item["nbytes"]
+            if used + nbytes > budget:
+                continue
+            selected.extend(item["leaf_keys"])
+            used += nbytes
+
+        return cls.build(phase, selected)
     @classmethod
     def build(cls, phase: str, resident_leaf_keys) -> ResidencyPlan:
         keys = frozenset((str(block), str(leaf)) for block, leaf in resident_leaf_keys)
@@ -263,3 +332,4 @@ class ResidencyState:
 
     def clear(self, *, phase: str = "clear") -> ResidencyDelta:
         return self.reconcile(ResidencyPlan.build(phase, ()))
+
