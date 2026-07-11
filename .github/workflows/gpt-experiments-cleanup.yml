@@ -1,0 +1,38 @@
+name: gpt-experiments cleanup
+
+on:
+  push:
+    branches:
+      - gpt-experiments
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gpt-experiments
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply cleanup
+        run: python scripts/remove_krea2_legacy.py
+      - name: Validate syntax
+        run: |
+          python -m py_compile \
+            extensions_built_in/diffusion_models/krea2/krea2.py \
+            extensions_built_in/diffusion_models/krea2/src/mmdit.py \
+            extensions_built_in/diffusion_models/krea2/src/immutable_arena.py
+      - name: Commit cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "Remove superseded Krea2 immutable legacy path"
+          git push origin HEAD:gpt-experiments
