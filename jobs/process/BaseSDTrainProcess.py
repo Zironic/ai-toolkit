@@ -26,6 +26,11 @@ import torch
 import torch.backends.cuda
 from huggingface_hub import HfApi, interpreter_login
 from toolkit.memory_management import MemoryManager, vram_budget
+from toolkit.memory_management.arena_offload import (
+    get_arena_runtime,
+    is_memory_managed,
+    memory_runtime_owns_compile,
+)
 
 from toolkit.basic import value_map
 from toolkit.clip_vision_adapter import ClipVisionAdapter
@@ -622,114 +627,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
             )
             else contextlib.nullcontext()
         )
-        # The immutable runtime owns residency across the train<->sample
-        # boundary over ONE arena. Switch it to its SAMPLE program (same
-        # resident sidecars, sample-mode callables: no checkpointing,
-        # forward-only streaming) and restore the TRAIN program afterward.
-        # Because the runtime owns residency, the legacy inference_resident
-        # sampling context must NOT also re-plan the transformer here -- force
-        # it to a nullcontext for this backend.
-        inner_unet = None
-        immutable_executor = None
-        immutable_train_plan = None
-        immutable_context_attr = "_mm_immutable_sampling_context"
+        # The arena runtime owns residency across the train<->sample boundary
+        # over ONE arena: the model enters runtime.sampling_image() per image
+        # (SAMPLE program: no checkpointing, forward-only streaming), and the
+        # session below restores the TRAIN program once at the end. Because the
+        # runtime owns residency, the legacy inference_resident sampling context
+        # must NOT also re-plan the transformer -- null it out for this backend.
+        arena_runtime = get_arena_runtime(self.sd.unet)
+        if arena_runtime is not None:
+            sampling_context = contextlib.nullcontext()
 
-        if getattr(self, "_immutable_arena_enabled", False):
-            inner_unet = unwrap_model(self.sd.unet)
-            immutable_executor = getattr(
-                inner_unet,
-                "_immutable_runtime",
-                None,
-            )
-
-            if immutable_executor is not None:
-                immutable_train_plan = inner_unet._mm_immutable_training_plan
-                sampling_context = contextlib.nullcontext()
-
-                gib = 1024**3
-
-                sampling_working_config = (
-                    self.model_config
-                    .layer_offloading_smart_sampling_working_reserve_gb
-                )
-
-                auto_sampling_working = sampling_working_config is None
-                if not auto_sampling_working:
-                    try:
-                        auto_sampling_working = (
-                            float(sampling_working_config) < 0
-                        )
-                    except (TypeError, ValueError):
-                        auto_sampling_working = (
-                            str(sampling_working_config).lower() == "auto"
-                        )
-
-                fixed_working_bytes = (
-                    None
-                    if auto_sampling_working
-                    else int(float(sampling_working_config) * gib)
-                )
-
-                hard_value = (
-                    self.model_config
-                    .layer_offloading_smart_sampling_wddm_hard_gb
-                )
-                hard_gib = 1.0 if hard_value is None else float(hard_value)
-
-                margin_gib = MemoryManager._resolve_wddm_margin_gib(
-                    self.device_torch,
-                    (
-                        self.model_config
-                        .layer_offloading_smart_sampling_wddm_margin_gb
-                    ),
-                    hard_gib=hard_gib,
-                    env_name="AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB",
-                )
-
-                cold_floor_bytes = int(margin_gib * gib)
-                hot_floor_bytes = int((hard_gib + 0.25) * gib)
-
-                def immutable_shape_key(config):
-                    reference_count = sum(
-                        value is not None
-                        for value in (
-                            getattr(config, "ctrl_img", None),
-                            getattr(config, "ctrl_img_1", None),
-                            getattr(config, "ctrl_img_2", None),
-                            getattr(config, "ctrl_img_3", None),
-                        )
-                    )
-                    return (
-                        int(config.width),
-                        int(config.height),
-                        bool(getattr(config, "batch_cfg", False)),
-                        int(reference_count),
-                    )
-
-                def immutable_sampling_context(config):
-                    shape_key = immutable_shape_key(config)
-                    cold_bytes = (
-                        int(estimate_fn([config]))
-                        if estimate_fn is not None
-                        else int(3.0 * gib)
-                    )
-                    return immutable_executor.sampling(
-                        shape_key=shape_key,
-                        cold_working_bytes=cold_bytes,
-                        fixed_working_bytes=fixed_working_bytes,
-                        cold_floor_bytes=cold_floor_bytes,
-                        hot_floor_bytes=hot_floor_bytes,
-                    )
-
-                setattr(
-                    inner_unet,
-                    immutable_context_attr,
-                    immutable_sampling_context,
-                )
+        arena_session = (
+            arena_runtime.sampling_session()
+            if arena_runtime is not None
+            else contextlib.nullcontext()
+        )
 
         try:
-            with sampling_context:
-                self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+            with arena_session:
+                with sampling_context:
+                    self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
         finally:
             # Restoring offload may have moved the base transformer to CPU and back; if the LoRA
             # network rode along, make sure it's back on the training device before training resumes.
@@ -738,18 +655,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.network.to(self.device_torch)
                 except Exception:
                     pass
-            # Immutable backend: switch the executor back to its TRAIN program
-            # (same resident sidecars, checkpointed backward-capable callables)
-            # so the next training step runs the training graph, not the
-            # forward-only sampling one.
-            if immutable_executor is not None:
-                if hasattr(inner_unet, immutable_context_attr):
-                    delattr(inner_unet, immutable_context_attr)
-
-                immutable_executor.activate(
-                    immutable_executor.TRAIN,
-                    immutable_train_plan,
-                )
 
 
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
@@ -3027,10 +2932,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             compiled_refs = []  # (block_list, index, original_block) for rollback on failure
             try:
                 inner_unet_check = unwrap_model(self.sd.unet)
-                immutable_compile_owner = bool(
-                    getattr(inner_unet_check, "_mm_immutable_backend", False)
-                )
-                is_unet_offloaded = hasattr(inner_unet_check, '_memory_manager')
+                # Compile ownership is exclusive: when the memory runtime
+                # compiles its own block kernels, generic block compile must not
+                # also wrap them.
+                immutable_compile_owner = memory_runtime_owns_compile(inner_unet_check)
+                is_unet_offloaded = is_memory_managed(inner_unet_check)
 
                 text_encoder = getattr(self.sd, "text_encoder", None)
                 text_encoder_check = unwrap_model(text_encoder) if text_encoder is not None else None
@@ -3294,59 +3200,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
-        inner_unet = unwrap_model(self.sd.unet)
-        if getattr(inner_unet, '_mm_immutable_backend', False):
-            # Generic compile-neutral immutable runtime
-            # (revised_combined_compile_neutral_krea2_refactor_plan.md).
-            # Two-phase lifecycle: the arena + residency + training
-            # ResidencyPlan were built in load_model, which also called
-            # prepare_immutable_runtime() to attach an unfinalized
-            # transformer._immutable_runtime -- BEFORE LoRA. The permanent
-            # train/sample programs must be FINALIZED HERE, after the LoRA
-            # network is applied, so they capture the installed adapter leaves.
-            # That is exactly why finalization lives in setup, not load_model.
-            # Fail closed and loud: silently running eager would make every
-            # perf/parity number mean the wrong thing.
-            runtime = getattr(inner_unet, '_immutable_runtime', None)
-            if runtime is None:
-                raise RuntimeError(
-                    "the model built a canonical arena but did not prepare an "
-                    "immutable runtime during load_model "
-                    "(_immutable_runtime is unset)."
-                )
-            finalize = getattr(inner_unet, 'finalize_immutable_runtime', None)
-            if finalize is None:
-                raise RuntimeError(
-                    "the model built an immutable runtime but does not expose "
-                    "finalize_immutable_runtime."
-                )
-            arena = inner_unet._mm_canonical_arena
-            residency = inner_unet._mm_residency_state
-            training_plan = inner_unet._mm_immutable_training_plan
-            # Phase B: build permanent LoRA-aware programs, then select the
-            # initial training residency plan for the TRAIN program.
-            finalize()
-            runtime.activate(runtime.TRAIN, training_plan)
-            depth = int(getattr(runtime, 'depth', 2))
-            self._immutable_arena_enabled = True
-            self._immutable_arena_depth = depth
+        arena_runtime = get_arena_runtime(self.sd.unet)
+        if arena_runtime is not None:
+            # Two-phase lifecycle: the model prepared the arena (unfinalized)
+            # during load_model, BEFORE LoRA. The permanent train/sample programs
+            # must be FINALIZED HERE, after the network is applied, so they
+            # capture the installed adapter leaves. That is exactly why
+            # finalization lives in setup, not load_model.
+            arena_runtime.finalize(self.network)
+            info = arena_runtime.diagnostics()
             print_acc(
-                "Immutable canonical arena training enabled: "
-                f"{len(arena.block_keys())} block(s), "
-                f"{residency.resident_bytes() / (1024 ** 3):.2f} GiB resident "
-                f"sidecars; plan={training_plan.fingerprint}; depth={depth}. "
+                "Arena offload training enabled: "
+                f"{info['blocks']} block(s), "
+                f"{info['resident_bytes'] / (1024 ** 3):.2f} GiB resident "
+                f"sidecars; plan={info['plan_fingerprint']}; "
+                f"depth={info['prefetch_depth']}. "
                 "First training step will compile."
             )
             # Before step 1: if another tenant on the GPU is the reason we are
             # streaming rather than resident, say so. Otherwise the symptom is
             # just a mysteriously slow run.
-            mm = getattr(inner_unet, '_memory_manager', None)
-            plan = getattr(mm, '_smart_training_plan', None) or {}
-            runtime.report_foreign_vram_once(
-                residency.device,
-                phase="training",
-                working_reserve_bytes=int(plan.get("working_reserve_bytes", 0)),
-            )
+            arena_runtime.report_foreign_vram_once(phase="training")
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
@@ -3557,15 +3431,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
             MemoryManager.offload_step_begin(shape_key=offload_shape_key)
             offload_step_completed = False
             try:
-                inner_unet = unwrap_model(self.sd.unet)
-                immutable_runtime = getattr(
-                    inner_unet,
-                    "_immutable_runtime",
-                    None,
-                )
+                # One generic context around the whole per-batch forward AND
+                # backward region. Backward must be inside: checkpoint
+                # recomputation re-enters the block runtime. This is also the
+                # residency controller's phase boundary (git-bug 0c577ef).
+                arena_runtime = get_arena_runtime(self.sd.unet)
                 execution_context = (
-                    immutable_runtime.execution(immutable_runtime.TRAIN)
-                    if immutable_runtime is not None
+                    arena_runtime.training_step(
+                        shape_key=offload_shape_key,
+                        step_num=self.step_num,
+                    )
+                    if arena_runtime is not None
                     else contextlib.nullcontext()
                 )
                 with execution_context:

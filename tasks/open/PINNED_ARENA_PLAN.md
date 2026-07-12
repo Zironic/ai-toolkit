@@ -3,7 +3,10 @@
 Tickets: 534ea49 (boundary pin churn), 763bb75 (register/alloc collision + pack
 leak). Phase 1 (landed 2026-07-08) built the arena mechanics: `pinned_arena.py`,
 attach/detach/unpin guards, sampling-boundary survival, ingraph sampling pack
-borrowing, `--pinned-arena` in both Krea2 smokes. Phase 2 makes it correct at
+borrowing, and `--pinned-arena` in the historical Krea2 smokes. Current
+validation entry points are `scripts/smoke_krea2_train_cuda.py` and
+`scripts/smoke_krea2_inference_cuda.py`; the immutable inference backend owns
+its arena without a legacy `--pinned-arena` switch. Phase 2 makes it correct at
 scale: the arena must obey the SAME pin budget the per-tensor path obeys, stop
 triple-pinning at first attach, and survive the realistic
 training -> strict-ingraph sampling -> training cycle.
@@ -101,7 +104,10 @@ training -> strict-ingraph sampling -> training cycle.
   arena is enabled, additionally assert-and-log how many packs are
   `borrowed_from_arena` vs owned fallback. Do NOT require every arena block to
   be pinned -- only the packs actually built for streamed blocks matter.
-- `scripts/smoke_krea2_ingraph_cuda.py` (`--pinned-arena` exists): add JSON
+- Historical implementation used the now-retired
+  `scripts/smoke_krea2_ingraph_cuda.py --pinned-arena`. Current regression
+  coverage belongs in `scripts/smoke_krea2_inference_cuda.py`, using its
+  immutable-runtime diagnostics rather than the deleted ingraph-pack fields:
   events + asserts for the full cycle:
   - training arena exists after `_attach_training_memory`
     (blocks/pinned/pageable from `arena.stats()`);
@@ -122,8 +128,9 @@ training -> strict-ingraph sampling -> training cycle.
 - Zero `cudaHostRegister` (pin_tensor_in_place) calls during arena-enabled
   attach; zero pin/unpin work at sampling boundaries (measured, not assumed).
 - Strict ingraph passes at 512px with every streamed pack borrowed+pinned.
-- Full cycle training -> sampling -> training on the real Krea2 smoke with
-  `--pinned-arena --strict-ingraph`: no `resource already mapped`, no ledger
+- Full cycle training -> sampling -> training using
+  `scripts/smoke_krea2_train_cuda.py` and
+  `scripts/smoke_krea2_inference_cuda.py`: no `resource already mapped`, no ledger
   drift, boundary cost <100 ms each way.
 - Flag off: byte-identical behavior (full suite green both ways).
 

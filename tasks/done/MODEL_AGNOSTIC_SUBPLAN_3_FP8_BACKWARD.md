@@ -1,3 +1,11 @@
+> **SUPERSEDED 2026-07-12** - archived, not shipped. The A/P/C/D upstream stack
+> and the model-agnostic subplans were retired when the immutable arena runtime
+> became the sole transformer backend (commit `3dd7f38`): PRs C and D were built
+> on `_BouncingLinearFn`, which no longer exists on the active path. Kept as the
+> record of the reasoning. **Current plan:**
+> `tasks/open/UPSTREAM_ARENA_EXTRACTION_PLAN.md` (PR P's crash-guard framing and
+> upstream audit survive there as Stage 1; PR A as the deferred Stage 4).
+
 # Subplan 3 of 4 -- FP8 Backward Behind the Backend (last / optional)
 
 Part of the "model-agnostic memory/compile layer" effort. The hardest and least important FP8

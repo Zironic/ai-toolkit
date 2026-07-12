@@ -50,12 +50,17 @@ outlives a test. **Do not hunt these.** The complete procedure:
    of driving the whole machine (assert a helper collects the right entries
    rather than building real pinned packs).
 
-## Training-shaped smoke without a trainer
+## Full-model smokes
 
-`scripts/smoke_krea2_train_cuda.py`: 5 fake LoRA training steps, no dataset,
-no trainer process. Baseline ~3.4-4.0 s/step @512px eager.
-`--train-compile-blocks` mirrors the trainer wiring. **Freeze the base model
-before applying the LoRA** -- the harness depends on it.
+`scripts/smoke_krea2_train_cuda.py`: fake adapter training steps, no dataset,
+no trainer process. Baseline ~3.4-4.0 s/step @512px eager. Freeze the base model
+before applying the adapter -- the harness depends on it.
+
+`scripts/smoke_krea2_inference_cuda.py`: cached-TE immutable-runtime sampling
+through the current arena lifecycle. Both scripts accept
+`--adapter-variant {lora,lokr,dora,full}`. Every current `scripts/smoke_*.py`
+fails when startup VRAM usage exceeds 30%; use `--ignore-contention` only when
+intentional contention is part of the test.
 
 ## Fail-fast conventions for new code
 

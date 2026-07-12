@@ -24,6 +24,7 @@ from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
 from toolkit.memory_management.canonical_arena import CanonicalArena
 from toolkit.memory_management.ingraph_stream import LoraEntry
 from toolkit.memory_management.residency import ResidencyPlan, ResidencyState
+from toolkit.models.lokr import LokrModule
 
 pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"), pytest.mark.leaky]
 
@@ -207,6 +208,47 @@ def test_compiled_train_parity_lora_grads_and_zero_graph_breaks():
         arena.release()
 
 
+
+
+def test_compiled_train_accepts_functional_lokr_owner():
+    class Network:
+        network_type = "lora"
+        is_active = True
+        is_merged_in = False
+        is_lorm = False
+        _multiplier = 1.0
+        torch_multiplier = torch.tensor([0.75], device="cuda")
+        vector_gates = None
+        is_assistant_adapter = False
+        base_model_ref = None
+
+    torch._dynamo.reset()
+    model, arena, state, _reference_args = _fixture()
+    child = model.blocks[0].attn.wq
+    network = Network()
+    lokr = LokrModule(
+        "test",
+        child,
+        network=network,
+        lora_dim=4,
+        alpha=4,
+    ).cuda()
+    lokr.apply_to()
+    adapters = {0: {"attn.wq": lokr}}
+    executor = _runtime(model, state, loras_by_block=adapters)
+    try:
+        executor.activate(executor.TRAIN, _train_plan())
+        inputs = _inputs(model, requires_grad=True)
+        out = _run(executor, *inputs)
+        out.square().mean().backward()
+        torch.cuda.synchronize()
+
+        trainable = tuple(parameter for parameter in lokr.parameters() if parameter.requires_grad)
+        assert all(parameter.grad is not None for parameter in trainable)
+        assert all(torch.isfinite(parameter.grad).all() for parameter in trainable)
+    finally:
+        ingraph_stream.drain_fetch_runtime()
+        arena.release()
 def test_phase_cycles_reuse_graphs_and_arena_fixed_across_boundaries():
     torch._dynamo.reset()
     model, arena, state, _reference_args = _fixture()

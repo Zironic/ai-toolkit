@@ -391,51 +391,37 @@ class ToolkitModuleMixin:
             and (getattr(self, "dropout", None) is None or isinstance(getattr(self, "dropout", None), nn.Identity))
         )
 
-    def _memory_management_compile_fast_lora_forward(self: Module, x, *args, **kwargs):
-        org_forwarded = self.org_forward(x, *args, **kwargs)
+    def _memory_management_compile_fast_lora_forward(self: Module, x, *args, inner=None, **kwargs):
+        base_forward = self.org_forward if inner is None else inner
+        org_forwarded = base_forward(x, *args, **kwargs)
         lora_input = x.to(self.lora_down.weight.dtype)
         lora_output = self.lora_up(self.lora_down(lora_input)) * self.scale
         multiplier = self.network_ref().torch_multiplier.reshape(())
         return org_forwarded + (lora_output * multiplier).to(org_forwarded.dtype)
 
-    def forward(self: Module, x, *args, **kwargs):
+    def functional_forward(self: Module, inner, x, *args, **kwargs):
         if getattr(self, "_memory_management_compile_lora_fast", False):
-            return self._memory_management_compile_fast_lora_forward(x, *args, **kwargs)
+            return self._memory_management_compile_fast_lora_forward(
+                x,
+                *args,
+                inner=inner,
+                **kwargs,
+            )
 
-        skip = False
         network: Network = self.network_ref()
         if network.is_lorm:
-            # we are doing lorm
             return self.lorm_forward(x, *args, **kwargs)
 
-        # skip if not active
-        if not network.is_active:
-            skip = True
+        if not network.is_active or network.is_merged_in or network._multiplier == 0:
+            return inner(x, *args, **kwargs)
 
-        # skip if is merged in
-        if network.is_merged_in:
-            skip = True
-
-        # skip if multiplier is 0
-        if network._multiplier == 0:
-            skip = True
-
-        if skip:
-            # network is not active, avoid doing anything
-            return self.org_forward(x, *args, **kwargs)
-
-        # if self.__class__.__name__ == "DoRAModule":
-        #     # return dora forward
-        #     return self.dora_forward(x, *args, **kwargs)
-        
         if self.__class__.__name__ == "LokrModule":
-            return self._call_forward(x)
+            return self._call_forward(x, inner=inner)
 
-        org_forwarded = self.org_forward(x, *args, **kwargs)
+        org_forwarded = inner(x, *args, **kwargs)
 
         if isinstance(x, QTensor):
             x = x.dequantize()
-        # always cast to float32
         lora_input = x.to(self.lora_down.weight.dtype)
         lora_output = self._call_forward(lora_input)
         multiplier = self.network_ref().torch_multiplier
@@ -444,7 +430,6 @@ class ToolkitModuleMixin:
         multiplier_batch_size = multiplier.size(0)
         if lora_output_batch_size != multiplier_batch_size:
             num_interleaves = lora_output_batch_size // multiplier_batch_size
-            # todo check if this is correct, do we just concat when doing cfg?
             multiplier = multiplier.repeat_interleave(num_interleaves)
 
         module_inverse_scale = _assistant_inverse_module_scale(self)
@@ -455,31 +440,37 @@ class ToolkitModuleMixin:
         scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)
 
         if self.__class__.__name__ == "DoRAModule":
-            # ref https://github.com/huggingface/peft/blob/1e6d1d73a0850223b0916052fd8d2382a90eae5a/src/peft/tuners/lora/layer.py#L417
-            # x = dropout(x)
-            # todo this wont match the dropout applied to the lora
             if isinstance(self.dropout, nn.Dropout) or isinstance(self.dropout, nn.Identity):
                 lx = self.dropout(x)
-            # normal dropout
             elif self.dropout is not None and self.training:
                 lx = torch.nn.functional.dropout(x, p=self.dropout)
             else:
                 lx = x
             lora_weight = self.lora_up.weight @ self.lora_down.weight
-            # scale it here
-            # todo handle our batch split scalers for slider training. For now take the mean of them
             scale = multiplier.mean()
             scaled_lora_weight = lora_weight * scale
-            scaled_lora_output = scaled_lora_output + self.apply_dora(lx, scaled_lora_weight).to(org_forwarded.dtype)
+            materialize = getattr(inner, "materialized_weight", None)
+            base_weight = (
+                None
+                if materialize is None
+                else materialize(dtype=scaled_lora_weight.dtype)
+            )
+            scaled_lora_output = scaled_lora_output + self.apply_dora(
+                lx,
+                scaled_lora_weight,
+                base_weight=base_weight,
+            ).to(org_forwarded.dtype)
 
         try:
-            x = org_forwarded + scaled_lora_output
-        except RuntimeError as e:
-            print(e)
+            return org_forwarded + scaled_lora_output
+        except RuntimeError as exc:
+            print(exc)
             print(org_forwarded.size())
             print(scaled_lora_output.size())
-            raise e
-        return x
+            raise
+
+    def forward(self: Module, x, *args, **kwargs):
+        return self.functional_forward(self.org_forward, x, *args, **kwargs)
 
     def enable_gradient_checkpointing(self: Module):
         self.is_checkpointing = True

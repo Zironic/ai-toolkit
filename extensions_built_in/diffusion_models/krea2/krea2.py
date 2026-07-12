@@ -51,6 +51,7 @@ from toolkit.metadata import get_meta_for_safetensors
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
 from toolkit.memory_management import MemoryManager
 from toolkit.memory_management import vram_budget
+from toolkit.memory_management.arena_offload import get_arena_runtime
 from toolkit.compile_cache import load_compile_cache, save_compile_cache
 
 from .src.mmdit import (
@@ -339,6 +340,25 @@ def _stream_and_quantize_checkpoint(base_model, transformer, checkpoint_path, dt
     base_model.print_and_status_update("  - finished streaming and quantizing transformer units")
     flush(garbage_collect=False)
 
+
+
+def _sampling_shape_key(gen_config) -> tuple:
+    """Bucket key for a sampling working-set peak: what actually moves the peak."""
+    reference_count = sum(
+        value is not None
+        for value in (
+            getattr(gen_config, "ctrl_img", None),
+            getattr(gen_config, "ctrl_img_1", None),
+            getattr(gen_config, "ctrl_img_2", None),
+            getattr(gen_config, "ctrl_img_3", None),
+        )
+    )
+    return (
+        int(gen_config.width),
+        int(gen_config.height),
+        bool(getattr(gen_config, "batch_cfg", False)),
+        int(reference_count),
+    )
 
 
 def _compile_cache_key(base_model) -> str:
@@ -744,125 +764,27 @@ class Krea2Model(BaseModel):
         self.invert_assistant_lora = True
 
     def _attach_immutable_training_memory(self, transformer, ignore_modules):
-        """Build Krea's canonical block arena and prepare the immutable runtime.
+        """Select the arena offload backend for the transformer.
 
-        Sequencing is strict: load/quantize -> freeze -> canonicalize -> build
-        arena/residency -> prepare (unfinalized) immutable runtime. Singleton
-        (non-canonical) modules stay resident; only the canonical blocks stream
-        through the arena. LoRA/optimizer construction and runtime finalization
-        happen later in the trainer, after all frozen base Parameter identities
-        are final.
+        Sequencing is strict and owned by the caller: load/quantize -> merge
+        assistant LoRA -> freeze -> prepare arena. Singleton (non-canonical)
+        modules stay resident; only the canonical blocks stream through the
+        arena. LoRA/optimizer construction and runtime finalization happen later
+        in the trainer, after all frozen base Parameter identities are final.
         """
         from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
-        from toolkit.memory_management.canonical_arena import CanonicalArena
-        from toolkit.memory_management.residency import ResidencyPlan, ResidencyState
-
-        transformer.requires_grad_(False)
-        architecture_adapter = SingleStreamMMDiTAdapter()
-        blocks = architecture_adapter.execution_blocks(transformer)
-        entries_by_block = {
-            architecture_adapter.block_key(transformer, index): list(
-                architecture_adapter.leaf_entries(block)
-            )
-            for index, block in enumerate(blocks)
-        }
-        arena = CanonicalArena()
-        arena.canonicalize(entries_by_block)
-        canonical_modules = []
-        for entries in entries_by_block.values():
-            for _name, child in entries:
-                child._mm_canonical_leaf = True
-                canonical_modules.append(child)
-
-        keep_last = self.model_config.layer_offloading_checkpoint_keep_last
-        pinned_keys = MemoryManager.training_pinned_keys_for_keep_last(
-            transformer, max(0, keep_last)
-        )
-        try:
-            smart_plan = MemoryManager.attach_smart_training_immutable(
-                transformer,
-                self.device_torch,
-                canonical_modules=canonical_modules,
-                working_reserve_gib=(
-                    self.model_config.layer_offloading_smart_working_reserve_gb
-                ),
-                wddm_margin_gib=(
-                    self.model_config.layer_offloading_smart_wddm_margin_gb
-                ),
-                wddm_hard_gib=(
-                    self.model_config.layer_offloading_smart_wddm_hard_gb
-                ),
-                ignore_modules=ignore_modules,
-                pinned_resident_keys=pinned_keys,
-                block_stream_only=(
-                    self.model_config.layer_offloading_block_stream_only
-                ),
-                wddm_spill_reserve_pct=(
-                    self.model_config.layer_offloading_wddm_spill_reserve_pct
-                ),
-                fp8_training_forward=(
-                    self.model_config.quantize
-                    and self.model_config.qtype in ("qfloat8", "float8")
-                    and self.model_config.layer_offloading_fp8_forward
-                ),
-            )
-        except Exception:
-            arena.release()
-            for child in canonical_modules:
-                if hasattr(child, "_mm_canonical_leaf"):
-                    del child._mm_canonical_leaf
-            raise
-
-        residency = ResidencyState(arena, self.device_torch)
-        training_plan = ResidencyPlan.from_smart_plan(
-            arena, smart_plan, phase="train"
-        )
-        residency.reconcile(training_plan)
-        transformer._mm_canonical_arena = arena
-        transformer._mm_residency_state = residency
-        transformer._mm_immutable_training_plan = training_plan
-        must_resident_names = set(
-            smart_plan.get("must_resident_layer_keys", ())
-        )
-        pinned_resident_blocks = set(
-            smart_plan.get("pinned_resident_keys", ())
-        )
-        transformer._mm_immutable_protected_training_leaf_keys = frozenset(
-            key
-            for key in training_plan.resident_leaf_keys
-            if key[0] in pinned_resident_blocks
-            or f"{key[0]}.{key[1]}" in must_resident_names
-        )
-        transformer._mm_immutable_smart_plan = smart_plan
-        transformer._mm_immutable_canonical_modules = tuple(canonical_modules)
-        transformer._mm_immutable_backend = True
-
-        from toolkit.memory_management.immutable_runtime import (
-            prepare_immutable_runtime,
+        from toolkit.memory_management.arena_offload import (
+            ArenaOffloadConfig,
+            prepare_arena_offload,
         )
 
-        prepare_immutable_runtime(
+        return prepare_arena_offload(
             transformer,
-            residency,
-            architecture_adapter=architecture_adapter,
-            depth=int(
-                getattr(
-                    self.model_config,
-                    "layer_offloading_prefetch_depth",
-                    2,
-                )
-            ),
-            compile_blocks=bool(
-                self.model_config.compile
-                or self.model_config.compile_sample
-                or getattr(
-                    self.model_config,
-                    "train_compile_blocks",
-                    False,
-                )
-            ),
+            device=self.device_torch,
+            adapter=SingleStreamMMDiTAdapter(),
+            config=ArenaOffloadConfig.from_model_config(self.model_config),
+            ignore_modules=ignore_modules,
         )
-        return smart_plan
 
     def load_model(self):
         dtype = self.torch_dtype
@@ -1050,11 +972,6 @@ class Krea2Model(BaseModel):
                 guard()
             except Exception as error:
                 print(f"[MemoryManager] sampling cohabitation guard failed: {error}")
-        immutable_context_factory = getattr(
-            self.model,
-            "_mm_immutable_sampling_context",
-            None,
-        )
         compile_cache_dir = getattr(self.model_config, 'compile_cache_dir', None)
         compile_cache_key = _compile_cache_key(self)
         if (
@@ -1087,9 +1004,16 @@ class Krea2Model(BaseModel):
             if self.model_config.compile_sample
             else contextlib.nullcontext()
         )
+        arena_runtime = get_arena_runtime(self.model)
         immutable_context = (
-            immutable_context_factory(gen_config)
-            if immutable_context_factory is not None
+            arena_runtime.sampling_image(
+                shape_key=_sampling_shape_key(gen_config),
+                cold_working_bytes=int(
+                    self.estimate_sampling_working_reserve_bytes([gen_config])
+                    or 3 * (1024 ** 3)
+                ),
+            )
+            if arena_runtime is not None
             else contextlib.nullcontext()
         )
         with immutable_context:

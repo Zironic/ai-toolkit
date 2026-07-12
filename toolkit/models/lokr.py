@@ -316,33 +316,40 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
                 return self.org_module[0].bias.data.detach()
         return None
 
-    def _call_forward(self, x):
+    def _call_forward(self, x, *, inner=None):
         if isinstance(x, QTensor) or isinstance(x, QBytesTensor):
             x = x.dequantize()
 
         orig_dtype = x.dtype
-
-        orig_weight = self.get_orig_weight(x.device)
+        materialize = getattr(inner, "materialized_weight", None)
+        orig_weight = (
+            self.get_orig_weight(x.device)
+            if materialize is None
+            else materialize(dtype=x.dtype)
+        )
         lokr_weight = self.get_weight(orig_weight).to(dtype=orig_weight.dtype)
-        multiplier = self.network_ref().torch_multiplier
+        multiplier = torch.mean(self.network_ref().torch_multiplier)
 
         if x.dtype != orig_weight.dtype:
             x = x.to(dtype=orig_weight.dtype)
 
-        # we do not currently support split batch multipliers for lokr. Just do a mean
-        multiplier = torch.mean(multiplier)
-
-        weight = (
-            orig_weight
-            + lokr_weight * multiplier
-        )
-        bias = self.get_orig_bias(x.device)
+        weight = orig_weight + lokr_weight * multiplier
+        bias = self.get_orig_bias(x.device) if materialize is None else inner.bias
         if bias is not None:
             bias = bias.to(weight.device, dtype=weight.dtype)
-        output = self.op(
-            x,
-            weight.view(self.shape),
-            bias,
-            **self.extra_args
-        )
+
+        if materialize is None:
+            output = self.op(
+                x,
+                weight.view(self.shape),
+                bias,
+                **self.extra_args,
+            )
+        else:
+            output = inner(
+                x,
+                weight=weight.view(self.shape),
+                bias=bias,
+                scale=None,
+            )
         return output.to(orig_dtype)

@@ -50,15 +50,14 @@ class SingleStreamMMDiTAdapter:
         return tuple(entries)
 
     def build_lora_args(self, index: int, loras_by_block, multiplier=None):
-        loras = (loras_by_block or {}).get(int(index))
-        if not loras:
+        adapters = (loras_by_block or {}).get(int(index))
+        if not adapters:
             return None
-
         args = []
         for leaf_name in self._leaf_paths:
-            entry = loras.get(leaf_name)
-            if entry is None:
-                args.append(None)
+            entry = adapters.get(leaf_name)
+            if entry is None or callable(getattr(entry, "functional_forward", None)):
+                args.append(entry)
             elif multiplier is None:
                 args.append((entry.a, entry.b, entry.scale))
             else:

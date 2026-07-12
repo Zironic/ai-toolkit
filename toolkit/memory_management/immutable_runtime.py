@@ -412,15 +412,7 @@ class ImmutableTransformerRuntime:
         entries = []
         for index, loras in sorted((loras_by_block or {}).items()):
             for name, entry in sorted(loras.items()):
-                entries.append(
-                    (
-                        int(index),
-                        str(name),
-                        id(entry.a),
-                        id(entry.b),
-                        id(entry.scale),
-                    )
-                )
+                entries.append((int(index), str(name), id(entry)))
         return tuple(entries), id(lora_multiplier)
 
     def finalize_execution(

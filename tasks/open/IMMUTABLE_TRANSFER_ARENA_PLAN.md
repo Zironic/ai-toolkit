@@ -208,7 +208,8 @@ Assumptions these measurements KILL (do not rebuild designs on them):
   `pin_tensor_in_place`. ~10 lines; saves ~1-1.5 s per full arena build.
   Ships on the CURRENT arena immediately.
 - **I2. Diagnose the real boundary recompile** (BLOCKS Slice 5): run the
-  Krea2 smoke across two sampling boundaries with
+  Krea2 inference smoke (`scripts/smoke_krea2_inference_cuda.py`) across two
+  sampling boundaries with
   `TORCH_LOGS=recompiles,guards` and identify the failing guard. The
   "fresh closures fail old guards" explanation is contradicted by
   measurement (test 14). Fix the actual cause, then delete
@@ -471,8 +472,9 @@ Compatibility:
   correctness and submission counts; depth-2 lifetime hammer;
   `torch.compile(fullgraph=True)` graph/recompile counters; TorchAO FP8
   forward + LoRA backward parity.
-- **C. Krea2 synthetic smokes**: `scripts/smoke_krea2_train_cuda.py` with
-  arena + ingraph training; strict sampling smoke; train -> sample ->
+- **C. Krea2 synthetic smokes**: `scripts/smoke_krea2_train_cuda.py` for
+  arena training and `scripts/smoke_krea2_inference_cuda.py` for immutable
+  sampling; train -> sample ->
   train in one process; A/B both backends same shape/seed.
 - **D. Real job validation** (user launches/approves): >=200 steps with
   sampling boundaries, two resolution buckets, perf-log digest for steady

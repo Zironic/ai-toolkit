@@ -202,21 +202,28 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         self.org_forward = self.org_module[0].forward
         self.org_module[0].forward = self.forward
 
-    def forward(self, x, *args, **kwargs):
+    def functional_forward(self, inner, x, *args, **kwargs):
         network: 'LoRASpecialNetwork' = self.network_ref()
         skip = (not network.is_active) or network.is_merged_in or network._multiplier == 0 or network.is_lorm
         if skip:
-            return self.org_forward(x, *args, **kwargs)
+            return inner(x, *args, **kwargs)
 
         om = self.org_module[0]
         multiplier = network.torch_multiplier
-        # weight space application can't be done per sample, so use the mean (same as the DoRA path)
         mult = multiplier.mean() if isinstance(multiplier, torch.Tensor) else multiplier
         mult = mult * _assistant_inverse_module_scale(self)
 
+        materialize = getattr(inner, "materialized_weight", None)
+        if materialize is not None:
+            base_weight = materialize(dtype=self.diff.dtype)
+            eff_weight = base_weight + (self.diff.to(base_weight.device) * mult).to(base_weight.dtype)
+            base_bias = inner.bias
+            eff_bias = base_bias
+            if self.diff_b is not None and base_bias is not None:
+                eff_bias = base_bias + (self.diff_b.to(base_bias.device) * mult).to(base_bias.dtype)
+            return inner(x, weight=eff_weight, bias=eff_bias, scale=None)
+
         orig_weight = om._parameters['weight']
-        # dequantize quantized weights to full precision so the delta can be added (the original
-        # quantized tensor is restored in the finally block below)
         base_weight = _dequantize_if_needed(orig_weight)
         eff_weight = base_weight + (self.diff.to(base_weight.device) * mult).to(base_weight.dtype)
 
@@ -225,18 +232,18 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
             orig_bias = om._parameters['bias']
             eff_bias = orig_bias + (self.diff_b.to(orig_bias.device) * mult).to(orig_bias.dtype)
 
-        # temporarily swap in the effective weights so the original forward (norm/linear/etc) uses them.
-        # this keeps autograd flowing into our delta while supporting any layer type.
         om._parameters['weight'] = eff_weight
         if has_bias:
             om._parameters['bias'] = eff_bias
         try:
-            out = self.org_forward(x, *args, **kwargs)
+            return inner(x, *args, **kwargs)
         finally:
             om._parameters['weight'] = orig_weight
             if has_bias:
                 om._parameters['bias'] = orig_bias
-        return out
+
+    def forward(self, x, *args, **kwargs):
+        return self.functional_forward(self.org_forward, x, *args, **kwargs)
 
     @torch.no_grad()
     def merge_in(self: 'FullModule', merge_weight=1.0):

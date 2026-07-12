@@ -166,7 +166,9 @@ Focused coverage must establish:
 
 Run the focused immutable lifecycle tests, all new runtime/lease/
 compile-neutrality/whole-block tests, Ruff on changed Python files, and relevant
-memory-management and Krea2 groups. Run CUDA smoke tests in isolated processes
+memory-management and Krea2 groups. Use
+`scripts/smoke_krea2_train_cuda.py` for training and
+`scripts/smoke_krea2_inference_cuda.py` for sampling. Run CUDA smoke tests in isolated processes
 when known WDDM or process-global test leakage applies. Per repository policy,
 confirm known order leaks with the file-alone and suite-with-file-omitted runs,
 record them on ticket `f2aceba`, and do not investigate further.

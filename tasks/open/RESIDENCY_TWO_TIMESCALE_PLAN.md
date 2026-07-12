@@ -1,9 +1,37 @@
 # Residency control via a two-timescale cap/demote loop -- implementation plan
 
-> **git-bug:** _new ticket to be filed_ (track status there, not here). Closely
-> related: `5fa0e3d` (autotune working_reserve + keep_last), `68d3565` (manual
-> WDDM cliff guard), `628b0cb` (immutable arena -- unrelated except both touch
-> residency). This file is the durable design; current state lives in the ticket.
+> **git-bug:** `0c577ef` -- "Make the two-timescale residency FSM live
+> (arena-native, block-granular)" owns the remaining wiring. Refactor context:
+> `553ffec`. Closely related: `5fa0e3d` (autotune working_reserve + keep_last),
+> `68d3565` (manual WDDM cliff guard), `628b0cb` (immutable arena). This file is
+> the durable design; current state lives in the ticket.
+
+> **STATE (verified 2026-07-12).** The **policy is built and green**: all five
+> pure helpers (`allocator_allowance_bytes`, `cap_bytes_for_live`,
+> `cap_can_host_promotion`, `residency_promote_ok`, `residency_fsm_step`) live in
+> `vram_budget.py`, with `tests/test_residency_two_timescale.py` passing (20).
+>
+> The **wiring (step 2 of the sketch below) was never done**: grep finds no
+> production caller of the FSM or either gate. The single live caller anywhere is
+> `cap_bytes_for_live` in `MemoryManager.inference_resident` (`manager.py:6024`)
+> -- the sampling-side cap reclaim. The FSM has never run in a training step.
+>
+> That wiring is now folded into `arena_offload/policy.py` (see
+> `UPSTREAM_ARENA_EXTRACTION_PLAN.md`, Phase 2) rather than being retrofitted
+> into `manager.py`: `vram_budget.py` is in the host-memory layer that both
+> backends import, so the FSM is callable from the arena policy as-is. Build it
+> once, there. This plan's open questions (training slack-pad sizing, `Kclean` /
+> `Kverify` / `N`) carry over unchanged.
+>
+> **Caveat on the throughput claim (added 2026-07-12).** The 2.50 GiB reclaimable
+> above is real, but the device-side fetch ring made Krea2 training
+> **compute-bound, not PCIe-bound** (occupancy 87 -> 96%). If streaming is already
+> hidden behind compute, a promoted block saves ~nothing on step time and the
+> banked VRAM buys *headroom* (resolution, batch, fewer OOM demotes) rather than
+> *throughput*. The FSM's guaranteed win is safety - banking VRAM without crossing
+> the thrash/paging cliff. Measure the marginal resident block (`0c577ef` S0)
+> before building the climb; the promote gate's aggressiveness depends on the
+> answer.
 
 Goal: turn the measured cap-descent result into a live residency policy that
 banks the reclaimable VRAM **safely**, by separating a cheap, reversible
@@ -12,7 +40,11 @@ by always approaching residency **from below**.
 
 ## What already exists (do not rebuild)
 
-- **`--cap-descent`** on `scripts/smoke_krea2_ingraph_cuda.py` -- notch-descends
+- **Historical `--cap-descent` measurement.** This lived on the retired
+  `scripts/smoke_krea2_ingraph_cuda.py`. The current inference entry point is
+  `scripts/smoke_krea2_inference_cuda.py`, which does not expose the deleted
+  legacy cap-descent control; add an arena-native probe there only if this
+  measurement must be repeated. The historical probe notch-descended
   the allocator cap (settle + measure pass per notch), reports the phase's true
   footprint floor and the dirty knee. Restores the manager cap afterwards.
 - **Per-window GC telemetry** -- `manager.py training_runtime_diagnostics` logs
@@ -145,6 +177,61 @@ bias already tolerates (undershoot is safe to sit in for a step).
   because at the cliff the only free allowance comes from lowering live.
 
 Same law, opposite behavior, driven purely by measured `cap_headroom`.
+
+### The cap is an invariant, not a relief rung
+
+The existing pre-step demote guard (`MemoryManager.prepare_training_memory_for_shape`,
+`manager.py:3660`) is structured as a **relief ladder**: rung 1 `empty_cache()`,
+rung 2 demote canonical sidecars. That shape is wrong under this design, in two
+separate ways.
+
+**1. Its predicate already assumes a perfect cap, so it already asks the right
+question.** Both pressure signals predict on *peak allocated* (live), not peak
+reserved, and say so:
+
+- `_predict_dxgi_local_peak_bytes` (`manager.py:2417`) returns
+  `non_torch + peak_allocated` -- "Historical allocator reservation is cache
+  appetite, not required live memory."
+- `training_cliff_predicted_peak_free_gib` (`vram_budget.py:439`) --
+  "ask whether peak allocated memory itself clears the WDDM hard floor."
+
+So "pressure" already means *even with zero idle cache, live at peak breaches the
+floor*. That is exactly the regime in which the cap lever **cannot help** -- you
+cannot cap your way out of live memory. When this predicate fires, demotion
+really is the only lever left, and the guard is right to reach for it.
+
+**2. Which makes the `empty_cache` rung structurally dead** (`manager.py:3755-3789`).
+It reclaims idle cache and re-evaluates a predicate that does not look at idle
+cache. In the DXGI path `non_torch = usage - current_reserved`, and `empty_cache`
+drops both by the reclaimed amount, so `non_torch` is invariant; `peak_allocated`
+is untouched. In the physical path NVML free rises by the reclaimed bytes while
+`torch_reserved` falls by the same, so `non_torch_gib` is invariant. The re-check
+can only flip if another process moved memory between the two samples -- i.e.
+noise. What it reliably costs is an all-or-nothing GC (~80 ms typical, seconds
+under VRAM pressure) on every pressure event, before falling through to demote
+anyway. Delete the rung. (Reasoned from the arithmetic, not yet measured --
+confirm with an instrumented pressure event before removing.)
+
+**The correction.** The cap is not something you reach for when pressure hits. It
+is a standing invariant, bound at phase boundaries to `live_at_peak + slack`, and
+its job is to *make the guard's live-based prediction true* rather than merely
+hoped-for. Nothing enforces that today: the allocator is free to hoard reserved
+above live for a whole step, and the predicate simply assumes it will not.
+
+With the cap bound, the guard becomes the last-resort floor guard it should be:
+
+- Pre-step pressure fires only on **genuine growth** -- a new larger shape bucket,
+  or a foreign VRAM tenant arriving. Demotion is then correct.
+- The **other** demote trigger is discovered by the cap lever, not by this
+  predicate: if the cap you would need sits below the thrash threshold
+  (`allowance = 0.95*cap - live <= 0`), the cheap lever is not viable at that
+  setting and residency must come down. That is the `CAP_VERIFY ->
+  DEMOTE_REQUIRED` edge in the state machine below -- measured cache churn at the
+  allotment we actually need is what forces the sticky lever.
+
+Demotes should therefore be **rare**, not because the controller tries the cheap
+lever first and it usually works, but because a correctly bound cap keeps
+"live alone breaches the floor" a rare event.
 
 ## The climb (promote) gate -- built on the shipped telemetry
 

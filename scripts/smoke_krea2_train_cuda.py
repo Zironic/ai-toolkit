@@ -42,6 +42,7 @@ from toolkit.lora_special import LoRASpecialNetwork  # noqa: E402
 from toolkit.memory_management import MemoryManager, bounce_pool, dxgi_meminfo, pin_manager  # noqa: E402
 from toolkit.prompt_utils import PromptEmbeds  # noqa: E402
 from toolkit.util.quantize import quantize_model  # noqa: E402
+from scripts.smoke_runtime import add_contention_args, fail_if_vram_contended  # noqa: E402
 
 GIB = 1024 ** 3
 DEFAULT_COND_CACHE = (
@@ -229,15 +230,32 @@ def _build_model_config(args):
     )
 
 
-def _apply_lora(model, transformer, device, rank, alpha):
+def _apply_lora(
+    model,
+    transformer,
+    device,
+    rank,
+    alpha,
+    *,
+    adapter_variant="lora",
+    full_if_contains=None,
+    lokr_factor=-1,
+    old_lokr_format=False,
+):
     # Mirror BaseSDTrainProcess's network setup order: freeze the base first
     # (streamed backward computes + stages base grads for any param that still
     # requires grad), then construct, force_to, _update_torch_multiplier,
     # apply_to, prepare_grad_etc, optimizer params.
     transformer.requires_grad_(False)
     transformer.train()
+    network_type = "lora" if adapter_variant == "full" else adapter_variant
     network_config = NetworkConfig(
-        type="lora", linear=rank, linear_alpha=alpha, transformer_only=True
+        type=network_type,
+        linear=rank,
+        linear_alpha=alpha,
+        transformer_only=True,
+        lokr_factor=lokr_factor,
+        old_lokr_format=old_lokr_format,
     )
     network = LoRASpecialNetwork(
         text_encoder=None,
@@ -249,6 +267,7 @@ def _apply_lora(model, transformer, device, rank, alpha):
         train_text_encoder=False,
         network_config=network_config,
         network_type=network_config.type,
+        full_if_contains=(full_if_contains or []),
         transformer_only=True,
         is_transformer=True,
         target_lin_modules=model.target_lora_modules,
@@ -262,6 +281,49 @@ def _apply_lora(model, transformer, device, rank, alpha):
     network.prepare_grad_etc(None, transformer)
     network.enable_gradient_checkpointing()
     return network
+
+
+def add_adapter_args(parser):
+    """Add adapter compatibility controls shared by both CUDA harnesses."""
+    parser.add_argument(
+        "--adapter-variant",
+        choices=("lora", "lokr", "dora", "full"),
+        default="lora",
+        help="adapter construction exercised by the smoke (default: lora)",
+    )
+    parser.add_argument(
+        "--full-if-contains",
+        action="append",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "target-name substring converted to FullModule; repeat for multiple "
+            "targets. With --adapter-variant full, defaults to attn.wq on block 0."
+        ),
+    )
+    parser.add_argument(
+        "--lokr-factor",
+        type=int,
+        default=-1,
+        help="LoKr factorization factor (default: automatic)",
+    )
+    parser.add_argument(
+        "--old-lokr-format",
+        action="store_true",
+        help="exercise the legacy LoKr naming/layout mode",
+    )
+
+
+def adapter_options(args):
+    full_targets = args.full_if_contains
+    if args.adapter_variant == "full" and not full_targets:
+        full_targets = ["blocks.0.attn.wq"]
+    return {
+        "adapter_variant": args.adapter_variant,
+        "full_if_contains": full_targets,
+        "lokr_factor": args.lokr_factor,
+        "old_lokr_format": args.old_lokr_format,
+    }
 
 
 def _named_trainable(network):
@@ -379,6 +441,7 @@ def _parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
+    add_adapter_args(parser)
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--working-reserve-gib", default="-1")
     parser.add_argument("--wddm-margin-gib", type=float, default=1.0)
@@ -468,11 +531,16 @@ def _parse_args():
         action="store_true",
         help="run the immutable trunk eager (no torch.compile of block kernels)",
     )
+    add_contention_args(parser)
     return parser.parse_args()
 
 
 def main():
     args = _parse_args()
+    fail_if_vram_contended(
+        args.device,
+        ignore_contention=args.ignore_contention,
+    )
     if not args.allow_download:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -559,10 +627,18 @@ def main():
     )
     _print_json(rows[-1])
 
-    print(f"[smoke] applying LoRA network (rank={args.lora_rank})")
+    print(
+        f"[smoke] applying {args.adapter_variant} network "
+        f"(rank={args.lora_rank})"
+    )
     t0 = time.perf_counter()
     network = _apply_lora(
-        model, transformer, device, args.lora_rank, args.lora_alpha
+        model,
+        transformer,
+        device,
+        args.lora_rank,
+        args.lora_alpha,
+        **adapter_options(args),
     )
     trainable = [p for p in network.parameters() if p.requires_grad]
     params = network.prepare_optimizer_params(
@@ -571,7 +647,9 @@ def main():
     optimizer = torch.optim.AdamW(params, lr=args.lr)
     rows.append(
         {
-            "event": "applied_lora",
+            "event": "applied_adapter",
+            "adapter_variant": args.adapter_variant,
+            "full_if_contains": adapter_options(args)["full_if_contains"],
             "seconds": time.perf_counter() - t0,
             "trainable_tensors": len(trainable),
             "trainable_params": sum(p.numel() for p in trainable),

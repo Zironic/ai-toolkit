@@ -28,8 +28,6 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from toolkit.memory_management.ingraph_stream import (
-    CompileRegionError,
-    LoraEntry,
     streamed_linear,
     streamed_linear_tensors,
 )
@@ -188,34 +186,69 @@ def _mask(mask: Tensor) -> Tensor | None:
     return mask[:, None, None, :]
 
 
-def _streamed_arg_linear_sample(
+def _streamed_arg_linear(
     x: Tensor,
     arg,
     fp8_qualifies: bool,
-    lora=None,
+    adapter=None,
+    *,
+    training: bool,
 ) -> Tensor:
     weight, bias, scale = arg
-    if lora is None:
+    adapter_forward = getattr(adapter, "functional_forward", None)
+    if adapter is None:
         return streamed_linear_tensors(
             x,
             weight,
             bias,
             scale,
             fp8_qualifies=fp8_qualifies,
-            training=False,
+            training=training,
         )
-    lora_a, lora_b, lora_scale = lora
-    return streamed_linear_tensors(
-        x,
-        weight,
-        bias,
-        scale,
-        fp8_qualifies=fp8_qualifies,
-        training=False,
-        lora_a=lora_a,
-        lora_b=lora_b,
-        lora_scale=lora_scale,
+    if adapter_forward is None:
+        lora_a, lora_b, lora_scale = adapter
+        return streamed_linear_tensors(
+            x,
+            weight,
+            bias,
+            scale,
+            fp8_qualifies=fp8_qualifies,
+            training=training,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            lora_scale=lora_scale,
+        )
+
+    from toolkit.functional_adapter import FunctionalLinear
+    from toolkit.memory_management.ingraph_stream import materialized_weight
+
+    def call_fn(value, explicit_weight, explicit_bias, explicit_scale):
+        return streamed_linear_tensors(
+            value,
+            explicit_weight,
+            explicit_bias,
+            explicit_scale,
+            fp8_qualifies=fp8_qualifies,
+            training=training,
+        )
+
+    base = FunctionalLinear(
+        weight=weight,
+        bias=bias,
+        scale=scale,
+        call_fn=call_fn,
+        materialize_fn=materialized_weight,
     )
+    return adapter_forward(base, x)
+
+
+def _streamed_arg_linear_sample(
+    x: Tensor,
+    arg,
+    fp8_qualifies: bool,
+    lora=None,
+) -> Tensor:
+    return _streamed_arg_linear(x, arg, fp8_qualifies, lora, training=False)
 
 
 def _streamed_arg_linear_train(
@@ -224,28 +257,7 @@ def _streamed_arg_linear_train(
     fp8_qualifies: bool,
     lora=None,
 ) -> Tensor:
-    weight, bias, scale = arg
-    if lora is None:
-        return streamed_linear_tensors(
-            x,
-            weight,
-            bias,
-            scale,
-            fp8_qualifies=fp8_qualifies,
-            training=True,
-        )
-    lora_a, lora_b, lora_scale = lora
-    return streamed_linear_tensors(
-        x,
-        weight,
-        bias,
-        scale,
-        fp8_qualifies=fp8_qualifies,
-        training=True,
-        lora_a=lora_a,
-        lora_b=lora_b,
-        lora_scale=lora_scale,
-    )
+    return _streamed_arg_linear(x, arg, fp8_qualifies, lora, training=True)
 
 
 def temb(
@@ -793,61 +805,53 @@ class SingleStreamDiT(nn.Module):
         self._checkpoint_keep_last = 0
 
     @staticmethod
-    def _lora_owners_on(child):
-        """Return LoRA modules in the Linear's forward-owner chain."""
+    def _forward_owners_on(child):
+        """Return bound owners in the installed forward chain, outermost first."""
         owners = []
         seen = set()
         pending = [getattr(child, "__dict__", {}).get("forward")]
         while pending:
             owner = getattr(pending.pop(0), "__self__", None)
-            if owner is None or id(owner) in seen:
+            if owner is None or owner is child or id(owner) in seen:
                 continue
             seen.add(id(owner))
-            if hasattr(owner, "lora_down"):
-                owners.append(owner)
+            owners.append(owner)
             pending.append(getattr(owner, "org_forward", None))
         return owners
 
     @staticmethod
-    def _has_foreign_forward_hijack(child):
-        forward = getattr(child, "__dict__", {}).get("forward")
-        if forward is None:
-            return False
-        owner = getattr(forward, "__self__", None)
-        return owner is None or not hasattr(owner, "lora_down")
+    def _unsupported_adapter_error(owner, target_path):
+        adapter_name = type(owner).__name__ if owner is not None else "unknown forward owner"
+        raise RuntimeError(
+            "arena offload supports LoRAModule, LokrModule, DoRAModule, and "
+            f"linear FullModule adapters; found {adapter_name} on {target_path}"
+        )
 
-    @staticmethod
-    def _collect_lora_entry(child):
-        owners = SingleStreamDiT._lora_owners_on(child)
+    @classmethod
+    def _collect_adapter_entry(cls, child, target_path):
+        owners = cls._forward_owners_on(child)
         if not owners:
+            forward = getattr(child, "__dict__", {}).get("forward")
+            if forward is not None:
+                cls._unsupported_adapter_error(getattr(forward, "__self__", None), target_path)
             return None
-        if len(owners) > 1:
-            raise CompileRegionError(["lora_chained"])
+        if len(owners) != 1:
+            raise RuntimeError(
+                "arena offload supports one adapter per canonical Linear; found "
+                f"{len(owners)} installed adapters on {target_path}"
+            )
+
         owner = owners[0]
+        supported = {"LoRAModule", "LokrModule", "DoRAModule", "FullModule"}
+        if type(owner).__name__ not in supported or not callable(
+            getattr(owner, "functional_forward", None)
+        ):
+            cls._unsupported_adapter_error(owner, target_path)
         network_ref = getattr(owner, "network_ref", None)
         network = network_ref() if network_ref is not None else None
-        multiplier = getattr(network, "torch_multiplier", None)
-        dropout = getattr(owner, "dropout", None)
-        if (
-            network is None
-            or multiplier is None
-            or getattr(multiplier, "numel", lambda: 0)() != 1
-            or getattr(network, "is_lorm", False)
-            or getattr(network, "vector_gates", None) is not None
-            or owner.__class__.__name__ in ("DoRAModule", "LokrModule")
-            or getattr(owner, "module_dropout", None) is not None
-            or getattr(owner, "rank_dropout", None) not in (None, 0)
-            or (
-                dropout is not None
-                and not isinstance(dropout, torch.nn.Identity)
-            )
-        ):
-            raise CompileRegionError(["lora_untraceable"])
-        return LoraEntry(
-            a=owner.lora_down.weight,
-            b=owner.lora_up.weight,
-            scale=float(owner.scale),
-        )
+        if network is None or getattr(network, "is_lorm", False):
+            cls._unsupported_adapter_error(owner, target_path)
+        return owner
 
     def _collect_block_loras(self, block_indices):
         runtime = self._immutable_runtime
@@ -855,78 +859,21 @@ class SingleStreamDiT(nn.Module):
             raise RuntimeError("immutable runtime is not prepared")
         architecture = runtime.architecture_adapter
         blocks = architecture.execution_blocks(self)
-        loras = {}
-        networks = []
+        adapters = {}
         for index in block_indices:
-            block_loras = {}
+            block_adapters = {}
+            block_key = architecture.block_key(self, index)
             for name, child in architecture.leaf_entries(blocks[index]):
-                entry = self._collect_lora_entry(child)
-                if entry is None:
-                    if self._has_foreign_forward_hijack(child):
-                        raise CompileRegionError(
-                            ["unknown_forward_hijack"]
-                        )
-                    continue
-                block_loras[name] = entry
-                network = self._lora_owners_on(child)[0].network_ref()
-                if all(network is not seen for seen in networks):
-                    networks.append(network)
-            if block_loras:
-                loras[index] = block_loras
-        if len(networks) > 1:
-            raise CompileRegionError(["lora_multiple_networks"])
-        return loras, (networks[0] if networks else None)
+                entry = self._collect_adapter_entry(
+                    child,
+                    f"{block_key}.{name}",
+                )
+                if entry is not None:
+                    block_adapters[name] = entry
+            if block_adapters:
+                adapters[index] = block_adapters
+        return adapters, None
 
-    @staticmethod
-    def _effective_lora_multiplier(network):
-        if network is None:
-            return 1.0
-        if (
-            not getattr(network, "is_active", True)
-            or getattr(network, "is_merged_in", False)
-        ):
-            return 0.0
-        if getattr(network, "_multiplier", None) == 0:
-            return 0.0
-        multiplier = getattr(network, "torch_multiplier", None)
-        if multiplier is None or multiplier.numel() != 1:
-            raise RuntimeError(
-                "runtime network multiplier must remain a scalar"
-            )
-        return float(multiplier.reshape(()))
-
-    def _ensure_runtime_lora_multiplier(self, network, loras):
-        if not loras:
-            return None
-        entry = next(iter(next(iter(loras.values())).values()))
-        multiplier = self._runtime_lora_multiplier
-        if (
-            multiplier is None
-            or multiplier.device != entry.a.device
-            or multiplier.dtype != entry.a.dtype
-        ):
-            multiplier = torch.ones(
-                (),
-                device=entry.a.device,
-                dtype=entry.a.dtype,
-            )
-            self._runtime_lora_multiplier = multiplier
-        self._runtime_lora_network = network
-        self._runtime_lora_multiplier_value = None
-        self._refresh_runtime_lora_multiplier()
-        return multiplier
-
-    def _refresh_runtime_lora_multiplier(self):
-        multiplier = self._runtime_lora_multiplier
-        if multiplier is None:
-            return
-        value = self._effective_lora_multiplier(
-            self._runtime_lora_network
-        )
-        if value != self._runtime_lora_multiplier_value:
-            with torch.no_grad():
-                multiplier.fill_(value)
-            self._runtime_lora_multiplier_value = value
     def finalize_immutable_runtime(self):
         """Finalize permanent programs after the training network is installed."""
         runtime = self._immutable_runtime
@@ -936,11 +883,10 @@ class SingleStreamDiT(nn.Module):
             )
 
         block_indices = tuple(range(len(self.blocks)))
-        loras, network = self._collect_block_loras(block_indices)
-        self._ensure_runtime_lora_multiplier(network, loras)
+        adapters, _network = self._collect_block_loras(block_indices)
         return runtime.finalize_execution(
-            loras_by_block=loras,
-            lora_multiplier=self._runtime_lora_multiplier,
+            loras_by_block=adapters,
+            lora_multiplier=None,
         )
 
     def disable_immutable_runtime(self):
@@ -1074,9 +1020,6 @@ class SingleStreamDiT(nn.Module):
             mask = torch.cat((mask, extra), dim=3)
         freqs = self.posemb(pos)
 
-        if use_runtime:
-            self._refresh_runtime_lora_multiplier()
-
         combined = self._blocks_trunk(
             combined,
             blockvec,
@@ -1110,10 +1053,7 @@ class SingleStreamDiT(nn.Module):
             ref_kv_capture=ref_kv_capture,
             blockcaches=blockcaches,
         ):
-            # run() picks the train/sample program from grad mode. Pull the
-            # current network multiplier into the trunk's live scalar first
-            # (identity-stable; no recompile).
-            self._refresh_runtime_lora_multiplier()
+            # run() picks the train/sample program from grad mode.
             return runtime.run(combined, tvec, freqs, mask)
 
         # Pure eager block math: fallback, reference-image/reference-K/V calls,

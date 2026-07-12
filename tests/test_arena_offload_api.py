@@ -1,0 +1,142 @@
+"""Facade-level coverage for `toolkit.memory_management.arena_offload`.
+
+These test the seam, not the machine: the helpers shared code now relies on
+(`get_arena_runtime`, `is_memory_managed`, `memory_runtime_owns_compile`) and
+the config mapping. Building a real arena needs CUDA and a real model; the
+lifecycle itself is covered by tests/test_immutable_arena_lifecycle.py and the
+Krea2 train smoke.
+"""
+
+import unittest
+
+import torch
+
+from toolkit.memory_management.arena_offload import (
+    ArenaOffloadConfig,
+    get_arena_runtime,
+    is_arena_offloaded,
+    is_memory_managed,
+    memory_runtime_owns_compile,
+)
+from toolkit.memory_management.arena_offload.api import RUNTIME_ATTR, unwrap
+from toolkit.memory_management.arena_offload.runtime import _fixed_working_bytes
+
+GIB = 1024**3
+
+
+class _Wrapper(torch.nn.Module):
+    """Stands in for Accelerate/DDP, which expose the real model at `.module`."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.module = inner
+
+
+class _FakeModelConfig:
+    quantize = True
+    qtype = "qfloat8"
+    layer_offloading = True
+    layer_offloading_smart = True
+    layer_offloading_fp8_forward = True
+    layer_offloading_fp8_grad_input = True
+    layer_offloading_fp8_sampling = True
+    compile = False
+    compile_sample = True
+    train_compile_blocks = False
+    layer_offloading_smart_working_reserve_gb = -1.0
+    layer_offloading_smart_wddm_margin_gb = None
+    layer_offloading_smart_wddm_hard_gb = 1.0
+    layer_offloading_wddm_spill_reserve_pct = 0.10
+    layer_offloading_block_stream_only = False
+    layer_offloading_checkpoint_keep_last = 2
+    layer_offloading_prefetch_depth = 3
+    layer_offloading_smart_sampling_working_reserve_gb = -1.0
+    layer_offloading_smart_sampling_wddm_margin_gb = -1.0
+    layer_offloading_smart_sampling_wddm_hard_gb = 1.0
+
+
+class ArenaOffloadHelpersTest(unittest.TestCase):
+    def test_helpers_are_none_safe(self):
+        self.assertIsNone(get_arena_runtime(None))
+        self.assertFalse(is_arena_offloaded(None))
+        self.assertFalse(is_memory_managed(None))
+        self.assertFalse(memory_runtime_owns_compile(None))
+
+    def test_plain_module_is_not_managed(self):
+        model = torch.nn.Linear(4, 4)
+        self.assertFalse(is_arena_offloaded(model))
+        self.assertFalse(is_memory_managed(model))
+        self.assertFalse(memory_runtime_owns_compile(model))
+
+    def test_runtime_found_through_wrappers(self):
+        inner = torch.nn.Linear(4, 4)
+        runtime = object()
+        setattr(inner, RUNTIME_ATTR, runtime)
+        wrapped = _Wrapper(_Wrapper(inner))
+
+        self.assertIs(unwrap(wrapped), inner)
+        self.assertIs(get_arena_runtime(wrapped), runtime)
+        self.assertTrue(is_arena_offloaded(wrapped))
+        self.assertTrue(is_memory_managed(wrapped))
+        self.assertTrue(memory_runtime_owns_compile(wrapped))
+
+    def test_legacy_backend_is_managed_but_does_not_own_compile(self):
+        """The distinction generic block compile depends on."""
+        model = torch.nn.Linear(4, 4)
+        model._memory_manager = object()
+
+        self.assertTrue(is_memory_managed(model))
+        self.assertFalse(is_arena_offloaded(model))
+        self.assertFalse(memory_runtime_owns_compile(model))
+
+    def test_unwrap_terminates_on_self_referential_wrapper(self):
+        model = torch.nn.Linear(4, 4)
+        model.module = model  # a module that is its own `.module`
+        self.assertIs(unwrap(model), model)
+
+
+class ArenaOffloadConfigTest(unittest.TestCase):
+    def test_from_model_config_maps_the_public_surface(self):
+        config = ArenaOffloadConfig.from_model_config(_FakeModelConfig())
+
+        self.assertTrue(config.enabled)
+        self.assertTrue(config.fp8_forward)
+        self.assertTrue(config.fp8_backward)
+        self.assertTrue(config.fp8_sampling)
+        # compile_blocks is derived, not its own public knob.
+        self.assertTrue(config.compile_blocks)
+        self.assertEqual(config.legacy.prefetch_depth, 3)
+        self.assertEqual(config.legacy.checkpoint_keep_last, 2)
+
+    def test_fp8_flags_require_fp8_weights(self):
+        """An fp8_* toggle on a non-fp8 model is a no-op, not a crash."""
+
+        class NoQuant(_FakeModelConfig):
+            quantize = False
+
+        config = ArenaOffloadConfig.from_model_config(NoQuant())
+        self.assertFalse(config.fp8_forward)
+        self.assertFalse(config.fp8_backward)
+        self.assertFalse(config.fp8_sampling)
+        self.assertTrue(config.enabled)
+
+    def test_missing_attributes_fall_back_to_defaults(self):
+        config = ArenaOffloadConfig.from_model_config(object())
+        self.assertFalse(config.enabled)
+        self.assertFalse(config.compile_blocks)
+        self.assertEqual(config.legacy.prefetch_depth, 2)
+
+
+class SamplingReserveTest(unittest.TestCase):
+    def test_auto_working_reserve_is_none(self):
+        """Unset / negative / 'auto' all mean 'let the runtime size it'."""
+        for value in (None, -1.0, "auto"):
+            self.assertIsNone(_fixed_working_bytes(value))
+
+    def test_explicit_working_reserve_is_bytes(self):
+        self.assertEqual(_fixed_working_bytes(2.0), 2 * GIB)
+        self.assertEqual(_fixed_working_bytes(0), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

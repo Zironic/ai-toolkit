@@ -127,12 +127,12 @@ class DoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         weight_norm = torch.linalg.norm(weight, dim=1)
         return weight_norm
 
-    def apply_dora(self, x, scaled_lora_weight):
+    def apply_dora(self, x, scaled_lora_weight, *, base_weight=None):
         # ref https://github.com/huggingface/peft/blob/1e6d1d73a0850223b0916052fd8d2382a90eae5a/src/peft/tuners/lora/layer.py#L192
         # lora weight is already scaled
 
         # magnitude = self.lora_magnitude_vector[active_adapter]
-        weight = self.get_orig_weight()
+        weight = self.get_orig_weight() if base_weight is None else base_weight
         weight = weight.to(scaled_lora_weight.device, dtype=scaled_lora_weight.dtype)
         weight_norm = self._get_weight_norm(weight, scaled_lora_weight)
         # see section 4.3 of DoRA (https://arxiv.org/abs/2402.09353)

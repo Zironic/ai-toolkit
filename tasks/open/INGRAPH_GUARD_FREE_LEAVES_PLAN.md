@@ -49,7 +49,8 @@ time.
 
 ## Acceptance Criterion
 
-Acceptance requires one real Krea2 sampling smoke with a mixed layout, meaning
+Acceptance requires one real Krea2 sampling smoke through
+`scripts/smoke_krea2_inference_cuda.py` with a mixed layout, meaning
 both counts are nonzero:
 
 - `resident_expected_blocks > 0`
@@ -255,7 +256,8 @@ Required resident-side rule:
 
 - In `_blocks_trunk`, keep dispatch ordered as resident compiled first,
   streamed compiled second.
-- Add an acceptance/debug assertion path for Krea2 smoke: if `compile_sample` and
+- Add an acceptance/debug assertion path for
+  `scripts/smoke_krea2_inference_cuda.py`: if `compile_sample` and
   streamed compile are requested, every block must be accounted for by exactly
   one compiled path.
 - Make strict in-graph mode mean strict streamed compile, not "skip resident
@@ -265,7 +267,8 @@ Required resident-side rule:
 
 ### S5 - Real Krea2 validation
 
-- Run the mixed smart partial Krea2 sampling smoke, not only all-stream.
+- Run `scripts/smoke_krea2_inference_cuda.py` with a mixed smart partial
+  layout, not only all-stream.
 - Confirm the smoke JSON satisfies every acceptance field above.
 - Search the recompile log for these forbidden resident-side sources:
   `_forward_pre_hooks`, `record_weight_access`, `_layer_memory_manager`, and
@@ -285,8 +288,9 @@ venv\Scripts\python.exe -m pytest tests\test_ingraph_training_ops.py -q
 venv\Scripts\python.exe -m py_compile toolkit\memory_management\ingraph_stream.py extensions_built_in\diffusion_models\krea2\src\mmdit.py
 ```
 
-Full Krea2 smokes are GPU/runtime validation and should be started only when
-the user asks, per repo convention.
+The current full Krea2 entry points are `scripts/smoke_krea2_train_cuda.py`
+and `scripts/smoke_krea2_inference_cuda.py`. They are GPU/runtime validation
+and should be started only when the user asks, per repo convention.
 
 ## Risks
 

@@ -8,12 +8,15 @@
 
 ## Goal (self-contained)
 
-`scripts/smoke_krea2_ingraph_cuda.py` produces a correct sample from the
+The retired legacy `scripts/smoke_krea2_ingraph_cuda.py` produced a correct
+sample from the
 real fp8 Krea2 model where **every streamed transformer block runs inside
 one `torch.compile(fullgraph=True)` region**, weights entering exclusively
 through `mm::fetch_start -> mm::fetch_wait -> in-graph views`. No regional
 compile, no MemoryManager hooks or forward hijacks inside the region, no
-TorchAO wrapper as a graph input, no silent fallback of any kind.
+TorchAO wrapper as a graph input, no silent fallback of any kind. Current
+immutable-runtime inference validation uses
+`scripts/smoke_krea2_inference_cuda.py`; do not restore the retired harness.
 
 Training compile, SAC backward re-fetch, LoRA gradients, Tier-2 scheduling,
 and CUDA graphs are explicitly out of scope (parent plan Phases 4+).

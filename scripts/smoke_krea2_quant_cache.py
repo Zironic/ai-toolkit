@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 from extensions_built_in.diffusion_models.krea2.krea2 import Krea2Model
 from toolkit.config_modules import ModelConfig
 from toolkit.basic import flush
+from scripts.smoke_runtime import add_contention_args, fail_if_vram_contended
 
 
 def main() -> None:
@@ -21,7 +22,12 @@ def main() -> None:
     parser.add_argument("--qtype", default="float8")
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--disable-cache", action="store_true")
+    add_contention_args(parser)
     args = parser.parse_args()
+    fail_if_vram_contended(
+        args.device,
+        ignore_contention=args.ignore_contention,
+    )
 
     kwargs = {"max_text_length": 512}
     if args.cache_dir:
