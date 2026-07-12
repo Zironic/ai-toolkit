@@ -1567,6 +1567,11 @@ class _Fp8LinearTrainingFn(torch.autograd.Function):
     def forward(ctx, x, qdata_t, scale_row, bias):
         ctx.save_for_backward(qdata_t, scale_row)
         ctx.input_dtype = x.dtype
+        # layer_offloading_fp8_grad_input decides whether the backward may use the
+        # lossy native fp8 grad-input GEMM. Capture it in the *traced* forward so
+        # it becomes a compile guard: flipping the flag recompiles instead of
+        # silently keeping whichever branch was baked in first.
+        ctx.fp8_grad_input = bool(_FP8_GRAD_INPUT)
         return _fp8_linear_compiled(x, qdata_t, scale_row, bias)
 
     @staticmethod
@@ -1574,15 +1579,22 @@ class _Fp8LinearTrainingFn(torch.autograd.Function):
         qdata_t, scale_row = ctx.saved_tensors
         target_dtype = getattr(ctx, "input_dtype", grad_out.dtype)
         qdata = qdata_t.t()
-        grad_input = _fp8_grad_input_compute(
-            grad_out,
-            qdata,
-            scale_row,
-            target_dtype,
-        )
+        grad_input = None
+        if ctx.fp8_grad_input:
+            grad_input = _fp8_grad_input_compute(
+                grad_out,
+                qdata,
+                scale_row,
+                target_dtype,
+            )
         if grad_input is None:
-            weight = qdata.to(torch.float32) * scale_row.reshape(-1, 1).to(torch.float32)
-            grad_input = grad_out.to(target_dtype) @ weight.to(target_dtype)
+            # Dequantize straight to the compute dtype. Transiting fp32 here would
+            # materialize a 4x-of-fp8 weight per Linear (the OOM-spiral shape that
+            # _dequantize_to exists to avoid), and the result is cast to
+            # target_dtype anyway. Row scales are applied in the compute dtype,
+            # matching the forward (_fp8_linear_compiled).
+            weight = qdata.to(target_dtype) * scale_row.reshape(-1, 1).to(target_dtype)
+            grad_input = grad_out.to(target_dtype) @ weight
         return grad_input.to(dtype=grad_out.dtype), None, None, None
 
 

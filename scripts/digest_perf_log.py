@@ -315,6 +315,24 @@ def summarize_records(records: list[dict]) -> list[str]:
                 conf=" ".join(f"{k}={v}" for k, v in sorted(confidence.items())),
             )
         )
+    compile_rows = [r["compile"] for r in records if r.get("compile")]
+    if compile_rows:
+        new_frames = [int(row.get("new_frames") or 0) for row in compile_rows]
+        # The first window that reports any tracing carries the cold compile;
+        # a warm run should be flat 0 after it.
+        warm = new_frames[1:]
+        lines.append(
+            "Compile: windows={n} new_frames total={t} first_window={c} "
+            "after_first={w} (windows_recompiling={rw}) graphs={g} graph_breaks={gb}".format(
+                n=len(compile_rows),
+                t=sum(new_frames),
+                c=new_frames[0],
+                w=sum(warm),
+                rw=sum(1 for v in warm if v > 0),
+                g=compile_rows[-1].get("graphs_total"),
+                gb=compile_rows[-1].get("graph_breaks_total"),
+            )
+        )
     gc_rows = [
         r.get("smart_training_offload") or {}
         for r in records
@@ -436,6 +454,20 @@ def summarize_record(record: dict, full: bool) -> list[str]:
                 b=g(bucket.get("normal_backward_s")),
                 pa=g(bucket.get("peak_allocated_gb_max")),
                 pr=g(bucket.get("peak_reserved_gb_max")),
+            )
+        )
+
+    compile_counters = record.get("compile")
+    if compile_counters:
+        lines.append(
+            "  compile: new_frames={nf} new_graphs={ng} new_breaks={nb}  "
+            "totals frames={tf} graphs={tg} breaks={tb}".format(
+                nf=compile_counters.get("new_frames"),
+                ng=compile_counters.get("new_graphs"),
+                nb=compile_counters.get("new_graph_breaks"),
+                tf=compile_counters.get("frames_total"),
+                tg=compile_counters.get("graphs_total"),
+                tb=compile_counters.get("graph_breaks_total"),
             )
         )
 

@@ -1646,6 +1646,20 @@ class BaseModel:
         # names (e.g. "model.x_embedder*").
         return None
     
+    def get_compile_sequence_layout(self):
+        # override in child classes whose compiled block trunk runs a packed
+        # [text | image] sequence, to describe that ABI (alignment, whether text
+        # rides in the sequence, extra tokens). Returns a
+        # toolkit.compile_shape_bounds.SequenceLayout. None = the trainer cannot
+        # derive dynamic-shape bounds for this arch and leaves them unset.
+        return None
+
+    def get_text_length_bounds(self) -> Optional[tuple]:
+        # override alongside get_compile_sequence_layout: the (min, max) number of
+        # text tokens a batch's conditioning can carry. Padding to the batch max
+        # means the max is the cap, not what any one sample happened to use.
+        return None
+
     def get_base_model_version(self) -> str:
         # override in child classes to get the base model version
         return self.arch if self.arch is not None else 'unknown'

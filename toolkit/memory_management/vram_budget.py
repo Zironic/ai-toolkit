@@ -573,6 +573,46 @@ def training_promotion_worst_shape_free_gib(
     return float(total_gib) - predicted_used
 
 
+def training_eager_promote_blocks(
+    *,
+    resident_gib,
+    block_gib,
+    ring_gib,
+    worst_working_reserve_gib,
+    other_gib,
+    total_gib,
+    promote_floor_gib,
+    max_blocks,
+):
+    """How many equal-sized blocks may be promoted at once while keeping the
+    predicted worst-shape free margin at or above ``promote_floor_gib`` (pure).
+
+    This is the eager-fill counterpart of the one-block-at-a-time climb: a roomy
+    card leaves GiBs idle if residency only ever grows one block per cadence
+    window. The prediction is the same conservative worst-measured-resolution
+    model as ``training_promotion_worst_shape_free_gib`` -- the blocks are assumed
+    to add their full size and the ring is assumed not to shrink -- so the floor is
+    what the run actually keeps free on its tightest measured shape. Returns 0 when
+    not even one block fits, which the caller reports as a worst-shape veto.
+    """
+    block = float(block_gib)
+    limit = int(max_blocks)
+    if block <= 0.0 or limit <= 0:
+        return 0
+    free_now = training_promotion_worst_shape_free_gib(
+        resident_gib=resident_gib,
+        added_block_gib=0.0,
+        ring_gib=ring_gib,
+        worst_working_reserve_gib=worst_working_reserve_gib,
+        other_gib=other_gib,
+        total_gib=total_gib,
+    )
+    room = free_now - float(promote_floor_gib)
+    if room < block:
+        return 0
+    return min(limit, int(room // block))
+
+
 def sampling_step_should_trim(free_before_b, trim_margin_b) -> bool:
     """Whether realized device-free warrants a per-step cache trim (pure).
 

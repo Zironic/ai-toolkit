@@ -369,6 +369,7 @@ class ImmutableTransformerRuntime:
             None if compile_dynamic is None else bool(compile_dynamic)
         )
         self.compile_dynamic_hints = tuple(compile_dynamic_hints or ())
+        self._hint_range_warned: set[tuple] = set()
         self._arena_signature = self.residency.arena.immutable_signature()
 
         self._block_abis = tuple(
@@ -565,6 +566,37 @@ class ImmutableTransformerRuntime:
         self._block_kernels[key] = kernel
         return kernel
 
+    def set_compile_dynamic_hints(self, hints) -> None:
+        """Install mark_dynamic hints derived after the runtime was prepared.
+
+        The trainer can only compute sequence bounds once the datasets exist,
+        which is long after `prepare_arena_offload`. Hints are read per call, so
+        installing them any time before the first compiled block call is enough.
+        A block kernel that already traced would have to re-specialize, so
+        refuse once anything is compiled rather than pay a silent recompile.
+        """
+        hints = tuple(tuple(hint) for hint in (hints or ()))
+        if hints == self.compile_dynamic_hints:
+            return
+        if self._block_kernels:
+            raise RuntimeError(
+                "compile_dynamic_hints changed after block kernels were built; "
+                "set them before the first forward pass."
+            )
+        self.compile_dynamic_hints = hints
+        self._hint_range_warned.clear()
+
+    def _warn_hint_out_of_range(self, dim, size, lo, hi) -> None:
+        key = (dim, size)
+        if key in self._hint_range_warned:
+            return
+        self._hint_range_warned.add(key)
+        print(
+            f"[immutable] dim {dim} size {size} is outside the declared dynamic "
+            f"range [{lo}, {hi}]; compiling a dedicated shape for it. "
+            "Widen compile_dynamic_hints to avoid the extra compile."
+        )
+
     def _current_lora_args(self, index: int):
         return self.architecture_adapter.build_lora_args(
             index,
@@ -607,6 +639,15 @@ class ImmutableTransformerRuntime:
                 # boundary in `kernel`, so a resolution-bucket run declares
                 # its shape range once instead of recompiling per bucket.
                 for dim, lo, hi in self.compile_dynamic_hints:
+                    size = int(x.shape[dim])
+                    if (lo is not None and size < lo) or (
+                        hi is not None and size > hi
+                    ):
+                        # A shape the bounds did not anticipate. Marking it
+                        # anyway is a hard ConstraintViolation; skipping the
+                        # hint just costs this shape its own specialization.
+                        self._warn_hint_out_of_range(dim, size, lo, hi)
+                        continue
                     torch._dynamo.mark_dynamic(x, dim, min=lo, max=hi)
             out = kernel(
                 x,

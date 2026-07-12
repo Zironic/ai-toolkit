@@ -67,6 +67,10 @@ class LegacyPlannerOptions:
     block_stream_only: bool = False
     checkpoint_keep_last: int = 0
     prefetch_depth: int = 2
+    # Free-margin (GiB) the live residency climb should aim to KEEP. 0 = off (the
+    # conservative one-block-per-cadence climb).
+    eager_promote_free_gib: float = 0.0
+    eager_promote_max_blocks: int = 4
 
     sampling_working_reserve_gib: float | None = None
     sampling_wddm_margin_gib: float | None = None
@@ -140,6 +144,14 @@ class ArenaOffloadConfig:
                     0, int(get("layer_offloading_checkpoint_keep_last", 0) or 0)
                 ),
                 prefetch_depth=int(get("layer_offloading_prefetch_depth", 2) or 2),
+                eager_promote_free_gib=max(
+                    0.0,
+                    float(get("layer_offloading_eager_promote_free_gb", 0.0) or 0.0),
+                ),
+                eager_promote_max_blocks=max(
+                    1,
+                    int(get("layer_offloading_eager_promote_max_blocks", 4) or 4),
+                ),
                 sampling_working_reserve_gib=get(
                     "layer_offloading_smart_sampling_working_reserve_gb"
                 ),

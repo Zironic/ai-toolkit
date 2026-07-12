@@ -383,6 +383,29 @@ def _compile_cache_key(base_model) -> str:
     return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
 
 
+def _train_compile_cache_key(base_model) -> str:
+    """Identity for the TRAIN-side block-kernel mega-cache.
+
+    Unlike sampling, the immutable runtime's train compile is NOT always
+    static-shape: compile_dynamic/compile_dynamic_hints choose whether (and
+    how) the block kernel treats input shapes as dynamic, so two runs with
+    different settings can compile structurally different graphs for the
+    same checkpoint. Folding those settings into the key keeps them from
+    silently reusing each other's cached artifacts (found via a settings
+    sweep in scripts/smoke_krea2_train_cuda.py loading a stale cache after
+    a --compile-dynamic change).
+    """
+    config = base_model.model_config
+    compile_identity = {
+        "compile_dynamic": config.compile_dynamic,
+        "compile_dynamic_hints": tuple(config.compile_dynamic_hints or ()),
+    }
+    compile_tag = hashlib.sha256(
+        json.dumps(compile_identity, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{_compile_cache_key(base_model)}_immutable_train_{compile_tag}"
+
+
 def _quantized_transformer_cache_info(base_model, checkpoint_path: str, dtype, config: SingleMMDiTConfig):
     model_kwargs = base_model.model_config.model_kwargs
     cache_enabled = bool(model_kwargs.get("quantized_transformer_cache", True))
@@ -1259,6 +1282,23 @@ class Krea2Model(BaseModel):
             features_list.append(features.to(self.torch_dtype))
 
         return AdvancedPromptEmbeds(text_embeds=features_list)
+
+    def get_compile_sequence_layout(self):
+        # The trunk runs cat([text, image]) and pads that to a 256-token bucket
+        # before the blocks (see MMDiT._forward_impl), so the compiled block
+        # kernels only ever see multiples of 256.
+        from toolkit.compile_shape_bounds import SequenceLayout
+
+        return SequenceLayout(
+            sequence_alignment=256,
+            includes_text=True,
+            extra_tokens=0,
+        )
+
+    def get_text_length_bounds(self) -> Optional[tuple]:
+        # Prompt features are padded to the batch max (pad_text_features), never
+        # to a fixed length, so any batch can reach the tokenizer cap.
+        return (0, int(self.max_text_length))
 
     def get_loss_target(self, *args, **kwargs):
         # Flow-matching velocity target: noise - clean.

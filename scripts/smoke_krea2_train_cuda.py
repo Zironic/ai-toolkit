@@ -268,6 +268,7 @@ def _build_model_config(args):
         layer_offloading_checkpoint_keep_last=args.checkpoint_keep_last,
         layer_offloading_block_stream_only=args.block_stream_only,
         layer_offloading_fp8_forward=args.fp8_training_forward,
+        layer_offloading_fp8_grad_input=args.fp8_grad_input,
         layer_offloading_pinned_arena=args.pinned_arena,
         # The immutable runtime is built during load_model, so its ring depth
         # and compile gate arrive through the config.
@@ -570,6 +571,22 @@ def _parse_args():
         help="how many blocks ahead the immutable runtime issues H2D fetches",
     )
     parser.add_argument(
+        "--compile-stance",
+        choices=("default", "eager_then_compile", "aot_eager_then_compile"),
+        default="default",
+        help=(
+            "torch.compiler.set_stance() around each step's forward+backward. "
+            "'eager_then_compile' runs the FIRST call for a given shape eager "
+            "and defers the compile to that shape's second occurrence -- but "
+            "CRASHES here: gradient checkpointing recomputes forward during "
+            "backward, so the recompute (a 'second call') takes the compiled "
+            "branch while the original forward took the eager branch, and "
+            "checkpoint's saved-tensor-count check throws CheckpointError. "
+            "'aot_eager_then_compile' is torch's fix for exactly this case "
+            "(AOT-eager first invocation, checkpoint-compatible)."
+        ),
+    )
+    parser.add_argument(
         "--blocking-h2d-timing",
         action="store_true",
         help="A/B control: settle each fetch's H2D timing inside fetch_wait "
@@ -644,6 +661,17 @@ def _parse_args():
 
 def main():
     args = _parse_args()
+    if args.compile_stance != "default":
+        from toolkit.compile_cache import compiler_stance_supported
+
+        if not compiler_stance_supported(args.compile_stance):
+            raise SystemExit(
+                f"--compile-stance {args.compile_stance!r} is not supported by "
+                f"this torch build (torch {torch.__version__}). It's a recent/"
+                f"experimental torch.compiler stance; older installs silently "
+                f"accept the string and only fail on the first compiled call "
+                f"mid-run, so this checks upfront instead."
+            )
     fail_if_vram_contended(
         args.device,
         ignore_contention=args.ignore_contention,
@@ -767,10 +795,10 @@ def main():
 
     compile_cache_key = None
     if args.compile_cache_dir:
-        from extensions_built_in.diffusion_models.krea2.krea2 import _compile_cache_key
+        from extensions_built_in.diffusion_models.krea2.krea2 import _train_compile_cache_key
         from toolkit.compile_cache import load_compile_cache
 
-        compile_cache_key = _compile_cache_key(model) + "_immutable_train"
+        compile_cache_key = _train_compile_cache_key(model)
         if load_compile_cache(args.compile_cache_dir, compile_cache_key):
             print(f"[smoke] loaded torch.compile mega-cache ({compile_cache_key})")
 
@@ -935,8 +963,13 @@ def main():
         )
         # Backward MUST stay inside the network context (multiplier is zeroed on
         # exit; leaving before backward silently kills LoRA grads).
+        compile_stance = (
+            torch.compiler.set_stance(args.compile_stance)
+            if args.compile_stance != "default"
+            else contextlib.nullcontext()
+        )
         try:
-            with execution_context, network:
+            with execution_context, network, compile_stance:
                 pred = model.get_noise_prediction(noisy, timestep, embeds)
                 loss = torch.nn.functional.mse_loss(pred.float(), target)
                 loss.backward()
@@ -1075,6 +1108,7 @@ def main():
         "resolution_buckets": [f"{w}x{h}" for w, h in resolution_buckets],
         "compile_dynamic": args.compile_dynamic,
         "compile_mark_dynamic": args.compile_mark_dynamic,
+        "compile_stance": args.compile_stance,
         "steps_with_new_compile_frames": [
             {"step": r["step"], "bucket": r["bucket"], "new_frames": r["new_compile_frames"]}
             for r in step_rows

@@ -321,6 +321,28 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.layer_offloading_eager_promote_free_gb': {
+    title: 'Eager Residency Fill',
+    description: (
+      <>
+        Only used with an auto (-1) Training VRAM Reserve. By default the controller grows residency very slowly �" one
+        transformer block every few steps, stopping well short of the card's capacity �" which leaves several GB of VRAM
+        idle on a roomy card while the model still streams every block from system RAM. Set this to the free VRAM margin
+        (GB) you want the run to keep: the controller then promotes as many blocks as fit above that margin, every step,
+        instead of one at a time. The margin is predicted on the largest resolution seen so far, so it holds for every
+        bucket. 0 = off (the slow default climb). Try 3 on a 16 GB card.
+      </>
+    ),
+  },
+  'model.layer_offloading_eager_promote_max_blocks': {
+    title: 'Eager Promote Block Limit',
+    description: (
+      <>
+        Cap on how many blocks a single eager-fill step may promote. Residency changes reset the prefetch schedule, so
+        the climb still moves in measured increments rather than one giant jump. Default 4.
+      </>
+    ),
+  },
   'model.layer_offloading_wddm_spill_reserve_pct': {
     title: 'Shared Spill Reserve',
     description: (

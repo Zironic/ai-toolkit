@@ -344,6 +344,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.logger = create_logger(self.logging_config, config, self.save_root)
         self.performance_log_path = os.path.join(self.save_root, 'performance_log.jsonl')
         self._archive_previous_performance_log()
+        # Dynamo counters are cumulative for the process; the perf log wants the
+        # per-window delta, so keep the previous window's snapshot.
+        self._compile_counters_prev = None
         self.timer.add_after_print_hook(self._write_performance_timing_log)
         self.optimizer: torch.optim.Optimizer = None
         self.lr_scheduler = None
@@ -1157,6 +1160,44 @@ class BaseSDTrainProcess(BaseTrainProcess):
         except Exception as error:
             print_acc(f"Could not archive previous {label}: {error}")
 
+    @staticmethod
+    def _compile_counter_snapshot():
+        """Cumulative Dynamo work counters, or None when nothing ever compiled."""
+        try:
+            counters = torch._dynamo.utils.counters
+        except AttributeError:
+            return None
+        frames = int(counters["frames"].get("total", 0) or 0)
+        graphs = int(counters["stats"].get("unique_graphs", 0) or 0)
+        if frames == 0 and graphs == 0:
+            return None
+        return {
+            'frames': frames,
+            'graphs': graphs,
+            'graph_breaks': int(sum(counters["graph_break"].values())),
+        }
+
+    def _compile_window_counters(self):
+        """Per-window compile activity.
+
+        `new_frames` is the headline: Dynamo traced a frame this window. After the
+        cold compile it should sit at 0 -- anything else is a recompile, i.e. a
+        guard (usually a shape) that the compiled kernels did not cover.
+        """
+        now = self._compile_counter_snapshot()
+        if now is None:
+            return None
+        prev = self._compile_counters_prev or {}
+        self._compile_counters_prev = now
+        return {
+            'new_frames': now['frames'] - int(prev.get('frames', 0)),
+            'new_graphs': now['graphs'] - int(prev.get('graphs', 0)),
+            'new_graph_breaks': now['graph_breaks'] - int(prev.get('graph_breaks', 0)),
+            'frames_total': now['frames'],
+            'graphs_total': now['graphs'],
+            'graph_breaks_total': now['graph_breaks'],
+        }
+
     def _archive_previous_performance_log(self):
         """Move an existing performance_log.jsonl aside before a new run.
 
@@ -1283,6 +1324,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
             'optimizer_step_s': optimizer,
             'other_overhead_s': max(0.0, total - accounted),
         }
+        compile_counters = self._compile_window_counters()
+        if compile_counters is not None:
+            record['compile'] = compile_counters
+            if compile_counters['new_frames']:
+                print_acc(
+                    "[compile] traced {nf} new frames ({ng} new graphs, "
+                    "{nb} new graph breaks) this window; "
+                    "totals frames={tf} graphs={tg}".format(
+                        nf=compile_counters['new_frames'],
+                        ng=compile_counters['new_graphs'],
+                        nb=compile_counters['new_graph_breaks'],
+                        tf=compile_counters['frames_total'],
+                        tg=compile_counters['graphs_total'],
+                    )
+                )
         try:
             from toolkit.memory_management import MemoryManager
             driver_free_sample = getattr(self, '_last_driver_free_sample', None) or {}
@@ -2368,6 +2424,107 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.cache_text_encoder_outputs_to_disk()
         self._write_te_caption_manifest()
 
+    def _observed_input_shapes(self, layout):
+        """Every (latent, text) shape combination this job can feed the trunk.
+
+        Latent sizes come from the buckets the datasets actually built plus the
+        sample resolutions -- sampling runs through the same compiled block
+        kernels, so a sample size outside the training buckets would otherwise
+        land outside the declared bounds. Returns None when any source cannot be
+        enumerated, which leaves the hints unset rather than guessing.
+        """
+        from toolkit.compile_shape_bounds import ObservedInputShape
+
+        vae_scale = int(getattr(self.sd, 'vae_scale_factor', 0) or 0)
+        if vae_scale < 1:
+            return None
+
+        pixel_sizes = set()
+        for loader in (self.data_loader, self.data_loader_reg):
+            if loader is None:
+                continue
+            dataset = loader.dataset
+            subsets = getattr(dataset, 'datasets', None) or [dataset]
+            for subset in subsets:
+                buckets = getattr(subset, 'buckets', None)
+                if not buckets:
+                    return None
+                for bucket in buckets.values():
+                    pixel_sizes.add((int(bucket.height), int(bucket.width)))
+
+        sample_items = getattr(self.sample_config, 'samples', None) or []
+        for item in sample_items:
+            pixel_sizes.add((int(item.height), int(item.width)))
+
+        if not pixel_sizes:
+            return None
+
+        text_bounds = (0, 0)
+        if layout.includes_text:
+            bounds = self.sd.get_text_length_bounds()
+            if bounds is None:
+                return None
+            text_bounds = (int(bounds[0]), int(bounds[1]))
+
+        shapes = []
+        for height, width in sorted(pixel_sizes):
+            if height % vae_scale or width % vae_scale:
+                return None
+            for text_length in set(text_bounds):
+                shapes.append(
+                    ObservedInputShape(
+                        latent_height=height // vae_scale,
+                        latent_width=width // vae_scale,
+                        text_length=text_length,
+                    )
+                )
+        return shapes
+
+    def _apply_derived_compile_dynamic_hints(self):
+        """Bound the compiled trunk's dynamic sequence dim from the job's shapes.
+
+        Only fills in hints the config left empty: an explicit
+        `compile_dynamic_hints` in the config always wins. Never touches
+        `compile_dynamic` itself -- the derived hints are a bound layered on
+        top of whatever dynamic mode the config already picked, gated by
+        `compile_dynamic_hints_auto` since GPU measurements found the best
+        setting is torch-version/hardware dependent (not always a win).
+        """
+        if getattr(self.model_config, 'compile_dynamic_hints', ()):
+            return
+        if not getattr(self.model_config, 'compile_dynamic_hints_auto', True):
+            return
+        runtime = get_arena_runtime(unwrap_model(self.sd.unet))
+        if runtime is None or not runtime.config.compile_blocks:
+            return
+
+        from toolkit.compile_shape_bounds import estimate_hidden_sequence_bounds
+
+        layout = self.sd.get_compile_sequence_layout()
+        if layout is None:
+            return
+        shapes = self._observed_input_shapes(layout)
+        if not shapes:
+            return
+
+        bounds = estimate_hidden_sequence_bounds(
+            transformer=unwrap_model(self.sd.unet),
+            observed_shapes=shapes,
+            layout=layout,
+        )
+        if bounds is None or bounds.minimum == bounds.maximum:
+            # A single shape needs no range: let it specialize.
+            return
+
+        hints = ((1, bounds.minimum, bounds.maximum),)
+        runtime.set_compile_dynamic_hints(hints)
+        self.model_config.compile_dynamic_hints = hints
+        print_acc(
+            f"Compiled blocks: sequence dim bounded to "
+            f"[{bounds.minimum}, {bounds.maximum}] tokens from "
+            f"{len(shapes)} observed shapes."
+        )
+
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
@@ -2917,6 +3074,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc("Install a working 'triton' package and compiler toolchain to use torch.compile.")
             self.model_config.compile = False
             self.model_config.train_compile_blocks = False
+
+        self._apply_derived_compile_dynamic_hints()
 
         # ============================================================
         # COMPILE

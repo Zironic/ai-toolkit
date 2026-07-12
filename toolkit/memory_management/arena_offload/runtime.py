@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 from ..vram_budget import apply_simulated_card
@@ -87,6 +88,10 @@ class ArenaOffloadRuntime:
         # be in force for the whole run, not just the phases we remember to ask.
         apply_simulated_card(config.simulated_vram_gib, device=device)
         MemoryManager.set_wddm_cap_strict(config.wddm_cap_strict)
+        # The fp8 Linear kernels read this as a process-global. Bind it from the
+        # config here so the arena path cannot disagree with what the job asked
+        # for -- an unbound config field is how the flag silently went dead.
+        MemoryManager.set_fp8_grad_input_enabled(config.fp8_backward)
 
         transformer.requires_grad_(False)
 
@@ -123,6 +128,8 @@ class ArenaOffloadRuntime:
                 block_stream_only=legacy.block_stream_only,
                 wddm_spill_reserve_pct=legacy.wddm_spill_reserve_pct,
                 fp8_training_forward=config.fp8_forward,
+                eager_promote_free_gib=legacy.eager_promote_free_gib,
+                eager_promote_max_blocks=legacy.eager_promote_max_blocks,
             )
         except Exception:
             arena.release()
@@ -206,6 +213,18 @@ class ArenaOffloadRuntime:
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
+
+    def set_compile_dynamic_hints(self, hints) -> None:
+        """Install mark_dynamic hints on the block kernels (see ImmutableRuntime).
+
+        The trainer derives sequence bounds from the datasets, which do not exist
+        when the runtime is prepared. Must be called before the first forward.
+        """
+        self._executor.set_compile_dynamic_hints(hints)
+        self._config = replace(
+            self._config,
+            compile_dynamic_hints=self._executor.compile_dynamic_hints,
+        )
 
     def finalize(self, network=None):
         """Build the permanent train/sample programs, then activate TRAIN.

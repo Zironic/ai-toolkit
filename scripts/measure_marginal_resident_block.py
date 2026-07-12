@@ -331,10 +331,10 @@ def main():
 
     compile_cache_key = None
     if args.compile_cache_dir and not args.no_compile:
-        from extensions_built_in.diffusion_models.krea2.krea2 import _compile_cache_key
+        from extensions_built_in.diffusion_models.krea2.krea2 import _train_compile_cache_key
         from toolkit.compile_cache import load_compile_cache
 
-        compile_cache_key = _compile_cache_key(model) + "_immutable_train"
+        compile_cache_key = _train_compile_cache_key(model)
         if load_compile_cache(args.compile_cache_dir, compile_cache_key):
             print(f"[s0] loaded compile mega-cache ({compile_cache_key})")
 

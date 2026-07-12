@@ -3083,6 +3083,8 @@ class MemoryManager:
         pinned_resident_keys=None,
         block_stream_only=False,
         wddm_spill_reserve_pct=None,
+        eager_promote_free_gib=0.0,
+        eager_promote_max_blocks=4,
     ):
         """Attach the legacy manager only to non-canonical singleton leaves.
 
@@ -3174,6 +3176,12 @@ class MemoryManager:
         mm._training_pinned_resident_keys = pinned_resident_keys
         mm._training_block_stream_only = bool(block_stream_only)
         mm._training_autotune_enabled = bool(auto_working_reserve)
+        mm._training_eager_promote_free_gib = max(
+            0.0, float(eager_promote_free_gib or 0.0)
+        )
+        mm._training_eager_promote_max_blocks = max(
+            1, int(eager_promote_max_blocks or 1)
+        )
         mm._immutable_planner_ignore_modules = planner_ignore
         mm._canonical_leaf_ids = canonical_ids
         module._mm_canonical_leaf_ids = canonical_ids
@@ -3476,7 +3484,9 @@ class MemoryManager:
         return int(candidates[0]["resident_bytes"])
 
     @classmethod
-    def _promote_training_layer(cls, module, mm, device, *, cache_pad_gib, wddm_stop_gib):
+    def _promote_training_layer(
+        cls, module, mm, device, *, cache_pad_gib, wddm_stop_gib, max_blocks=1
+    ):
         runtime = getattr(module, "_immutable_runtime", None)
         promote_runtime = getattr(
             runtime,
@@ -3501,7 +3511,7 @@ class MemoryManager:
             )
             result = promote_runtime(
                 available_growth_bytes,
-                max_blocks=1,
+                max_blocks=max(1, int(max_blocks)),
             )
             if not result.get("added_blocks"):
                 return 0, "no_immutable_block_fits"
@@ -4406,7 +4416,27 @@ class MemoryManager:
         elif move == "up":
             last_step = int(state.get("last_step", -1))
             step_index = int(step_num if step_num is not None else bucket["steps"])
-            cadence_ready = last_step < 0 or step_index - last_step >= promote_interval
+            # Eager fill (layer_offloading_eager_promote_free_gb). The default climb
+            # is one block per cadence window and stops at the WDDM hold floor, which
+            # strands GiBs of VRAM on a card that has room to spare. When a free-margin
+            # target is configured, promote every block that still fits above THAT
+            # margin, every step, up to a per-step block bound. The safety gates below
+            # (worst-shape prediction, post-promote free re-check) are unchanged and a
+            # target above the hold floor makes each promotion strictly more careful,
+            # not less: eager buys speed of climb and reach, never headroom.
+            eager_free_gib = float(
+                getattr(mm, "_training_eager_promote_free_gib", 0.0) or 0.0
+            )
+            eager = eager_free_gib > 0.0
+            eager_max_blocks = max(
+                1, int(getattr(mm, "_training_eager_promote_max_blocks", 4) or 4)
+            )
+            promote_floor_gib = max(wddm_hold_high_gib, eager_free_gib)
+            cadence_ready = (
+                eager
+                or last_step < 0
+                or step_index - last_step >= promote_interval
+            )
             # Promote on MEASUREMENT + headroom, NOT on prefetch health. move=="up"
             # already proved peak-free headroom (the deadband); we only require the
             # working set for this bucket to have been measured first — start
@@ -4429,22 +4459,42 @@ class MemoryManager:
             # resolutions are handled by demote-on-arrival, not this gate.
             worst_case_veto = False
             predicted_worst_free_gib = None
+            promote_blocks = 1
             if promoting:
                 promote_block_bytes = cls._next_promotion_layer_bytes(module, mm)
                 if promote_block_bytes > 0:
-                    predicted_worst_free_gib = (
-                        vram_budget.training_promotion_worst_shape_free_gib(
-                            resident_gib=diagnostics.get("planned_resident_gb", 0.0),
-                            added_block_gib=promote_block_bytes / gib,
-                            ring_gib=diagnostics.get(
-                                "ring_peak_gb", diagnostics.get("planned_ring_gb", 0.0)
-                            ),
+                    block_gib = promote_block_bytes / gib
+                    ring_gib = diagnostics.get(
+                        "ring_peak_gb", diagnostics.get("planned_ring_gb", 0.0)
+                    )
+                    resident_gib = diagnostics.get("planned_resident_gb", 0.0)
+                    total_gib = diagnostics["device_total_gb"]
+                    if eager:
+                        promote_blocks = vram_budget.training_eager_promote_blocks(
+                            resident_gib=resident_gib,
+                            block_gib=block_gib,
+                            ring_gib=ring_gib,
                             worst_working_reserve_gib=new_working_reserve,
                             other_gib=other_gib,
-                            total_gib=diagnostics["device_total_gb"],
+                            total_gib=total_gib,
+                            promote_floor_gib=promote_floor_gib,
+                            max_blocks=eager_max_blocks,
+                        )
+                        if promote_blocks < 1:
+                            promoting = False
+                            worst_case_veto = True
+                            promote_blocks = 1
+                    predicted_worst_free_gib = (
+                        vram_budget.training_promotion_worst_shape_free_gib(
+                            resident_gib=resident_gib,
+                            added_block_gib=block_gib * promote_blocks,
+                            ring_gib=ring_gib,
+                            worst_working_reserve_gib=new_working_reserve,
+                            other_gib=other_gib,
+                            total_gib=total_gib,
                         )
                     )
-                    if predicted_worst_free_gib < wddm_hold_high_gib:
+                    if promoting and predicted_worst_free_gib < promote_floor_gib:
                         promoting = False
                         worst_case_veto = True
             if pool is not None and not prefetch_ok and not promoting:
@@ -4483,6 +4533,7 @@ class MemoryManager:
                     device,
                     cache_pad_gib=cache_pad_gib,
                     wddm_stop_gib=wddm_stop_gib,
+                    max_blocks=promote_blocks,
                 )
                 if changed_layers:
                     state["last_step"] = step_index
@@ -4495,7 +4546,7 @@ class MemoryManager:
             elif worst_case_veto:
                 layout_action = (
                     "worst_shape_hold:"
-                    f"{predicted_worst_free_gib:.2f}<{wddm_hold_high_gib:.2f}"
+                    f"{predicted_worst_free_gib:.2f}<{promote_floor_gib:.2f}"
                 )
             elif not measured:
                 layout_action = f"measuring_working_set:{bucket['steps']}/{stable_windows}"
@@ -4875,7 +4926,21 @@ class MemoryManager:
             bias = getattr(child, "bias", None)
             return bias is None or _profile_is_pinned(bias.data)
 
-        if sources and all(_layer_pinned(child) for _, child in sources):
+        if not sources:
+            # No legacy per-Linear streamed layers on this module at all (e.g.
+            # the immutable/arena backend, whose canonical block transfers go
+            # through pin_manager + the device-side fetch ring and MANDATE a
+            # pinned host source -- see ingraph_stream._fetch_start_impl,
+            # which raises rather than reading a pageable tensor). There is
+            # nothing this pool could ever bounce, so it would just burn WDDM
+            # shared-budget pinned buffers for no transfers. Don't create one.
+            print(
+                "[MemoryManager] bounce pool disabled: no legacy-managed "
+                "streamed layers on this module (arena/immutable block "
+                "streaming requires pinned sources and never uses the pool)"
+            )
+            return
+        if all(_layer_pinned(child) for _, child in sources):
             print(
                 "[MemoryManager] bounce pool disabled: all "
                 f"{registered} streamed layers are pinned (pinned-source "

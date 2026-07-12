@@ -54,6 +54,8 @@ export const handleModelArchChange = (
       delete newModel.layer_offloading_smart_wddm_margin_gb;
       delete newModel.layer_offloading_wddm_spill_reserve_pct;
       delete newModel.layer_offloading_smart_wddm_hard_gb;
+      delete newModel.layer_offloading_eager_promote_free_gb;
+      delete newModel.layer_offloading_eager_promote_max_blocks;
       delete newModel.layer_offloading_smart_headroom_gb;
       delete newModel.layer_offloading_smart_sampling;
       delete newModel.layer_offloading_smart_sampling_working_reserve_gb;

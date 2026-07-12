@@ -191,6 +191,8 @@ export interface ModelConfig {
   layer_offloading_smart_wddm_margin_gb?: number;
   layer_offloading_wddm_spill_reserve_pct?: number;
   layer_offloading_smart_wddm_hard_gb?: number;
+  layer_offloading_eager_promote_free_gb?: number;
+  layer_offloading_eager_promote_max_blocks?: number;
   /** @deprecated renamed to layer_offloading_smart_working_reserve_gb; read for back-compat. */
   layer_offloading_smart_headroom_gb?: number;
   /** @deprecated the arena runtime unconditionally owns sampling residency once layer_offloading_smart is on; this flag has no effect on the live backend. */

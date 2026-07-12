@@ -872,6 +872,26 @@ class ModelConfig:
         self.layer_offloading_prefetch_depth = kwargs.get(
             "layer_offloading_prefetch_depth", 2
         )
+        # Eager residency fill (auto working_reserve only). The default climb is
+        # deliberately timid -- one block every few steps, stopping as soon as the
+        # predicted worst-shape free margin nears the WDDM hold floor (~2 GiB) --
+        # because it was written for a card with nothing to spare. On a roomy card
+        # that leaves GiBs of VRAM idle while the model still streams every block.
+        # Set this to the free margin (GiB) you want the run to KEEP: the
+        # controller then promotes blocks in bulk every step until the predicted
+        # worst-measured-resolution free margin would fall below it. The worst-shape
+        # veto and the post-promote free re-check are unchanged, so a value here
+        # above the WDDM hold floor is strictly more conservative per promotion --
+        # it only makes the climb faster and lets it run further. 0 = off.
+        self.layer_offloading_eager_promote_free_gb = kwargs.get(
+            "layer_offloading_eager_promote_free_gb", 0.0
+        )
+        # Bound on how many blocks a single eager step may promote, so residency
+        # (which destroys the prefetch trace on every change) still moves in
+        # measured increments rather than one giant jump.
+        self.layer_offloading_eager_promote_max_blocks = kwargs.get(
+            "layer_offloading_eager_promote_max_blocks", 4
+        )
         # The WDDM allocator cap (see MemoryManager._apply_wddm_hard_allocator_cap)
         # is a tuning lever: it recycles idle cache on demand and keeps the run
         # off the paging cliff. Violating it is NOT fatal by default -- the cap
@@ -931,6 +951,16 @@ class ModelConfig:
         # e.g. ((1, 256, 4096),) marks dim 1 (sequence length) dynamic over
         # that range. Empty = no explicit hints (rely on compile_dynamic alone).
         self.compile_dynamic_hints = kwargs.get("compile_dynamic_hints", ())
+        # Whether the trainer derives compile_dynamic_hints automatically from
+        # observed dataset/sample shapes (BaseSDTrainProcess._apply_derived_
+        # compile_dynamic_hints) when compile_dynamic_hints above is left
+        # empty. Purely a bound around whatever compile_dynamic is already
+        # set to -- it never changes compile_dynamic itself. GPU measurements
+        # on this box found compile_dynamic=None with no hints faster than
+        # any hinted arm, but that was one torch version on one card; leave
+        # this on by default and let it be turned off where the opposite
+        # holds instead of assuming it generalizes.
+        self.compile_dynamic_hints_auto = kwargs.get("compile_dynamic_hints_auto", True)
         self.cache_size_limit = kwargs.get("cache_size_limit", None)
         # Emit graph_breaks + recompiles + guards to stdout while compiling.
         # Use this to confirm blocks are compile-clean and guards aren't failing
