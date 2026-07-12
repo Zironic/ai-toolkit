@@ -19,8 +19,12 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
+from .. import allocator_cap
 from ..vram_budget import apply_simulated_card
-from .policy import TrainingSignalWindow
+from .policy import (
+    ArenaResidencyController,
+    TrainingSignalWindow,
+)
 
 RUNTIME_ATTR = "_arena_offload_runtime"
 
@@ -62,6 +66,8 @@ class ArenaOffloadRuntime:
         self._last_step_num: int | None = None
         self._signals = TrainingSignalWindow()
         self._last_policy_error: str | None = None
+        self._policy = ArenaResidencyController()
+        self._last_training_cap_target_bytes: int | None = None
 
     # ------------------------------------------------------------------
     # construction
@@ -92,6 +98,9 @@ class ArenaOffloadRuntime:
         # be in force for the whole run, not just the phases we remember to ask.
         apply_simulated_card(config.simulated_vram_gib, device=device)
         MemoryManager.set_wddm_cap_strict(config.wddm_cap_strict)
+        allocator_cap.apply_wddm_hard_allocator_cap(
+            device, config.legacy.wddm_hard_gib, log_prefix="[ArenaOffload]"
+        )
         # The fp8 Linear kernels read this as a process-global. Bind it from the
         # config here so the arena path cannot disagree with what the job asked
         # for -- an unbound config field is how the flag silently went dead.
@@ -239,6 +248,7 @@ class ArenaOffloadRuntime:
         the model collects its own adapters.
         """
         self._require_open()
+        self._bind_training_cap()
         finalize_fn = getattr(self._model, "finalize_immutable_runtime", None)
         if finalize_fn is None:
             raise RuntimeError(
@@ -276,29 +286,37 @@ class ArenaOffloadRuntime:
         Backward must be inside: checkpoint recomputation re-enters the block
         runtime, so the source snapshot has to stay pinned for the whole step.
 
-        This is the hook the two-timescale residency controller wires into
-        (git-bug 0c577ef): enter = plan/act, exit = observe. Nothing drives it
-        yet.
+        This is the two-timescale residency controller's phase-boundary hook:
+        enter = plan/act, exit = observe.
         """
         self._require_open()
         self._last_shape_key = shape_key
         self._last_step_num = step_num
+        self._apply_training_policy()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(self._device)
+        except Exception:
+            pass
         started_at = time.perf_counter()
+        succeeded = False
         try:
             with self._executor.execution(self._executor.TRAIN):
                 yield self
+            succeeded = True
         finally:
-            try:
-                self._observe_training_step(
-                    shape_key=shape_key,
-                    step_num=step_num,
-                    step_wall_ms=(time.perf_counter() - started_at) * 1000.0,
-                )
-                self._last_policy_error = None
-            except Exception as error:
-                # Observation is diagnostic-only in S1 and must never mask the
-                # training result (especially an OOM raised by the body).
-                self._last_policy_error = f"{type(error).__name__}: {error}"
+            if succeeded:
+                try:
+                    self._observe_training_step(
+                        shape_key=shape_key,
+                        step_num=step_num,
+                        step_wall_ms=(time.perf_counter() - started_at) * 1000.0,
+                    )
+                    self._last_policy_error = None
+                except Exception as error:
+                    # Diagnostics must never mask a successful training step.
+                    self._last_policy_error = f"{type(error).__name__}: {error}"
 
     @contextlib.contextmanager
     def sampling_session(self):
@@ -312,6 +330,7 @@ class ArenaOffloadRuntime:
         try:
             yield self
         finally:
+            self._bind_training_cap()
             self._executor.activate(self._executor.TRAIN, self._training_plan)
 
     @contextlib.contextmanager
@@ -330,6 +349,9 @@ class ArenaOffloadRuntime:
             1.0
             if legacy.sampling_wddm_hard_gib is None
             else float(legacy.sampling_wddm_hard_gib)
+        )
+        allocator_cap.apply_wddm_hard_allocator_cap(
+            self._device, hard_gib, log_prefix="[ArenaOffload]"
         )
         # PHASE-2: margin resolution moves into policy.py.
         from ..manager import MemoryManager
@@ -350,17 +372,161 @@ class ArenaOffloadRuntime:
             yield self
 
     # ------------------------------------------------------------------
+    def _protected_training_blocks(self):
+        return frozenset(
+            str(block)
+            for block, _leaf in getattr(
+                self._model,
+                "_mm_immutable_protected_training_leaf_keys",
+                (),
+            )
+        )
+
+    def _promotion_candidate(self):
+        plan = getattr(self._residency, "plan", None) or self._training_plan
+        protected = self._protected_training_blocks()
+        candidates = []
+        for order, block_key in enumerate(self._arena.block_keys()):
+            record = self._arena.block_record(block_key)
+            keys = tuple((block_key, name) for name in record.leaf_names)
+            if block_key in protected or any(
+                key in plan.resident_leaf_keys for key in keys
+            ):
+                continue
+            candidates.append(
+                (int(record.committed_bytes), order, str(block_key))
+            )
+        if not candidates:
+            return None
+        block_bytes, _order, block_key = min(candidates)
+        return {"block_key": block_key, "block_bytes": block_bytes}
+
+    def _demotion_candidate(self):
+        plan = getattr(self._residency, "plan", None) or self._training_plan
+        protected = self._protected_training_blocks()
+        candidates = []
+        for order, block_key in enumerate(self._arena.block_keys()):
+            record = self._arena.block_record(block_key)
+            keys = tuple((block_key, name) for name in record.leaf_names)
+            if block_key in protected or not all(
+                key in plan.resident_leaf_keys for key in keys
+            ):
+                continue
+            actual = sum(
+                self._residency.resident_leaf_bytes(key) for key in keys
+            )
+            candidates.append(
+                (actual or int(record.committed_bytes), -order, str(block_key))
+            )
+        if not candidates:
+            return None
+        block_bytes, _order, block_key = max(candidates)
+        return {"block_key": block_key, "block_bytes": block_bytes}
+
+    def _worst_shape_candidate_margin_bytes(self, candidate):
+        if candidate is None:
+            return 0
+        signal = self._signals.last_signal
+        peaks = self._signals.shape_peaks
+        if signal is None or not peaks:
+            return 0
+        from .. import vram_budget
+
+        total = int(vram_budget.device_total_bytes(self._device))
+        worst_allocated = max(
+            int(peak.peak_allocated_bytes)
+            for peak in peaks.values()
+            if peak.steps > 0
+        ) if any(peak.steps > 0 for peak in peaks.values()) else 0
+        non_torch = max(
+            0,
+            total
+            - int(signal.get("device_free_bytes", 0) or 0)
+            - int(signal.get("peak_reserved_bytes", 0) or 0),
+        )
+        hard_gib = self._config.legacy.wddm_hard_gib
+        hard_bytes = int(
+            (1.0 if hard_gib is None else max(1.0, float(hard_gib))) * GIB
+        )
+        predicted_free = total - (
+            worst_allocated + non_torch + int(candidate["block_bytes"])
+        )
+        return int(predicted_free - hard_bytes)
+
+    def _apply_training_policy(self):
+        import torch
+
+        if torch.device(self._device).type != "cuda" or not torch.cuda.is_available():
+            return
+        candidate = self._promotion_candidate()
+        demote_candidate = self._demotion_candidate()
+        cliff_cap = allocator_cap.wddm_cliff_cap_bytes(
+            self._device, self._config.legacy.wddm_hard_gib
+        )
+        signal = self._signals.last_signal
+        current_cap = min(
+            cliff_cap,
+            int(self._last_training_cap_target_bytes or cliff_cap),
+        )
+        decision = self._policy.step(
+            self._signals.last_signal,
+            candidate=candidate,
+            demote_candidate=demote_candidate,
+            cliff_cap_bytes=cliff_cap,
+            current_cap_bytes=current_cap,
+            worst_shape_free_bytes=self._worst_shape_candidate_margin_bytes(
+                candidate
+            ),
+        )
+        if decision.action == "promote":
+            self.transition_training_block(decision.block_key, resident=True)
+        elif decision.action in ("demote", "rollback"):
+            self.transition_training_block(decision.block_key, resident=False)
+        elif decision.action == "raise_cap":
+            allocator_cap.apply_wddm_hard_allocator_cap(
+                self._device,
+                self._config.legacy.wddm_hard_gib,
+                target_cap_bytes=decision.target_cap_bytes,
+                log_prefix="[ArenaOffload]",
+            )
+            self._last_training_cap_target_bytes = decision.target_cap_bytes
+
+    def transition_training_block(self, block_key: str, *, resident: bool) -> dict:
+        """Apply one executor-owned whole-block transaction at a boundary."""
+        self._require_open()
+        result = self._executor.transition_training_block(
+            str(block_key), resident=bool(resident)
+        )
+        if result.get("changed"):
+            self._training_plan = result["plan"]
+            self._signals.invalidate_shape_peaks()
+        return result
+
+    def _bind_training_cap(self) -> None:
+        allocator_cap.apply_wddm_hard_allocator_cap(
+            self._device,
+            self._config.legacy.wddm_hard_gib,
+            log_prefix="[ArenaOffload]",
+        )
+
     # diagnostics
     # ------------------------------------------------------------------
 
     def diagnostics(self) -> dict:
         """One stable dict. Shared logging prints it; nobody reconstructs it."""
         active_plan = getattr(self._residency, "plan", None) or self._training_plan
+        canonical_resident = int(self._residency.resident_bytes())
+        singleton_resident = int(
+            (self._smart_plan or {}).get("singleton_resident_bytes", 0)
+        )
         return {
             "backend": "arena",
             "blocks": self.block_count,
             "finalized": self.finalized,
-            "resident_bytes": int(self._residency.resident_bytes()),
+            "resident_bytes": singleton_resident + canonical_resident,
+            "singleton_resident_bytes": singleton_resident,
+            "canonical_resident_bytes": canonical_resident,
+            "total_weight_resident_bytes": singleton_resident + canonical_resident,
             "plan_fingerprint": getattr(active_plan, "fingerprint", None),
             "prefetch_depth": int(getattr(self._executor, "depth", 0)),
             "compile_blocks": bool(self._config.compile_blocks),
@@ -368,17 +534,23 @@ class ArenaOffloadRuntime:
             "fp8_forward": bool(self._config.fp8_forward),
             "fp8_backward": bool(self._config.fp8_backward),
             "fp8_sampling": bool(self._config.fp8_sampling),
+            "training_cap_target_bytes": getattr(
+                self, "_last_training_cap_target_bytes", None
+            ),
             "working_reserve_bytes": int(
                 (self._smart_plan or {}).get("working_reserve_bytes", 0)
             ),
             "last_shape_key": self._last_shape_key,
             "last_step_num": self._last_step_num,
-            "policy": self._signals.diagnostics(),
+            "policy": {
+                **self._signals.diagnostics(),
+                "controller": self._policy.diagnostics(),
+            },
             "policy_error": self._last_policy_error,
         }
 
     def _observe_training_step(self, *, shape_key, step_num, step_wall_ms) -> None:
-        """Collect S1 policy signals after execution; never changes layout."""
+        """Collect the completed step's policy signals."""
         import torch
 
         from .. import ingraph_stream
@@ -395,7 +567,7 @@ class ArenaOffloadRuntime:
             for key in ("num_alloc_retries", "num_device_alloc", "num_device_free")
         }
         transfer = (
-            ingraph_stream.fetch_stats(reset=False)
+            ingraph_stream.lifetime_fetch_stats()
             if self._signals.transfer_snapshot_due
             else None
         )
@@ -406,7 +578,10 @@ class ArenaOffloadRuntime:
             peak_allocated_bytes=torch.cuda.max_memory_allocated(self._device),
             peak_reserved_bytes=torch.cuda.max_memory_reserved(self._device),
             device_free_bytes=device_free_bytes(self._device),
-            resident_bytes=self._residency.resident_bytes(),
+            resident_bytes=(
+                self._residency.resident_bytes()
+                + int((self._smart_plan or {}).get("singleton_resident_bytes", 0))
+            ),
             ring_bytes=self._training_ring_bytes(),
             compile_counters=_compile_counter_snapshot(torch),
             transfer_counters=transfer,

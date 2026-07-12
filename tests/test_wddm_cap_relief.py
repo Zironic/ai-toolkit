@@ -9,6 +9,7 @@ OOM is the point.
 import unittest
 from unittest import mock
 
+from toolkit.memory_management import allocator_cap
 from toolkit.memory_management import manager as manager_module
 from toolkit.memory_management.manager import MemoryManager
 
@@ -95,6 +96,11 @@ class WddmCapReliefTests(unittest.TestCase):
         # cliff bound = 12 - 2 (non_torch) - 1 (hard) = 9 GiB, plus 1 GiB relief.
         applied = MemoryManager._wddm_hard_cap_applied[0]
         self.assertAlmostEqual(applied * 12, 10.0, places=2)
+
+
+    def test_applied_cap_bytes_reports_the_active_allocator_bound(self):
+        MemoryManager._wddm_hard_cap_applied[0] = 9.0 / 12.0
+        self.assertEqual(allocator_cap.applied_cap_bytes("cuda:0"), 9 * GIB)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,200 @@
-"""Arena-native planning signals. S1 observes only; it performs no actions."""
+"""Arena-native training signals and two-timescale residency policy."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .. import vram_budget
+
 _ALLOC = ("num_alloc_retries", "num_device_alloc", "num_device_free")
 _COMPILE = ("frames", "graphs", "graph_breaks")
+
+DEFAULT_SLACK_PAD_BYTES = 256 * 1024**2
+def transfer_benefits_from_residency(transfer) -> bool:
+    """Return whether a valid window proves that weights are still streaming."""
+    if not transfer or transfer.get("h2d_duty_overflow"):
+        return False
+    return (
+        int(transfer.get("bytes", 0) or 0) > 0
+        and float(transfer.get("h2d_ms", 0.0) or 0.0) > 0.0
+    )
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    action: str
+    block_key: str | None = None
+    block_bytes: int = 0
+    target_cap_bytes: int | None = None
+    reason: str = ""
+
+
+class ArenaResidencyController:
+    """Stateful wiring around the pure two-timescale residency FSM."""
+
+    def __init__(self, *, slack_pad_bytes=DEFAULT_SLACK_PAD_BYTES):
+        self.state = vram_budget.ResidencyFsmState()
+        self.slack_pad_bytes = max(0, int(slack_pad_bytes))
+        self.last_action = "hold"
+        self.last_reason = "cold_start"
+        self.last_promoted_key = None
+        self.last_block_key = None
+        self.last_block_bytes = 0
+        self.last_target_cap_bytes = None
+        self.last_worst_shape_margin_bytes = None
+        self.last_throughput_gate = None
+        self.last_promote_gate = None
+        self.last_cap_covers_promo = None
+        self.bootstrapped = False
+
+    def step(self, signal, *, candidate, demote_candidate, cliff_cap_bytes,
+             worst_shape_free_bytes, current_cap_bytes=None):
+        if not self.bootstrapped:
+            self.bootstrapped = True
+            if demote_candidate is not None:
+                return self._decision(
+                    "demote",
+                    demote_candidate,
+                    reason="approach_from_below",
+                )
+        if signal is None:
+            return self._hold("awaiting_signal")
+
+        block_bytes = 0 if candidate is None else int(candidate["block_bytes"])
+        retries = int(
+            (signal.get("allocator") or {}).get("alloc_retries_delta", 0) or 0
+        )
+        reclaimable = int(signal.get("reclaimable_at_peak_bytes", 0) or 0)
+        live = int(
+            signal.get("peak_allocated_bytes", signal.get("live_bytes", 0)) or 0
+        )
+        throughput_ok = transfer_benefits_from_residency(signal.get("transfer"))
+        worst_ok = candidate is not None and int(worst_shape_free_bytes) >= 0
+        promote_ok = (
+            candidate is not None
+            and throughput_ok
+            and worst_ok
+            and vram_budget.residency_promote_ok(
+                retries, reclaimable, block_bytes, self.slack_pad_bytes
+            )
+        )
+        active_cap = (
+            int(cliff_cap_bytes)
+            if current_cap_bytes is None
+            else int(current_cap_bytes)
+        )
+        cap_covers = (
+            candidate is not None
+            and vram_budget.cap_can_host_promotion(
+                live, block_bytes, self.slack_pad_bytes, active_cap
+            )
+        )
+        binding = retries > 0 or int(worst_shape_free_bytes) < 0
+        self.last_worst_shape_margin_bytes = int(worst_shape_free_bytes)
+        self.last_throughput_gate = bool(throughput_ok)
+        self.last_promote_gate = bool(promote_ok)
+        self.last_cap_covers_promo = bool(cap_covers)
+        cap_raise_bytes = (
+            block_bytes
+            if promote_ok and block_bytes > 0
+            else self.slack_pad_bytes
+        )
+        needed_cap = min(
+            int(cliff_cap_bytes),
+            active_cap + max(0, int(cap_raise_bytes)),
+        )
+        self.state, action = vram_budget.residency_fsm_step(
+            self.state,
+            {
+                "measurements_invalid": bool(signal.get("compile_invalid")),
+                "binding": binding,
+                "cap_can_relieve": (
+                    active_cap < needed_cap <= int(cliff_cap_bytes)
+                ),
+                "promote_gate": promote_ok,
+                "cap_covers_promo": cap_covers,
+            },
+        )
+        if action == vram_budget.ACT_PROMOTE and candidate is not None:
+            self.last_promoted_key = candidate["block_key"]
+            return self._decision(
+                action, candidate, reason="safe_transfer_benefit"
+            )
+        if (
+            action == vram_budget.ACT_ROLLBACK
+            and self.last_promoted_key is not None
+        ):
+            key = self.last_promoted_key
+            self.last_promoted_key = None
+            return self._decision(
+                action, {"block_key": key, "block_bytes": 0},
+                reason="promotion_bound",
+            )
+        if action == vram_budget.ACT_DEMOTE and demote_candidate is not None:
+            return self._decision(
+                action, demote_candidate, reason="live_pressure"
+            )
+        if action == vram_budget.ACT_RAISE_CAP:
+            self.last_action = action
+            self.last_reason = "prefund_or_relieve"
+            self.last_block_key = None
+            self.last_block_bytes = 0
+            self.last_target_cap_bytes = needed_cap
+            return PolicyDecision(
+                action, target_cap_bytes=needed_cap, reason=self.last_reason
+            )
+        reason = (
+            "worst_shape_veto"
+            if candidate is not None and not worst_ok
+            else (
+                "throughput_gate"
+                if candidate is not None and not throughput_ok
+                else "fsm_hold"
+            )
+        )
+        return self._hold(reason, candidate=candidate)
+
+    def _decision(self, action, candidate, *, reason):
+        self.last_action = action
+        self.last_reason = reason
+        self.last_block_key = candidate["block_key"]
+        self.last_block_bytes = int(candidate["block_bytes"])
+        self.last_target_cap_bytes = None
+        return PolicyDecision(
+            action,
+            candidate["block_key"],
+            int(candidate["block_bytes"]),
+            reason=reason,
+        )
+
+    def _hold(self, reason, *, candidate=None):
+        self.last_action = "hold"
+        self.last_reason = reason
+        self.last_block_key = (
+            None if candidate is None else candidate["block_key"]
+        )
+        self.last_block_bytes = (
+            0 if candidate is None else int(candidate["block_bytes"])
+        )
+        self.last_target_cap_bytes = None
+        return PolicyDecision("hold", reason=reason)
+
+    def diagnostics(self):
+        return {
+            "state": self.state.name,
+            "windows_in_state": self.state.windows_in_state,
+            "last_action": self.last_action,
+            "last_reason": self.last_reason,
+            "last_promoted_key": self.last_promoted_key,
+            "last_block_key": self.last_block_key,
+            "last_block_bytes": self.last_block_bytes,
+            "last_target_cap_bytes": self.last_target_cap_bytes,
+            "last_worst_shape_margin_bytes": self.last_worst_shape_margin_bytes,
+            "last_throughput_gate": self.last_throughput_gate,
+            "last_promote_gate": self.last_promote_gate,
+            "last_cap_covers_promo": self.last_cap_covers_promo,
+            "slack_pad_bytes": self.slack_pad_bytes,
+        }
 
 
 def _deltas(previous, current, keys, cast=int):
@@ -54,6 +243,7 @@ class TrainingSignalWindow:
 
     def invalidate_shape_peaks(self):
         self._shape_peaks.clear()
+        self._last_signal = None
 
     def observe(
         self, *, shape_key, step_num, allocator_counters,

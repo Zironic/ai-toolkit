@@ -333,6 +333,68 @@ def summarize_records(records: list[dict]) -> list[str]:
                 gb=compile_rows[-1].get("graph_breaks_total"),
             )
         )
+    arena_rows = [
+        r.get("arena_offload") or {}
+        for r in records
+        if r.get("arena_offload")
+    ]
+    if arena_rows:
+        actions = {}
+        reasons = {}
+        states = {}
+        policy_errors = 0
+        layout_actions = 0
+        for arena in arena_rows:
+            controller = (
+                ((arena.get("policy") or {}).get("controller") or {})
+            )
+            action = controller.get("last_action") or "unknown"
+            reason = controller.get("last_reason") or "unknown"
+            state = controller.get("state") or "unknown"
+            actions[action] = actions.get(action, 0) + 1
+            reasons[reason] = reasons.get(reason, 0) + 1
+            states[state] = states.get(state, 0) + 1
+            if action in ("promote", "demote", "rollback"):
+                layout_actions += 1
+            if arena.get("policy_error") or arena.get("diagnostic_error"):
+                policy_errors += 1
+        last_arena = arena_rows[-1]
+        last_controller = (
+            ((last_arena.get("policy") or {}).get("controller") or {})
+        )
+        lines.append(
+            "Arena policy: windows={windows} state={state} "
+            "resident={resident}GiB (singleton={singleton} canonical={canonical}) "
+            "plan={plan} layout_actions={layout} "
+            "policy_errors={errors} actions=[{actions}] reasons=[{reasons}] "
+            "states=[{states}]".format(
+                windows=len(arena_rows),
+                state=last_controller.get("state"),
+                resident=g(
+                    float(last_arena.get("resident_bytes", 0)) / (1024 ** 3)
+                ),
+                singleton=g(
+                    float(last_arena.get("singleton_resident_bytes", 0))
+                    / (1024 ** 3)
+                ),
+                canonical=g(
+                    float(last_arena.get("canonical_resident_bytes", 0))
+                    / (1024 ** 3)
+                ),
+                plan=last_arena.get("plan_fingerprint"),
+                layout=layout_actions,
+                errors=policy_errors,
+                actions=" ".join(
+                    f"{key}={value}" for key, value in sorted(actions.items())
+                ),
+                reasons=" ".join(
+                    f"{key}={value}" for key, value in sorted(reasons.items())
+                ),
+                states=" ".join(
+                    f"{key}={value}" for key, value in sorted(states.items())
+                ),
+            )
+        )
     gc_rows = [
         r.get("smart_training_offload") or {}
         for r in records
@@ -481,6 +543,76 @@ def summarize_record(record: dict, full: bool) -> list[str]:
                 pg=g(record.get("dop_prior_generation_s")),
                 pm=g(record.get("dop_prior_generation_per_miss_s")),
             )
+        )
+
+    arena = record.get("arena_offload")
+    if arena and "diagnostic_error" not in arena:
+        policy = arena.get("policy") or {}
+        controller = policy.get("controller") or {}
+        signal = policy.get("last_signal") or {}
+        allocator = signal.get("allocator") or {}
+        transfer = signal.get("transfer") or {}
+        block_bytes = controller.get("last_block_bytes")
+        cap_bytes = (
+            controller.get("last_target_cap_bytes")
+            or arena.get("training_cap_target_bytes")
+        )
+        margin_bytes = controller.get("last_worst_shape_margin_bytes")
+        slack_bytes = controller.get("slack_pad_bytes")
+        lines.append(
+            "  arena_policy: state={state} windows={windows} action={action} "
+            "reason={reason} block={block} block_gib={block_gib} "
+            "cap_target_gib={cap_gib} resident_gib={resident} "
+            "singleton_gib={singleton} canonical_gib={canonical} plan={plan} "
+            "worst_margin_gib={margin} slack_gib={slack} "
+            "throughput_gate={throughput} promote_gate={promote} "
+            "cap_covers={covers} retries=+{retries} duty={duty} "
+            "achieved={gbps}GB/s error={error}".format(
+                state=controller.get("state"),
+                windows=controller.get("windows_in_state"),
+                action=controller.get("last_action"),
+                reason=controller.get("last_reason"),
+                block=controller.get("last_block_key"),
+                block_gib=g(
+                    None if block_bytes is None else block_bytes / (1024 ** 3)
+                ),
+                cap_gib=g(
+                    None if cap_bytes is None else cap_bytes / (1024 ** 3)
+                ),
+                resident=g(
+                    float(arena.get("resident_bytes", 0)) / (1024 ** 3)
+                ),
+                singleton=g(
+                    float(arena.get("singleton_resident_bytes", 0))
+                    / (1024 ** 3)
+                ),
+                canonical=g(
+                    float(arena.get("canonical_resident_bytes", 0))
+                    / (1024 ** 3)
+                ),
+                plan=arena.get("plan_fingerprint"),
+                margin=g(
+                    None if margin_bytes is None else margin_bytes / (1024 ** 3)
+                ),
+                slack=g(
+                    None if slack_bytes is None else slack_bytes / (1024 ** 3)
+                ),
+                throughput=controller.get("last_throughput_gate"),
+                promote=controller.get("last_promote_gate"),
+                covers=controller.get("last_cap_covers_promo"),
+                retries=allocator.get("alloc_retries_delta"),
+                duty=(
+                    "-"
+                    if transfer.get("h2d_duty_pct") is None
+                    else f"{float(transfer['h2d_duty_pct']):.1f}%"
+                ),
+                gbps=g(transfer.get("achieved_gbps")),
+                error=arena.get("policy_error"),
+            )
+        )
+    elif arena:
+        lines.append(
+            f"  arena_policy: diagnostic_error={arena.get('diagnostic_error')}"
         )
 
     offload = record.get("smart_training_offload")

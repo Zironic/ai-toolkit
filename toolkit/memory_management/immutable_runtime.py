@@ -294,6 +294,11 @@ class ImmutableRuntimeSourceTable:
         self._plan = None
 
 
+def _mark_dynamic_dim(tensor, dim: int) -> None:
+    """Request a dynamic dim without enforcing an invalid dense interval."""
+    torch._dynamo.maybe_mark_dynamic(tensor, int(dim))
+
+
 def _leaf_layout(record) -> tuple:
     layout = []
     for leaf_name in record.leaf_names:
@@ -636,8 +641,8 @@ class ImmutableTransformerRuntime:
             if self.compile_blocks and self.compile_dynamic_hints:
                 # Must be set on this exact tensor instance every call (a
                 # fresh x each step) before it crosses the torch.compile
-                # boundary in `kernel`, so a resolution-bucket run declares
-                # its shape range once instead of recompiling per bucket.
+                # boundary in `kernel`, so a resolution-bucket run requests a
+                # dynamic sequence dimension instead of specializing eagerly.
                 for dim, lo, hi in self.compile_dynamic_hints:
                     size = int(x.shape[dim])
                     if (lo is not None and size < lo) or (
@@ -648,7 +653,13 @@ class ImmutableTransformerRuntime:
                         # hint just costs this shape its own specialization.
                         self._warn_hint_out_of_range(dim, size, lo, hi)
                         continue
-                    torch._dynamo.mark_dynamic(x, dim, min=lo, max=hi)
+                    # Krea sequence lengths are aligned, so the kernel may infer
+                    # divisibility guards (for example size % 8 == 0). A hard
+                    # min/max mark claims every integer in the interval is
+                    # valid and raises ConstraintViolationError. Weak marking
+                    # requests dynamism without forbidding specialization when
+                    # an inferred alignment constraint requires it.
+                    _mark_dynamic_dim(x, dim)
             out = kernel(
                 x,
                 tvec,
@@ -715,6 +726,57 @@ class ImmutableTransformerRuntime:
     def activate_sampling_fallback(self) -> ImmutableProgram:
         self.set_residency_plan(self.sampling_fallback_plan)
         return self.program(self.SAMPLE)
+
+    def transition_training_block(self, block_key: str, *, resident: bool) -> dict:
+        """Atomically add or remove one complete training block by stable key."""
+        current = self._sources.plan or self.residency.plan
+        if current.phase != self.TRAIN:
+            raise ImmutableRuntimeError(
+                f"training_block_transition_requires_train:{current.phase}"
+            )
+        key = str(block_key)
+        abi = next((item for item in self._block_abis if item.block_key == key), None)
+        if abi is None:
+            raise ImmutableRuntimeError(f"unknown_training_block:{key}")
+        leaf_keys = tuple((key, leaf) for leaf in abi.leaf_names)
+        present = tuple(item for item in leaf_keys if item in current.resident_leaf_keys)
+        if present and len(present) != len(leaf_keys):
+            raise ImmutableRuntimeError(f"partial_training_block_layout:{key}")
+        want_resident = bool(resident)
+        if bool(present) == want_resident:
+            return {
+                "changed": False,
+                "block_key": key,
+                "resident": want_resident,
+                "plan": current,
+            }
+        protected = frozenset(
+            (str(block), str(leaf))
+            for block, leaf in getattr(
+                self.model,
+                "_mm_immutable_protected_training_leaf_keys",
+                (),
+            )
+        )
+        if not want_resident and any(item in protected for item in leaf_keys):
+            raise ImmutableRuntimeError(f"protected_training_block:{key}")
+
+        next_keys = set(current.resident_leaf_keys)
+        if want_resident:
+            next_keys.update(leaf_keys)
+        else:
+            next_keys.difference_update(leaf_keys)
+        next_plan = ResidencyPlan.build(self.TRAIN, next_keys)
+        delta = self.set_residency_plan(next_plan)
+        self.model._mm_immutable_training_plan = next_plan
+        return {
+            "changed": True,
+            "block_key": key,
+            "resident": want_resident,
+            "resident_bytes": self.residency.resident_bytes(),
+            "delta": delta,
+            "plan": next_plan,
+        }
 
     def next_training_promotion_bytes(self) -> int:
         current = self._sources.plan or self.residency.plan

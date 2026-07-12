@@ -989,6 +989,7 @@ _STATS = {
     "wait_ms": 0.0,
     "depth_waits": 0,
 }
+_LIFETIME_STATS = dict(_STATS)
 # (h2d_start, h2d_end) pairs awaiting timing. Drained only when the events have
 # already completed, so accounting for a copy never blocks the host on it.
 _PENDING_H2D: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
@@ -1020,7 +1021,9 @@ def _drain_h2d(block: bool = False) -> None:
                 continue
             if block:
                 h2d_end.synchronize()
-            _STATS["h2d_ms"] += h2d_start.elapsed_time(h2d_end)
+            elapsed_ms = h2d_start.elapsed_time(h2d_end)
+            _STATS["h2d_ms"] += elapsed_ms
+            _LIFETIME_STATS["h2d_ms"] += elapsed_ms
         except RuntimeError:
             # Event never recorded (abandoned fetch, e.g. OOM unwind): drop it.
             pass
@@ -1075,6 +1078,12 @@ def fetch_stats(reset: bool = False) -> dict:
     if reset:
         reset_fetch_stats()
     return stats
+
+
+def lifetime_fetch_stats() -> dict:
+    """Return monotonic fetch counters unaffected by report-window resets."""
+    _drain_h2d(block=True)
+    return dict(_LIFETIME_STATS)
 
 
 def fetch_performance_metrics(stats: dict, *, step_wall_ms=None) -> dict:
@@ -1261,6 +1270,9 @@ def _fetch_start_impl(host_flat: torch.Tensor) -> torch.Tensor:
         _STATS["fetches"] += 1
         _STATS["bytes"] += int(host_flat.numel())
         _STATS["copies"] += 1
+        _LIFETIME_STATS["fetches"] += 1
+        _LIFETIME_STATS["bytes"] += int(host_flat.numel())
+        _LIFETIME_STATS["copies"] += 1
     return torch.tensor([tid], dtype=torch.int64)
 
 
@@ -1359,6 +1371,9 @@ def _fetch_start_multi_impl(
         _STATS["fetches"] += 1
         _STATS["bytes"] += compact_nbytes
         _STATS["copies"] += len(rows)
+        _LIFETIME_STATS["fetches"] += 1
+        _LIFETIME_STATS["bytes"] += compact_nbytes
+        _LIFETIME_STATS["copies"] += len(rows)
     return torch.tensor([tid], dtype=torch.int64)
 
 
@@ -1456,7 +1471,9 @@ def fetch_wait(token: torch.Tensor, nbytes: int) -> torch.Tensor:
     current = torch.cuda.current_stream()
     start = time.perf_counter()
     current.wait_event(ticket.ready_event)
-    _STATS["wait_ms"] += (time.perf_counter() - start) * 1000.0
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    _STATS["wait_ms"] += elapsed_ms
+    _LIFETIME_STATS["wait_ms"] += elapsed_ms
     if ticket.h2d_start is not None and ticket.h2d_end is not None:
         # Queue the pair for opportunistic draining; do NOT synchronize here.
         # Blocking on h2d_end just to service a counter stalls the submit loop,

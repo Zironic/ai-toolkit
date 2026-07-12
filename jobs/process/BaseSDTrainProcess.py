@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 import torch
 import torch.backends.cuda
 from huggingface_hub import HfApi, interpreter_login
-from toolkit.memory_management import MemoryManager, vram_budget
+from toolkit.memory_management import MemoryManager, allocator_cap, vram_budget
 from toolkit.memory_management.arena_offload import (
     get_arena_runtime,
     is_memory_managed,
@@ -1098,16 +1098,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.logger.start()
         self.prepare_accelerator()
         if self.accelerator.is_main_process:
-            try:
-                from toolkit.memory_management import MemoryManager
-                memory = MemoryManager.training_runtime_diagnostics(
-                    getattr(self.sd, 'unet', None), self.device_torch
-                )
-            except Exception as error:
-                print_acc(
-                    f"[MemoryManager] pre-training diagnostic failed: {error}"
-                )
-                memory = None
+            memory = None
+            if get_arena_runtime(getattr(self.sd, 'unet', None)) is None:
+                try:
+                    from toolkit.memory_management import MemoryManager
+                    memory = MemoryManager.training_runtime_diagnostics(
+                        getattr(self.sd, 'unet', None), self.device_torch
+                    )
+                except Exception as error:
+                    print_acc(
+                        f"[MemoryManager] pre-training diagnostic failed: {error}"
+                    )
             if memory is not None:
                 print_acc(
                     "[MemoryManager] pre-training smart layout: "
@@ -1339,17 +1340,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         tg=compile_counters['graphs_total'],
                     )
                 )
-        try:
-            from toolkit.memory_management import MemoryManager
-            driver_free_sample = getattr(self, '_last_driver_free_sample', None) or {}
-            smart_memory = MemoryManager.training_runtime_diagnostics(
-                getattr(self.sd, 'unet', None), self.device_torch,
-                observed_driver_free_min_bytes=driver_free_sample.get('min_free_bytes'),
-                observed_driver_total_bytes=driver_free_sample.get('total_bytes'),
-                observed_driver_free_samples=driver_free_sample.get('samples'),
-            )
-        except Exception as error:
-            smart_memory = {'diagnostic_error': str(error)}
+        arena_runtime = get_arena_runtime(getattr(self.sd, 'unet', None))
+        smart_memory = None
+        if arena_runtime is None:
+            try:
+                from toolkit.memory_management import MemoryManager
+                driver_free_sample = getattr(self, '_last_driver_free_sample', None) or {}
+                smart_memory = MemoryManager.training_runtime_diagnostics(
+                    getattr(self.sd, 'unet', None), self.device_torch,
+                    observed_driver_free_min_bytes=driver_free_sample.get('min_free_bytes'),
+                    observed_driver_total_bytes=driver_free_sample.get('total_bytes'),
+                    observed_driver_free_samples=driver_free_sample.get('samples'),
+                )
+            except Exception as error:
+                smart_memory = {'diagnostic_error': str(error)}
         if smart_memory is not None:
             record['smart_training_offload'] = smart_memory
             if 'diagnostic_error' not in smart_memory:
@@ -1389,6 +1393,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
             offload_profile = MemoryManager.offload_profile_report(reset=True)
         except Exception as error:
             offload_profile = f"[OffloadProfile] report failed: {error}"
+        if arena_runtime is not None:
+            try:
+                arena_memory = arena_runtime.diagnostics()
+            except Exception as error:
+                arena_memory = {'diagnostic_error': str(error)}
+            record['arena_offload'] = arena_memory
+            if 'diagnostic_error' not in arena_memory:
+                controller = (
+                    (arena_memory.get('policy') or {}).get('controller') or {}
+                )
+                print_acc(
+                    "[ArenaOffload] policy: "
+                    f"state={controller.get('state')} "
+                    f"action={controller.get('last_action')} "
+                    f"reason={controller.get('last_reason')} "
+                    f"block={controller.get('last_block_key')} "
+                    f"resident={arena_memory.get('resident_bytes', 0) / (1024 ** 3):.2f} GiB "
+                    f"(singleton={arena_memory.get('singleton_resident_bytes', 0) / (1024 ** 3):.2f} "
+                    f"canonical={arena_memory.get('canonical_resident_bytes', 0) / (1024 ** 3):.2f}) "
+                    f"plan={arena_memory.get('plan_fingerprint')}"
+                )
         if offload_profile:
             record['offload_profile'] = offload_profile
             print_acc(offload_profile)
@@ -3571,16 +3596,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
                 ),
             )
-            try:
-                MemoryManager.prepare_training_memory_for_shape(
-                    getattr(self.sd, 'unet', None),
-                    self.device_torch,
-                    shape_key=offload_shape_key,
-                )
-            except Exception as error:
-                print_acc(
-                    f"[MemoryManager] manual pre-step guard failed: {error}"
-                )
+            arena_runtime = get_arena_runtime(self.sd.unet)
+            if arena_runtime is None:
+                try:
+                    MemoryManager.prepare_training_memory_for_shape(
+                        getattr(self.sd, 'unet', None),
+                        self.device_torch,
+                        shape_key=offload_shape_key,
+                    )
+                except Exception as error:
+                    print_acc(
+                        f"[MemoryManager] manual pre-step guard failed: {error}"
+                    )
             driver_free_monitor = None
             driver_free_sample = None
             if torch.cuda.is_available():
@@ -3597,7 +3624,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # backward region. Backward must be inside: checkpoint
                 # recomputation re-enters the block runtime. This is also the
                 # residency controller's phase boundary (git-bug 0c577ef).
-                arena_runtime = get_arena_runtime(self.sd.unet)
                 execution_context = (
                     arena_runtime.training_step(
                         shape_key=offload_shape_key,
@@ -3626,12 +3652,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     driver_free_sample = driver_free_monitor.stop()
                 self._last_driver_free_sample = driver_free_sample
             if did_oom:
-                # Our own allocator cap is a tuning lever, not a kill switch: if
-                # that is what the step hit, widen it and let the run continue
-                # (the batch is still skipped) rather than spend a strike on it.
-                # Strict mode declines, and physical OOMs cannot be relieved.
-                cap_relieved = MemoryManager.relieve_wddm_cap_after_oom(
-                    self.device_torch, context=f"training step {self.step_num}"
+                # Legacy offload treats its allocator cap as an OOM relief
+                # lever. Arena offload binds the cap only at phase boundaries,
+                # so an arena OOM never widens it from this per-step path.
+                cap_relieved = (
+                    arena_runtime is None
+                    and MemoryManager.relieve_wddm_cap_after_oom(
+                        self.device_torch,
+                        context=f"training step {self.step_num}",
+                    )
                 )
                 if not cap_relieved:
                     self.num_consecutive_oom += 1
@@ -3647,12 +3676,43 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     reserved = torch.cuda.memory_reserved(dev) / gib
                     peak_allocated = torch.cuda.max_memory_allocated(dev) / gib
                     peak_reserved = torch.cuda.max_memory_reserved(dev) / gib
+                    active_cap_bytes = allocator_cap.applied_cap_bytes(dev)
+                    active_cap_gib = (
+                        None
+                        if active_cap_bytes is None
+                        else active_cap_bytes / gib
+                    )
+                    driver_free_bytes = (driver_free_sample or {}).get(
+                        'min_free_bytes'
+                    )
+                    driver_free_gib = (
+                        None
+                        if driver_free_bytes is None
+                        else float(driver_free_bytes) / gib
+                    )
+                    arena_cap_target = None
+                    if arena_runtime is not None:
+                        try:
+                            arena_cap_target = arena_runtime.diagnostics().get(
+                                'training_cap_target_bytes'
+                            )
+                        except Exception:
+                            arena_cap_target = None
+                    cap_mode = (
+                        'arena_target'
+                        if arena_cap_target is not None
+                        else ('cliff_bound' if active_cap_bytes is not None else 'none')
+                    )
                     print_acc(
                         "[MemoryManager] OOM snapshot before ring reset: "
                         f"allocated={allocated:.2f} GiB "
                         f"reserved={reserved:.2f} GiB "
                         f"peak_allocated={peak_allocated:.2f} GiB "
-                        f"peak_reserved={peak_reserved:.2f} GiB"
+                        f"peak_reserved={peak_reserved:.2f} GiB "
+                        f"allocator_cap={active_cap_gib if active_cap_gib is not None else '-'} GiB "
+                        f"cap_mode={cap_mode} "
+                        f"driver_free={driver_free_gib if driver_free_gib is not None else '-'} GiB "
+                        f"policy_owner={'arena' if arena_runtime is not None else 'legacy'}"
                     )
                     MemoryManager.recover_cuda_pipeline_after_oom()
                     # True within-step peak across accumulations (the per-accumulation
@@ -3666,24 +3726,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         getattr(self, '_step_peak_reserved_bytes', 0),
                         int(torch.cuda.max_memory_reserved(dev)),
                     )
-                    try:
-                        MemoryManager.auto_tune_training_memory(
-                            getattr(self.sd, 'unet', None),
-                            self.device_torch,
-                            shape_key=offload_shape_key,
-                            step_num=self.step_num,
-                            step_time_s=time.perf_counter() - step_started_at,
-                            did_oom=True,
-                            peak_allocated_override=peak_alloc_override,
-                            peak_reserved_override=peak_reserved_override,
-                            observed_driver_free_min_bytes=(driver_free_sample or {}).get('min_free_bytes'),
-                            observed_driver_total_bytes=(driver_free_sample or {}).get('total_bytes'),
-                            observed_driver_free_samples=(driver_free_sample or {}).get('samples'),
-                        )
-                    except Exception as error:
-                        print_acc(
-                            f"[MemoryManager] training autotune after OOM failed: {error}"
-                        )
+                    if arena_runtime is None:
+                        try:
+                            MemoryManager.auto_tune_training_memory(
+                                getattr(self.sd, 'unet', None),
+                                self.device_torch,
+                                shape_key=offload_shape_key,
+                                step_num=self.step_num,
+                                step_time_s=time.perf_counter() - step_started_at,
+                                did_oom=True,
+                                peak_allocated_override=peak_alloc_override,
+                                peak_reserved_override=peak_reserved_override,
+                                observed_driver_free_min_bytes=(driver_free_sample or {}).get('min_free_bytes'),
+                                observed_driver_total_bytes=(driver_free_sample or {}).get('total_bytes'),
+                                observed_driver_free_samples=(driver_free_sample or {}).get('samples'),
+                            )
+                        except Exception as error:
+                            print_acc(
+                                f"[MemoryManager] training autotune after OOM failed: {error}"
+                            )
                     torch.cuda.reset_peak_memory_stats(dev)
                 # skip this step and keep going
                 print_acc("")
@@ -3708,24 +3769,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         getattr(self, '_step_peak_reserved_bytes', 0),
                         int(torch.cuda.max_memory_reserved(_dev)),
                     )
-                try:
-                    MemoryManager.auto_tune_training_memory(
-                        getattr(self.sd, 'unet', None),
-                        self.device_torch,
-                        shape_key=offload_shape_key,
-                        step_num=self.step_num,
-                        step_time_s=time.perf_counter() - step_started_at,
-                        did_oom=False,
-                        peak_allocated_override=peak_alloc_override,
-                        peak_reserved_override=peak_reserved_override,
-                        observed_driver_free_min_bytes=(driver_free_sample or {}).get('min_free_bytes'),
-                        observed_driver_total_bytes=(driver_free_sample or {}).get('total_bytes'),
-                        observed_driver_free_samples=(driver_free_sample or {}).get('samples'),
-                    )
-                except Exception as error:
-                    print_acc(
-                        f"[MemoryManager] training autotune failed: {error}"
-                    )
+                if arena_runtime is None:
+                    try:
+                        MemoryManager.auto_tune_training_memory(
+                            getattr(self.sd, 'unet', None),
+                            self.device_torch,
+                            shape_key=offload_shape_key,
+                            step_num=self.step_num,
+                            step_time_s=time.perf_counter() - step_started_at,
+                            did_oom=False,
+                            peak_allocated_override=peak_alloc_override,
+                            peak_reserved_override=peak_reserved_override,
+                            observed_driver_free_min_bytes=(driver_free_sample or {}).get('min_free_bytes'),
+                            observed_driver_total_bytes=(driver_free_sample or {}).get('total_bytes'),
+                            observed_driver_free_samples=(driver_free_sample or {}).get('samples'),
+                        )
+                    except Exception as error:
+                        print_acc(
+                            f"[MemoryManager] training autotune failed: {error}"
+                        )
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()

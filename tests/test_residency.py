@@ -5,12 +5,30 @@ import torch
 
 from toolkit.memory_management import pin_manager
 from toolkit.memory_management.canonical_arena import CanonicalArena
-from toolkit.memory_management.immutable_runtime import ImmutableTransformerRuntime
+from toolkit.memory_management.immutable_runtime import (
+    ImmutableRuntimeError,
+    ImmutableTransformerRuntime,
+    _mark_dynamic_dim,
+)
 from toolkit.memory_management.residency import (
     ResidencyError,
     ResidencyPlan,
     ResidencyState,
 )
+
+
+
+
+def test_dynamic_hint_is_weak_so_alignment_guards_can_specialize(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch._dynamo,
+        "maybe_mark_dynamic",
+        lambda tensor, dim: calls.append((tensor, dim)),
+    )
+    tensor = torch.zeros(1, 768, 4)
+    _mark_dynamic_dim(tensor, 1)
+    assert calls == [(tensor, 1)]
 
 
 def _linear(seed=0, *, device="cpu", dtype=torch.float32):
@@ -94,6 +112,60 @@ def test_runtime_training_transitions_are_whole_block(arena_layers):
     relief = runtime.reduce_training_residency(1)
     assert relief["removed_blocks"] == ("blocks.0",)
     assert state.plan.resident_leaf_keys == frozenset()
+
+def test_exact_training_block_transaction_uses_stable_key(arena_layers):
+    arena, layers = arena_layers
+    block = SimpleNamespace(entries=tuple(layers.items()))
+    model = SimpleNamespace(
+        blocks=(block,),
+        _mm_immutable_protected_training_leaf_keys=frozenset(),
+    )
+    state = ResidencyState(arena, "cpu")
+    state.reconcile(ResidencyPlan.build("train", ()))
+    runtime = ImmutableTransformerRuntime(
+        model,
+        state,
+        architecture_adapter=_LinearBlockAdapter(),
+        compile_blocks=False,
+    )
+    runtime.finalize_execution()
+
+    promoted = runtime.transition_training_block("blocks.0", resident=True)
+    expected = frozenset(("blocks.0", name) for name in layers)
+    assert promoted["changed"] is True
+    assert state.plan.resident_leaf_keys == expected
+
+    unchanged = runtime.transition_training_block("blocks.0", resident=True)
+    assert unchanged["changed"] is False
+
+    demoted = runtime.transition_training_block("blocks.0", resident=False)
+    assert demoted["changed"] is True
+    assert state.plan.resident_leaf_keys == frozenset()
+
+
+def test_exact_training_block_transaction_rejects_protected_demote(arena_layers):
+    arena, layers = arena_layers
+    block = SimpleNamespace(entries=tuple(layers.items()))
+    protected = frozenset({("blocks.0", next(iter(layers)))})
+    model = SimpleNamespace(
+        blocks=(block,),
+        _mm_immutable_protected_training_leaf_keys=protected,
+    )
+    state = ResidencyState(arena, "cpu")
+    all_keys = tuple(("blocks.0", name) for name in layers)
+    state.reconcile(ResidencyPlan.build("train", all_keys))
+    runtime = ImmutableTransformerRuntime(
+        model,
+        state,
+        architecture_adapter=_LinearBlockAdapter(),
+        compile_blocks=False,
+    )
+    runtime.finalize_execution()
+
+    with pytest.raises(ImmutableRuntimeError, match="protected_training_block"):
+        runtime.transition_training_block("blocks.0", resident=False)
+    assert state.plan.resident_leaf_keys == frozenset(all_keys)
+
 
 def test_cpu_reconcile_never_mutates_parameters_or_pin_ledger(arena_layers):
     arena, layers = arena_layers

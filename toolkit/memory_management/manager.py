@@ -45,6 +45,7 @@ from .ingraph_stream import drain_fetch_runtime as ingraph_drain_fetch_runtime
 from .ingraph_stream import _flatten_leaves, _rebuild_from_leaves
 from . import bounce_pool
 from . import pin_manager
+from . import allocator_cap
 from . import vram_budget
 
 
@@ -225,7 +226,7 @@ def _dxgi_attach_log_text(cuda_device_index: int = 0) -> str:
 # Per-device bytes the allocator cap has been permanently widened by, after the
 # cap was violated in non-strict mode. Keyed by CUDA device index; see
 # MemoryManager.relieve_wddm_cap_after_oom.
-_WDDM_CAP_RELIEF_BYTES: dict = {}
+_WDDM_CAP_RELIEF_BYTES = allocator_cap.RELIEF_BYTES
 
 
 class MemoryManager:
@@ -2716,7 +2717,7 @@ class MemoryManager:
         """Cold-start reserve-space assumption before the first measured step."""
         return float(_env("AI_TOOLKIT_TRAINING_AUTO_SEED_WORKING_RESERVE_GIB", "5.0"))
 
-    _wddm_hard_cap_applied: dict = {}
+    _wddm_hard_cap_applied = allocator_cap.APPLIED_FRACTIONS
     # Cap violations are not fatal by default. The cap exists as a *tuning
     # lever* (it recycles idle cache on demand and is the residency
     # controller's cheap inner lever), not as a kill switch: a training run
@@ -2780,86 +2781,12 @@ class MemoryManager:
     def _apply_wddm_hard_allocator_cap(
         cls, device, wddm_hard_gib=None, *, target_cap_bytes=None
     ):
-        """Hard-cap torch's allocator below the WDDM dedicated ceiling.
-
-        Crossing the dedicated-VRAM ceiling on Windows does not OOM -- WDDM
-        silently pages GPU memory to system RAM (catastrophic slowdown, no
-        error; we have observed torch_allocated=12.23 GiB on an 11.99 GiB
-        card). set_per_process_memory_fraction makes the caching allocator
-        recycle its cache and, failing that, raise a real OOM at the cap
-        instead, so the failure is loud, attributable, and never a silent
-        30x slowdown. The cap accounts for non-torch device usage (see
-        _wddm_cap_fraction); it is re-measured at every call, and each call
-        site is a phase boundary (training attach / sampling start), so the
-        latest measurement wins.
-
-        ``target_cap_bytes`` optionally requests a *reclaim* cap below the cliff
-        bound: the caller has planned its live footprint and wants the cap to sit
-        just above it (banking the unused dedicated VRAM as the DXGI overflow
-        valve + tier-1 climb headroom) rather than at the ceiling. It is clamped
-        to the cliff bound above, so the worst case is exactly the default
-        behavior; the reclaim only ever tightens, never loosens past the ceiling.
-        """
-        if sys.platform != "win32" or not torch.cuda.is_available():
-            return
-        dev = torch.device(device if device is not None else "cuda")
-        if dev.type != "cuda":
-            return
-        index = dev.index if dev.index is not None else torch.cuda.current_device()
-        try:
-            hard_gib = float(wddm_hard_gib) if wddm_hard_gib is not None else 1.0
-        except (TypeError, ValueError):
-            hard_gib = 1.0
-        if hard_gib <= 0:
-            hard_gib = 1.0
-        # `total`/`free` are the *governing* card, which a simulated smaller card
-        # shrinks (vram_budget.set_simulated_card_bytes). torch enforces the
-        # fraction against the physical card, so the cap is planned in governing
-        # bytes and converted back to a real-card fraction at the last moment.
-        total = vram_budget.device_total_bytes(index)
-        real_total = vram_budget.real_device_total_bytes(index)
-        free_bytes, _governing_total = vram_budget.device_mem_info(index)
-        reserved_bytes = torch.cuda.memory_reserved(index)
-        cliff_fraction = cls._wddm_cap_fraction(total, free_bytes, reserved_bytes, hard_gib)
-        fraction = cliff_fraction
-        reclaimed = False
-        if target_cap_bytes is not None:
-            target_fraction = float(target_cap_bytes) / float(total)
-            # Never loosen past the cliff, never collapse below a sane floor.
-            fraction = max(0.1, min(cliff_fraction, target_fraction))
-            reclaimed = fraction < cliff_fraction - 1e-9
-        # Relief granted after a past violation survives phase boundaries: a cap
-        # that snapped back to the cliff bound every phase would re-crash on the
-        # very footprint it just forgave.
-        relief_bytes = _WDDM_CAP_RELIEF_BYTES.get(index, 0)
-        if relief_bytes:
-            fraction = min(1.0, fraction + relief_bytes / float(total))
-        applied = fraction * total / float(real_total)
-        previous = cls._wddm_hard_cap_applied.get(index)
-        # 64 MiB tolerance: non_torch jitters a little every step (the per-step
-        # trim re-measures); only real shifts (phase changes, kernel-code
-        # growth) are worth a reset and a log line.
-        if previous is not None and abs(previous - applied) < (64 * 1024 ** 2) / real_total:
-            return
-        torch.cuda.set_per_process_memory_fraction(applied, index)
-        cls._wddm_hard_cap_applied[index] = applied
-        gib = 1024 ** 3
-        non_torch = max(0, (total - free_bytes) - reserved_bytes)
-        source = (
-            f"reclaim target, cliff {cliff_fraction * total / gib:.2f} GiB"
-            if reclaimed
-            else "cliff bound"
-        )
-        if relief_bytes:
-            source += f"; +{relief_bytes / gib:.2f} GiB post-violation relief"
-        if total != real_total:
-            source += f"; SIMULATED {total / gib:.2f} GiB card"
-        print(
-            "[MemoryManager] WDDM hard allocator cap: "
-            f"{fraction * total / gib:.2f}/{total / gib:.2f} GiB "
-            f"({source}; margin {hard_gib:.2f} GiB, non_torch {non_torch / gib:.2f} GiB; "
-            "allocation beyond this recycles cache or raises OOM "
-            "instead of silently paging)"
+        """Compatibility wrapper for the shared phase-boundary cap mechanism."""
+        return allocator_cap.apply_wddm_hard_allocator_cap(
+            device,
+            wddm_hard_gib,
+            target_cap_bytes=target_cap_bytes,
+            log_prefix="[MemoryManager]",
         )
 
     @classmethod
@@ -3142,6 +3069,12 @@ class MemoryManager:
                 or child.__class__.__name__ in CONV_MODULES
             )
         }
+        plan["singleton_resident_bytes"] = int(sum(
+            cls._module_bytes(child)
+            for child in module.modules()
+            if id(child) in runtime_candidate_ids
+        ))
+
         # The immutable runtime is the sole backend: the canonical blocks
         # stream through the arena, and every non-canonical singleton module
         # (tmlp, tproj, first/last projections, text fusion, ...) stays

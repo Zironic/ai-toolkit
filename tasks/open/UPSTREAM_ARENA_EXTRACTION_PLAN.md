@@ -340,43 +340,94 @@ reconstruct it from private fields.
 use block keys. Controller actions add/remove complete blocks only. Legacy
 manager tests pass unchanged.
 
-## Phase 3 - Transactional canonicalization
+## Phase 3 - Destination-first transactional arena construction
 
 Today the arena canonicalizes and repoints blocks one at a time; on a mid-block
 failure the earlier Parameters stay repointed at released storage, and
 [canonical_arena.py](../../toolkit/memory_management/canonical_arena.py) says so
 in a comment ("cannot un-repoint a Parameter").
 
-Replace with prepare-and-commit:
+This phase replaces that canonicalization path outright. Do not first make the
+existing full-model repack transactional and then replace it: that would retain
+a second model-sized copy as a knowingly temporary implementation.
 
-- **Prepare** (no model mutation): validate leaves, build layout, allocate and
-  populate host flats, register/pin, retain original Parameter objects. On any
-  failure: release every prepared flat, unregister every pin, leave every
-  Parameter unchanged, leave no runtime marker, raise a clear setup error.
-- **Commit** (only after all blocks prepare): repoint Parameters, publish block
-  records, install the whole-model movement guard, register the runtime. If
-  commit fails, restore the retained originals before releasing storage.
+### 3a - Extract the layout prerequisite
+
+Move the static packing half of `ingraph_stream.py` into `layout.py` before
+building the transaction. It owns leaf inspection, final packed-layout
+descriptions, alignment and byte ranges, typed destination views, Parameter
+views, supported-wrapper reconstruction, and packed-storage release. It owns no
+CUDA streams, queues, profiling, traces, hooks, or transfer lifetime.
+
+Make the leaf list data-driven while extracting it: carry `leaf_descriptors` +
+`native_fp8_eligible` instead of name-specific flags and string branches. This
+is the whole quantization cleanup; it is needed so the construction transaction
+can expose destinations for every supported weight, scale, and bias without
+encoding Krea2 internals.
+
+### 3b - Build the generic transaction
+
+The arena package exposes a prepared build rather than making Krea2 construct
+arena internals:
+
+```python
+build = runtime.prepare_canonical_storage(transformer, adapter)
+loader.populate(build.destinations)
+build.commit()
+```
+
+The compatibility path for loaders that still materialize model tensors is:
+
+```python
+build = runtime.prepare_canonical_storage(transformer, adapter)
+build.populate_from_model()
+build.commit()
+```
+
+The transaction has three explicit stages:
+
+- **Prepare** (no model mutation): inspect the architecture adapter; calculate
+  every block's final packed layout; allocate the final page-exclusive host
+  flats; expose typed destination views for every weight, scale, and bias; and
+  retain the original Parameter objects. Populate the destinations from either
+  a direct checkpoint/cache loader or `populate_from_model()`. Register the
+  populated flats with `cudaHostRegister`, then validate wrapper reconstruction.
+  On any failure, release every prepared flat, unregister every pin, leave every
+  Parameter unchanged, leave no runtime marker, and raise a clear setup error.
+- **Commit** (only after all blocks prepare): construct quantized wrappers and
+  Parameter views over the final flats; repoint all canonical leaves as one
+  atomic publication; publish block records and the runtime marker; and install
+  the whole-model movement guard. If commit fails, restore the retained original
+  Parameters before releasing storage.
+- **Rollback:** if commit began, restore the original Parameters before releasing
+  prepared storage. If it did not, release the prepared flats and pins without
+  touching the model.
+
+The direct source is the performance path: loaders write once into final arena
+storage and never materialize a second full canonical model copy. The
+`populate_from_model()` source is a compatibility path, not the implementation
+that direct-capable loaders should use. It keeps arena offload available to
+other supported models without requiring every loader to change at once.
 
 **No silent fallback to per-linear** after the user explicitly selected arena
 offload. Fail clearly, leave the model intact and eagerly executable.
 
 Failure-injection tests: unsupported layout mid-stack; pin failure mid-stack;
-allocation failure after earlier blocks prepared; commit failure after the first
-repoint. Assert Parameter identity/storage restored, data pointers valid, no
-pin-ledger leak, no runtime marker, model still runs eagerly.
+allocation failure after earlier blocks prepared; direct population failure;
+wrapper validation failure; commit failure after the first repoint. Assert
+Parameter identity/storage restored, data pointers valid, no pin-ledger leak,
+no runtime marker, model still runs eagerly. Test both population sources and
+assert that the direct source does not allocate or copy a second canonical
+model-sized payload.
 
-## Phase 4 - Split layout and transfer out of `ingraph_stream`
+## Phase 4 - Split transfer out of `ingraph_stream`
 
 Cheaper than it looks. Commit `3dd7f38` already retired the legacy in-graph
-paths, so `ingraph_stream.py` is essentially `layout.py` + `transfer.py`
-already: packing/views/leaf-plans up top, the fetch ring below. The bouncing
+paths, and Phase 3 has already moved packing/views/leaf plans into `layout.py`.
+Move the remaining fetch-ring half into `transfer.py`. The bouncing
 Linear execution, per-linear trace recording, sampling monkeypatches, and
 bounce-pool scheduling are **already gone**.
 
-- `layout.py`: leaf inspection, packed-layout descriptions, alignment/byte
-  ranges, flat alloc/populate, Parameter views, supported-wrapper
-  reconstruction, packed-storage release. No CUDA streams, queues, profiling,
-  traces, or hooks.
 - `transfer.py`: compact transfer plans, range tensors, block fetch custom ops,
   fetch ring alloc, start/wait/free lifetime, backward-recompute lifetime,
   checkpoint context helpers for the immutable train trunk.
@@ -387,12 +438,7 @@ check. Also remove the process-global setup calls from
 `BaseSDTrainProcess.__init__` (trace/profile/prefetch); the runtime owns one
 transfer runtime. Legacy `MemoryManager` keeps its own process-global state.
 
-While here, make the leaf list **data-driven** rather than hardcoding FP8 in
-names: carry `leaf_descriptors` + `native_fp8_eligible` instead of `fp8_flags` /
-`weight_scale` / `kind == "fp8_rowwise"` string branches. That is the whole of
-the quantization cleanup - see the non-goal below.
-
-## Phase 5 - Krea2 collapses to backend selection
+## Phase 5 - Krea2 direct population and backend selection
 
 ```python
 if model_config.arena_offload:
@@ -406,10 +452,21 @@ else:
                          offload_percent=..., ignore_modules=...)
 ```
 
-Preserve the verified load order: load transformer -> merge assistant LoRA into
-the frozen base -> quantize -> freeze canonical base -> prepare arena -> move
-permanent noncanonical modules -> (trainer attaches network) -> finalize runtime
--> build optimizer -> compile on first use.
+Wire both Krea2 materialization paths - ranged checkpoint loading and quantized
+cache loading - to populate Phase 3's final typed destination views directly.
+They select and feed the generic arena transaction; they do not calculate
+layouts, allocate flats, construct wrappers, publish block records, or manage
+rollback. Retain `populate_from_model()` for arbitrary supported models whose
+loaders have not adopted direct population.
+
+Preserve the semantic load order: incorporate the assistant LoRA into the frozen
+base before its final canonical representation is committed; produce the final
+quantized or unquantized canonical values directly in prepared arena
+destinations; commit and freeze the canonical base; move permanent noncanonical
+modules; (trainer attaches network); finalize runtime; build optimizer; compile
+on first use. The compatibility path may continue to materialize and quantize
+the transformer before `populate_from_model()`, but Krea2's direct-capable paths
+must not take that second-copy route.
 
 Do not call `transformer.to(...)` after canonicalization; route whole-model moves
 through `runtime.place_permanent_modules(device, dtype)` and keep the arena's
@@ -419,8 +476,11 @@ through `runtime.place_permanent_modules(device, dtype)` and keep the arena's
 offload applies only to the supported transformer blocks.
 
 **Acceptance:** Krea memory code = backend selection + adapter selection +
-config conversion + one sampling context call. No arena construction, plan
-conversion, residency manipulation, or compile logic in the Krea folder.
+config conversion + loader destination population + one sampling context call.
+No arena construction, layout calculation, wrapper construction, plan
+conversion, residency manipulation, or compile logic in the Krea folder. Both
+Krea loader paths populate final arena storage directly; the generic
+compatibility source remains covered independently.
 
 ## Phase 6 - Shared trainer reduces to generic lifecycle calls
 
@@ -549,9 +609,11 @@ Stage 3 lands, when there is exactly one owner of that code.
 
 ## Unit
 
-- **Arena admission:** transactional success; mid-block layout failure; mid-block
-  pin failure; no Parameter mutation on failed prepare; no pin leak; safe close
-  after partial prepare.
+- **Arena admission:** direct destination population without a second canonical
+  payload; compatibility population from an existing model; transactional
+  success; mid-block layout, population, wrapper, and pin failures; no Parameter
+  mutation on failed prepare; restored originals after failed commit; no pin
+  leak; safe close after partial prepare.
 - **Planner:** plans by block key; accounts for permanent singleton bytes;
   accounts for actual block ring depth; protects requested trailing blocks; never
   emits partial-block initial plans; deterministic for equal-size blocks.
@@ -618,12 +680,15 @@ worsens steady-state transfer overlap.
    along with it. The worst-shape promotion veto does NOT - see Phase 2.)
 4. Phase 1 - arena package + facade.
 5. Phase 2 - arena-native policy; cut the `MemoryManager` calls.
-6. Phase 3 - transactional canonicalization.
-7. Phase 4 - split layout/transfer; data-driven leaf list.
-8. Phases 5-6 - Krea and shared trainer collapse to the facade.
-9. Phase 7-8 - remove obsolete legacy branches; settle config.
-10. Full validation matrix.
-11. Stage 3 - real extraction, using the dry run's diff as the source.
+6. Phase 3a - extract layout and the data-driven leaf description API.
+7. Phase 3b - destination-first transactional construction, including the
+   `populate_from_model()` compatibility source.
+8. Phase 4 - split the remaining transfer runtime out of `ingraph_stream`.
+9. Phases 5-6 - wire Krea's direct loader population and collapse Krea/shared
+   trainer orchestration to the facade.
+10. Phase 7-8 - remove obsolete legacy branches; settle config.
+11. Full validation matrix.
+12. Stage 3 - real extraction, using the dry run's diff as the source.
 
 # Readiness checklist
 
