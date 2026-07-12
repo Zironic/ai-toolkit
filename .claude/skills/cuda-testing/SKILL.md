@@ -34,6 +34,15 @@ Validate real CUDA behavior without a real model:
   wall-clock, except in explicitly-named bench scripts.
 - Existing tests under `tests/` are the style guide: bounce pool, block
   stream, working-reserve sim, shape keys.
+- **Exercise torch.compile on CUDA tensors, never CPU ones.** Compilation is
+  host work, but the device picks the backend: CUDA -> Triton (self-contained,
+  works), CPU -> Inductor C++ -> needs `cl.exe`, which this box lacks. The CPU
+  compile then degrades silently and Dynamo's counters stop moving, which looks
+  exactly like the thing you are measuring being broken.
+- Timing comparisons need an idle card. This box's desktop (Teams, Edge,
+  Discord, overlays) can hold ~1.7 GiB of VRAM and swing memcpy time 2x between
+  runs; check `nvidia-smi` utilization before trusting any A/B, and compare
+  kernel-level totals (which are contention-robust) alongside wall clock.
 
 ## Test-order leaks: the standing policy
 

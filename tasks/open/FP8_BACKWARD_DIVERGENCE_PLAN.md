@@ -12,6 +12,19 @@ pass (which the existing one-time `allclose(rtol=2e-2)` self-check in
 
 ## What exactly is under test
 
+> **Any divergence measurement taken before the gate was made real must be
+> redone.** `layer_offloading_fp8_grad_input` gated only the legacy
+> `_BouncingLinearFn.backward` described below. The compiled/arena path
+> (`_Fp8LinearTrainingFn.backward`, the one every offloaded run with
+> `layer_offloading_fp8_forward` on actually executes) called the native fp8
+> grad-input unconditionally and never read the flag, and
+> `ArenaOffloadConfig.fp8_backward` was populated but consumed by nothing. Both
+> arms of any such A/B therefore ran the *same* fp8 backward: the experiment
+> compared the lossy path against itself and its numbers mean nothing. The gate
+> is now honored in both paths (captured in the traced forward, so flipping it
+> recompiles rather than baking in a stale branch), and the OFF arm dequantizes
+> straight to the compute dtype instead of transiting fp32.
+
 `layer_offloading_fp8_grad_input` gates ONE thing, in
 `toolkit/memory_management/manager_modules.py` (`_BouncingLinearFn.backward`,
 ~line 2080):

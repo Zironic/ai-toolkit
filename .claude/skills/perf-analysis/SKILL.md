@@ -29,6 +29,17 @@ path, or no argument (most-recently-updated run under `output/`). Key flags:
 `--last N`, `--all`, `--archived` -- see `--help`. Parse the raw jsonl by
 hand only when the digest provably lacks the field you need.
 
+## Recompiles: the `compile` block / `new_frames`
+
+Each window carries `compile.new_frames` -- the per-window delta of Dynamo's
+cumulative traced-frame count. The first window that reports any tracing is the
+cold compile; **after that, every non-zero `new_frames` is a recompile**, i.e. a
+guard (nearly always a shape) the compiled kernels did not cover. The digest's
+`Compile:` line reports `after_first` = the recompile budget burned past the
+cold compile, which is the number to look at when step times spike after a
+resolution-bucket change. Steady state must be 0. The key is absent for eager
+runs and for logs written before the metric existed.
+
 ## Finding the currently running job
 
 Check the live python process's command line instead of guessing:

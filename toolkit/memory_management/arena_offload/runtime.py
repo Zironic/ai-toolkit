@@ -14,11 +14,13 @@ the seam is a single grep away). Phase 2 replaces those calls with
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
 from ..vram_budget import apply_simulated_card
+from .policy import TrainingSignalWindow
 
 RUNTIME_ATTR = "_arena_offload_runtime"
 
@@ -58,6 +60,8 @@ class ArenaOffloadRuntime:
         # reads these at the step boundary.
         self._last_shape_key: tuple | None = None
         self._last_step_num: int | None = None
+        self._signals = TrainingSignalWindow()
+        self._last_policy_error: str | None = None
 
     # ------------------------------------------------------------------
     # construction
@@ -279,8 +283,22 @@ class ArenaOffloadRuntime:
         self._require_open()
         self._last_shape_key = shape_key
         self._last_step_num = step_num
-        with self._executor.execution(self._executor.TRAIN):
-            yield self
+        started_at = time.perf_counter()
+        try:
+            with self._executor.execution(self._executor.TRAIN):
+                yield self
+        finally:
+            try:
+                self._observe_training_step(
+                    shape_key=shape_key,
+                    step_num=step_num,
+                    step_wall_ms=(time.perf_counter() - started_at) * 1000.0,
+                )
+                self._last_policy_error = None
+            except Exception as error:
+                # Observation is diagnostic-only in S1 and must never mask the
+                # training result (especially an OOM raised by the body).
+                self._last_policy_error = f"{type(error).__name__}: {error}"
 
     @contextlib.contextmanager
     def sampling_session(self):
@@ -355,7 +373,63 @@ class ArenaOffloadRuntime:
             ),
             "last_shape_key": self._last_shape_key,
             "last_step_num": self._last_step_num,
+            "policy": self._signals.diagnostics(),
+            "policy_error": self._last_policy_error,
         }
+
+    def _observe_training_step(self, *, shape_key, step_num, step_wall_ms) -> None:
+        """Collect S1 policy signals after execution; never changes layout."""
+        import torch
+
+        from .. import ingraph_stream
+        from ..vram_budget import device_free_bytes
+
+        if torch.device(self._device).type != "cuda" or not torch.cuda.is_available():
+            return
+        try:
+            stats = torch.cuda.memory_stats(self._device)
+        except Exception:
+            stats = {}
+        allocator = {
+            key: int(stats.get(key, 0) or 0)
+            for key in ("num_alloc_retries", "num_device_alloc", "num_device_free")
+        }
+        transfer = (
+            ingraph_stream.fetch_stats(reset=False)
+            if self._signals.transfer_snapshot_due
+            else None
+        )
+        self._signals.observe(
+            shape_key=shape_key,
+            step_num=step_num,
+            allocator_counters=allocator,
+            peak_allocated_bytes=torch.cuda.max_memory_allocated(self._device),
+            peak_reserved_bytes=torch.cuda.max_memory_reserved(self._device),
+            device_free_bytes=device_free_bytes(self._device),
+            resident_bytes=self._residency.resident_bytes(),
+            ring_bytes=self._training_ring_bytes(),
+            compile_counters=_compile_counter_snapshot(torch),
+            transfer_counters=transfer,
+            step_wall_ms=step_wall_ms,
+        )
+
+    def _training_ring_bytes(self) -> int:
+        from ..transfer_plan import build_transfer_plan
+
+        largest = 0
+        plan = getattr(self._residency, "plan", None) or self._training_plan
+        for block_key in self._arena.block_keys():
+            record = self._arena.block_record(block_key)
+            streamed = tuple(
+                name
+                for name in record.leaf_names
+                if (block_key, name) not in plan.resident_leaf_keys
+            )
+            if streamed:
+                transfer = build_transfer_plan(record, streamed)
+                largest = max(largest, transfer.compact_nbytes)
+        depth = max(1, int(getattr(self._executor, "depth", 1)))
+        return int(largest * depth)
 
     def report_foreign_vram_once(self, *, phase: str) -> None:
         """Say so, once, if another tenant on the GPU is why we are streaming."""
@@ -380,6 +454,22 @@ class ArenaOffloadRuntime:
     def _legacy_training_plan(self):
         """PHASE-2: the TRAIN ResidencyPlan, for call sites not yet migrated."""
         return self._training_plan
+
+
+def _compile_counter_snapshot(torch_module):
+    try:
+        counters = torch_module._dynamo.utils.counters
+    except AttributeError:
+        return None
+    frames = int(counters["frames"].get("total", 0) or 0)
+    graphs = int(counters["stats"].get("unique_graphs", 0) or 0)
+    if frames == 0 and graphs == 0:
+        return None
+    return {
+        "frames": frames,
+        "graphs": graphs,
+        "graph_breaks": int(sum(counters["graph_break"].values())),
+    }
 
 
 def _fixed_working_bytes(value) -> int | None:

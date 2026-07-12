@@ -194,4 +194,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Serialize GPU scripts: two full-model runs on a 12 GB card do not just
+    # measure badly, the second OOMs. See scripts/smoke_runtime.py.
+    from smoke_runtime import run_locked
+
+    sys.exit(run_locked("bench_checkpoint_save", main))

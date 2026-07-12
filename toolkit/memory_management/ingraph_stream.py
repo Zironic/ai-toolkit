@@ -1077,15 +1077,61 @@ def fetch_stats(reset: bool = False) -> dict:
     return stats
 
 
-def fetch_report(reset: bool = False) -> str | None:
+def fetch_performance_metrics(stats: dict, *, step_wall_ms=None) -> dict:
+    """Derive transfer-stream utilization from a settled reporting window.
+
+    ``h2d_ms`` is CUDA-event time on the single serialized transfer stream.
+    Dividing its window total by the matching step-wall total estimates transfer
+    duty. ``wait_ms`` is deliberately excluded: it is host blocking around an
+    event wait and does not say whether the GPU compute stream was idle.
+
+    H2D timing drains opportunistically, so callers should provide a multi-step
+    reporting window. Duty above 100% is retained and flagged rather than
+    clamped; it indicates accounting carried across a window boundary or a
+    mismatched denominator.
+    """
+    h2d_ms = float((stats or {}).get("h2d_ms", 0.0) or 0.0)
+    byte_count = int((stats or {}).get("bytes", 0) or 0)
+    wall_ms = None if step_wall_ms is None else float(step_wall_ms)
+    duty_pct = None
+    if wall_ms is not None and wall_ms > 0.0:
+        duty_pct = 100.0 * h2d_ms / wall_ms
+    achieved_gbps = None
+    if h2d_ms > 0.0:
+        achieved_gbps = byte_count / (h2d_ms * 1_000_000.0)
+    return {
+        "step_wall_ms": wall_ms,
+        "h2d_duty_pct": duty_pct,
+        "h2d_duty_overflow": bool(duty_pct is not None and duty_pct > 100.0),
+        "achieved_gbps": achieved_gbps,
+    }
+
+
+def fetch_report(reset: bool = False, *, step_wall_ms=None) -> str | None:
     stats = fetch_stats(reset=reset)
     if not stats["fetches"]:
         return None
-    gb = stats["bytes"] / 1024 ** 3
+    metrics = fetch_performance_metrics(stats, step_wall_ms=step_wall_ms)
+    gib = stats["bytes"] / 1024 ** 3
+    duty = (
+        "-" if metrics["h2d_duty_pct"] is None
+        else f"{metrics['h2d_duty_pct']:.1f}"
+    )
+    gbps = (
+        "-" if metrics["achieved_gbps"] is None
+        else f"{metrics['achieved_gbps']:.2f}"
+    )
+    wall = (
+        "-" if metrics["step_wall_ms"] is None
+        else f"{metrics['step_wall_ms']:.3f}"
+    )
     return (
         f"[InGraphStream] fetches={int(stats['fetches'])} "
         f"copies={int(stats['copies'])} "
-        f"bytes={gb:.2f} GiB h2d_ms={stats['h2d_ms']:.3f} "
+        f"bytes={gib:.2f} GiB h2d_ms={stats['h2d_ms']:.3f} "
+        f"step_wall_ms={wall} h2d_duty_pct={duty} "
+        f"h2d_duty_overflow={int(metrics['h2d_duty_overflow'])} "
+        f"achieved_gbps={gbps} "
         f"wait_ms={stats['wait_ms']:.3f} depth_waits={int(stats['depth_waits'])}"
     )
 

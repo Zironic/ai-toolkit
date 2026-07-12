@@ -23,15 +23,23 @@
 > once, there. This plan's open questions (training slack-pad sizing, `Kclean` /
 > `Kverify` / `N`) carry over unchanged.
 >
-> **Caveat on the throughput claim (added 2026-07-12).** The 2.50 GiB reclaimable
-> above is real, but the device-side fetch ring made Krea2 training
-> **compute-bound, not PCIe-bound** (occupancy 87 -> 96%). If streaming is already
-> hidden behind compute, a promoted block saves ~nothing on step time and the
-> banked VRAM buys *headroom* (resolution, batch, fewer OOM demotes) rather than
-> *throughput*. The FSM's guaranteed win is safety - banking VRAM without crossing
-> the thrash/paging cliff. Measure the marginal resident block (`0c577ef` S0)
-> before building the climb; the promote gate's aggressiveness depends on the
-> answer.
+> **Caveat on the throughput claim (updated 2026-07-12).** The 2.50 GiB
+> reclaimable above is real, but whether residency buys throughput is specific
+> to the machine and execution profile (model/layout, precision, resolution,
+> batch, compile generation, and prefetch depth). On this RTX 4070 Krea2 run the
+> device-side fetch ring was compute-bound rather than PCIe-bound, so promoted
+> blocks bought headroom rather than measurable speed. That local S0 result is
+> not a universal controller rule.
+>
+> The live proxy is transfer-stream duty over a settled multi-step window:
+> in-graph CUDA-event `h2d_ms / step_wall_ms`, paired with achieved decimal GB/s
+> (`bytes / h2d_ms`). High duty near the PCIe ceiling means genuine bandwidth
+> pressure; high duty at low GB/s means a staging/submit pathology; low duty
+> means transfers have slack but can also mean the step is host-bound. The trace
+> remains ground truth. `wait_ms` is host blocking around `wait_event` and must
+> never be used as GPU-idle evidence. Promotion remains safety-gated, then uses
+> this measured execution-profile signal rather than a hardcoded machine-wide
+> compute-bound assumption.
 
 Goal: turn the measured cap-descent result into a live residency policy that
 banks the reclaimable VRAM **safely**, by separating a cheap, reversible

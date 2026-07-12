@@ -31,6 +31,17 @@ before relying on details.
   worker fills), not at transfer sizes.
 - **For in-graph sampling, fold the LoRA into the streamed weights instead
   of rendering the base model separately** (see commit 56eabd5).
+- **`mode="max-autotune"` is unusable with streamed weights** -- it enables
+  CUDA graphs, which capture fixed device pointers, and the whole premise of
+  the arena is that block weights move (the ring recycles slots, the compact
+  buffer is refilled per block). Only `max-autotune-no-cudagraphs`, or the
+  narrower `torch._inductor.config.max_autotune_gemm`, are on the table; the
+  latter is the one worth trying (it lets Inductor template the GEMM so the
+  quant/dequant pointwise kernels can fold into its epilogue). Untested.
+- **Bound the dynamic sequence dim; measure recompiles with `new_frames`.**
+  Bounds are auto-derived (`toolkit/compile_shape_bounds.py`) from dataset
+  buckets + sample resolutions + the model's `SequenceLayout`. Sampling shares
+  the compiled block kernels, so its resolutions belong in the bounds too.
 - Offload/compile changes must stay off-by-default and behavior-preserving
   when their flags are off (upstream-PR separability,
   `docs/decisions/UPSTREAM_PR_PLAN.md`).

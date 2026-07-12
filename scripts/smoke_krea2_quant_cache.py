@@ -57,4 +57,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Serialize GPU scripts: two 11+ GiB smokes on a 12 GB card do not
+    # just measure badly, the second OOMs. See scripts/_gpu_lock.py.
+    from smoke_runtime import run_locked
+
+    sys.exit(run_locked("smoke_krea2_quant_cache", main))

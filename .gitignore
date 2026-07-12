@@ -194,3 +194,6 @@ aitk_db.db
 masks/*
 MULTITRIGGER_DOP_REFACTOR_PLAN.md
 /tools/git-bug.exe
+
+# GPU lock for smoke/bench scripts (scripts/smoke_runtime.py)
+.gpu.lock

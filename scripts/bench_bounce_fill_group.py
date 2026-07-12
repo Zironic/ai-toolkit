@@ -25,6 +25,8 @@ import argparse
 import statistics
 import time
 
+import sys
+
 import torch
 
 from toolkit.memory_management import bounce_pool
@@ -166,4 +168,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Serialize GPU scripts: two full-model runs on a 12 GB card do not just
+    # measure badly, the second OOMs. See scripts/smoke_runtime.py.
+    from smoke_runtime import run_locked
+
+    sys.exit(run_locked("bench_bounce_fill_group", main))

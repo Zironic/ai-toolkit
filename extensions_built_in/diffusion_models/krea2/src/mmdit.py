@@ -9,8 +9,8 @@ velocity on the image tokens.
 Differences from the reference (all training-driven, numerically equivalent):
   - ``torch.compile`` decorators are dropped (they fight gradient checkpointing,
     LoRA module swapping and variable shapes during training).
-  - Attention uses a plain ``F.scaled_dot_product_attention`` instead of forcing
-    the cuDNN SDPA backend, so it works across dtypes / masks / backward.
+  - Attention prefers native cuDNN GQA for eligible CUDA signatures and keeps
+    the expanded-KV memory-efficient fallback for unsupported builds.
   - ``enable_gradient_checkpointing`` / ``disable_gradient_checkpointing`` and a
     per-block ``torch.utils.checkpoint`` wrapper are added (gated on
     ``torch.is_grad_enabled()`` so eval/sampling never pays for it).
@@ -31,6 +31,7 @@ from toolkit.memory_management.ingraph_stream import (
     streamed_linear,
     streamed_linear_tensors,
 )
+from toolkit.sdpa_patch import can_use_native_cudnn_gqa
 
 
 def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
@@ -112,7 +113,12 @@ def _sdpa_debug_report(q, k, v, mask, gqa) -> None:
             value_to_name.get(int(value), str(value))
             for value in torch._C._get_sdp_priority_order()
         ]
-        selected = next((name for name in order if eligible.get(name)), "NONE")
+        forced_cudnn = can_use_native_cudnn_gqa(q, k, v, mask)
+        selected = (
+            "CUDNN_ATTENTION (forced native GQA)"
+            if forced_cudnn
+            else next((name for name in order if eligible.get(name)), "NONE")
+        )
     except Exception as error:  # never let diagnostics break a forward
         print(f"[SDPA] backend probe failed: {error}")
         return
@@ -133,26 +139,13 @@ def attention(
     scale: float | None = None,
     gqa: bool = False,
 ) -> Tensor:
-    # Do not force cuDNN here. For some training sequence shapes its selected
-    # plan reserves a multi-GiB workspace (observed as a 9.9 -> 24.4 GiB live
-    # allocation spike on a 12 GiB Ada card). Automatic SDPA dispatch can use
-    # Flash or another memory-efficient backend and retains the math fallback.
-    #
-    # But enable_gqa=True disqualifies every fast backend this box has: the
-    # memory-efficient (cutlass) backend rejects enable_gqa outright, Flash
-    # (which would accept unmasked GQA) is not compiled into Windows torch
-    # builds, and torch 2.12's default priority order puts MATH above CUDNN —
-    # so dispatch silently falls to the math backend, which materializes the
-    # full (B, heads, L, L) score tensor (multiple GiB at sampling
-    # resolutions). Expand the KV heads to match Q and drop enable_gqa, so
-    # the memory-efficient backend becomes eligible. This is numerically
-    # identical to enable_gqa=True: it repeats each KV head across its
-    # query-head group. Two cases need it:
-    #   * an explicit mask (Flash rejects arbitrary masks everywhere), and
-    #   * no Flash in the build (the unmasked GQA path would fall to MATH —
-    #     this regressed once when the expansion was gated on mask-only).
-    # On builds WITH Flash, unmasked GQA stays on Flash's native GQA path.
-    if gqa and k.shape[1] != q.shape[1] and (
+    # Native cuDNN GQA avoids both the math backend's score tensor and physical
+    # KV expansion. The process-wide SDPA wrapper forces cuDNN for eligible
+    # signatures. Expand only when cuDNN is unavailable or rejects this call;
+    # that makes the memory-efficient backend eligible as the fallback. Masked
+    # calls and builds without Flash otherwise need this fallback.
+    native_cudnn_gqa = gqa and can_use_native_cudnn_gqa(q, k, v, mask)
+    if gqa and not native_cudnn_gqa and k.shape[1] != q.shape[1] and (
         mask is not None or not _FLASH_SDP_AVAILABLE
     ):
         groups = q.shape[1] // k.shape[1]

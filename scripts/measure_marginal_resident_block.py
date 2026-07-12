@@ -136,9 +136,12 @@ def _model_config(args):
             checkpoint_keep_last=0,
             block_stream_only=False,
             fp8_training_forward=args.fp8_training_forward,
+            fp8_grad_input=False,
             pinned_arena=False,
             prefetch_depth=args.prefetch_depth,
             no_compile=args.no_compile,
+            compile_dynamic="true",
+            compile_mark_dynamic=None,
         )
     )
 
@@ -196,6 +199,7 @@ def _run_step(model, transformer, network, embeds, optimizer, trainable, args, g
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
     retries_before = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+    frames_before = sum(torch._dynamo.utils.counters["frames"].values())
     t0 = time.perf_counter()
     with executor.execution(executor.TRAIN), network:
         # Diff-output preservation, as SDTrainer runs it: a no-grad prior
@@ -243,12 +247,14 @@ def _run_step(model, transformer, network, embeds, optimizer, trainable, args, g
     torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - t0
     stats = torch.cuda.memory_stats(device)
+    frames_after = sum(torch._dynamo.utils.counters["frames"].values())
     return {
         "seconds": elapsed,
         "loss": float(loss.item()),
         "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / GIB,
         "reserved_gib": torch.cuda.memory_reserved(device) / GIB,
         "alloc_retries": int(stats.get("num_alloc_retries", 0) - retries_before),
+        "new_compile_frames": int(frames_after - frames_before),
         "device_free_gib": vram_budget.device_free_bytes(device) / GIB,
         "grads": grads,
     }
@@ -271,6 +277,7 @@ def _summarize(arm_name, samples, fetch_stats):
             statistics.stdev(peaks) if len(peaks) > 1 else 0.0
         ),
         "alloc_retries": sum(s["alloc_retries"] for s in samples),
+        "new_compile_frames": sum(s["new_compile_frames"] for s in samples),
         "device_free_gib_min": min(s["device_free_gib"] for s in samples),
         "fetch_gib_per_step": fetch_bytes / GIB / max(1, len(times)),
         "h2d_ms_per_step": fetch_stats.get("h2d_ms", 0.0) / max(1, len(times)),
@@ -507,15 +514,21 @@ def main():
                 "building; size S3's promote gate against these numbers."
             )
 
-    # S0's second question: the training slack pad.
-    all_peaks = [
-        row["peak_allocated_gib"] for rows in kept.values() for row in rows
-    ]
+    # S0's second question: the training slack pad. Compare repeated steps at
+    # a fixed layout; pooling arms would mistake promoted sidecar bytes for
+    # within-layout peak noise.
+    per_arm_peak_spreads = {
+        name: max(row["peak_allocated_gib"] for row in arm_rows)
+        - min(row["peak_allocated_gib"] for row in arm_rows)
+        for name, arm_rows in kept.items()
+    }
+    all_peaks = [row["peak_allocated_gib"] for row in kept[arms[0]["name"]]]
     pad = {
         "peak_allocated_gib_mean": statistics.fmean(all_peaks),
         "peak_allocated_gib_stdev": statistics.stdev(all_peaks),
         "peak_allocated_gib_max": max(all_peaks),
-        "peak_spread_gib": max(all_peaks) - min(all_peaks),
+        "peak_spread_gib": max(per_arm_peak_spreads.values()),
+        "per_arm_peak_spread_gib": per_arm_peak_spreads,
     }
     print(
         f"[s0] training peak: mean={pad['peak_allocated_gib_mean']:.3f} GiB "
@@ -524,10 +537,14 @@ def main():
         f"spread={pad['peak_spread_gib']:.3f} GiB  "
         f"(slack pad >= spread; sampling's is 0.21 GiB)"
     )
+    measured_compile_frames = sum(
+        summary["new_compile_frames"] for summary in summaries
+    )
     print(
         f"[s0] dynamo frames during sweep: "
-        f"{dynamo_frames_after - dynamo_frames_before} "
-        f"(non-zero means residency switches are retracing -- distrust the times)"
+        f"{dynamo_frames_after - dynamo_frames_before}; "
+        f"during measured steps: {measured_compile_frames} "
+        f"(only measured-step frames invalidate the timings; arm warmups may compile)"
     )
 
     payload = {

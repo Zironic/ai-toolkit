@@ -9,6 +9,12 @@ Watch reserved, num_alloc_retries, num_device_free.
 import time
 import torch
 
+# Serialize GPU scripts against each other (see scripts/smoke_runtime.py):
+# this bench allocates hard against the cap and a co-running smoke would OOM.
+from smoke_runtime import acquire_gpu_lock
+
+acquire_gpu_lock("bench_allocator_cap_gc")
+
 assert torch.cuda.is_available()
 dev = 0
 GIB = 1024 ** 3

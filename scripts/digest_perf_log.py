@@ -610,12 +610,21 @@ def summarize_record(record: dict, full: bool) -> list[str]:
     ingraph = record.get("ingraph_stream", "")
     ingraph_fetches = _search(r"fetches=(\d+)", ingraph, int)
     ingraph_h2d = _search(r"h2d_ms=([\d.]+)", ingraph, float)
+    ingraph_duty = _search(r"h2d_duty_pct=([\d.]+)", ingraph, float)
+    ingraph_duty_overflow = _search(r"h2d_duty_overflow=(\d+)", ingraph, int)
+    ingraph_gbps = _search(r"achieved_gbps=([\d.]+)", ingraph, float)
     ingraph_wait = _search(r"wait_ms=([\d.]+)", ingraph, float)
     if ingraph_fetches:
+        duty_text = "-" if ingraph_duty is None else f"{ingraph_duty[0]:.1f}%"
+        if ingraph_duty_overflow and ingraph_duty_overflow[0]:
+            duty_text += "!"
         lines.append(
-            "  ingraph: fetches={f} h2d_ms={h} wait_ms={w}".format(
+            "  ingraph: fetches={f} h2d_ms={h} duty={d} achieved={gbs}GB/s "
+            "host_wait_ms={w} (diagnostic only)".format(
                 f=ingraph_fetches[0],
                 h="-" if ingraph_h2d is None else g(ingraph_h2d[0], 3),
+                d=duty_text,
+                gbs="-" if ingraph_gbps is None else g(ingraph_gbps[0], 2),
                 w="-" if ingraph_wait is None else g(ingraph_wait[0], 3),
             )
         )

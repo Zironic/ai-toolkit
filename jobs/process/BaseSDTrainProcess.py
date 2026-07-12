@@ -1400,7 +1400,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             record['offload_prefetch'] = prefetch_report
             print_acc(prefetch_report)
         try:
-            ingraph_report = MemoryManager.ingraph_fetch_report(reset=True)
+            ingraph_report = MemoryManager.ingraph_fetch_report(
+                reset=True,
+                step_wall_ms=total * step_count * 1000.0,
+            )
         except Exception as error:
             ingraph_report = f"[InGraphStream] report failed: {error}"
         if ingraph_report:

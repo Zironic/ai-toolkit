@@ -5478,9 +5478,9 @@ class MemoryManager:
         return summarize_offload_profile(reset=reset)
 
     @staticmethod
-    def ingraph_fetch_report(reset: bool = False):
+    def ingraph_fetch_report(reset: bool = False, *, step_wall_ms=None):
         """Return in-graph streaming fetch stats, or None if inactive."""
-        return ingraph_fetch_report(reset=reset)
+        return ingraph_fetch_report(reset=reset, step_wall_ms=step_wall_ms)
 
     @staticmethod
     def offload_step_begin(shape_key=None):

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from typing import TYPE_CHECKING, Optional, Tuple
 from torch.overrides import has_torch_function_unary  # (ADD) torchao detection
 from . import pin_manager
+from .fp8_transpose import column_major
 
 
 from .bounce_pool import (
@@ -1245,7 +1246,9 @@ def _fp8_grad_input_compute(grad_out, qdata, scale, target_dtype):
         one = torch.ones((), device=grad_out.device, dtype=torch.float32)
         # need qdata [out,in] as a column-major operand: transpose a contiguous
         # [in,out] fp8 copy (half the bytes of the bf16 weight we are avoiding).
-        b = qdata.t().contiguous().t()
+        # Tiled -- the elementwise clone this replaces moved 1-byte elements with
+        # uncoalesced writes at ~1/5 of the card's bandwidth.
+        b = column_major(qdata)
         gi = torch._scaled_mm(
             g_fp8, b, scale_a=scale_g, scale_b=one,
             out_dtype=target_dtype, use_fast_accum=True,

@@ -140,6 +140,23 @@ overrides that are not required for normal training.
 
 Prefer focused tests and synthetic CUDA scripts over full training jobs.
 
+### No CPU compilation
+
+CPU compilation is not a supported or useful validation path in this
+repository. The relevant `torch.compile` work targets CUDA block kernels on the
+GPU. Do not intentionally compile CPU functions or tensors, do not add a CPU
+compile fallback, and do not install or require MSVC/`cl.exe` to satisfy
+PyTorch Inductor's CPU code-generation probes.
+
+On Windows, a CUDA `torch.compile` smoke may still enter an incidental Inductor
+CPU capability/vector-ISA probe and fail with errors such as
+`Compiler: cl is not found`. Treat that as an irrelevant CPU-probe/toolchain
+failure, not evidence that the CUDA kernel needs CPU compilation. Do not pursue
+the CPU path or change production code around it. Use a CUDA-only focused smoke
+that avoids the probe, or report the full-model compiled smoke as blocked by
+the incidental CPU probe while continuing CUDA validation through the focused
+CUDA seam.
+
 Useful commands:
 
 ```powershell

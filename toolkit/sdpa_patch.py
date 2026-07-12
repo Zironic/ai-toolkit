@@ -1,22 +1,10 @@
-"""Global SDPA GQA fallback: expand KV heads when enable_gqa would land on MATH.
+"""Global SDPA GQA dispatch without math score materialization.
 
-torch's SDPA dispatcher tries backends in priority order (2.12 default:
-FLASH > EFFICIENT > MATH > CUDNN). ``enable_gqa=True`` is only supported by
-Flash; the memory-efficient (cutlass) backend rejects it. Windows torch
-wheels ship without Flash, so ANY enable_gqa call -- and, on every platform,
-any enable_gqa call WITH an attn_mask (Flash rejects arbitrary masks) --
-silently falls through to the math backend, which materializes the full
-(B, heads, Lq, Lk) score tensor: tens of ms and GiBs of transient VRAM at
-diffusion sequence lengths (measured 40.2 ms -> 2.6 ms at L=4096 on the
-RTX 4070).
-
-Repeating each KV head across its query-head group is numerically identical
-to ``enable_gqa=True`` and makes the memory-efficient backend eligible. So
-wrap ``F.scaled_dot_product_attention`` once, process-wide: when a CUDA call
-would fall to MATH (enable_gqa with a mask, or enable_gqa without Flash in
-the build), expand KV and drop the flag. Everywhere else the wrapper is a
-pure passthrough. Dynamo inlines it (the build facts are trace-time
-constants), so compiled graphs are unaffected.
+Recent cuDNN SDPA builds support native GQA, including broadcast padding
+masks. Prefer that path without expanding K/V when the exact eager signature
+is eligible. During compilation use build and dtype facts, because constructing
+SDPAParams in a traced function causes a graph break. Retain KV expansion as
+the fallback for builds or signatures without cuDNN support.
 
 Kill-switch for diagnostics only (never required for correct training):
 ``AI_TOOLKIT_DISABLE_SDPA_GQA_PATCH=1``.
@@ -27,11 +15,47 @@ import os
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 try:
     _FLASH_AVAILABLE = bool(torch.backends.cuda.is_flash_attention_available())
 except Exception:
     _FLASH_AVAILABLE = False
+
+try:
+    _CUDNN_AVAILABLE = bool(torch.backends.cuda.cudnn_sdp_enabled())
+except Exception:
+    _CUDNN_AVAILABLE = False
+
+
+def can_use_native_cudnn_gqa(
+    query, key, value, attn_mask, dropout_p=0.0, is_causal=False
+) -> bool:
+    """Whether this unexpanded CUDA GQA call should be forced to cuDNN."""
+    if not (
+        _CUDNN_AVAILABLE
+        and query.is_cuda
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and key.ndim >= 3
+        and key.shape[-3] != query.shape[-3]
+    ):
+        return False
+    if torch.compiler.is_compiling():
+        # Avoid tracing SDPAParams (a pybind object). Only assume eligibility
+        # for the exact Krea2 signature validated by the CUDA smoke.
+        return (
+            query.shape[-1] == 128
+            and key.shape[-1] == 128
+            and dropout_p == 0.0
+            and not is_causal
+        )
+    try:
+        params = torch.backends.cuda.SDPAParams(
+            query, key, value, attn_mask, dropout_p, is_causal, True
+        )
+        return bool(torch.backends.cuda.can_use_cudnn_attention(params, False))
+    except Exception:
+        return False
 
 
 def apply_sdpa_gqa_patch() -> None:
@@ -54,13 +78,28 @@ def apply_sdpa_gqa_patch() -> None:
         scale=None,
         enable_gqa=False,
     ):
-        if (
+        needs_fast_gqa = (
             enable_gqa
             and query.is_cuda
             and key.ndim >= 3
             and key.shape[-3] != query.shape[-3]
             and (attn_mask is not None or not _FLASH_AVAILABLE)
+        )
+        if needs_fast_gqa and can_use_native_cudnn_gqa(
+            query, key, value, attn_mask, dropout_p, is_causal
         ):
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                return original(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                    scale=scale,
+                    enable_gqa=True,
+                )
+        if needs_fast_gqa:
             groups = query.shape[-3] // key.shape[-3]
             key = key.repeat_interleave(groups, dim=-3)
             value = value.repeat_interleave(groups, dim=-3)
