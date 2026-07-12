@@ -82,6 +82,15 @@ class ArenaOffloadConfig:
     fp8_backward: bool = False
     fp8_sampling: bool = False
     compile_blocks: bool = False
+    compile_dynamic: bool | None = True
+    compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = ()
+    # Validation knob: pretend the card is this many GiB, so small-card
+    # behaviour (deeper streaming, tighter caps, a residency plan that cannot
+    # fit) is exercisable on a bigger one. 0/None = use the real card.
+    simulated_vram_gib: float | None = None
+    # Violating the allocator cap raises instead of widening the cap. Off in
+    # production: the cap is a lever, not a kill switch.
+    wddm_cap_strict: bool = False
 
     legacy: LegacyPlannerOptions = field(default_factory=LegacyPlannerOptions)
 
@@ -107,6 +116,18 @@ class ArenaOffloadConfig:
                 or get("compile_sample", False)
                 or get("train_compile_blocks", False)
             ),
+            compile_dynamic=(
+                None
+                if get("compile_dynamic", True) is None
+                else bool(get("compile_dynamic", True))
+            ),
+            compile_dynamic_hints=tuple(
+                tuple(hint) for hint in (get("compile_dynamic_hints", ()) or ())
+            ),
+            simulated_vram_gib=(
+                float(get("layer_offloading_simulated_vram_gb") or 0.0) or None
+            ),
+            wddm_cap_strict=bool(get("layer_offloading_wddm_cap_strict", False)),
             legacy=LegacyPlannerOptions(
                 working_reserve_gib=get("layer_offloading_smart_working_reserve_gb"),
                 wddm_margin_gib=get("layer_offloading_smart_wddm_margin_gb"),

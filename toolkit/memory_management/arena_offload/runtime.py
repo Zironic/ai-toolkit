@@ -17,6 +17,8 @@ import contextlib
 from collections.abc import Sequence
 from typing import Any
 
+from ..vram_budget import apply_simulated_card
+
 RUNTIME_ATTR = "_arena_offload_runtime"
 
 GIB = 1024**3
@@ -80,6 +82,11 @@ class ArenaOffloadRuntime:
         existing = getattr(transformer, RUNTIME_ATTR, None)
         if existing is not None:
             raise RuntimeError("arena_offload_already_prepared")
+
+        # Before ANY planning reads a VRAM number: a simulated smaller card must
+        # be in force for the whole run, not just the phases we remember to ask.
+        apply_simulated_card(config.simulated_vram_gib, device=device)
+        MemoryManager.set_wddm_cap_strict(config.wddm_cap_strict)
 
         transformer.requires_grad_(False)
 
@@ -153,6 +160,8 @@ class ArenaOffloadRuntime:
             architecture_adapter=adapter,
             depth=legacy.prefetch_depth,
             compile_blocks=config.compile_blocks,
+            compile_dynamic=config.compile_dynamic,
+            compile_dynamic_hints=config.compile_dynamic_hints,
         )
 
         runtime = cls(
@@ -318,6 +327,7 @@ class ArenaOffloadRuntime:
             "plan_fingerprint": getattr(active_plan, "fingerprint", None),
             "prefetch_depth": int(getattr(self._executor, "depth", 0)),
             "compile_blocks": bool(self._config.compile_blocks),
+            "compile_dynamic": bool(self._config.compile_dynamic),
             "fp8_forward": bool(self._config.fp8_forward),
             "fp8_backward": bool(self._config.fp8_backward),
             "fp8_sampling": bool(self._config.fp8_sampling),

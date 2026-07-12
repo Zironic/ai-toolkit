@@ -350,6 +350,8 @@ class ImmutableTransformerRuntime:
         architecture_adapter,
         depth: int = 2,
         compile_blocks: bool = True,
+        compile_dynamic: bool | None = True,
+        compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = (),
     ) -> None:
         self._sampling_working_bytes: dict[tuple, int] = {}
         self._sampling_baseline = None
@@ -363,6 +365,10 @@ class ImmutableTransformerRuntime:
         self.lora_multiplier = None
         self.depth = max(1, int(depth))
         self.compile_blocks = bool(compile_blocks)
+        self.compile_dynamic = (
+            None if compile_dynamic is None else bool(compile_dynamic)
+        )
+        self.compile_dynamic_hints = tuple(compile_dynamic_hints or ())
         self._arena_signature = self.residency.arena.immutable_signature()
 
         self._block_abis = tuple(
@@ -554,6 +560,7 @@ class ImmutableTransformerRuntime:
                 kernel,
                 mode="default",
                 fullgraph=False,
+                dynamic=self.compile_dynamic,
             )
         self._block_kernels[key] = kernel
         return kernel
@@ -594,6 +601,13 @@ class ImmutableTransformerRuntime:
                 self.residency,
                 compact_flat,
             )
+            if self.compile_blocks and self.compile_dynamic_hints:
+                # Must be set on this exact tensor instance every call (a
+                # fresh x each step) before it crosses the torch.compile
+                # boundary in `kernel`, so a resolution-bucket run declares
+                # its shape range once instead of recompiling per bucket.
+                for dim, lo, hi in self.compile_dynamic_hints:
+                    torch._dynamo.mark_dynamic(x, dim, min=lo, max=hi)
             out = kernel(
                 x,
                 tvec,
@@ -1035,6 +1049,8 @@ def prepare_immutable_runtime(
     architecture_adapter,
     depth: int = 2,
     compile_blocks: bool = True,
+    compile_dynamic: bool | None = True,
+    compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = (),
 ) -> ImmutableTransformerRuntime:
     existing = getattr(transformer, "_immutable_runtime", None)
     if existing is not None:
@@ -1051,6 +1067,8 @@ def prepare_immutable_runtime(
         architecture_adapter=architecture_adapter,
         depth=depth,
         compile_blocks=compile_blocks,
+        compile_dynamic=compile_dynamic,
+        compile_dynamic_hints=compile_dynamic_hints,
     )
     transformer._immutable_runtime = runtime
     return runtime
