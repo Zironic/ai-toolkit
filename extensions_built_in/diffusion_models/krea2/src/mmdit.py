@@ -1053,7 +1053,7 @@ class SingleStreamDiT(nn.Module):
             ref_kv_capture=ref_kv_capture,
             blockcaches=blockcaches,
         ):
-            # run() picks the train/sample program from grad mode.
+            # run() picks the train/sample program from the active phase.
             return runtime.run(combined, tvec, freqs, mask)
 
         # Pure eager block math: fallback, reference-image/reference-K/V calls,

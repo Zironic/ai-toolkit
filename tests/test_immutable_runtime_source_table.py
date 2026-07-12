@@ -161,12 +161,25 @@ class ImmutableRuntimeSourceTableTests(unittest.TestCase):
                 "hidden",
             )
 
+        # A no-grad forward inside a training step is legitimate (diff-output
+        # preservation runs the prior prediction with the network detached) and
+        # stays on the TRAIN program.
         with executor.execution(executor.TRAIN):
-            with torch.no_grad(), self.assertRaisesRegex(
+            with torch.no_grad():
+                self.assertEqual(
+                    executor.run("hidden", None, None, None),
+                    "hidden",
+                )
+
+        # The reverse still fails closed: no grad graphs during sampling.
+        executor.set_residency_plan(ResidencyPlan.build("sample", ()))
+        with executor.execution(executor.SAMPLE):
+            with self.assertRaisesRegex(
                 ImmutableRuntimeError,
-                "immutable_execution_mode_mismatch:active=train:call=sample",
+                "immutable_execution_mode_mismatch:active=sample:call=train",
             ):
                 executor.run("hidden", None, None, None)
+
     def test_structural_fingerprint_has_no_residency_input(self):
         parameters = inspect.signature(build_program_fingerprint).parameters
         self.assertNotIn("residency", parameters)

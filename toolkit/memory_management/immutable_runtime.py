@@ -1005,11 +1005,18 @@ class ImmutableTransformerRuntime:
             raise ImmutableRuntimeError(
                 "no_residency_source_table: publish a plan before execution"
             )
-        mode = self.TRAIN if torch.is_grad_enabled() else self.SAMPLE
-        if mode != self._active_mode:
+        mode = self._active_mode
+        # The active phase -- not grad mode -- selects the program. A training
+        # step legitimately contains no-grad forwards (diff-output preservation
+        # runs a prior prediction with the network detached), and those stay on
+        # the TRAIN program: same residency plan, same fetch policy, and the
+        # train block fn is already no-grad safe. The reverse is still a bug:
+        # a grad-enabled call inside a sampling phase would build a graph the
+        # forward-only program never planned working memory for.
+        if mode == self.SAMPLE and torch.is_grad_enabled():
             raise ImmutableRuntimeError(
                 f"immutable_execution_mode_mismatch:"
-                f"active={self._active_mode}:call={mode}"
+                f"active={self.SAMPLE}:call={self.TRAIN}"
             )
         return self._programs[mode].trunk(combined, tvec, freqs, mask)
 

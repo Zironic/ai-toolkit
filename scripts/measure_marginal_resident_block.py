@@ -96,6 +96,20 @@ def _parse_args():
         "in whichever arm runs first.",
     )
     parser.add_argument("--prefetch-depth", type=int, default=2)
+    parser.add_argument(
+        "--dop", action="store_true",
+        help="emulate diff-output preservation: an extra no-grad prior forward "
+        "with the network off, plus a second grad-enabled preservation "
+        "forward+backward (SDTrainer's shape). ~2.5x the streaming per step and "
+        "far more memory pressure, so the residency trade is not the same one.",
+    )
+    parser.add_argument("--dop-multiplier", type=float, default=1.0)
+    parser.add_argument(
+        "--dop-single-backward", action="store_true",
+        help="mirror train_config.dop_single_backward: combine both losses into "
+        "ONE backward, which keeps both graphs live to the peak (default False, "
+        "matching the config default: backward the main loss first)",
+    )
     parser.add_argument("--fp8-training-forward", action="store_true")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--compile-cache-dir", default="tmp/torch_compile_cache")
@@ -184,9 +198,45 @@ def _run_step(model, transformer, network, embeds, optimizer, trainable, args, g
     retries_before = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
     t0 = time.perf_counter()
     with executor.execution(executor.TRAIN), network:
+        # Diff-output preservation, as SDTrainer runs it: a no-grad prior
+        # prediction with the network switched OFF, then -- after the main
+        # forward -- a SECOND grad-enabled forward whose output is pulled back
+        # toward that prior. It roughly 2.5x's the streaming volume per step and,
+        # in single-backward mode, keeps two graphs live at once. That changes
+        # both terms of the residency trade, which is why it gets its own arm.
+        prior_pred = None
+        if args.dop:
+            was_active = network.is_active
+            network.is_active = False
+            try:
+                with torch.no_grad():
+                    prior_pred = model.get_noise_prediction(
+                        noisy, timestep, embeds
+                    ).detach()
+            finally:
+                network.is_active = was_active
+
         pred = model.get_noise_prediction(noisy, timestep, embeds)
         loss = torch.nn.functional.mse_loss(pred.float(), target)
-        loss.backward()
+
+        if prior_pred is None:
+            loss.backward()
+        elif args.dop_single_backward:
+            preservation_pred = model.get_noise_prediction(noisy, timestep, embeds)
+            preservation_loss = torch.nn.functional.mse_loss(
+                preservation_pred.float(), prior_pred.float()
+            )
+            (loss + args.dop_multiplier * preservation_loss).backward()
+        else:
+            # Two-pass (the default): the main graph is freed before the
+            # preservation forward allocates its own, which is the whole point
+            # -- it keeps the peak at one graph instead of two.
+            loss.backward()
+            preservation_pred = model.get_noise_prediction(noisy, timestep, embeds)
+            preservation_loss = torch.nn.functional.mse_loss(
+                preservation_pred.float(), prior_pred.float()
+            )
+            (args.dop_multiplier * preservation_loss).backward()
     grads = sum(1 for p in trainable if p.grad is not None)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
@@ -489,6 +539,8 @@ def main():
             "steps_per_arm": args.steps_per_arm,
             "prefetch_depth": args.prefetch_depth,
             "fp8_training_forward": bool(args.fp8_training_forward),
+            "dop": bool(args.dop),
+            "dop_single_backward": bool(args.dop_single_backward),
             "compiled": not args.no_compile,
             "total_blocks": total_blocks,
             "full_model_resident_gib": full_resident_gib,
