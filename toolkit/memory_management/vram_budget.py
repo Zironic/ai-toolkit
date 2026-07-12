@@ -731,7 +731,7 @@ def training_guard_pressure(dxgi: dict, physical: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Two-timescale residency control (see tasks/open/RESIDENCY_TWO_TIMESCALE_PLAN.md)
+# Two-timescale residency control (see tasks/done/RESIDENCY_TWO_TIMESCALE_PLAN.md)
 #
 # Allowance lives in *target-space* (0.95*cap - live); the allocator cap is set
 # in *cap-space*. The two differ by the gc_threshold factor: a cap raise of ``d``
@@ -815,7 +815,7 @@ def cap_can_host_promotion(
 
 def residency_promote_ok(
     num_alloc_retries,
-    reclaimable_at_peak_bytes,
+    allocator_slack_bytes,
     block_bytes,
     slack_pad_bytes,
 ) -> bool:
@@ -825,16 +825,16 @@ def residency_promote_ok(
     the telemetry proves the room is really there --
 
       * ``num_alloc_retries == 0`` over the window (nothing cap-binding), AND
-      * ``reclaimable_at_peak`` (= peak_reserved - peak_alloc, idle cache still
-        held AT the allocation peak) exceeds one block plus the pad, so the
-        promotion still leaves ``slack_pad`` of allowance.
+      * worst-shape allocator slack (``0.95 * cap - predicted_live``)
+        exceeds one block plus the pad, so the promotion still leaves
+        ``slack_pad`` of reusable-cache allowance.
 
     Both must hold: retries can be zero simply because residency is too low, so
-    the reclaimable-at-peak test is what proves there is slack to spend.
+    the worst-shape allocator-slack test is what proves there is room to spend.
     """
     if int(num_alloc_retries or 0) > 0:
         return False
-    return float(reclaimable_at_peak_bytes or 0) > float(block_bytes) + float(slack_pad_bytes)
+    return float(allocator_slack_bytes or 0) > float(block_bytes) + float(slack_pad_bytes)
 
 
 # --- Hysteresis FSM (one transition per phase boundary) ---------------------
@@ -929,10 +929,10 @@ def residency_fsm_step(
         return enter(FSM_STABLE) if w >= k_verify else stay()
 
     if name == FSM_PROMOTION_VERIFY:
-        if w == 1:
-            return stay()  # ignore the first (cold) window: new layout re-primes
         if binding:
             return enter(FSM_COOLDOWN, ACT_ROLLBACK)
+        if w == 1:
+            return stay()  # ignore only layout-contaminated non-binding signals
         return enter(FSM_STABLE) if w >= k_verify + 1 else stay()
 
     if name == FSM_COOLDOWN:

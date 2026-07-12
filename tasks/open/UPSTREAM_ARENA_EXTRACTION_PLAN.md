@@ -236,6 +236,14 @@ that have not been cut over. No shared-code reader of a `_mm_*` field survives.
 
 ## Phase 2 - Arena-native policy (the expensive phase)
 
+Phase 2 is complete. The arena runtime now owns block-granular planning and
+the live two-timescale controller without importing `MemoryManager`. The
+controller was validated on a compiled, mixed-resolution Krea2 run: 59 clean
+post-warmup windows (30 x 512-class, 29 x 768-class), zero allocator retries,
+zero new Dynamo frames, and zero policy errors. The durable controller design
+below is the starting contract for Phase 3; run details remain on git-bug
+ticket `0c577ef`.
+
 Create `arena_offload/policy.py` and cut these calls:
 
 ```text
@@ -292,12 +300,12 @@ canonical block, so the veto's "next promotion bytes" input becomes the next
 block's bytes and the guard/promoter agreement has to be re-established on that
 basis.
 
-**It is also unvalidated.** Per `RESIDENCY_TWO_TIMESCALE_PLAN.md`, the veto has
-never been GPU-checked in a real multi-resolution run - the train smoke bypasses
-`auto_tune_training_memory` entirely (forward/backward only). Do not port it as
-settled behavior. Either validate it on the legacy path first, or port it and
-validate once in `policy.py`, but do not let it cross the refactor boundary
-carrying an assumption nobody has tested.
+The block-granular veto is now validated on the arena path. A compiled,
+mixed-resolution Krea2 run completed 59 clean post-warmup windows while the
+controller changed whole-block layouts: allocator retry delta remained zero,
+Dynamo added no frames, and policy errors remained zero. Keep the veto and the
+promoter coupled to the exact same candidate block; do not reintroduce the
+legacy per-Linear predictor during extraction.
 
 `policy.py` is therefore not a from-scratch controller: it is the *wiring* the
 two-timescale plan always called for (its step 2, "controller wiring at the
@@ -321,9 +329,24 @@ frozenset[str]`, derived by the adapter/prep code. The policy must not search
 for `_checkpoint_keep_last` or `.blocks` through module traversal.
 
 Move only the controller behavior the immutable runtime uses: per-shape
-working-set peak learning, safety margin, whole-block promote/demote, peak
-invalidation after a layout change, and the WDDM dedicated-memory cliff
-accounting. **This is a port of the WDDM controller, not a rewrite** - the
+working-set peak learning, safety margin, whole-block promote/demote, and the
+WDDM dedicated-memory cliff accounting. Shape peaks are stored as
+layout-independent working bytes (peak allocated minus resident and ring
+bytes) so residency transitions preserve the worst-shape envelope;
+compile/retrace still invalidates it. A promotion remains provisional during
+verification, under a fixed cap. Allocator GC/retries immediately roll it back.
+Anti-chatter is a deadband in worst-shape allocator slack: promotion requires
+0.95 * cap minus predicted live bytes to exceed the candidate block plus the
+headband. Cooldown remains a separate, temporary settling mechanism.
+
+Bootstrap avoids a long one-block climb. Accumulate monitored minimum
+physical free across the first two logical steps, then bootstrap at the third
+step boundary and compute
+``min_free - WDDM hard floor - 1 GiB``. Select as many whole blocks as
+fit and publish them in one provisional layout transaction under the unchanged
+cap. The normal first-window GC/retry verification rolls the entire bootstrap
+batch back if it overshoots.
+**This is a port of the WDDM controller, not a rewrite** - the
 hard-won cliff behavior is preserved as-is. Leave behind: per-linear
 promote/demote, `_layer_memory_manager`, bounce-pool trace recovery, resident
 per-linear hooks, random/interleaved Linear selection, per-linear offload IDs
@@ -617,9 +640,10 @@ Stage 3 lands, when there is exactly one owner of that code.
 - **Planner:** plans by block key; accounts for permanent singleton bytes;
   accounts for actual block ring depth; protects requested trailing blocks; never
   emits partial-block initial plans; deterministic for equal-size blocks.
-- **Controller:** peak learning; promotion with headroom; demotion under
-  predicted pressure; OOM relief; peak invalidation after layout change; no
-  per-linear state or actions.
+- **Controller:** layout-independent peak learning; worst-shape allocator-slack
+  headband; immediate rollback on allocator GC/retry; temporary cooldown;
+  demotion under pressure; arena-owned abnormal-exit fetch drain and OOM
+  rollback; compile invalidation; no per-linear state or actions.
 - **Lifecycle:** prepare before LoRA; finalize after LoRA; compatible double
   finalize; incompatible double finalize fails; training context spans checkpoint
   recompute; no residency publication during execution; train->sample->train;
@@ -694,15 +718,15 @@ worsens steady-state transfer overlap.
 
 - [ ] Upstream per-linear `MemoryManager` behavior still available.
 - [ ] Arena installs no per-linear wrappers on canonical blocks.
-- [ ] `arena_offload/` does not import the legacy manager (enforced by test).
+- [x] `arena_offload/` does not import the legacy manager (enforced by test).
 - [ ] Host-memory layer imports neither backend.
 - [ ] Krea constructs no arena or residency objects; setup is one facade call.
 - [ ] Shared trainer inspects no arena private state.
 - [ ] One context spans arena training forward and backward.
 - [ ] Arena runtime exclusively owns its functional compilation.
 - [ ] Generic block compile unchanged for non-arena models.
-- [ ] Planning uses block keys and actual block transfer sizes.
-- [ ] Controller transitions operate on complete blocks.
+- [x] Planning uses block keys and actual block transfer sizes.
+- [x] Controller transitions operate on complete blocks.
 - [ ] Canonicalization failure leaves the model untouched.
 - [ ] Whole-model movement cannot detach canonical weights.
 - [ ] Training and sampling FP8 controls independent.

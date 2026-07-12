@@ -27,6 +27,7 @@ class PolicyDecision:
     block_bytes: int = 0
     target_cap_bytes: int | None = None
     reason: str = ""
+    block_keys: tuple[str, ...] = ()
 
 
 class ArenaResidencyController:
@@ -45,10 +46,15 @@ class ArenaResidencyController:
         self.last_throughput_gate = None
         self.last_promote_gate = None
         self.last_cap_covers_promo = None
+        self.last_worst_shape_allocator_slack_bytes = None
+        self.pending_promotion = None
+        self.last_safe_residency_bytes = None
+        self.last_rejected_residency_bytes = None
         self.bootstrapped = False
 
     def step(self, signal, *, candidate, demote_candidate, cliff_cap_bytes,
-             worst_shape_free_bytes, current_cap_bytes=None):
+             worst_shape_free_bytes, worst_shape_allocator_slack_bytes=None,
+             current_cap_bytes=None):
         if not self.bootstrapped:
             self.bootstrapped = True
             if demote_candidate is not None:
@@ -61,21 +67,23 @@ class ArenaResidencyController:
             return self._hold("awaiting_signal")
 
         block_bytes = 0 if candidate is None else int(candidate["block_bytes"])
-        retries = int(
-            (signal.get("allocator") or {}).get("alloc_retries_delta", 0) or 0
-        )
-        reclaimable = int(signal.get("reclaimable_at_peak_bytes", 0) or 0)
-        live = int(
-            signal.get("peak_allocated_bytes", signal.get("live_bytes", 0)) or 0
+        allocator = signal.get("allocator") or {}
+        retries = int(allocator.get("alloc_retries_delta", 0) or 0)
+        device_frees = int(allocator.get("free_count_delta", 0) or 0)
+        allocator_slack = int(
+            signal.get("reclaimable_at_peak_bytes", 0)
+            if worst_shape_allocator_slack_bytes is None
+            else worst_shape_allocator_slack_bytes
         )
         throughput_ok = transfer_benefits_from_residency(signal.get("transfer"))
         worst_ok = candidate is not None and int(worst_shape_free_bytes) >= 0
+        resulting_resident = int(signal.get("resident_bytes", 0) or 0) + block_bytes
         promote_ok = (
             candidate is not None
             and throughput_ok
             and worst_ok
             and vram_budget.residency_promote_ok(
-                retries, reclaimable, block_bytes, self.slack_pad_bytes
+                retries, allocator_slack, block_bytes, self.slack_pad_bytes
             )
         )
         active_cap = (
@@ -85,12 +93,11 @@ class ArenaResidencyController:
         )
         cap_covers = (
             candidate is not None
-            and vram_budget.cap_can_host_promotion(
-                live, block_bytes, self.slack_pad_bytes, active_cap
-            )
+            and allocator_slack > block_bytes + self.slack_pad_bytes
         )
         binding = retries > 0 or int(worst_shape_free_bytes) < 0
         self.last_worst_shape_margin_bytes = int(worst_shape_free_bytes)
+        self.last_worst_shape_allocator_slack_bytes = allocator_slack
         self.last_throughput_gate = bool(throughput_ok)
         self.last_promote_gate = bool(promote_ok)
         self.last_cap_covers_promo = bool(cap_covers)
@@ -103,6 +110,13 @@ class ArenaResidencyController:
             int(cliff_cap_bytes),
             active_cap + max(0, int(cap_raise_bytes)),
         )
+        if (
+            self.pending_promotion is not None
+            and (retries > 0 or device_frees > 0)
+        ):
+            return self.reject_pending_promotion("promotion_allocator_gc")
+
+        previous_state = self.state.name
         self.state, action = vram_budget.residency_fsm_step(
             self.state,
             {
@@ -115,21 +129,29 @@ class ArenaResidencyController:
                 "cap_covers_promo": cap_covers,
             },
         )
+        if (
+            previous_state == vram_budget.FSM_PROMOTION_VERIFY
+            and self.state.name == vram_budget.FSM_STABLE
+        ):
+            self.pending_promotion = None
+            self.last_promoted_key = None
         if action == vram_budget.ACT_PROMOTE and candidate is not None:
             self.last_promoted_key = candidate["block_key"]
+            self.pending_promotion = {
+                "block_key": candidate["block_key"],
+                "block_bytes": block_bytes,
+                "resident_bytes_before": int(signal.get("resident_bytes", 0) or 0),
+                "resident_bytes_after": resulting_resident,
+                "previous_cap_target_bytes": active_cap,
+            }
             return self._decision(
                 action, candidate, reason="safe_transfer_benefit"
             )
         if (
             action == vram_budget.ACT_ROLLBACK
-            and self.last_promoted_key is not None
+            and self.pending_promotion is not None
         ):
-            key = self.last_promoted_key
-            self.last_promoted_key = None
-            return self._decision(
-                action, {"block_key": key, "block_bytes": 0},
-                reason="promotion_bound",
-            )
+            return self.reject_pending_promotion("promotion_bound")
         if action == vram_budget.ACT_DEMOTE and demote_candidate is not None:
             return self._decision(
                 action, demote_candidate, reason="live_pressure"
@@ -149,10 +171,70 @@ class ArenaResidencyController:
             else (
                 "throughput_gate"
                 if candidate is not None and not throughput_ok
-                else "fsm_hold"
+                else (
+                    "allocator_headband"
+                    if candidate is not None
+                    and allocator_slack <= block_bytes + self.slack_pad_bytes
+                    else "fsm_hold"
+                )
             )
         )
         return self._hold(reason, candidate=candidate)
+
+    def reject_pending_promotion(self, reason):
+        pending = self.pending_promotion
+        if pending is None:
+            return self._hold(reason)
+        self.last_safe_residency_bytes = int(
+            pending["resident_bytes_before"]
+        )
+        self.last_rejected_residency_bytes = int(
+            pending["resident_bytes_after"]
+        )
+        self.pending_promotion = None
+        self.last_promoted_key = None
+        self.state = vram_budget.ResidencyFsmState(
+            vram_budget.FSM_COOLDOWN, 0
+        )
+        self.last_action = "rollback"
+        self.last_reason = reason
+        self.last_block_key = pending["block_key"]
+        self.last_block_bytes = int(pending["block_bytes"])
+        self.last_target_cap_bytes = int(pending["previous_cap_target_bytes"])
+        return PolicyDecision(
+            "rollback",
+            pending["block_key"],
+            int(pending["block_bytes"]),
+            target_cap_bytes=int(pending["previous_cap_target_bytes"]),
+            reason=reason,
+            block_keys=tuple(
+                pending.get("block_keys") or (pending["block_key"],)
+            ),
+        )
+
+    def begin_bootstrap_promotion(
+        self, block_keys, block_bytes, resident_bytes_before, active_cap_bytes
+    ):
+        keys = tuple(str(key) for key in block_keys)
+        self.last_promoted_key = keys[-1] if keys else None
+        self.pending_promotion = {
+            "block_key": self.last_promoted_key,
+            "block_keys": keys,
+            "block_bytes": int(block_bytes),
+            "resident_bytes_before": int(resident_bytes_before),
+            "resident_bytes_after": int(resident_bytes_before) + int(block_bytes),
+            "previous_cap_target_bytes": int(active_cap_bytes),
+        }
+        self.state = vram_budget.ResidencyFsmState(
+            vram_budget.FSM_PROMOTION_VERIFY, 0
+        )
+        self.last_action = "promote"
+        self.last_reason = "bootstrap_physical_free"
+        self.last_block_key = self.last_promoted_key
+        self.last_block_bytes = int(block_bytes)
+
+    def allocation_failure(self):
+        return self.reject_pending_promotion("promotion_allocation_failure")
 
     def _decision(self, action, candidate, *, reason):
         self.last_action = action
@@ -193,6 +275,14 @@ class ArenaResidencyController:
             "last_throughput_gate": self.last_throughput_gate,
             "last_promote_gate": self.last_promote_gate,
             "last_cap_covers_promo": self.last_cap_covers_promo,
+            "last_worst_shape_allocator_slack_bytes": (
+                self.last_worst_shape_allocator_slack_bytes
+            ),
+            "pending_promotion": self.pending_promotion,
+            "last_safe_residency_bytes": self.last_safe_residency_bytes,
+            "last_rejected_residency_bytes": (
+                self.last_rejected_residency_bytes
+            ),
             "slack_pad_bytes": self.slack_pad_bytes,
         }
 
@@ -212,6 +302,7 @@ class ShapePeak:
     warmup_steps: int = 1
     peak_allocated_bytes: int = 0
     peak_reserved_bytes: int = 0
+    working_peak_bytes: int = 0
 
 
 class TrainingSignalWindow:
@@ -269,7 +360,11 @@ class TrainingSignalWindow:
         key = _shape_key(shape_key)
         if not compile_invalid:
             self._record_shape_peak(
-                key, int(peak_allocated_bytes or 0), int(peak_reserved_bytes or 0)
+                key,
+                int(peak_allocated_bytes or 0),
+                int(peak_reserved_bytes or 0),
+                int(resident_bytes or 0),
+                int(ring_bytes or 0),
             )
         transfer = self._observe_transfer(transfer_counters, float(step_wall_ms or 0.0))
         allocated = int(peak_allocated_bytes or 0)
@@ -308,6 +403,7 @@ class TrainingSignalWindow:
                     "warmup_steps": peak.warmup_steps,
                     "peak_allocated_bytes": peak.peak_allocated_bytes,
                     "peak_reserved_bytes": peak.peak_reserved_bytes,
+                    "working_peak_bytes": peak.working_peak_bytes,
                 }
                 for key, peak in self._shape_peaks.items()
             ],
@@ -315,7 +411,7 @@ class TrainingSignalWindow:
             "transfer_pending_steps": self._transfer_steps,
         }
 
-    def _record_shape_peak(self, key, allocated, reserved):
+    def _record_shape_peak(self, key, allocated, reserved, resident, ring):
         previous = self._shape_peaks.get(key)
         if previous is None:
             self._shape_peaks[key] = ShapePeak()
@@ -325,6 +421,10 @@ class TrainingSignalWindow:
             warmup_steps=previous.warmup_steps,
             peak_allocated_bytes=max(previous.peak_allocated_bytes, allocated),
             peak_reserved_bytes=max(previous.peak_reserved_bytes, reserved),
+            working_peak_bytes=max(
+                previous.working_peak_bytes,
+                max(0, allocated - resident - ring),
+            ),
         )
 
     def _observe_transfer(self, counters, wall_ms):

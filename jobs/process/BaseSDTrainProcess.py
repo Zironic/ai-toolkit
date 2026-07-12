@@ -1412,6 +1412,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"resident={arena_memory.get('resident_bytes', 0) / (1024 ** 3):.2f} GiB "
                     f"(singleton={arena_memory.get('singleton_resident_bytes', 0) / (1024 ** 3):.2f} "
                     f"canonical={arena_memory.get('canonical_resident_bytes', 0) / (1024 ** 3):.2f}) "
+                    f"allocator_slack={float(controller.get('last_worst_shape_allocator_slack_bytes') or 0) / (1024 ** 3):.2f} GiB "
+                    f"headband={float(controller.get('slack_pad_bytes') or 0) / (1024 ** 3):.2f} GiB "
+                    f"bootstrap={arena_memory.get('bootstrap_budget_bytes', 0) / (1024 ** 3):.2f} GiB/"
+                    f"{len(arena_memory.get('bootstrap_block_keys') or ())} blocks "
                     f"plan={arena_memory.get('plan_fingerprint')}"
                 )
         if offload_profile:
@@ -3651,7 +3655,40 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if driver_free_monitor is not None:
                     driver_free_sample = driver_free_monitor.stop()
                 self._last_driver_free_sample = driver_free_sample
+            if (
+                offload_step_completed
+                and arena_runtime is not None
+                and driver_free_sample is not None
+            ):
+                arena_runtime.record_training_physical_free_min(
+                    driver_free_sample.get('min_free_bytes')
+                )
             if did_oom:
+                if arena_runtime is not None:
+                    failure_event = (
+                        arena_runtime.diagnostics().get('last_failure_event')
+                    )
+                    if failure_event is not None:
+                        os.makedirs(
+                            os.path.dirname(self.performance_log_path),
+                            exist_ok=True,
+                        )
+                        with open(
+                            self.performance_log_path, 'a', encoding='utf-8'
+                        ) as handle:
+                            handle.write(
+                                json.dumps(failure_event, separators=(',', ':'))
+                                + '\n'
+                            )
+                        print_acc(
+                            "[ArenaOffload] allocation failure: "
+                            f"classification={failure_event.get('classification')} "
+                            f"exception={failure_event.get('exception_type')}: "
+                            f"{failure_event.get('exception')} "
+                            f"rollback={failure_event.get('rollback_block')} "
+                            f"abandoned_fetches="
+                            f"{failure_event.get('abandoned_fetch_tickets')}"
+                        )
                 # Legacy offload treats its allocator cap as an OOM relief
                 # lever. Arena offload binds the cap only at phase boundaries,
                 # so an arena OOM never widens it from this per-step path.

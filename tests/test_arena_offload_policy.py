@@ -133,7 +133,7 @@ def test_transfer_metrics_require_settled_multi_step_window_and_handle_reset():
 
 
 
-def test_runtime_invalidates_shape_peaks_after_layout_change():
+def test_runtime_preserves_shape_peaks_after_layout_change():
     signals = TrainingSignalWindow()
     observe(signals)
     observe(signals, peak_allocated_bytes=110)
@@ -157,7 +157,33 @@ def test_runtime_invalidates_shape_peaks_after_layout_change():
     result = runtime.transition_training_block("blocks.3", resident=True)
     assert result["plan"] is next_plan
     assert runtime._training_plan is next_plan
-    assert signals.shape_peaks == {}
+    assert signals.shape_peaks
+
+
+def test_worst_shape_allocator_slack_reconstructs_current_layout():
+    signals = TrainingSignalWindow()
+    observe(
+        signals,
+        shape_key=(512, 512),
+        peak_allocated_bytes=700,
+        resident_bytes=100,
+        ring_bytes=50,
+    )
+    observe(
+        signals,
+        shape_key=(512, 512),
+        peak_allocated_bytes=750,
+        resident_bytes=100,
+        ring_bytes=50,
+    )
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._signals = signals
+    runtime._residency = SimpleNamespace(resident_bytes=lambda: 120)
+    runtime._smart_plan = {"singleton_resident_bytes": 30}
+    runtime._training_ring_bytes = lambda: 50
+
+    # working=600, current layout=150 resident + 50 ring => live=800.
+    assert runtime._worst_shape_allocator_slack_bytes(1000) == 150
 
 
 def test_training_cap_binding_uses_configured_phase_margin(monkeypatch):
@@ -177,6 +203,14 @@ def test_training_cap_binding_uses_configured_phase_margin(monkeypatch):
     assert calls == [
         ("cuda:1", 1.25, {"log_prefix": "[ArenaOffload]"})
     ]
+def test_shape_working_peak_excludes_residency():
+    window = TrainingSignalWindow()
+    observe(window, peak_allocated_bytes=900, resident_bytes=200)
+    observe(window, peak_allocated_bytes=1000, resident_bytes=300)
+    peak = window.shape_peaks[(512, 512)]
+    assert peak.working_peak_bytes == 620
+
+
 def test_signal_contains_memory_accounting():
     signal = observe(TrainingSignalWindow())
     assert signal["reclaimable_at_peak_bytes"] == 40
@@ -204,6 +238,7 @@ def test_controller_promotes_exact_candidate_then_rolls_it_back():
     clean = {
         "allocator": {"alloc_retries_delta": 0},
         "peak_allocated_bytes": 100,
+        "resident_bytes": 200,
         "reclaimable_at_peak_bytes": 100,
         "compile_invalid": False,
         "transfer": {
@@ -237,7 +272,13 @@ def test_controller_promotes_exact_candidate_then_rolls_it_back():
         cliff_cap_bytes=1000,
         worst_shape_free_bytes=0,
     )
-    dirty = {**clean, "allocator": {"alloc_retries_delta": 1}}
+    dirty = {
+        **clean,
+        "allocator": {
+            "alloc_retries_delta": 0,
+            "free_count_delta": 1,
+        },
+    }
     rollback = controller.step(
         dirty,
         candidate=None,
@@ -247,6 +288,34 @@ def test_controller_promotes_exact_candidate_then_rolls_it_back():
     )
     assert rollback.action == "rollback"
     assert rollback.block_key == "blocks.3"
+    assert controller.last_safe_residency_bytes == 200
+    assert controller.last_rejected_residency_bytes == 220
+
+    for _ in range(8):
+        held = controller.step(
+            clean,
+            candidate=candidate,
+            demote_candidate=None,
+            cliff_cap_bytes=1000,
+            worst_shape_free_bytes=100,
+            worst_shape_allocator_slack_bytes=20,
+        )
+        assert held.action != "promote"
+    assert held.reason == "allocator_headband"
+
+    promoted_again = None
+    for _ in range(4):
+        promoted_again = controller.step(
+            clean,
+            candidate=candidate,
+            demote_candidate=None,
+            cliff_cap_bytes=1000,
+            worst_shape_free_bytes=100,
+            worst_shape_allocator_slack_bytes=31,
+        )
+        if promoted_again.action == "promote":
+            break
+    assert promoted_again.action == "promote"
 
 
 def test_controller_cold_starts_one_whole_block_below():
@@ -286,6 +355,219 @@ def test_controller_raises_cap_by_fixed_fsm_increment():
     assert decision.target_cap_bytes == 710
 
 
+def test_arena_sampling_binds_fp8_only_to_singletons(monkeypatch):
+    model = SimpleNamespace(
+        _memory_manager=SimpleNamespace(
+            _training_runtime_candidate_ids={11, 22}
+        )
+    )
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._closed = False
+    runtime._model = model
+    runtime._config = SimpleNamespace(fp8_sampling=True)
+    runtime._sampling_fp8_singletons = 0
+    runtime._training_plan = object()
+    runtime._executor = SimpleNamespace(
+        TRAIN="train",
+        activate=lambda *_args: None,
+    )
+    runtime._bind_training_cap = lambda: None
+    calls = []
+    monkeypatch.setattr(
+        "toolkit.memory_management.manager.MemoryManager._enable_fp8_sampling",
+        lambda module, include_ids=None: (
+            calls.append(("enable", module, set(include_ids)))
+            or (["restore"], 2, 0)
+        ),
+    )
+    monkeypatch.setattr(
+        "toolkit.memory_management.manager.MemoryManager._disable_fp8_sampling",
+        lambda module, restores: calls.append(
+            ("disable", module, list(restores))
+        ),
+    )
+
+    with runtime.sampling_session():
+        assert runtime._sampling_fp8_singletons == 2
+
+    assert calls == [
+        ("enable", model, {11, 22}),
+        ("disable", model, ["restore"]),
+    ]
+
+
+def test_bf16_sampling_reserves_largest_singleton_dequant(monkeypatch):
+    gib = 1024 ** 3
+    dequant = 864 * 1024 ** 2
+    captured = {}
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._closed = False
+    runtime._device = "cpu"
+    runtime._smart_plan = {
+        "largest_singleton_bf16_dequant_bytes": dequant
+    }
+    runtime._config = SimpleNamespace(
+        fp8_sampling=False,
+        legacy=SimpleNamespace(
+            sampling_working_reserve_gib="auto",
+            sampling_wddm_hard_gib=1.0,
+            sampling_wddm_margin_gib=1.0,
+        ),
+    )
+
+    @contextlib.contextmanager
+    def sampling(**kwargs):
+        captured.update(kwargs)
+        yield
+
+    runtime._executor = SimpleNamespace(sampling=sampling)
+    monkeypatch.setattr(
+        "toolkit.memory_management.arena_offload.runtime."
+        "allocator_cap.apply_wddm_hard_allocator_cap",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "toolkit.memory_management.manager.MemoryManager."
+        "_resolve_wddm_margin_gib",
+        lambda *_args, **_kwargs: 1.0,
+    )
+
+    with runtime.sampling_image(
+        shape_key=(768, 768), cold_working_bytes=2 * gib
+    ):
+        pass
+
+    assert captured["cold_floor_bytes"] == gib + dequant
+    assert captured["hot_floor_bytes"] == int(1.25 * gib) + dequant
+
+
+def test_bootstrap_uses_min_physical_free_and_one_gib_margin():
+    gib = 1024 ** 3
+    block_bytes = 200 * 1024 ** 2
+    records = {
+        f"blocks.{index}": SimpleNamespace(
+            committed_bytes=block_bytes,
+            leaf_names=("linear",),
+        )
+        for index in range(3)
+    }
+    plan = SimpleNamespace(resident_leaf_keys=frozenset())
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._bootstrap_complete = False
+    runtime._bootstrap_min_free_bytes = 2 * gib + 450 * 1024 ** 2
+    runtime._bootstrap_budget_bytes = 0
+    runtime._bootstrap_block_keys = ()
+    runtime._last_step_num = 2
+    runtime._config = SimpleNamespace(
+        legacy=SimpleNamespace(wddm_hard_gib=1.0)
+    )
+    runtime._model = SimpleNamespace(
+        _mm_immutable_protected_training_leaf_keys=frozenset()
+    )
+    runtime._arena = SimpleNamespace(
+        block_keys=lambda: tuple(records),
+        block_record=lambda key: records[key],
+    )
+    runtime._residency = SimpleNamespace(
+        plan=plan,
+        resident_bytes=lambda: 0,
+    )
+    runtime._training_plan = plan
+    runtime._smart_plan = {"singleton_resident_bytes": 100}
+    runtime._policy = ArenaResidencyController()
+    transitions = []
+    runtime.transition_training_blocks = lambda keys, resident: (
+        transitions.append((tuple(keys), resident))
+        or {
+            "changed": True,
+            "block_keys": tuple(keys),
+            "plan": object(),
+        }
+    )
+
+    assert runtime._bootstrap_training_residency(10 * gib) is False
+    assert runtime._bootstrap_complete is False
+
+    runtime._last_step_num = 3
+    assert runtime._bootstrap_training_residency(10 * gib) is True
+    assert runtime._bootstrap_budget_bytes == 450 * 1024 ** 2
+    assert transitions == [(("blocks.0", "blocks.1"), True)]
+    assert runtime._policy.pending_promotion["block_keys"] == (
+        "blocks.0",
+        "blocks.1",
+    )
+    assert runtime._policy.pending_promotion["resident_bytes_before"] == 100
+
+
+def test_arena_allocation_failure_drains_and_rolls_back(monkeypatch):
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._device = "cpu"
+    runtime._config = SimpleNamespace(
+        legacy=SimpleNamespace(wddm_hard_gib=1.0)
+    )
+    runtime._last_training_cap_target_bytes = None
+    runtime._signals = TrainingSignalWindow()
+    runtime._policy = ArenaResidencyController()
+    runtime._policy.pending_promotion = {
+        "block_key": "blocks.7",
+        "block_bytes": 20,
+        "resident_bytes_before": 200,
+        "resident_bytes_after": 220,
+        "previous_cap_target_bytes": 1000,
+    }
+    transitions = []
+    runtime.transition_training_blocks = (
+        lambda keys, resident: transitions.append((tuple(keys), resident))
+    )
+    monkeypatch.setattr(
+        "toolkit.memory_management.ingraph_stream.drain_fetch_runtime",
+        lambda: 2,
+    )
+    cap_calls = []
+    monkeypatch.setattr(
+        "toolkit.memory_management.arena_offload.runtime."
+        "allocator_cap.apply_wddm_hard_allocator_cap",
+        lambda *args, **kwargs: cap_calls.append((args, kwargs)),
+    )
+
+    runtime._handle_training_failure(
+        __import__("torch").cuda.OutOfMemoryError("synthetic allocator OOM"),
+        shape_key=(768, 768),
+        step_num=65,
+    )
+
+    assert transitions == [(("blocks.7",), False)]
+    assert runtime._policy.last_safe_residency_bytes == 200
+    assert runtime._policy.last_rejected_residency_bytes == 220
+    assert runtime._last_failure_event["rollback_block"] == ["blocks.7"]
+    assert runtime._last_failure_event["abandoned_fetch_tickets"] == 2
+    assert cap_calls[0][1]["target_cap_bytes"] == 1000
+
+
+def test_failed_training_step_preserves_original_error_if_cleanup_fails():
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._closed = False
+    runtime._last_shape_key = None
+    runtime._last_step_num = None
+    runtime._device = "cpu"
+    runtime._last_policy_error = None
+    runtime._apply_training_policy = lambda: None
+    runtime._handle_training_failure = (
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("cleanup failed")
+        )
+    )
+    runtime._executor = SimpleNamespace(
+        TRAIN="train",
+        execution=lambda _mode: contextlib.nullcontext(),
+    )
+
+    with pytest.raises(ValueError, match="original"):
+        with runtime.training_step(shape_key=(768, 768), step_num=2):
+            raise ValueError("original")
+    assert "cleanup failed" in runtime._last_policy_error
+
+
 def test_failed_training_step_does_not_publish_partial_peak(monkeypatch):
     runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
     runtime._closed = False
@@ -293,6 +575,7 @@ def test_failed_training_step_does_not_publish_partial_peak(monkeypatch):
     runtime._last_step_num = None
     runtime._device = "cpu"
     runtime._apply_training_policy = lambda: None
+    runtime._handle_training_failure = lambda *_args, **_kwargs: None
     runtime._executor = SimpleNamespace(
         TRAIN="train",
         execution=lambda _mode: contextlib.nullcontext(),

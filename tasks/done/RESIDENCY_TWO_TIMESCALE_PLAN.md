@@ -1,27 +1,25 @@
 # Residency control via a two-timescale cap/demote loop -- implementation plan
 
 > **git-bug:** `0c577ef` -- "Make the two-timescale residency FSM live
-> (arena-native, block-granular)" owns the remaining wiring. Refactor context:
+> (arena-native, block-granular)" records the completed implementation and
+> validation. Refactor context:
 > `553ffec`. Closely related: `5fa0e3d` (autotune working_reserve + keep_last),
 > `68d3565` (manual WDDM cliff guard), `628b0cb` (immutable arena). This file is
 > the durable design; current state lives in the ticket.
 
-> **STATE (verified 2026-07-12).** The **policy is built and green**: all five
+> **OUTCOME (verified 2026-07-13).** The **policy is built and green**: all five
 > pure helpers (`allocator_allowance_bytes`, `cap_bytes_for_live`,
 > `cap_can_host_promotion`, `residency_promote_ok`, `residency_fsm_step`) live in
 > `vram_budget.py`, with `tests/test_residency_two_timescale.py` passing (20).
 >
-> The **wiring (step 2 of the sketch below) was never done**: grep finds no
-> production caller of the FSM or either gate. The single live caller anywhere is
-> `cap_bytes_for_live` in `MemoryManager.inference_resident` (`manager.py:6024`)
-> -- the sampling-side cap reclaim. The FSM has never run in a training step.
->
-> That wiring is now folded into `arena_offload/policy.py` (see
+> The production wiring is implemented in `arena_offload/policy.py` (see
 > `UPSTREAM_ARENA_EXTRACTION_PLAN.md`, Phase 2) rather than being retrofitted
 > into `manager.py`: `vram_budget.py` is in the host-memory layer that both
-> backends import, so the FSM is callable from the arena policy as-is. Build it
-> once, there. This plan's open questions (training slack-pad sizing, `Kclean` /
-> `Kverify` / `N`) carry over unchanged.
+> backends import, so the arena policy calls the shared FSM as-is. Planning and
+> transitions use stable block keys and whole canonical blocks; learned working
+> peaks remain layout-independent across residency changes. The compiled,
+> mixed-resolution Krea2 validation produced 59 clean post-warmup windows with
+> zero allocator retries, zero new Dynamo frames, and zero policy errors.
 >
 > **Caveat on the throughput claim (updated 2026-07-12).** The 2.50 GiB
 > reclaimable above is real, but whether residency buys throughput is specific

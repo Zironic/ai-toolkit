@@ -1398,13 +1398,16 @@ class MemoryManager:
             child._mm_resident_trace_key = key
             current[child_id] = cls._install_resident_trace_hook(child, key)
     @classmethod
-    def _enable_fp8_sampling(cls, module):
+    def _enable_fp8_sampling(cls, module, include_ids=None):
         """Install native FP8 forwards without bypassing attached LoRA modules."""
         restores = []
+        include_ids = None if include_ids is None else set(include_ids)
         resident_layers = 0
         streamed_layers = 0
         for child in module.modules():
             if child.__class__.__name__ not in LINEAR_MODULES:
+                continue
+            if include_ids is not None and id(child) not in include_ids:
                 continue
             weight = getattr(child, "weight", None)
             if (
@@ -1467,12 +1470,15 @@ class MemoryManager:
         return restores, resident_layers, streamed_layers
 
     @classmethod
-    def _enable_fp8_training_compile(cls, module):
+    def _enable_fp8_training_compile(cls, module, include_ids=None):
         """Install grad-safe native FP8 forwards for resident training compile."""
         restores = []
+        include_ids = None if include_ids is None else set(include_ids)
         resident_layers = 0
         for child in module.modules():
             if child.__class__.__name__ not in LINEAR_MODULES:
+                continue
+            if include_ids is not None and id(child) not in include_ids:
                 continue
             weight = getattr(child, "weight", None)
             if (
@@ -3073,6 +3079,17 @@ class MemoryManager:
             cls._module_bytes(child)
             for child in module.modules()
             if id(child) in runtime_candidate_ids
+        ))
+        plan["largest_singleton_bf16_dequant_bytes"] = int(max(
+            (
+                child.weight.data.qdata.numel() * 2
+                for child in module.modules()
+                if id(child) in runtime_candidate_ids
+                and isinstance(getattr(child, "weight", None), torch.nn.Parameter)
+                and hasattr(child.weight.data, "qdata")
+                and child.weight.data.qdata.dtype == torch.float8_e4m3fn
+            ),
+            default=0,
         ))
 
         # The immutable runtime is the sole backend: the canonical blocks

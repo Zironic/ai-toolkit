@@ -147,6 +147,7 @@ def test_digest_surfaces_arena_policy_window_and_run_summary():
     assert "achieved=9.50GB/s" in window
     assert "resident_gib=2.00 singleton_gib=0.50 canonical_gib=1.50" in window
     assert "worst_margin_gib=1.00" in window
+    assert "allocator_slack_gib=- headband_gib=0.25" in window
     assert "throughput_gate=True promote_gate=True cap_covers=True" in window
 
     summary = "\n".join(summarize_records([record]))

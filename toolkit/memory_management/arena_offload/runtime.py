@@ -29,6 +29,8 @@ from .policy import (
 RUNTIME_ATTR = "_arena_offload_runtime"
 
 GIB = 1024**3
+BOOTSTRAP_MARGIN_BYTES = GIB
+BOOTSTRAP_MIN_STEP = 3
 
 
 class ArenaOffloadRuntime:
@@ -66,8 +68,16 @@ class ArenaOffloadRuntime:
         self._last_step_num: int | None = None
         self._signals = TrainingSignalWindow()
         self._last_policy_error: str | None = None
+        self._last_failure_event: dict | None = None
         self._policy = ArenaResidencyController()
         self._last_training_cap_target_bytes: int | None = None
+        self._bootstrap_complete = False
+        self._bootstrap_min_free_bytes: int | None = None
+        self._bootstrap_budget_bytes = 0
+        self._bootstrap_block_keys: tuple[str, ...] = ()
+        self._training_fp8_restores = []
+        self._training_fp8_singletons = 0
+        self._sampling_fp8_singletons = 0
 
     # ------------------------------------------------------------------
     # construction
@@ -256,12 +266,29 @@ class ArenaOffloadRuntime:
                 "finalize_immutable_runtime."
             )
         finalize_fn()
+        if self._config.fp8_forward:
+            from ..manager import MemoryManager
+
+            (
+                self._training_fp8_restores,
+                self._training_fp8_singletons,
+            ) = MemoryManager._enable_fp8_training_compile(
+                self._model,
+                include_ids=self._singleton_runtime_ids(),
+            )
         self._executor.activate(self._executor.TRAIN, self._training_plan)
         return self
 
     def close(self) -> None:
         if self._closed:
             return
+        if getattr(self, "_training_fp8_restores", None):
+            from ..manager import MemoryManager
+
+            MemoryManager._disable_fp8_training_compile(
+                self._model, self._training_fp8_restores
+            )
+            self._training_fp8_restores = []
         disable = getattr(self._model, "disable_immutable_runtime", None)
         if disable is not None:
             disable()
@@ -292,7 +319,19 @@ class ArenaOffloadRuntime:
         self._require_open()
         self._last_shape_key = shape_key
         self._last_step_num = step_num
-        self._apply_training_policy()
+        try:
+            self._apply_training_policy()
+        except BaseException as error:
+            try:
+                self._handle_training_failure(
+                    error, shape_key=shape_key, step_num=step_num
+                )
+            except Exception as cleanup_error:
+                self._last_policy_error = (
+                    "training_policy_cleanup: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
         try:
             import torch
             if torch.cuda.is_available():
@@ -305,6 +344,17 @@ class ArenaOffloadRuntime:
             with self._executor.execution(self._executor.TRAIN):
                 yield self
             succeeded = True
+        except BaseException as error:
+            try:
+                self._handle_training_failure(
+                    error, shape_key=shape_key, step_num=step_num
+                )
+            except Exception as cleanup_error:
+                self._last_policy_error = (
+                    "training_failure_cleanup: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
         finally:
             if succeeded:
                 try:
@@ -318,6 +368,103 @@ class ArenaOffloadRuntime:
                     # Diagnostics must never mask a successful training step.
                     self._last_policy_error = f"{type(error).__name__}: {error}"
 
+    def _handle_training_failure(self, error, *, shape_key, step_num):
+        """Clean arena-owned state after the executor has unwound."""
+        import torch
+
+        from .. import ingraph_stream
+        from ..vram_budget import device_free_bytes
+
+        abandoned = ingraph_stream.drain_fetch_runtime()
+        text = str(error)
+        allocation_failure = (
+            isinstance(error, torch.cuda.OutOfMemoryError)
+            or "out of memory" in text.lower()
+        )
+        rollback = None
+        if allocation_failure:
+            decision = self._policy.allocation_failure()
+            if decision.action == "rollback" and decision.block_key is not None:
+                rollback_keys = tuple(decision.block_keys or ())
+                if rollback_keys:
+                    self.transition_training_blocks(
+                        rollback_keys, resident=False
+                    )
+                else:
+                    self.transition_training_block(
+                        decision.block_key, resident=False
+                    )
+                if decision.target_cap_bytes is not None:
+                    allocator_cap.apply_wddm_hard_allocator_cap(
+                        self._device,
+                        self._config.legacy.wddm_hard_gib,
+                        target_cap_bytes=decision.target_cap_bytes,
+                        log_prefix="[ArenaOffload]",
+                    )
+                    self._last_training_cap_target_bytes = (
+                        decision.target_cap_bytes
+                    )
+                rollback = (
+                    list(decision.block_keys)
+                    if decision.block_keys
+                    else decision.block_key
+                )
+        try:
+            stats = torch.cuda.memory_stats(self._device)
+            peak_allocated = int(torch.cuda.max_memory_allocated(self._device))
+            peak_reserved = int(torch.cuda.max_memory_reserved(self._device))
+            physical_free = int(device_free_bytes(self._device))
+        except Exception:
+            stats = {}
+            peak_allocated = 0
+            peak_reserved = 0
+            physical_free = 0
+        active_cap = allocator_cap.applied_cap_bytes(self._device)
+        legacy = getattr(getattr(self, "_config", None), "legacy", None)
+        hard_gib = getattr(legacy, "wddm_hard_gib", None)
+        hard_bytes = int(max(1.0, float(hard_gib or 1.0)) * GIB)
+        classification = "non_allocation_failure"
+        if allocation_failure:
+            classification = (
+                "capped_allocator_rejection"
+                if active_cap is not None and physical_free > hard_bytes / 2
+                else "cuda_allocation_failure_unknown"
+            )
+        self._last_failure_event = {
+            "event": "training_allocation_failure",
+            "classification": classification,
+            "exception_type": type(error).__name__,
+            "exception": text,
+            "shape_key": shape_key,
+            "step_num": step_num,
+            "active_cap_bytes": active_cap,
+            "peak_allocated_bytes": peak_allocated,
+            "peak_reserved_bytes": peak_reserved,
+            "physical_free_bytes": physical_free,
+            "allocator_retry_delta": max(
+                0,
+                int(stats.get("num_alloc_retries", 0) or 0)
+                - int(
+                    (
+                        getattr(self._signals, "_allocator_previous", None)
+                        or {}
+                    ).get("num_alloc_retries", 0)
+                    or 0
+                ),
+            ),
+            "rollback_block": rollback,
+            "rejected_residency_bytes": (
+                self._policy.last_rejected_residency_bytes
+            ),
+            "abandoned_fetch_tickets": int(abandoned),
+        }
+
+    def _singleton_runtime_ids(self):
+        manager = getattr(self._model, "_memory_manager", None)
+        return set(
+            getattr(manager, "_training_runtime_candidate_ids", ())
+        )
+
     @contextlib.contextmanager
     def sampling_session(self):
         """Wraps a whole sampling run (all images), restoring TRAIN at the end.
@@ -327,9 +474,27 @@ class ArenaOffloadRuntime:
         training plan and churn the sidecars for nothing.
         """
         self._require_open()
+        sampling_restores = []
+        if self._config.fp8_sampling:
+            from ..manager import MemoryManager
+
+            (
+                sampling_restores,
+                self._sampling_fp8_singletons,
+                _streamed,
+            ) = MemoryManager._enable_fp8_sampling(
+                self._model,
+                include_ids=self._singleton_runtime_ids(),
+            )
         try:
             yield self
         finally:
+            if sampling_restores:
+                from ..manager import MemoryManager
+
+                MemoryManager._disable_fp8_sampling(
+                    self._model, sampling_restores
+                )
             self._bind_training_cap()
             self._executor.activate(self._executor.TRAIN, self._training_plan)
 
@@ -362,16 +527,94 @@ class ArenaOffloadRuntime:
             hard_gib=hard_gib,
             env_name="AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB",
         )
+        dequant_reserve = (
+            0
+            if self._config.fp8_sampling
+            else int(
+                (self._smart_plan or {}).get(
+                    "largest_singleton_bf16_dequant_bytes", 0
+                )
+            )
+        )
         with self._executor.sampling(
             shape_key=shape_key,
             cold_working_bytes=int(cold_working_bytes),
             fixed_working_bytes=fixed_working_bytes,
-            cold_floor_bytes=int(margin_gib * GIB),
-            hot_floor_bytes=int((hard_gib + 0.25) * GIB),
+            cold_floor_bytes=int(margin_gib * GIB) + dequant_reserve,
+            hot_floor_bytes=int((hard_gib + 0.25) * GIB) + dequant_reserve,
         ):
             yield self
 
     # ------------------------------------------------------------------
+    def record_training_physical_free_min(self, free_bytes) -> None:
+        """Publish one successful step's physical high-water for bootstrap."""
+        if self._bootstrap_complete or free_bytes is None:
+            return
+        value = max(0, int(free_bytes))
+        self._bootstrap_min_free_bytes = (
+            value
+            if self._bootstrap_min_free_bytes is None
+            else min(self._bootstrap_min_free_bytes, value)
+        )
+
+    def _bootstrap_training_residency(self, active_cap_bytes) -> bool:
+        if (
+            self._bootstrap_complete
+            or self._bootstrap_min_free_bytes is None
+            or int(self._last_step_num or 0) < BOOTSTRAP_MIN_STEP
+        ):
+            return False
+        hard_gib = self._config.legacy.wddm_hard_gib
+        hard_bytes = int(
+            (1.0 if hard_gib is None else max(1.0, float(hard_gib))) * GIB
+        )
+        budget = max(
+            0,
+            self._bootstrap_min_free_bytes
+            - hard_bytes
+            - BOOTSTRAP_MARGIN_BYTES,
+        )
+        self._bootstrap_budget_bytes = budget
+        candidates = []
+        protected = self._protected_training_blocks()
+        plan = getattr(self._residency, "plan", None) or self._training_plan
+        for order, block_key in enumerate(self._arena.block_keys()):
+            record = self._arena.block_record(block_key)
+            keys = tuple((block_key, name) for name in record.leaf_names)
+            if block_key in protected or any(
+                key in plan.resident_leaf_keys for key in keys
+            ):
+                continue
+            candidates.append(
+                (int(record.committed_bytes), order, str(block_key))
+            )
+        selected = []
+        used = 0
+        for block_bytes, _order, block_key in sorted(candidates):
+            if used + block_bytes > budget:
+                continue
+            selected.append(block_key)
+            used += block_bytes
+        if not selected:
+            self._bootstrap_complete = True
+            return False
+        resident_before = (
+            int(self._residency.resident_bytes())
+            + int((self._smart_plan or {}).get("singleton_resident_bytes", 0))
+        )
+        result = self.transition_training_blocks(selected, resident=True)
+        if not result.get("changed"):
+            return False
+        self._bootstrap_complete = True
+        self._bootstrap_block_keys = tuple(result["block_keys"])
+        self._policy.begin_bootstrap_promotion(
+            self._bootstrap_block_keys,
+            used,
+            resident_before,
+            active_cap_bytes,
+        )
+        return True
+
     def _protected_training_blocks(self):
         return frozenset(
             str(block)
@@ -433,11 +676,16 @@ class ArenaOffloadRuntime:
         from .. import vram_budget
 
         total = int(vram_budget.device_total_bytes(self._device))
-        worst_allocated = max(
-            int(peak.peak_allocated_bytes)
+        worst_working = max(
+            int(peak.working_peak_bytes)
             for peak in peaks.values()
             if peak.steps > 0
         ) if any(peak.steps > 0 for peak in peaks.values()) else 0
+        current_resident = (
+            int(self._residency.resident_bytes())
+            + int((self._smart_plan or {}).get("singleton_resident_bytes", 0))
+        )
+        current_ring = self._training_ring_bytes()
         non_torch = max(
             0,
             total
@@ -449,9 +697,37 @@ class ArenaOffloadRuntime:
             (1.0 if hard_gib is None else max(1.0, float(hard_gib))) * GIB
         )
         predicted_free = total - (
-            worst_allocated + non_torch + int(candidate["block_bytes"])
+            worst_working
+            + current_resident
+            + current_ring
+            + non_torch
+            + int(candidate["block_bytes"])
         )
         return int(predicted_free - hard_bytes)
+
+    def _worst_shape_allocator_slack_bytes(self, current_cap_bytes):
+        peaks = self._signals.shape_peaks
+        if not any(peak.steps > 0 for peak in peaks.values()):
+            return 0
+        from .. import vram_budget
+
+        worst_working = max(
+            int(peak.working_peak_bytes)
+            for peak in peaks.values()
+            if peak.steps > 0
+        )
+        current_resident = (
+            int(self._residency.resident_bytes())
+            + int((self._smart_plan or {}).get("singleton_resident_bytes", 0))
+        )
+        predicted_live = (
+            worst_working
+            + current_resident
+            + self._training_ring_bytes()
+        )
+        return vram_budget.allocator_allowance_bytes(
+            current_cap_bytes, predicted_live
+        )
 
     def _apply_training_policy(self):
         import torch
@@ -468,6 +744,8 @@ class ArenaOffloadRuntime:
             cliff_cap,
             int(self._last_training_cap_target_bytes or cliff_cap),
         )
+        if self._bootstrap_training_residency(current_cap):
+            return
         decision = self._policy.step(
             self._signals.last_signal,
             candidate=candidate,
@@ -477,11 +755,35 @@ class ArenaOffloadRuntime:
             worst_shape_free_bytes=self._worst_shape_candidate_margin_bytes(
                 candidate
             ),
+            worst_shape_allocator_slack_bytes=(
+                self._worst_shape_allocator_slack_bytes(current_cap)
+            ),
         )
         if decision.action == "promote":
             self.transition_training_block(decision.block_key, resident=True)
         elif decision.action in ("demote", "rollback"):
-            self.transition_training_block(decision.block_key, resident=False)
+            rollback_keys = tuple(decision.block_keys or ())
+            if rollback_keys:
+                self.transition_training_blocks(
+                    rollback_keys, resident=False
+                )
+            else:
+                self.transition_training_block(
+                    decision.block_key, resident=False
+                )
+            if (
+                decision.action == "rollback"
+                and decision.target_cap_bytes is not None
+            ):
+                allocator_cap.apply_wddm_hard_allocator_cap(
+                    self._device,
+                    self._config.legacy.wddm_hard_gib,
+                    target_cap_bytes=decision.target_cap_bytes,
+                    log_prefix="[ArenaOffload]",
+                )
+                self._last_training_cap_target_bytes = (
+                    decision.target_cap_bytes
+                )
         elif decision.action == "raise_cap":
             allocator_cap.apply_wddm_hard_allocator_cap(
                 self._device,
@@ -491,6 +793,16 @@ class ArenaOffloadRuntime:
             )
             self._last_training_cap_target_bytes = decision.target_cap_bytes
 
+    def transition_training_blocks(self, block_keys, *, resident: bool) -> dict:
+        """Apply one executor-owned multi-block transaction at a boundary."""
+        self._require_open()
+        result = self._executor.transition_training_blocks(
+            tuple(block_keys), resident=bool(resident)
+        )
+        if result.get("changed"):
+            self._training_plan = result["plan"]
+        return result
+
     def transition_training_block(self, block_key: str, *, resident: bool) -> dict:
         """Apply one executor-owned whole-block transaction at a boundary."""
         self._require_open()
@@ -499,7 +811,6 @@ class ArenaOffloadRuntime:
         )
         if result.get("changed"):
             self._training_plan = result["plan"]
-            self._signals.invalidate_shape_peaks()
         return result
 
     def _bind_training_cap(self) -> None:
@@ -534,9 +845,26 @@ class ArenaOffloadRuntime:
             "fp8_forward": bool(self._config.fp8_forward),
             "fp8_backward": bool(self._config.fp8_backward),
             "fp8_sampling": bool(self._config.fp8_sampling),
+            "training_fp8_singletons": getattr(
+                self, "_training_fp8_singletons", 0
+            ),
+            "sampling_fp8_singletons": getattr(
+                self, "_sampling_fp8_singletons", 0
+            ),
+            "largest_singleton_bf16_dequant_bytes": int(
+                (self._smart_plan or {}).get(
+                    "largest_singleton_bf16_dequant_bytes", 0
+                )
+            ),
             "training_cap_target_bytes": getattr(
                 self, "_last_training_cap_target_bytes", None
             ),
+            "bootstrap_complete": self._bootstrap_complete,
+            "bootstrap_min_free_bytes": self._bootstrap_min_free_bytes,
+            "bootstrap_margin_bytes": BOOTSTRAP_MARGIN_BYTES,
+            "bootstrap_min_step": BOOTSTRAP_MIN_STEP,
+            "bootstrap_budget_bytes": self._bootstrap_budget_bytes,
+            "bootstrap_block_keys": self._bootstrap_block_keys,
             "working_reserve_bytes": int(
                 (self._smart_plan or {}).get("working_reserve_bytes", 0)
             ),
@@ -547,6 +875,7 @@ class ArenaOffloadRuntime:
                 "controller": self._policy.diagnostics(),
             },
             "policy_error": self._last_policy_error,
+            "last_failure_event": self._last_failure_event,
         }
 
     def _observe_training_step(self, *, shape_key, step_num, step_wall_ms) -> None:

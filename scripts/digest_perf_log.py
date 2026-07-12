@@ -558,13 +558,19 @@ def summarize_record(record: dict, full: bool) -> list[str]:
             or arena.get("training_cap_target_bytes")
         )
         margin_bytes = controller.get("last_worst_shape_margin_bytes")
+        allocator_slack_bytes = controller.get(
+            "last_worst_shape_allocator_slack_bytes"
+        )
         slack_bytes = controller.get("slack_pad_bytes")
         lines.append(
             "  arena_policy: state={state} windows={windows} action={action} "
             "reason={reason} block={block} block_gib={block_gib} "
             "cap_target_gib={cap_gib} resident_gib={resident} "
-            "singleton_gib={singleton} canonical_gib={canonical} plan={plan} "
-            "worst_margin_gib={margin} slack_gib={slack} "
+            "singleton_gib={singleton} canonical_gib={canonical} "
+            "bootstrap_gib={bootstrap} bootstrap_blocks={bootstrap_blocks} "
+            "plan={plan} "
+            "worst_margin_gib={margin} allocator_slack_gib={allocator_slack} "
+            "headband_gib={slack} "
             "throughput_gate={throughput} promote_gate={promote} "
             "cap_covers={covers} retries=+{retries} duty={duty} "
             "achieved={gbps}GB/s error={error}".format(
@@ -590,9 +596,19 @@ def summarize_record(record: dict, full: bool) -> list[str]:
                     float(arena.get("canonical_resident_bytes", 0))
                     / (1024 ** 3)
                 ),
+                bootstrap=g(
+                    float(arena.get("bootstrap_budget_bytes", 0))
+                    / (1024 ** 3)
+                ),
+                bootstrap_blocks=len(arena.get("bootstrap_block_keys") or ()),
                 plan=arena.get("plan_fingerprint"),
                 margin=g(
                     None if margin_bytes is None else margin_bytes / (1024 ** 3)
+                ),
+                allocator_slack=g(
+                    None
+                    if allocator_slack_bytes is None
+                    else allocator_slack_bytes / (1024 ** 3)
                 ),
                 slack=g(
                     None if slack_bytes is None else slack_bytes / (1024 ** 3)
@@ -818,9 +834,11 @@ def main() -> int:
         archives = sorted((path.parent / "logs").glob(f"*_{PERF_NAME}"))
         sources = archives + sources
 
-    records: list[dict] = []
+    loaded: list[dict] = []
     for source in sources:
-        records.extend(load_records(source))
+        loaded.extend(load_records(source))
+    events = [record for record in loaded if record.get("event")]
+    records = [record for record in loaded if not record.get("event")]
 
     if not records:
         print(f"No timing windows in {path}")
@@ -830,6 +848,26 @@ def main() -> int:
     print(f"Windows: {len(records)} (steps {records[0].get('step')}..{records[-1].get('step')})")
     for line in summarize_records(records):
         print(line)
+    if events:
+        print(f"Failure events: {len(events)}")
+        for event in events:
+            print(
+                "  {event}: step={step} classification={classification} "
+                "rollback={rollback} rejected_gib={rejected} "
+                "abandoned_fetches={abandoned} exception={exception}".format(
+                    event=event.get("event"),
+                    step=event.get("step_num"),
+                    classification=event.get("classification"),
+                    rollback=event.get("rollback_block"),
+                    rejected=g(
+                        None
+                        if event.get("rejected_residency_bytes") is None
+                        else event["rejected_residency_bytes"] / (1024 ** 3)
+                    ),
+                    abandoned=event.get("abandoned_fetch_tickets"),
+                    exception=event.get("exception"),
+                )
+            )
     print()
 
     shown = records if args.all else records[-max(1, args.last):]

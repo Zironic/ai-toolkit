@@ -129,11 +129,9 @@ def test_cap_verify_pressure_escalates_to_demote():
     assert s.name == vb.FSM_COLD and a == vb.ACT_DEMOTE
 
 
-def test_promotion_verify_ignores_cold_window_then_rolls_back_dirty():
+def test_promotion_verify_rolls_back_binding_first_window():
     s = vb.ResidencyFsmState(vb.FSM_PROMOTION_VERIFY, 0)
-    s, a = drive(s, BIND, k_verify=2)  # first window: cold, ignored
-    assert s.name == vb.FSM_PROMOTION_VERIFY and a == vb.ACT_HOLD
-    s, a = drive(s, BIND, k_verify=2)  # now dirty -> rollback + cooldown
+    s, a = drive(s, BIND, k_verify=2)
     assert s.name == vb.FSM_COOLDOWN and a == vb.ACT_ROLLBACK
 
 

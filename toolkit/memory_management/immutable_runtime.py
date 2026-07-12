@@ -727,6 +727,67 @@ class ImmutableTransformerRuntime:
         self.set_residency_plan(self.sampling_fallback_plan)
         return self.program(self.SAMPLE)
 
+    def transition_training_blocks(self, block_keys, *, resident: bool) -> dict:
+        """Atomically add or remove complete training blocks in one plan."""
+        current = self._sources.plan or self.residency.plan
+        if current.phase != self.TRAIN:
+            raise ImmutableRuntimeError(
+                f"training_block_transition_requires_train:{current.phase}"
+            )
+        requested = tuple(dict.fromkeys(str(key) for key in block_keys))
+        protected = frozenset(
+            (str(block), str(leaf))
+            for block, leaf in getattr(
+                self.model,
+                "_mm_immutable_protected_training_leaf_keys",
+                (),
+            )
+        )
+        next_keys = set(current.resident_leaf_keys)
+        changed = []
+        for key in requested:
+            abi = next(
+                (item for item in self._block_abis if item.block_key == key),
+                None,
+            )
+            if abi is None:
+                raise ImmutableRuntimeError(f"unknown_training_block:{key}")
+            leaf_keys = tuple((key, leaf) for leaf in abi.leaf_names)
+            present = tuple(
+                item for item in leaf_keys if item in current.resident_leaf_keys
+            )
+            if present and len(present) != len(leaf_keys):
+                raise ImmutableRuntimeError(
+                    f"partial_training_block_layout:{key}"
+                )
+            if not resident and any(item in protected for item in leaf_keys):
+                raise ImmutableRuntimeError(f"protected_training_block:{key}")
+            if bool(present) == bool(resident):
+                continue
+            changed.append(key)
+            if resident:
+                next_keys.update(leaf_keys)
+            else:
+                next_keys.difference_update(leaf_keys)
+        if not changed:
+            return {
+                "changed": False,
+                "block_keys": requested,
+                "resident": bool(resident),
+                "plan": current,
+            }
+        next_plan = ResidencyPlan.build(self.TRAIN, next_keys)
+        delta = self.set_residency_plan(next_plan)
+        self.model._mm_immutable_training_plan = next_plan
+        return {
+            "changed": True,
+            "block_keys": tuple(changed),
+            "resident": bool(resident),
+            "resident_bytes": self.residency.resident_bytes(),
+            "delta": delta,
+            "plan": next_plan,
+        }
+
     def transition_training_block(self, block_key: str, *, resident: bool) -> dict:
         """Atomically add or remove one complete training block by stable key."""
         current = self._sources.plan or self.residency.plan
