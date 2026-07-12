@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Union, List
 from optimum.quanto import QBytesTensor, QTensor
 
 from toolkit.network_mixins import ToolkitModuleMixin, ExtractableModuleMixin
+from toolkit.util.quantize import is_quantized_tensor
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
@@ -103,14 +104,17 @@ class DoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
 
     def get_orig_weight(self):
         weight = self.org_module[0].weight
-        if isinstance(weight, QTensor) or isinstance(weight, QBytesTensor):
+        if isinstance(weight, QTensor) or isinstance(weight, QBytesTensor) or is_quantized_tensor(weight):
             return weight.dequantize().data.detach()
         else:
             return weight.data.detach()
 
     def get_orig_bias(self):
         if hasattr(self.org_module[0], 'bias') and self.org_module[0].bias is not None:
-            return self.org_module[0].bias.data.detach()
+            bias = self.org_module[0].bias
+            if isinstance(bias, QTensor) or isinstance(bias, QBytesTensor) or is_quantized_tensor(bias):
+                return bias.dequantize().data.detach()
+            return bias.data.detach()
         return None
 
     # def dora_forward(self, x, *args, **kwargs):

@@ -234,7 +234,8 @@ class ExtractableModuleMixin:
             extract_mode = 'fixed'
             extract_mode_param = self.lora_dim
             
-        if isinstance(weight_to_extract, QBytesTensor):
+        from toolkit.util.quantize import is_quantized_tensor
+        if isinstance(weight_to_extract, QBytesTensor) or is_quantized_tensor(weight_to_extract):
             weight_to_extract = weight_to_extract.dequantize()
         
         weight_to_extract = weight_to_extract.clone().detach().float()
