@@ -205,7 +205,6 @@ export interface ModelConfig {
   layer_offloading_fp8_forward?: boolean;
   layer_offloading_fp8_grad_input?: boolean;
   layer_offloading_checkpoint_keep_last?: number;
-  layer_offloading_compile_streamed?: boolean;
   train_compile_blocks?: boolean;
   assistant_lora_path?: string;
   unconditional_lora_path?: string;

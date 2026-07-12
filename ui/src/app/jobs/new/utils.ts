@@ -67,7 +67,6 @@ export const handleModelArchChange = (
       delete newModel.layer_offloading_fp8_forward;
       delete newModel.layer_offloading_fp8_grad_input;
       delete newModel.layer_offloading_checkpoint_keep_last;
-      delete newModel.layer_offloading_compile_streamed;
       delete newModel.train_compile_blocks;
       setJobConfig(newModel, 'config.process[0].model');
     }
@@ -88,7 +87,6 @@ export const handleModelArchChange = (
       setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_forward');
       setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_grad_input');
       setJobConfig(0, 'config.process[0].model.layer_offloading_checkpoint_keep_last');
-      setJobConfig(false, 'config.process[0].model.layer_offloading_compile_streamed');
       setJobConfig(false, 'config.process[0].model.train_compile_blocks');
     }
   }

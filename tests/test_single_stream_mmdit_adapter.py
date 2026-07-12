@@ -97,15 +97,10 @@ def _dispatch_fixture():
     block = _EagerBlock()
     transformer = SimpleNamespace(
         _immutable_runtime=runtime,
-        _compiled_blocks=None,
-        _compiled_training_blocks=None,
-        _ingraph_sampling_plans={},
-        _ingraph_sampling_loras={},
-        _ingraph_lora_multiplier=None,
         _checkpoint_keep_last=0,
         gradient_checkpointing=False,
         blocks=[block],
-        _refresh_ingraph_lora_multiplier=lambda: None,
+        _refresh_runtime_lora_multiplier=lambda: None,
     )
     return transformer, runtime, block
 

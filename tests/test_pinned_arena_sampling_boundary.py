@@ -87,12 +87,11 @@ class PinnedArenaSamplingBoundaryTests(unittest.TestCase):
         finally:
             MemoryManager.detach(model)
 
-    def test_reserve_pin_for_ingraph_no_longer_disables_the_arena(self):
-        """Phase 2 Slice C: reserve_pin_for_ingraph used to force
-        use_pinned_arena=False in inference_resident's internal attach calls
-        (arena and ingraph packs were two independent pin grants). Ingraph
-        sampling packs now BORROW arena flats (try_borrow_pack), so the arena
-        must stay active and untouched through this boundary too."""
+    def test_sampling_boundary_keeps_the_pinned_arena_active(self):
+        """The arena is the single pin authority for the base weights across
+        both train and sample: inference_resident's internal attach calls must
+        keep it active and untouched through the sampling boundary rather than
+        falling back to pageable streaming."""
         device = torch.device("cuda:0")
         model = _Model(16, 2)
         MemoryManager.attach(
@@ -105,9 +104,7 @@ class PinnedArenaSamplingBoundaryTests(unittest.TestCase):
             flat_ptr_before = arena.block_pack(block0).host_flat.untyped_storage().data_ptr()
             weights_before = pin_manager.pinned_bytes_by_kind().get("weights", 0)
 
-            with MemoryManager.inference_resident(
-                model, device, reserve_pin_for_ingraph=True
-            ):
+            with MemoryManager.inference_resident(model, device):
                 x = torch.randn(2, 16, device=device)
                 model(x)
 

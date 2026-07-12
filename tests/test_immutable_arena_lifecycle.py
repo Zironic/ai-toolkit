@@ -90,29 +90,6 @@ class ImmutableBackendCudaTests(unittest.TestCase):
         module._mm_immutable_backend = True
         return arena
 
-    def test_destroy_immutable_arena_preserves_data_and_clears_state(self):
-        module = _TwoLinear()
-        before_keep = module.keep.weight.detach().clone()
-        before_canon = module.canon.weight.detach().clone()
-        arena = self._canonicalize(module)
-        flat_ptr = arena.block_pack("blocks.0").host_flat.data_ptr()
-        # Canonical params now view the arena flat.
-        self.assertEqual(module.keep.weight.data_ptr(), flat_ptr)
-
-        MemoryManager._destroy_immutable_arena(module)
-
-        # Data survives byte-for-byte on standalone (non-arena) storage.
-        self.assertTrue(torch.equal(module.keep.weight.detach(), before_keep))
-        self.assertTrue(torch.equal(module.canon.weight.detach(), before_canon))
-        self.assertNotEqual(module.keep.weight.data_ptr(), flat_ptr)
-        # Every immutable-backend marker is gone; the module reads as plain.
-        self.assertIsNone(getattr(module, "_mm_canonical_arena", None))
-        self.assertFalse(getattr(module, "_mm_immutable_backend", False))
-        self.assertFalse(getattr(module.keep, "_mm_canonical_leaf", False))
-        self.assertFalse(getattr(module.canon, "_mm_canonical_leaf", False))
-        # The "weights" pin tier returns to its pre-arena baseline.
-        self.assertEqual(pin_manager.pinned_bytes_by_kind().get("weights", 0), 0)
-
     def _assert_move_skips_canonical(self, mover):
         # Invariant 5: no whole-model move path may touch a canonical leaf.
         # A real cpu->cuda move is deterministic (unlike a "meta" move, which
@@ -134,11 +111,6 @@ class ImmutableBackendCudaTests(unittest.TestCase):
 
     def test_move_unmanaged_parameters_skips_canonical_leaf(self):
         self._assert_move_skips_canonical(MemoryManager._move_unmanaged_parameters)
-
-    def test_destroy_immutable_arena_is_noop_without_an_arena(self):
-        module = _TwoLinear()
-        # Never canonicalized -> must not raise.
-        MemoryManager._destroy_immutable_arena(module)
 
     def test_attach_smart_training_immutable_excludes_canonical_leaves(self):
         device = torch.device("cuda:0")

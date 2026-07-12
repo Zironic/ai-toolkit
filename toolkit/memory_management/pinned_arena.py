@@ -42,8 +42,7 @@ only (3) and (4) live in the model file, and neither contains arena logic.
    them (residency is chosen per-Linear, so a block is routinely part streamed /
    part resident) and packs only the streamed ones.
 
-4. **Enable via the shared helper.** ``enable_ingraph_sampling`` /
-   ``enable_ingraph_training`` call
+4. **Enable via the shared helper.** Call
    ``ingraph_stream.build_block_leaf_plans(arena, entries_by_block, ...)``,
    which owns the borrow-or-own policy, the fail-closed reasons
    (``non_pinned_pack``, ``unsupported_quant_wrapper``, ``wrapper_pack_missing``,

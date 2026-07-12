@@ -13,7 +13,8 @@ implementation detail, trust the code and git-bug tickets over this file.
 
 1. **Dedicated VRAM ceiling** (~11.5 GiB usable of 11.99): crossing it makes
    WDDM silently page GPU memory to system RAM. Catastrophic slowdown, **no
-   error**. Governed by `torch.cuda.mem_get_info`.
+   error**. Governed by `vram_budget.device_free_bytes` (NVML-backed) -- **NOT**
+   by `torch.cuda.mem_get_info`, see below.
 2. **Shared (DXGI NON_LOCAL) budget** (~15.1-15.7 GiB on this box, dynamic):
    a slice of system RAM that **pinned host memory commits against**.
    Exhausting it is a hard `cudaErrorMemoryAllocation` crash. CUDA cannot see
@@ -24,6 +25,41 @@ dedicated cliff's overflow valve. **Over-pinning converts a would-be slowdown
 into a crash.** Size pinned memory against both cliffs independently. The
 real DXGI headroom probe governs the pin cap; RAM proxies (the old RAM*0.25,
 ~7.94 GiB) are fallback only.
+
+## The free signal: only NVML tells the truth
+
+**`torch.cuda.mem_get_info` free is NOT physical availability.** It is what the
+driver will promise *this* process, and on WDDM that promise is backed by paging
+other processes out. **DXGI LOCAL `Budget` is no better** for this purpose: it is
+a *permission*, not an availability -- it shrinks under contention but still
+grants memory the OS intends to obtain by evicting the other tenant. That
+permission IS the silent-paging mechanism.
+
+Measured with a second process holding 9 GiB of the 12 GB card:
+
+```text
+NVML physical free              :  0.39 GiB   <- the truth (== nvidia-smi)
+torch.cuda.mem_get_info free    : 10.85 GiB   <- promises nearly the whole card
+DXGI LOCAL Budget - CurrentUsage:  4.58 GiB   <- also over-reports
+```
+
+So **govern on `vram_budget.device_free_bytes`** (NVML-backed, `min` with the
+driver number), never raw `mem_get_info`. NVML sees every process on the GPU, is
+cross-platform (`nvml.dll` / `libnvidia-ml.so.1`, ctypes, no dependency), and at
+~3 us/call is ~25x *cheaper* than `mem_get_info` (~80 us) -- it is safe on hot
+paths. Sensor: `nvml_meminfo.py`. DXGI keeps its own job: the *shared* NON_LOCAL
+pin budget, not the dedicated cliff.
+
+Consequence: **any other GPU tenant silently wrecks a run** if you trust the
+driver number -- a game, a ComfyUI server, or an orphaned training job. Observed
+in production: a 73 s/it job ran at **304 s/it** because a duplicate of itself
+was still alive holding VRAM; the planner saw "4.33 GiB free" (physical: 0.4)
+and sized residency into memory that did not exist. No error, no allocator
+retry -- `num_alloc_retries` does not catch this, because the allocation
+genuinely succeeds. Only throughput tells you.
+
+Delta-probe loops that measure this process's *own* allocation deltas may keep
+using raw `mem_get_info` -- they measure differences, not availability.
 
 ## Allocator hard cap: make the silent cliff loud
 

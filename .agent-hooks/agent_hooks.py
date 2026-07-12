@@ -582,8 +582,9 @@ def mode_pre_bash() -> int:
     # rewrite (and the rewritten command must itself be valid PowerShell). Keep
     # Claude's explicit Bash tool on the POSIX path.
     tool_name = str(event.get("tool_name") or "")
+    is_codex_event = "model" in event or "turn_id" in event
     native_powershell_tool = tool_name.lower() == "powershell" or (
-        os.name == "nt" and tool_name.lower() != "bash"
+        os.name == "nt" and (is_codex_event or tool_name.lower() != "bash")
     )
     if native_powershell_tool:
         if likely_noisy(command):

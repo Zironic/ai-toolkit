@@ -1,15 +1,13 @@
 """Manual CUDA smoke for Krea2 LoRA *training* steps with smart offload.
 
-Training-side counterpart of smoke_krea2_ingraph_cuda.py: loads the full
-quantized Krea2 transformer, attaches the real smart MemoryManager exactly the
-way load_model() does, applies a fresh LoRA network the way BaseSDTrainProcess
-does, then runs a handful of fake training steps (random latents + cached TE
-embeddings, flow-matching velocity loss, backward, AdamW step) and quits. No
-dataset, no dataloader, no trainer process.
+Loads the full quantized Krea2 transformer, attaches the compile-neutral
+immutable runtime exactly the way load_model() does, applies a fresh LoRA
+network the way BaseSDTrainProcess does, then runs a handful of fake training
+steps (random latents + cached TE embeddings, flow-matching velocity loss,
+backward, AdamW step) and quits. No dataset, no dataloader, no trainer process.
 
-This is the harness for the Phase 4 ladder (INGRAPH_STREAM_PLAN.md): today it
-exercises the legacy eager streamed training path as the baseline; compile
-knobs get added rung by rung as they land.
+The two-phase lifecycle is mirrored faithfully: the runtime is prepared during
+the attach (before LoRA) and finalized after the network is applied.
 
 Example:
 
@@ -223,75 +221,12 @@ def _build_model_config(args):
         layer_offloading_block_stream_only=args.block_stream_only,
         layer_offloading_fp8_forward=args.fp8_training_forward,
         layer_offloading_pinned_arena=args.pinned_arena,
-        layer_offloading_immutable_arena=getattr(args, "use_immutable_arena", False),
-        # The immutable runtime is built during load_model, so its ring depth and
-        # compile gate have to arrive through the config -- not through the
-        # post-LoRA enable call the old ingraph path used.
-        layer_offloading_ingraph_depth=args.ingraph_depth,
-        compile=bool(
-            getattr(args, "use_immutable_arena", False)
-            and not args.no_ingraph_compile
-        ),
+        # The immutable runtime is built during load_model, so its ring depth
+        # and compile gate arrive through the config.
+        layer_offloading_prefetch_depth=args.prefetch_depth,
+        compile=not args.no_compile,
         model_kwargs=model_kwargs,
     )
-
-
-def _attach_training_memory(transformer, model_config, device, *, ingraph_training=False):
-    # Mirror Krea2Model.load_model()'s smart-offload attach exactly.
-    # Phase 3 Slice B: the arena and ingraph training coexist -- ingraph training
-    # BORROWS the arena flats for the frozen base. When the arena is off, ingraph
-    # training pins its own packs (attach pins would double-commit), so keep the
-    # legacy pinned_weight_gib=0.0 for the arena-off ingraph path.
-    use_pinned_arena = bool(model_config.layer_offloading_pinned_arena)
-    pinned_weight_gib = (
-        0.0
-        if (ingraph_training and not use_pinned_arena)
-        else model_config.layer_offloading_pinned_weight_gb
-    )
-    if use_pinned_arena:
-        # The arena covers FROZEN base weights only, and it is built inside
-        # attach. In the real trainer the base is frozen (BaseSDTrainProcess:
-        # 2524) but that runs AFTER load_model's attach, so freeze here to
-        # realize the "frozen before attach" invariant. Safe: the base is
-        # fp8-quantized (never genuinely trainable) and LoRA trains adapters,
-        # so an early freeze is behavior-neutral for adapter training.
-        transformer.requires_grad_(False)
-    ignore_modules = [
-        module
-        for module in transformer.modules()
-        if isinstance(module, (SimpleModulation, DoubleSharedModulation))
-    ]
-    keep_last = model_config.layer_offloading_checkpoint_keep_last
-    pinned_resident_keys = MemoryManager.training_pinned_keys_for_keep_last(
-        transformer, max(0, keep_last)
-    )
-    MemoryManager.attach_smart_training(
-        transformer,
-        device,
-        working_reserve_gib=model_config.layer_offloading_smart_working_reserve_gb,
-        wddm_margin_gib=model_config.layer_offloading_smart_wddm_margin_gb,
-        wddm_hard_gib=model_config.layer_offloading_smart_wddm_hard_gb,
-        ignore_modules=ignore_modules,
-        pinned_resident_keys=pinned_resident_keys,
-        block_stream_only=model_config.layer_offloading_block_stream_only,
-        pinned_weight_gib=pinned_weight_gib,
-        wddm_spill_reserve_pct=model_config.layer_offloading_wddm_spill_reserve_pct,
-        fp8_training_forward=bool(model_config.layer_offloading_fp8_forward),
-        # Phase 3 Slice B: arena + ingraph training coexist; enable_ingraph_-
-        # training borrows the arena flats (see mmdit.enable_ingraph_training).
-        use_pinned_arena=use_pinned_arena,
-    )
-    # Mirror krea2.py:815. Residency is per-Linear, so attach leaves some block
-    # linears resident -- and they are still on the CPU until this runs (attach
-    # only offloads the STREAMED ones). It must happen before the trunk is
-    # enabled: _move_unmanaged_parameters REPLACES a quantized Parameter when it
-    # moves it, so a trunk built first would capture the dead CPU tensors and
-    # _scaled_mm would see cuda:0 and cpu.
-    transformer.to(device)
-    transformer.enable_gradient_checkpointing(keep_last=max(0, keep_last))
-    if getattr(transformer, "_memory_manager", None) is not None:
-        MemoryManager._attach_prefetch_pool(transformer, device)
-
 
 
 def _apply_lora(model, transformer, device, rank, alpha):
@@ -455,19 +390,7 @@ def _parse_args():
         help=(
             "Ticket 534ea49: pin offloaded weights once into a persistent "
             "per-block flat arena instead of re-pinning them at every "
-            "sampling boundary. Combine with --ingraph-training (Phase 3 "
-            "Slice B): the training trunk borrows the arena flats for the "
-            "frozen base instead of pinning a second copy."
-        ),
-    )
-    parser.add_argument(
-        "--use-immutable-arena", action="store_true",
-        help=(
-            "Slice 6 (IMMUTABLE_TRANSFER_ARENA_PLAN.md): build the canonical "
-            "immutable host arena + manager-owned GPU residency sidecars and "
-            "run the compiled train/sample plan executor instead of the legacy "
-            "pinned arena. Mutually exclusive with --pinned-arena / "
-            "--ingraph-training."
+            "sampling boundary."
         ),
     )
     parser.add_argument("--checkpoint-keep-last", type=int, default=0)
@@ -501,12 +424,9 @@ def _parse_args():
         help="torch.save'd optimizer state_dict to load before step 0",
     )
     parser.add_argument(
-        "--ingraph-training",
-        action="store_true",
-        help="call enable_ingraph_training() after LoRA apply (Phase 4a): "
-        "compiled fully-streamed training trunk, all blocks checkpointed",
+        "--prefetch-depth", type=int, default=2,
+        help="how many blocks ahead the immutable runtime issues H2D fetches",
     )
-    parser.add_argument("--ingraph-depth", type=int, default=2)
     parser.add_argument(
         "--blocking-h2d-timing",
         action="store_true",
@@ -544,15 +464,9 @@ def _parse_args():
         "the ~2.5 min cold trunk compile into seconds); empty string disables",
     )
     parser.add_argument(
-        "--no-ingraph-compile",
+        "--no-compile",
         action="store_true",
-        help="with --ingraph-training: run the eager ingraph trunk (no torch.compile)",
-    )
-    parser.add_argument(
-        "--train-compile-blocks",
-        action="store_true",
-        help="call enable_compiled_training() after LoRA apply, mirroring the "
-        "trainer's train_compile_blocks flag (Rung 1 / Phase 4-pre)",
+        help="run the immutable trunk eager (no torch.compile of block kernels)",
     )
     return parser.parse_args()
 
@@ -621,26 +535,17 @@ def main():
 
     print("[smoke] attaching smart training memory manager")
     t0 = time.perf_counter()
-    if args.use_immutable_arena:
-        # Mirror Krea2Model.load_model()'s immutable path: canonicalize the
-        # frozen base into the arena + build residency/plan. The compiled
-        # executor is stood up AFTER LoRA apply (below), exactly like the
-        # trainer does with enable_ingraph_training.
-        ignore_modules = [
-            module
-            for module in transformer.modules()
-            if isinstance(module, (SimpleModulation, DoubleSharedModulation))
-        ]
-        model._attach_immutable_training_memory(transformer, ignore_modules)
-        transformer.enable_gradient_checkpointing(
-            keep_last=max(0, config.layer_offloading_checkpoint_keep_last)
-        )
-        if getattr(transformer, "_memory_manager", None) is not None:
-            MemoryManager._attach_prefetch_pool(transformer, device)
-    else:
-        _attach_training_memory(
-            transformer, config, device, ingraph_training=bool(args.ingraph_training)
-        )
+    # Mirror Krea2Model.load_model(): canonicalize the frozen base into the
+    # arena, build residency/plan, and prepare the (unfinalized) runtime. The
+    # permanent programs are finalized AFTER LoRA apply, below.
+    ignore_modules = [
+        module
+        for module in transformer.modules()
+        if isinstance(module, (SimpleModulation, DoubleSharedModulation))
+    ]
+    model._attach_immutable_training_memory(transformer, ignore_modules)
+    if getattr(transformer, "_memory_manager", None) is not None:
+        MemoryManager._attach_prefetch_pool(transformer, device)
     model.model = transformer
     rows.append(
         {
@@ -676,130 +581,39 @@ def main():
     _print_json(rows[-1])
 
     compile_cache_key = None
-    if (args.ingraph_training or args.use_immutable_arena) and args.compile_cache_dir:
+    if args.compile_cache_dir:
         from extensions_built_in.diffusion_models.krea2.krea2 import _compile_cache_key
         from toolkit.compile_cache import load_compile_cache
 
-        suffix = "_immutable_train" if args.use_immutable_arena else "_ingraph_train"
-        compile_cache_key = _compile_cache_key(model) + suffix
+        compile_cache_key = _compile_cache_key(model) + "_immutable_train"
         if load_compile_cache(args.compile_cache_dir, compile_cache_key):
             print(f"[smoke] loaded torch.compile mega-cache ({compile_cache_key})")
 
-    if args.ingraph_training:
-        # Mirror BaseSDTrainProcess's layer_offloading_ingraph_training hook:
-        # enable after LoRA apply so entries see the final module state.
-        print("[smoke] enabling in-graph streamed training trunk")
-        t0 = time.perf_counter()
-        enable = getattr(transformer, "enable_ingraph_training", None)
-        if enable is None:
-            raise SystemExit(
-                "--ingraph-training: this model no longer exposes "
-                "enable_ingraph_training (the compile-neutral refactor replaced "
-                "it with the immutable runtime). Use --use-immutable-arena."
-            )
-        block_count = enable(
-            depth=args.ingraph_depth, compile=not args.no_ingraph_compile
+    # Mirror BaseSDTrainProcess: finalize the permanent programs and activate
+    # the TRAIN plan AFTER LoRA apply, so they capture the adapter leaves.
+    print("[smoke] finalizing immutable runtime")
+    t0 = time.perf_counter()
+    training_plan = transformer._mm_immutable_training_plan
+    runtime = transformer._immutable_runtime
+    if runtime is None:
+        raise SystemExit(
+            "load_model did not prepare an immutable runtime "
+            "(_immutable_runtime is unset)"
         )
-        borrowed = int(getattr(transformer, "_ingraph_training_borrowed_count", 0))
-        owned = int(getattr(transformer, "_ingraph_training_owned_count", 0))
-        rows.append(
-            {
-                "event": "ingraph_training_enabled",
-                "seconds": time.perf_counter() - t0,
-                "blocks": block_count,
-                "borrowed": borrowed,
-                "owned": owned,
-                # Residency is per-Linear: a block may be part streamed / part
-                # resident, and a fully-resident block builds no pack at all.
-                "fully_resident_blocks": int(
-                    getattr(transformer, "_ingraph_training_resident_blocks", 0)
-                ),
-                "streamed_leaves": int(
-                    getattr(transformer, "_ingraph_training_streamed_leaves", 0)
-                ),
-                "resident_leaves": int(
-                    getattr(transformer, "_ingraph_training_resident_leaves", 0)
-                ),
-                "depth": args.ingraph_depth,
-                "compiled": not args.no_ingraph_compile,
-                "lora_blocks": len(getattr(transformer, "_ingraph_training_loras", {})),
-                "cuda": _cuda_snapshot("ingraph_training_enabled", device),
-                "dxgi": _dxgi_snapshot("ingraph_training_enabled"),
-            }
-        )
-        _print_json(rows[-1])
-        # Phase 3 Slice B validation: under --pinned-arena every streamed base
-        # block MUST be borrowed from the arena. An owned-fallback pack means
-        # the arena did not cover a streamed block -- a silent regression that
-        # a green run would otherwise hide.
-        if args.pinned_arena and owned:
-            raise SystemExit(
-                f"[smoke] pinned-arena ingraph training built {owned} OWNED "
-                f"pack(s) (expected all {borrowed + owned} borrowed); arena did "
-                "not cover the streamed leaves"
-            )
-
-    if args.use_immutable_arena:
-        # Mirror BaseSDTrainProcess's layer_offloading_immutable_arena hook:
-        # stand up the compiled executor and activate its TRAIN plan AFTER LoRA
-        # apply, so it captures the adapter leaves.
-        print("[smoke] enabling immutable-arena compiled runtime")
-        t0 = time.perf_counter()
-        training_plan = transformer._mm_immutable_training_plan
-        runtime = transformer._immutable_runtime
-        if runtime is None:
-            raise SystemExit(
-                "--use-immutable-arena: load_model did not prepare an immutable "
-                "runtime (_immutable_runtime is unset)"
-            )
-        # Two-phase, exactly as BaseSDTrainProcess does it: the runtime was
-        # prepared in load_model BEFORE LoRA; finalize here, AFTER LoRA apply,
-        # so the permanent programs capture the installed adapter leaves.
-        transformer.finalize_immutable_runtime()
-        runtime.activate(runtime.TRAIN, training_plan)
-        rows.append(
-            {
-                "event": "immutable_arena_enabled",
-                "seconds": time.perf_counter() - t0,
-                "depth": int(runtime.depth),
-                "compiled": bool(runtime.compile_blocks),
-                "immutable_arena": _immutable_arena_summary(transformer),
-                "cuda": _cuda_snapshot("immutable_arena_enabled", device),
-                "dxgi": _dxgi_snapshot("immutable_arena_enabled"),
-            }
-        )
-        _print_json(rows[-1])
-
-    if args.train_compile_blocks:
-        # Mirror BaseSDTrainProcess's train_compile_blocks wiring: compile the
-        # pinned-resident blocks for grad-enabled training (Rung 1). Must run
-        # after LoRA apply so the readiness audit sees the final module state.
-        print("[smoke] enabling resident-block training compile")
-        t0 = time.perf_counter()
-        mm = getattr(transformer, "_memory_manager", None)
-        pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()) or set())
-        compiled_count, blocked_count = transformer.enable_compiled_training(pinned_keys)
-        readiness = transformer.training_compile_readiness(pinned_keys)
-        rows.append(
-            {
-                "event": "train_compile_blocks",
-                "seconds": time.perf_counter() - t0,
-                "compiled_blocks": compiled_count,
-                "blocked_blocks": blocked_count,
-                "pinned_keys": len(pinned_keys),
-                "blocked_reasons": [
-                    {"index": item["index"], "reasons": item.get("reasons")}
-                    for item in readiness.get("statuses", [])
-                    if item.get("pinned") and not item.get("ready")
-                ],
-            }
-        )
-        _print_json(rows[-1])
-        if compiled_count == 0:
-            raise SystemExit(
-                "train-compile-blocks requested but 0 blocks compiled -- "
-                "use --checkpoint-keep-last N so pinned resident blocks exist"
-            )
+    transformer.finalize_immutable_runtime()
+    runtime.activate(runtime.TRAIN, training_plan)
+    rows.append(
+        {
+            "event": "immutable_runtime_finalized",
+            "seconds": time.perf_counter() - t0,
+            "depth": int(runtime.depth),
+            "compiled": bool(runtime.compile_blocks),
+            "immutable_arena": _immutable_arena_summary(transformer),
+            "cuda": _cuda_snapshot("immutable_runtime_finalized", device),
+            "dxgi": _dxgi_snapshot("immutable_runtime_finalized"),
+        }
+    )
+    _print_json(rows[-1])
 
     # --- fp8 backward divergence experiment wiring (ticket fce0b45) ---
     named = _named_trainable(network)
@@ -1075,23 +889,20 @@ def main():
         rows.append(teardown_row)
         _print_json(teardown_row)
 
-    if args.use_immutable_arena:
-        # Slice 6 true-unload (genuine model unload, not a phase boundary): the
-        # canonical Parameters are cloned off the arena and every pinned byte
-        # returns to the pre-arena "weights" baseline.
-        ledger_before_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
-        transformer.disable_immutable_runtime()
-        ledger_after_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
-        teardown_row = {
-            "event": "immutable_arena_destroyed",
-            "ledger_weights_gib_before": _gib(ledger_before_destroy),
-            "ledger_weights_gib_after": _gib(ledger_after_destroy),
-            "arena_present_after": getattr(transformer, "_mm_canonical_arena", None)
-            is not None,
-            "backend_flag_after": getattr(transformer, "_mm_immutable_backend", False),
-        }
-        rows.append(teardown_row)
-        _print_json(teardown_row)
+    # True unload (a genuine model unload, not a phase boundary): the runtime
+    # closes and every pinned byte returns to the pre-arena baseline.
+    ledger_before_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+    transformer.disable_immutable_runtime()
+    ledger_after_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
+    teardown_row = {
+        "event": "immutable_runtime_closed",
+        "ledger_weights_gib_before": _gib(ledger_before_destroy),
+        "ledger_weights_gib_after": _gib(ledger_after_destroy),
+        "runtime_present_after": getattr(transformer, "_immutable_runtime", None)
+        is not None,
+    }
+    rows.append(teardown_row)
+    _print_json(teardown_row)
 
     if args.output_json:
         json_path = Path(args.output_json)

@@ -148,9 +148,16 @@ overrides that are not required for normal training.
   positive at the live peak — if live alone exceeds the target, every sweep
   dumps all idle cache and every reuse becomes a fresh malloc that sweeps
   again (self-sustaining thrash).
+  - **Only NVML reports true free VRAM.** `torch.cuda.mem_get_info` free is a
+    per-process *promise*, not physical availability, and DXGI LOCAL `Budget` is
+    a *permission* — both over-report massively when anything else is on the card
+    (measured with a 9 GiB squatter: NVML 0.39 GiB vs mem_get_info 10.85 GiB).
+    Govern on `vram_budget.device_free_bytes` (NVML-backed, cross-platform,
+    ~25× cheaper than `mem_get_info`); never plan residency off the raw driver
+    number, or a stray game/ComfyUI/orphaned job silently pages the run.
   - **Two distinct memory cliffs, different failure modes.** Crossing the
     *dedicated* VRAM ceiling makes WDDM silently page GPU memory to system RAM —
-    catastrophic slowdown, **no error** (governed by `torch.cuda.mem_get_info`).
+    catastrophic slowdown, **no error** (governed by `vram_budget.device_free_bytes`).
     Exhausting the *shared* (DXGI NON_LOCAL) budget — a slice of system RAM that
     **pinned host memory commits against** — is a hard `cudaErrorMemoryAllocation`
     crash. CUDA can't see the shared budget; only DXGI can (the ledger in

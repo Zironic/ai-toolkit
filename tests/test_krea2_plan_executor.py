@@ -30,13 +30,21 @@ pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA req
 LAYERS = 2
 
 
-def _runtime(model, state, **kwargs):
-    return ImmutableTransformerRuntime(
+def _runtime(model, state, *, compile_blocks=True, **finalize_kwargs):
+    """Build a runtime through the two-phase lifecycle the trainer uses.
+
+    Phase A (construct) sees no LoRA; phase B (finalize_execution) installs the
+    LoRA metadata and builds the permanent programs.
+    """
+    runtime = ImmutableTransformerRuntime(
         model,
         state,
         architecture_adapter=SingleStreamMMDiTAdapter(),
-        **kwargs,
+        compile_blocks=compile_blocks,
     )
+    runtime.finalize_execution(**finalize_kwargs)
+    return runtime
+
 
 def _run(executor, *args):
     mode = executor.TRAIN if torch.is_grad_enabled() else executor.SAMPLE
@@ -63,6 +71,9 @@ def _model():
     return model
 
 
+_ADAPTER = SingleStreamMMDiTAdapter()
+
+
 def _inputs(model, *, requires_grad=False):
     x = torch.randn(1, 5, 32, device="cuda", requires_grad=requires_grad)
     vec = torch.randn(1, 192, device="cuda")
@@ -74,7 +85,7 @@ def _inputs(model, *, requires_grad=False):
 def _fixture():
     model = _model()
     entries_by_block = {
-        f"blocks.{index}": list(model._block_linear_entries(model.blocks[index]))
+        f"blocks.{index}": list(_ADAPTER.leaf_entries(model.blocks[index]))
         for index in range(LAYERS)
     }
     reference_args_by_block = {
@@ -99,7 +110,7 @@ def _loras(model, rank=4):
     trainable = []
     for index in range(LAYERS):
         block_loras = {}
-        for name, child in model._block_linear_entries(model.blocks[index]):
+        for name, child in _ADAPTER.leaf_entries(model.blocks[index]):
             a = torch.randn(rank, child.in_features, device="cuda", requires_grad=True)
             b = torch.randn(child.out_features, rank, device="cuda", requires_grad=True)
             block_loras[name] = LoraEntry(a=a, b=b, scale=0.125)
@@ -137,7 +148,7 @@ def _parameter_ids(model):
     return tuple(
         id(child.weight)
         for index in range(LAYERS)
-        for _name, child in model._block_linear_entries(model.blocks[index])
+        for _name, child in _ADAPTER.leaf_entries(model.blocks[index])
     )
 
 
@@ -174,8 +185,8 @@ def test_compiled_train_parity_lora_grads_and_zero_graph_breaks():
         with torch.no_grad():
             expected = inputs[0].detach()
             for index in range(LAYERS):
-                lora_args = model._block_lora_tuple(
-                    loras[index], torch.tensor(0.75, device="cuda")
+                lora_args = _ADAPTER.build_lora_args(
+                    index, loras, torch.tensor(0.75, device="cuda")
                 )
                 expected = model.blocks[index].forward_streamed(
                     expected,
@@ -219,19 +230,37 @@ def test_phase_cycles_reuse_graphs_and_arena_fixed_across_boundaries():
             _run(executor, *_inputs(model))
         torch.cuda.synchronize()
 
+    train_program = executor.program(executor.TRAIN)
+    sample_program = executor.program(executor.SAMPLE)
+    trunks = (train_program.trunk, sample_program.trunk)
+    fingerprints = (train_program.fingerprint, sample_program.fingerprint)
+
     try:
         cycle()
         graphs_after_first, breaks = _dynamo_counts()
         assert breaks == 0
-        builds_after_first = executor.stats["plan_builds"]
+        generation_after_first = executor.source_generation
 
         cycle()
         graphs_after_second, breaks = _dynamo_counts()
         assert breaks == 0
-        # Same-plan cycles add no unique graphs and no new plan fingerprints.
+        # Same-plan cycles add no unique graphs: residency publication swaps
+        # source snapshots only.
         assert graphs_after_second == graphs_after_first
-        assert executor.stats["plan_builds"] == builds_after_first
-        assert executor.stats["plan_reuse"] >= 2
+
+        # The programs are permanent: republishing residency never rebuilds a
+        # trunk or changes a program fingerprint, only the source generation.
+        assert executor.program(executor.TRAIN) is train_program
+        assert executor.program(executor.SAMPLE) is sample_program
+        assert (
+            executor.program(executor.TRAIN).trunk,
+            executor.program(executor.SAMPLE).trunk,
+        ) == trunks
+        assert (
+            executor.program(executor.TRAIN).fingerprint,
+            executor.program(executor.SAMPLE).fingerprint,
+        ) == fingerprints
+        assert executor.source_generation > generation_after_first
 
         # Arena pointers, registrations, pin ledger, and Parameter identity
         # are byte-for-byte fixed across every boundary.
@@ -325,9 +354,6 @@ def test_training_residency_reduction_is_subset_only_and_preserves_protected():
         assert state.plan.resident_leaf_keys < before_keys
         assert state.resident_bytes() < before_bytes
         assert model._mm_immutable_training_plan is state.plan
-        assert executor.program(executor.TRAIN).resident_leaf_keys == (
-            state.plan.resident_leaf_keys
-        )
         assert _arena_signature(arena) == signature
         assert _parameter_ids(model) == parameter_ids
     finally:
@@ -346,12 +372,13 @@ def test_all_streamed_sampling_fallback_needs_no_host_rebuild():
             _run(executor, *_inputs(model))
 
         # Emergency demotion: prebuilt all-streamed plan, no host-side work.
-        program = executor.activate_sampling_fallback()
+        executor.activate_sampling_fallback()
         assert state.resident_bytes() == 0
-        for block_plan in program.block_plans:
-            assert block_plan.transfer is not None
-            assert block_plan.transfer.fully_streamed
-            assert block_plan.transfer.num_ranges == 1
+        for index in range(LAYERS):
+            snapshot = executor.source(index)
+            assert snapshot.transfer is not None
+            assert snapshot.transfer.fully_streamed
+            assert snapshot.transfer.num_ranges == 1
         assert _arena_signature(arena) == signature
 
         ingraph_stream.fetch_stats(reset=True)
@@ -372,18 +399,21 @@ def test_run_fails_closed_without_activation_and_on_stale_plan():
     model, arena, state, _reference_args = _fixture()
     executor = _runtime(model, state, compile_blocks=False)
     try:
+        # No residency published yet: there is no source table to run against.
         with torch.no_grad(), pytest.raises(
-            ImmutableRuntimeError, match="no_active_plan:sample"
+            ImmutableRuntimeError, match="no_residency_source_table"
         ):
             _run(executor, *_inputs(model))
 
         executor.activate(executor.SAMPLE, _sample_plan())
-        # A residency change behind the executor's back must fail closed.
-        state.reconcile(ResidencyPlan.build("rogue", (("blocks.0", "attn.wk"),)))
-        with torch.no_grad(), pytest.raises(
-            ImmutableRuntimeError, match="residency_plan_changed:sample"
-        ):
-            _run(executor, *_inputs(model))
+        # Republishing residency under a live execution must fail closed: the
+        # in-flight trunk is reading the current source snapshots.
+        with torch.no_grad(), executor.execution(executor.SAMPLE):
+            with pytest.raises(
+                ImmutableRuntimeError, match="residency_transition_during_execution"
+            ):
+                executor.set_residency_plan(_train_plan())
+            assert executor.run(*_inputs(model)).shape == (1, 5, 32)
     finally:
         ingraph_stream.drain_fetch_runtime()
         arena.release()

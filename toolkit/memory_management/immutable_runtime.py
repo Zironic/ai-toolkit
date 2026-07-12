@@ -403,6 +403,10 @@ class ImmutableTransformerRuntime:
     def finalized(self) -> bool:
         return self._finalized
 
+    def source(self, block_index: int) -> ImmutableBlockSourceSnapshot:
+        """Current published source snapshot for one block."""
+        return self._sources.source(block_index)
+
     @staticmethod
     def _execution_signature(loras_by_block, lora_multiplier):
         entries = []

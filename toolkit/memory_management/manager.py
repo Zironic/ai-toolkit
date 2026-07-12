@@ -2598,17 +2598,6 @@ class MemoryManager:
     )
     _training_guard_pressure = staticmethod(vram_budget.training_guard_pressure)
 
-    @staticmethod
-    def _invalidate_compiled_blocks(module):
-        for name in ("disable_compiled_sampling", "disable_compiled_training"):
-            fn = getattr(module, name, None)
-            if fn is None:
-                continue
-            try:
-                fn()
-            except Exception:
-                pass
-
     @classmethod
     def promote_layer(cls, child):
         """Make one streamed layer resident, in place (offloaded -> resident).
@@ -2681,7 +2670,6 @@ class MemoryManager:
             child._mm_pinned_bytes = 0
         del child._layer_memory_manager
         cls._refresh_resident_trace_hooks(lmm.manager.module, lmm.manager)
-        cls._invalidate_compiled_blocks(lmm.manager.module)
         return True
 
     @classmethod
@@ -2701,8 +2689,6 @@ class MemoryManager:
                 "immutable training attempted to demote a trainable module: "
                 f"{layer_key or child.__class__.__name__}"
             )
-
-        cls._invalidate_compiled_blocks(manager.module)
 
         name = child.__class__.__name__
         if name in LINEAR_MODULES:
@@ -5652,11 +5638,10 @@ class MemoryManager:
             ):
                 continue
             # Only layers whose weights actually occupy the DEVICE are demote
-            # candidates. Ingraph pack-source linears have no streaming hook
-            # (enable_ingraph_sampling strips the legacy markers) so they look
-            # resident, but their weights live in CPU host packs -- "demoting"
-            # one frees zero device bytes (observed: futile demote loop at
-            # 2000px picking pack blocks, 0.81 GiB plan / 0.00 GiB gained).
+            # candidates. Pack-source linears carry no streaming hook, so they
+            # look resident, but their weights live in CPU host packs --
+            # "demoting" one frees zero device bytes (observed: futile demote
+            # loop at 2000px picking pack blocks, 0.81 GiB plan / 0.00 gained).
             weight = getattr(child, "weight", None)
             if weight is None or weight.device.type == "cpu":
                 continue
@@ -5714,7 +5699,7 @@ class MemoryManager:
     @contextlib.contextmanager
     def inference_resident(
         cls, module, device=None, fp8_sampling=False, working_reserve_gib=None,
-        wddm_margin_gib=None, wddm_hard_gib=None, reserve_pin_for_ingraph=False,
+        wddm_margin_gib=None, wddm_hard_gib=None,
         cold_start_hint_bytes=None,
     ):
         """Temporarily make an offloaded module fully GPU-resident for a forward-only run.
@@ -6047,7 +6032,7 @@ class MemoryManager:
 
         move_started = time.perf_counter()
         try:
-            if not plan["fits"] and not reserve_pin_for_ingraph:
+            if not plan["fits"]:
                 raise torch.cuda.OutOfMemoryError(
                     "model, streaming buffers, and sampling working_reserve do not fit"
                 )
@@ -6058,32 +6043,12 @@ class MemoryManager:
                     offload_percent=1.0,
                     ignore_modules=args.get("ignore_modules", []),
                     _offload_module_ids=plan["offload_ids"],
-                    # 0.0 starves the per-tensor path on purpose (ingraph used
-                    # to pin its OWN packs, so per-tensor pinning the same
-                    # weights would double-commit). But `pinned_weight_gib`
-                    # also sizes the ARENA's own budget (Slice B) when the
-                    # arena is active -- zeroing it here would starve any
-                    # block newly added to the arena this attach (e.g. one
-                    # resident during training but streamed for sampling),
-                    # forcing it pageable and making ingraph's borrow
-                    # attempt fail closed to an owned pack with no headroom
-                    # left (ticket 534ea49 Phase 2 bug: this exact path
-                    # produced "non_pinned_pack" after "pin refused
-                    # (ingraph_pack)"). Only zero it for the non-arena path.
-                    pinned_weight_gib=(
-                        0.0
-                        if reserve_pin_for_ingraph and not args.get("use_pinned_arena", False)
-                        else args.get("pinned_weight_gib")
-                    ),
+                    pinned_weight_gib=args.get("pinned_weight_gib"),
                     # Ticket 534ea49: if training already folded these weights
                     # into a persistent pinned arena, reuse it here rather than
                     # falling back to pageable streaming -- _build_pinned_arena
                     # skips children already arena-current, so this costs
-                    # nothing when the arena is already built. Ingraph sampling
-                    # packs now BORROW arena flats (Slice 4's try_borrow_pack)
-                    # rather than pinning a second copy, so arena+ingraph is
-                    # the intended pairing, not a double-commit -- do not gate
-                    # this on reserve_pin_for_ingraph.
+                    # nothing when the arena is already built.
                     use_pinned_arena=bool(args.get("use_pinned_arena", False)),
                 )
                 cls._move_unmanaged_parameters(module, target)
@@ -6277,12 +6242,6 @@ class MemoryManager:
                     f"[MemoryManager] mid-denoise OOM: abandoned "
                     f"{abandoned_fetches} in-flight ingraph fetch(es)"
                 )
-            # Compiled block functions capture the resident weights (same
-            # reference-pinning shape as the fp8 closures): demoting under a
-            # live compiled set frees NOTHING (observed: 0.81 GiB demoted,
-            # device gained 0.00). The layout is about to change anyway, so
-            # drop the compiled state first; the caller rebuilds it.
-            cls._invalidate_compiled_blocks(module)
             if cuda_target:
                 # Full sync so side-stream frees (transfer-stream fetch
                 # buffers) become releasable before the cache trim; without it
@@ -6370,18 +6329,7 @@ class MemoryManager:
             cls.attach(
                 module, target, offload_percent=1.0,
                 ignore_modules=ignore, _offload_module_ids=all_ids,
-                # See the comment at the sibling attach() call above: zeroing
-                # this would starve the arena's own budget for any block newly
-                # added here, not just the (irrelevant, arena-bypassed)
-                # per-tensor path.
-                pinned_weight_gib=(
-                    0.0
-                    if reserve_pin_for_ingraph and not args.get("use_pinned_arena", False)
-                    else args.get("pinned_weight_gib")
-                ),
-                # See the comment at the sibling attach() call above: ingraph
-                # sampling packs borrow arena flats now, so this is no longer
-                # gated on reserve_pin_for_ingraph.
+                pinned_weight_gib=args.get("pinned_weight_gib"),
                 use_pinned_arena=bool(args.get("use_pinned_arena", False)),
             )
             cls._move_unmanaged_parameters(module, target)

@@ -428,16 +428,6 @@ export default function SimpleJob({
                             docKey="model.train_compile_blocks"
                           />
                         )}
-                        {jobConfig.config.process[0].model.layer_offloading_smart && (
-                          <Checkbox
-                            label="Compile Streamed Blocks"
-                            checked={jobConfig.config.process[0].model.layer_offloading_compile_streamed || false}
-                            onChange={value =>
-                              setJobConfig(value, 'config.process[0].model.layer_offloading_compile_streamed')
-                            }
-                            docKey="model.layer_offloading_compile_streamed"
-                          />
-                        )}
                       </>
                     )}
                     {!(

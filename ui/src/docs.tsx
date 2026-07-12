@@ -446,21 +446,12 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
-  'model.layer_offloading_compile_streamed': {
-    title: 'Compile Streamed Blocks',
-    description: (
-      <>
-        Experimental compile path for offloaded transformer blocks. This flag is reserved for the staged streamed-block
-        compiler and is disabled by default while resident-block training compile lands first.
-      </>
-    ),
-  },
   'model.train_compile_blocks': {
     title: 'Compile Training Blocks',
     description: (
       <>
-        Compiles permanent-resident Krea 2 transformer blocks during training. Streamed blocks remain eager until the
-        streamed compiler is enabled; readiness details are printed in the MemoryManager plan line.
+        Compiles the Krea 2 transformer block kernels used by the immutable runtime during training. Resident and
+        streamed blocks share the same compiled kernel; residency changes do not recompile.
       </>
     ),
   },

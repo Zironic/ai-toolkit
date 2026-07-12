@@ -614,10 +614,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 wddm_hard_gib=(
                     self.model_config.layer_offloading_smart_sampling_wddm_hard_gb
                 ),
-                reserve_pin_for_ingraph=bool(
-                    getattr(self.model_config, 'layer_offloading_compile_streamed', False)
-                    or getattr(self.model_config, 'layer_offloading_ingraph_sampling', False)
-                ),
             )
             if (
                 self.model_config.layer_offloading
@@ -626,26 +622,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             )
             else contextlib.nullcontext()
         )
-        # The in-graph training trunk marks every streamed block linear as a pack
-        # source (_mm_ingraph_pack_source), and _move_unmanaged_parameters never
-        # moves a pack source -- its CPU residency IS the design, the trunk
-        # streams it from the pinned pack. Sampling, however, promotes some of
-        # those same blocks to GPU residency, and with the marks up it cannot:
-        # the resident sampler block then runs F.linear against a CPU weight
-        # ("mat2 is on cpu"). So take the trunk down for the duration of
-        # sampling and stand it back up once _restore_offload has put the
-        # training layout back. With the pinned arena this is cheap -- the
-        # re-enable BORROWS the persistent flats rather than re-pinning ~12 GiB.
+        # The immutable runtime owns residency across the train<->sample
+        # boundary over ONE arena. Switch it to its SAMPLE program (same
+        # resident sidecars, sample-mode callables: no checkpointing,
+        # forward-only streaming) and restore the TRAIN program afterward.
+        # Because the runtime owns residency, the legacy inference_resident
+        # sampling context must NOT also re-plan the transformer here -- force
+        # it to a nullcontext for this backend.
         inner_unet = None
-        ingraph_depth = None
-        # Immutable canonical-arena backend (Slice 6): the compiled executor
-        # owns residency across the train<->sample boundary over ONE arena --
-        # no trunk teardown/re-pin like ingraph training needs. Switch the
-        # executor to its SAMPLE program (same resident sidecars, sample-mode
-        # callables: no checkpointing, forward-only streaming) and restore the
-        # TRAIN program afterward. Because the executor owns residency, the
-        # legacy inference_resident sampling context must NOT also re-plan the
-        # transformer here -- force it to a nullcontext for this backend.
         immutable_executor = None
         immutable_train_plan = None
         immutable_context_attr = "_mm_immutable_sampling_context"
@@ -743,15 +727,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     immutable_sampling_context,
                 )
 
-        if getattr(self, '_ingraph_training_enabled', False):
-            inner_unet = unwrap_model(self.sd.unet)
-            disable_ingraph_training = getattr(
-                inner_unet, 'disable_ingraph_training', None
-            )
-            if disable_ingraph_training is not None:
-                disable_ingraph_training()
-                ingraph_depth = getattr(self, '_ingraph_training_depth', 2)
-
         try:
             with sampling_context:
                 self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
@@ -763,10 +738,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.network.to(self.device_torch)
                 except Exception:
                     pass
-            # Re-arm the trunk only after the LoRA network is back on-device: its
-            # adapters enter the compiled graph as ordinary trainable inputs.
-            if ingraph_depth is not None:
-                inner_unet.enable_ingraph_training(depth=ingraph_depth, compile=True)
             # Immutable backend: switch the executor back to its TRAIN program
             # (same resident sidecars, checkpointed backward-capable callables)
             # so the next training step runs the training graph, not the
