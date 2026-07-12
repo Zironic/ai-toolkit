@@ -195,6 +195,53 @@ def _load_prompt_cache(path: str):
     return embeds
 
 
+def _parse_compile_dynamic(value):
+    if value == "none":
+        return None
+    return value == "true"
+
+
+def _parse_dynamic_hints(specs):
+    """Parse repeated --compile-mark-dynamic DIM:MIN:MAX into hint tuples.
+
+    MIN/MAX may be empty (unbounded on that side), e.g. "1:256:" or "1::4096".
+    """
+    hints = []
+    for spec in specs or ():
+        parts = spec.split(":")
+        if len(parts) != 3:
+            raise SystemExit(
+                f"--compile-mark-dynamic expects DIM:MIN:MAX, got {spec!r}"
+            )
+        dim_s, lo_s, hi_s = parts
+        hints.append(
+            (int(dim_s), int(lo_s) if lo_s else None, int(hi_s) if hi_s else None)
+        )
+    return tuple(hints)
+
+
+def _parse_resolutions(spec, default_width, default_height):
+    """Parse --resolutions "WxH,WxH,..." into a list of (width, height) buckets.
+
+    Empty/None falls back to the single (default_width, default_height) bucket
+    so existing single-resolution invocations are unaffected.
+    """
+    if not spec:
+        return [(default_width, default_height)]
+    buckets = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        w_s, _, h_s = part.partition("x")
+        if not h_s:
+            raise SystemExit(f"--resolutions expects WxH pairs, got {part!r}")
+        buckets.append((int(w_s), int(h_s)))
+    if not buckets:
+        raise SystemExit(f"--resolutions parsed to no buckets: {spec!r}")
+    return buckets
+
+
 def _build_model_config(args):
     model_kwargs = {
         "max_text_length": args.max_text_length,
@@ -225,7 +272,11 @@ def _build_model_config(args):
         # The immutable runtime is built during load_model, so its ring depth
         # and compile gate arrive through the config.
         layer_offloading_prefetch_depth=args.prefetch_depth,
+        layer_offloading_simulated_vram_gb=getattr(args, "simulated_vram_gib", 0.0),
+        layer_offloading_wddm_cap_strict=getattr(args, "wddm_cap_strict", False),
         compile=not args.no_compile,
+        compile_dynamic=_parse_compile_dynamic(args.compile_dynamic),
+        compile_dynamic_hints=_parse_dynamic_hints(args.compile_mark_dynamic),
         model_kwargs=model_kwargs,
     )
 
@@ -435,6 +486,17 @@ def _parse_args():
     parser.add_argument("--max-text-length", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
+    parser.add_argument(
+        "--resolutions",
+        default=None,
+        help=(
+            "comma-separated WxH buckets cycled round-robin across training "
+            "steps, e.g. '512x512,768x512,512x768,896x640' -- simulates a "
+            "multi-bucket dataset feeding the same run. Unset = single bucket "
+            "from --width/--height (unchanged behaviour). The fixed eval batch "
+            "(--dump-dir) still uses --width/--height regardless."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
@@ -446,6 +508,23 @@ def _parse_args():
     parser.add_argument("--working-reserve-gib", default="-1")
     parser.add_argument("--wddm-margin-gib", type=float, default=1.0)
     parser.add_argument("--wddm-hard-gib", type=float, default=1.0)
+    parser.add_argument(
+        "--simulated-vram-gib",
+        type=float,
+        default=0.0,
+        help=(
+            "Pretend the card has this many GiB (e.g. 8 or 6) to validate "
+            "small-card residency/streaming/OOM behaviour. 0 = real card."
+        ),
+    )
+    parser.add_argument(
+        "--wddm-cap-strict",
+        action="store_true",
+        help=(
+            "Violating the allocator cap raises instead of widening it. Off in "
+            "production; on when the OOM is the thing being measured."
+        ),
+    )
     parser.add_argument("--spill-reserve-pct", type=float, default=0.20)
     parser.add_argument("--pinned-weight-gib", type=float, default=-1.0)
     parser.add_argument(
@@ -530,6 +609,34 @@ def _parse_args():
         "--no-compile",
         action="store_true",
         help="run the immutable trunk eager (no torch.compile of block kernels)",
+    )
+    parser.add_argument(
+        "--compile-dynamic",
+        choices=("true", "false", "none"),
+        default="true",
+        help=(
+            "dynamic= passed to the block-kernel torch.compile call. 'true'/"
+            "'false' pin the shape assumption; 'none' lets Dynamo infer "
+            "dynamism automatically (starts static, widens after the first "
+            "shape-guard recompile). Ignored when --no-compile is set."
+        ),
+    )
+    parser.add_argument(
+        "--compile-mark-dynamic",
+        action="append",
+        default=None,
+        metavar="DIM:MIN:MAX",
+        help=(
+            "explicit torch._dynamo.mark_dynamic(x, DIM, min=MIN, max=MAX) hint "
+            "on the per-block hidden-state tensor, applied every block_fn call "
+            "before it crosses the compile boundary. MIN/MAX may be empty for "
+            "unbounded (e.g. '1:256:' or '1::4096'). Repeatable. x is "
+            "[batch, seq_len, hidden] for Krea2's single-stream MMDiT blocks, "
+            "so dim 1 is the resolution-dependent sequence length -- pass "
+            "--compile-mark-dynamic 1:<min_seq>:<max_seq> to pre-declare the "
+            "range your --resolutions buckets span instead of relying on "
+            "Dynamo to discover it via recompiles."
+        ),
     )
     add_contention_args(parser)
     return parser.parse_args()
@@ -747,6 +854,9 @@ def main():
             "lr": args.lr,
             "width": args.width,
             "height": args.height,
+            "resolutions": args.resolutions,
+            "compile_dynamic": args.compile_dynamic,
+            "compile_mark_dynamic": args.compile_mark_dynamic,
             "batch_size": args.batch_size,
             "qtype": args.qtype,
             "init_lora": args.init_lora,
@@ -763,11 +873,14 @@ def main():
             )
             _dump_horizon(dump_dir, 0, named, optimizer, None, eval_outs)
 
-    lat_h, lat_w = args.height // 8, args.width // 8
+    resolution_buckets = _parse_resolutions(args.resolutions, args.width, args.height)
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
-    print(f"[smoke] running {args.steps} fake training steps "
-          f"(batch={args.batch_size}, latents {args.batch_size}x16x{lat_h}x{lat_w})")
+    print(
+        f"[smoke] running {args.steps} fake training steps "
+        f"(batch={args.batch_size}, resolution buckets "
+        f"{['x'.join(map(str, wh)) for wh in resolution_buckets]} round-robin)"
+    )
     step_rows = []
     # Trace only the tail steps: step 0 is the trunk compile, and the first
     # steady step still faults fresh allocator segments, so neither is
@@ -792,6 +905,9 @@ def main():
             )
             profiler.start()
             print(f"[smoke] tracing steps {trace_from}..{args.steps - 1}")
+        bucket_w, bucket_h = resolution_buckets[step % len(resolution_buckets)]
+        lat_h, lat_w = bucket_h // 8, bucket_w // 8
+        frames_before = torch._dynamo.utils.counters["frames"].get("total", 0)
         latents = torch.randn(
             args.batch_size, 16, lat_h, lat_w, generator=generator
         ).to(device, model.torch_dtype)
@@ -819,10 +935,22 @@ def main():
         )
         # Backward MUST stay inside the network context (multiplier is zeroed on
         # exit; leaving before backward silently kills LoRA grads).
-        with execution_context, network:
-            pred = model.get_noise_prediction(noisy, timestep, embeds)
-            loss = torch.nn.functional.mse_loss(pred.float(), target)
-            loss.backward()
+        try:
+            with execution_context, network:
+                pred = model.get_noise_prediction(noisy, timestep, embeds)
+                loss = torch.nn.functional.mse_loss(pred.float(), target)
+                loss.backward()
+        except torch.cuda.OutOfMemoryError:
+            # Same policy as BaseSDTrainProcess: an allocator-cap violation
+            # widens the cap and skips the batch; strict mode re-raises.
+            optimizer.zero_grad(set_to_none=True)
+            if not MemoryManager.relieve_wddm_cap_after_oom(
+                device, context=f"smoke step {step}"
+            ):
+                raise
+            MemoryManager.recover_cuda_pipeline_after_oom()
+            print(f"[smoke] step {step}: OOM at the cap, skipped (cap widened)")
+            continue
         grad_norm = torch.sqrt(
             sum(
                 p.grad.detach().float().pow(2).sum()
@@ -849,20 +977,24 @@ def main():
                 dump_dir, completed, named, optimizer, horizon_grads, eval_outs
             )
 
+        frames_after = torch._dynamo.utils.counters["frames"].get("total", 0)
         row = {
             "event": "train_step",
             "step": step,
+            "bucket": f"{bucket_w}x{bucket_h}",
             "seconds": elapsed,
             "loss": loss.item(),
             "grad_norm": grad_norm,
             "grad_tensors": f"{grads_present}/{len(trainable)}",
+            "new_compile_frames": frames_after - frames_before,
             "cuda": _cuda_snapshot(f"step_{step}", device),
             "dxgi": _dxgi_snapshot(f"step_{step}"),
         }
         step_rows.append(row)
         print(
-            f"[smoke] step {step}: {elapsed:.2f}s loss={row['loss']:.4f} "
-            f"grad_norm={grad_norm:.4e} grads={row['grad_tensors']}"
+            f"[smoke] step {step} [{row['bucket']}]: {elapsed:.2f}s "
+            f"loss={row['loss']:.4f} grad_norm={grad_norm:.4e} "
+            f"grads={row['grad_tensors']} new_frames={row['new_compile_frames']}"
         )
         if step == 0 and compile_cache_key is not None:
             from toolkit.compile_cache import save_compile_cache
@@ -934,9 +1066,23 @@ def main():
             trace_summary["profiler_overhead_pct"] = (
                 (trace_summary["traced_step_avg_s"] - base) / base * 100.0
             )
+    per_bucket_steady_s = {}
+    for r in step_rows[1:]:
+        per_bucket_steady_s.setdefault(r["bucket"], []).append(r["seconds"])
     summary = {
         "event": "done",
         "steps": args.steps,
+        "resolution_buckets": [f"{w}x{h}" for w, h in resolution_buckets],
+        "compile_dynamic": args.compile_dynamic,
+        "compile_mark_dynamic": args.compile_mark_dynamic,
+        "steps_with_new_compile_frames": [
+            {"step": r["step"], "bucket": r["bucket"], "new_frames": r["new_compile_frames"]}
+            for r in step_rows
+            if r["new_compile_frames"] > 0
+        ],
+        "per_bucket_steady_avg_s": {
+            bucket: sum(secs) / len(secs) for bucket, secs in per_bucket_steady_s.items()
+        },
         "ab_h2d_parity": ab_summary,
         "trace": trace_summary,
         "first_step_s": step_rows[0]["seconds"],

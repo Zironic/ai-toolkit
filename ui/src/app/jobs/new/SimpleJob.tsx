@@ -381,17 +381,7 @@ export default function SimpleJob({
                             docKey="model.layer_offloading_block_stream_only"
                           />
                         )}
-                        {jobConfig.config.process[0].model.layer_offloading_smart && (
-                          <Checkbox
-                            label="Use Smart Sampling Layout"
-                            checked={jobConfig.config.process[0].model.layer_offloading_smart_sampling || false}
-                            onChange={value =>
-                              setJobConfig(value, 'config.process[0].model.layer_offloading_smart_sampling')
-                            }
-                            docKey="model.layer_offloading_smart_sampling"
-                          />
-                        )}
-                        {jobConfig.config.process[0].model.layer_offloading_smart_sampling &&
+                        {jobConfig.config.process[0].model.layer_offloading_smart &&
                           jobConfig.config.process[0].model.quantize &&
                           ['qfloat8', 'float8'].includes(jobConfig.config.process[0].model.qtype || '') && (
                             <Checkbox
@@ -403,31 +393,6 @@ export default function SimpleJob({
                               docKey="model.layer_offloading_fp8_sampling"
                             />
                           )}
-                        {jobConfig.config.process[0].model.layer_offloading_smart && (
-                          <NumberInput
-                            label="Uncheckpointed Trailing Blocks"
-                            value={
-                              jobConfig.config.process[0].model.layer_offloading_checkpoint_keep_last ?? 0
-                            }
-                            onChange={value =>
-                              setJobConfig(
-                                value ?? 0,
-                                'config.process[0].model.layer_offloading_checkpoint_keep_last',
-                              )
-                            }
-                            min={-1}
-                            max={48}
-                            docKey="model.layer_offloading_checkpoint_keep_last"
-                          />
-                        )}
-                        {jobConfig.config.process[0].model.layer_offloading_smart && (
-                          <Checkbox
-                            label="Compile Training Blocks"
-                            checked={jobConfig.config.process[0].model.train_compile_blocks || false}
-                            onChange={value => setJobConfig(value, 'config.process[0].model.train_compile_blocks')}
-                            docKey="model.train_compile_blocks"
-                          />
-                        )}
                       </>
                     )}
                     {!(
@@ -460,38 +425,12 @@ export default function SimpleJob({
                       step={1}
                     />
                     <Checkbox
-                      label="Profile Layer Offloading"
-                      checked={jobConfig.config.process[0].model.layer_offloading_profile || false}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].model.layer_offloading_profile')
-                      }
-                      docKey="model.layer_offloading_profile"
-                    />
-                    <Checkbox
                       label="Prefetch Offloaded Layers"
                       checked={jobConfig.config.process[0].model.layer_offloading_prefetch || false}
                       onChange={value =>
                         setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch')
                       }
                       docKey="model.layer_offloading_prefetch"
-                    />
-                    <TextInput
-                      label="Prefetch Trace Capture"
-                      value={jobConfig.config.process[0].model.layer_offloading_prefetch_trace_capture || ''}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch_trace_capture')
-                      }
-                      placeholder="prefetch_trace_capture.jsonl"
-                      docKey="model.layer_offloading_prefetch_trace_capture"
-                    />
-                    <NumberInput
-                      label="Prefetch Capture Steps"
-                      value={jobConfig.config.process[0].model.layer_offloading_prefetch_trace_capture_steps ?? 256}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch_trace_capture_steps')
-                      }
-                      min={0}
-                      docKey="model.layer_offloading_prefetch_trace_capture_steps"
                     />
                     {jobConfig.config.process[0].model.layer_offloading_smart &&
                       jobConfig.config.process[0].model.quantize &&

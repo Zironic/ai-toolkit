@@ -872,6 +872,24 @@ class ModelConfig:
         self.layer_offloading_prefetch_depth = kwargs.get(
             "layer_offloading_prefetch_depth", 2
         )
+        # The WDDM allocator cap (see MemoryManager._apply_wddm_hard_allocator_cap)
+        # is a tuning lever: it recycles idle cache on demand and keeps the run
+        # off the paging cliff. Violating it is NOT fatal by default -- the cap
+        # widens by 0.5 GiB and the run continues, degrading toward paging.
+        # Strict = a violation raises a real OutOfMemoryError instead, which is
+        # what you want when validating (a simulated smaller card) or when
+        # attributing an OOM to the allocation that actually caused it.
+        self.layer_offloading_wddm_cap_strict = kwargs.get(
+            "layer_offloading_wddm_cap_strict", False
+        )
+        # Validation knob: run as if the card had this many GiB of VRAM. The
+        # difference against the real card is hidden from BOTH total and free
+        # (and enforced by the allocator cap), so residency planning, streaming
+        # depth and OOM behaviour match the smaller card. Lets an 8 GB or 6 GB
+        # card's behaviour be validated on a 12 GB one. 0 = use the real card.
+        self.layer_offloading_simulated_vram_gb = kwargs.get(
+            "layer_offloading_simulated_vram_gb", 0
+        )
         self.train_compile_blocks = kwargs.get("train_compile_blocks", False)
         # Ticket 534ea49: pin offloaded weights ONCE into persistent per-block
         # flat host buffers instead of cudaHostRegister-ing/unregistering them
@@ -908,6 +926,11 @@ class ModelConfig:
         self.compile_mode = kwargs.get("compile_mode", "default")
         self.compile_fullgraph = kwargs.get("compile_fullgraph", False)
         self.compile_dynamic = kwargs.get("compile_dynamic", True)
+        # Explicit torch._dynamo.mark_dynamic hints applied to the immutable
+        # runtime's per-block hidden-state tensor before each block_fn call,
+        # e.g. ((1, 256, 4096),) marks dim 1 (sequence length) dynamic over
+        # that range. Empty = no explicit hints (rely on compile_dynamic alone).
+        self.compile_dynamic_hints = kwargs.get("compile_dynamic_hints", ())
         self.cache_size_limit = kwargs.get("cache_size_limit", None)
         # Emit graph_breaks + recompiles + guards to stdout while compiling.
         # Use this to confirm blocks are compile-clean and guards aren't failing

@@ -1769,10 +1769,11 @@ class SDTrainer(BaseSDTrainProcess):
         if module is None or not getattr(module, 'gradient_checkpointing', False):
             self._checkpoint_autotuner_off = True
             return None
+        from toolkit.memory_management import vram_budget
         from toolkit.memory_management.checkpoint_autotuner import (
             CheckpointKeepLastAutotuner,
         )
-        total = torch.cuda.get_device_properties(self.device_torch).total_memory
+        total = vram_budget.device_total_bytes(self.device_torch)
         max_keep = max(0, len(module.blocks) - 1)
 
         def _set(n, _m=module):

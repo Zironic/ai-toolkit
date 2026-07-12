@@ -78,6 +78,93 @@ def reconcile_free_bytes(driver_free_bytes, physical_free_bytes) -> int:
     return min(driver, max(0, int(physical_free_bytes)))
 
 
+# --------------------------------------------------------------------------
+# Simulated smaller card (validation knob)
+# --------------------------------------------------------------------------
+# Pretend the GPU is smaller than it is, so an 8 GB / 6 GB card's residency,
+# streaming and cap behaviour can be exercised on a 12 GB one. Implemented as a
+# *phantom ballast*: a fixed number of bytes subtracted from BOTH total and free
+# everywhere this module reports them. That keeps every derived quantity
+# self-consistent (non_torch, margins, promotion checks, the allocator cap) with
+# no per-call-site special cases -- an unfittable model is unfittable for the
+# same arithmetic reason it would be on the real small card.
+#
+# It does not shrink the physical card: the allocator cap is what actually makes
+# an over-plan fail, and `_apply_wddm_hard_allocator_cap` converts the simulated
+# cap bytes back into a fraction of the REAL total before handing it to torch.
+_SIMULATED_CARD_BYTES: int | None = None
+
+
+def set_simulated_card_bytes(total_bytes) -> None:
+    """Pretend the card has ``total_bytes`` of VRAM (``None`` disables)."""
+    global _SIMULATED_CARD_BYTES
+    if total_bytes is None:
+        _SIMULATED_CARD_BYTES = None
+        return
+    value = int(total_bytes)
+    if value <= 0:
+        raise ValueError(f"simulated card size must be positive, got {total_bytes}")
+    _SIMULATED_CARD_BYTES = value
+
+
+def simulated_card_bytes() -> int | None:
+    return _SIMULATED_CARD_BYTES
+
+
+def apply_simulated_card(simulated_vram_gib, *, device=None) -> int | None:
+    """Install (or clear) the simulated card size; logs once when active.
+
+    ``simulated_vram_gib`` of ``None``/``0`` clears the simulation. A size at or
+    above the real card is a no-op with a warning -- the ballast can only hide
+    VRAM, never invent it.
+    """
+    if not simulated_vram_gib:
+        set_simulated_card_bytes(None)
+        return None
+
+    wanted = int(float(simulated_vram_gib) * GIB)
+    if device is None or not torch.cuda.is_available():
+        set_simulated_card_bytes(wanted)
+        return wanted
+
+    real = real_device_total_bytes(device)
+    if wanted >= real:
+        print(
+            "[MemoryManager] simulated VRAM "
+            f"{wanted / GIB:.2f} GiB >= real card {real / GIB:.2f} GiB; "
+            "ignoring (a simulation can only shrink the card)"
+        )
+        set_simulated_card_bytes(None)
+        return None
+
+    set_simulated_card_bytes(wanted)
+    print(
+        "[MemoryManager] SIMULATED CARD: reporting "
+        f"{wanted / GIB:.2f} GiB total (real {real / GIB:.2f} GiB); "
+        f"{(real - wanted) / GIB:.2f} GiB is hidden from both total and free, "
+        "and the allocator cap enforces it. Planning, residency and OOMs now "
+        "behave as they would on the smaller card."
+    )
+    return wanted
+
+
+def real_device_total_bytes(device) -> int:
+    """Physical card size, ignoring any simulation."""
+    return int(torch.cuda.mem_get_info(device)[1])
+
+
+def simulated_ballast_bytes(device) -> int:
+    """Bytes hidden from total AND free to fake a smaller card (0 when off)."""
+    if _SIMULATED_CARD_BYTES is None:
+        return 0
+    return max(0, real_device_total_bytes(device) - _SIMULATED_CARD_BYTES)
+
+
+def device_total_bytes(device) -> int:
+    """Governing card size: the simulated one when a simulation is active."""
+    return max(0, real_device_total_bytes(device) - simulated_ballast_bytes(device))
+
+
 def device_free_bytes(device) -> int:
     """Governing physical free bytes on ``device``, across ALL processes.
 
@@ -92,7 +179,10 @@ def device_free_bytes(device) -> int:
     index = torch.device(device).index
     if index is None:
         index = torch.cuda.current_device()
-    return reconcile_free_bytes(driver_free, nvml_meminfo.physical_free_bytes(index))
+    free = reconcile_free_bytes(
+        driver_free, nvml_meminfo.physical_free_bytes(index)
+    )
+    return max(0, free - simulated_ballast_bytes(device))
 
 
 # A quiet box still has non-torch bytes on the card: the CUDA context, cuDNN /
@@ -247,10 +337,9 @@ def device_mem_info(device) -> tuple[int, int]:
     """Drop-in for ``torch.cuda.mem_get_info``: ``(free, total)`` in bytes.
 
     Identical shape to the torch call, but ``free`` is the NVML-backed physical
-    free (sees other processes). ``total`` is the card size either way.
+    free (sees other processes) and ``total`` honours a simulated smaller card.
     """
-    total = int(torch.cuda.mem_get_info(device)[1])
-    return device_free_bytes(device), total
+    return device_free_bytes(device), device_total_bytes(device)
 
 
 @dataclass(frozen=True)
@@ -278,9 +367,8 @@ class DeviceSnapshot:
         dev = torch.device(device)
         if dev.type != "cuda":
             return None
-        _driver_free, total = torch.cuda.mem_get_info(dev)
         return DeviceSnapshot(
-            total=int(total),
+            total=device_total_bytes(dev),
             # NVML-backed: sees other processes on the card. See the module
             # docstring -- mem_get_info free would over-report here.
             free=device_free_bytes(dev),
@@ -329,12 +417,9 @@ class WddmMargins:
 def auto_margin_gib(device, pct: float = 0.10, floor_gib: float = 1.0) -> float:
     """Auto planning margin: max(floor, pct * card size)."""
     try:
-        total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+        total_bytes = device_total_bytes(device)
     except Exception:
-        try:
-            _free, total_bytes = torch.cuda.mem_get_info(device)
-        except Exception:
-            total_bytes = 0
+        total_bytes = 0
     total_gib = max(0.0, float(total_bytes) / GIB)
     return max(float(floor_gib), float(pct) * total_gib)
 

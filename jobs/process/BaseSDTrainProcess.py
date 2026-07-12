@@ -3464,9 +3464,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     driver_free_sample = driver_free_monitor.stop()
                 self._last_driver_free_sample = driver_free_sample
             if did_oom:
-                self.num_consecutive_oom += 1
-                if self.num_consecutive_oom > 3:
-                    raise RuntimeError("OOM during training step 3 times in a row, aborting training")
+                # Our own allocator cap is a tuning lever, not a kill switch: if
+                # that is what the step hit, widen it and let the run continue
+                # (the batch is still skipped) rather than spend a strike on it.
+                # Strict mode declines, and physical OOMs cannot be relieved.
+                cap_relieved = MemoryManager.relieve_wddm_cap_after_oom(
+                    self.device_torch, context=f"training step {self.step_num}"
+                )
+                if not cap_relieved:
+                    self.num_consecutive_oom += 1
+                    if self.num_consecutive_oom > 3:
+                        raise RuntimeError("OOM during training step 3 times in a row, aborting training")
                 optimizer.zero_grad(set_to_none=True)
                 flush()
                 torch.cuda.ipc_collect()

@@ -60,10 +60,13 @@ export const handleModelArchChange = (
       delete newModel.layer_offloading_smart_sampling_wddm_margin_gb;
       delete newModel.layer_offloading_smart_sampling_wddm_hard_gb;
       delete newModel.layer_offloading_fp8_sampling;
+      // Dev-only diagnostics (profiling, trace capture): no longer exposed as
+      // form controls, but still cleared here in case a stale value survives
+      // from a job created before this change.
       delete newModel.layer_offloading_profile;
-      delete newModel.layer_offloading_prefetch;
       delete newModel.layer_offloading_prefetch_trace_capture;
       delete newModel.layer_offloading_prefetch_trace_capture_steps;
+      delete newModel.layer_offloading_prefetch;
       delete newModel.layer_offloading_fp8_forward;
       delete newModel.layer_offloading_fp8_grad_input;
       delete newModel.layer_offloading_checkpoint_keep_last;
@@ -78,16 +81,10 @@ export const handleModelArchChange = (
       setJobConfig(1.0, 'config.process[0].model.layer_offloading_transformer_percent');
       setJobConfig(false, 'config.process[0].model.layer_offloading_smart');
       setJobConfig(false, 'config.process[0].model.layer_offloading_block_stream_only');
-      setJobConfig(false, 'config.process[0].model.layer_offloading_smart_sampling');
       setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_sampling');
-      setJobConfig(false, 'config.process[0].model.layer_offloading_profile');
       setJobConfig(false, 'config.process[0].model.layer_offloading_prefetch');
-      setJobConfig('', 'config.process[0].model.layer_offloading_prefetch_trace_capture');
-      setJobConfig(256, 'config.process[0].model.layer_offloading_prefetch_trace_capture_steps');
       setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_forward');
       setJobConfig(false, 'config.process[0].model.layer_offloading_fp8_grad_input');
-      setJobConfig(0, 'config.process[0].model.layer_offloading_checkpoint_keep_last');
-      setJobConfig(false, 'config.process[0].model.train_compile_blocks');
     }
   }
 

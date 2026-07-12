@@ -193,6 +193,7 @@ export interface ModelConfig {
   layer_offloading_smart_wddm_hard_gb?: number;
   /** @deprecated renamed to layer_offloading_smart_working_reserve_gb; read for back-compat. */
   layer_offloading_smart_headroom_gb?: number;
+  /** @deprecated the arena runtime unconditionally owns sampling residency once layer_offloading_smart is on; this flag has no effect on the live backend. */
   layer_offloading_smart_sampling?: boolean;
   layer_offloading_smart_sampling_working_reserve_gb?: number;
   layer_offloading_smart_sampling_wddm_margin_gb?: number;
@@ -204,7 +205,9 @@ export interface ModelConfig {
   layer_offloading_prefetch_trace_capture_steps?: number;
   layer_offloading_fp8_forward?: boolean;
   layer_offloading_fp8_grad_input?: boolean;
+  /** Not exposed in the guided form: low-value, JSON-editable only. */
   layer_offloading_checkpoint_keep_last?: number;
+  /** @deprecated redundant with model.compile; compile_blocks is already `compile OR compile_sample OR train_compile_blocks`. */
   train_compile_blocks?: boolean;
   assistant_lora_path?: string;
   unconditional_lora_path?: string;
