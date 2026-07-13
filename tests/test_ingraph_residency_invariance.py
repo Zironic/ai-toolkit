@@ -17,6 +17,9 @@ import unittest
 
 import torch
 
+from toolkit.quantization.fp8_linear import bind_rowwise_fp8, bind_storage_operation
+from toolkit.quantization.storage import linear_storage_binding
+
 from toolkit.memory_management.ingraph_stream import (
     resident_linear_tensors,
     streamed_linear_tensors,
@@ -52,10 +55,24 @@ class Fp8LeafPlacementIsBitwiseInvariantTests(unittest.TestCase):
         self.assertNotEqual(view.data_ptr(), qdata.data_ptr())
 
         resident = streamed_linear_tensors(
-            x, qdata, None, scale, fp8_qualifies=True, training=True
+            x,
+            qdata,
+            None,
+            scale,
+            operation=bind_rowwise_fp8(
+                qdata, scale, device=qdata.device, has_bias=False
+            ),
+            training=True,
         )
         streamed = streamed_linear_tensors(
-            x, view, None, scale, fp8_qualifies=True, training=True
+            x,
+            view,
+            None,
+            scale,
+            operation=bind_rowwise_fp8(
+                view, scale, device=view.device, has_bias=False
+            ),
+            training=True,
         )
         torch.cuda.synchronize()
         self.assertTrue(
@@ -88,7 +105,14 @@ class Fp8LeafPlacementIsBitwiseInvariantTests(unittest.TestCase):
             out = x
             for weight, bias, scale in triples:
                 out = streamed_linear_tensors(
-                    out, weight, bias, scale, fp8_qualifies=True, training=True
+                    out,
+                    weight,
+                    bias,
+                    scale,
+                    operation=bind_rowwise_fp8(
+                        weight, scale, device=weight.device, has_bias=False
+                    ),
+                    training=True,
                 )
             return out
 
@@ -100,11 +124,22 @@ class ResidentLinearTensorsTests(unittest.TestCase):
     def test_float_linear_round_trips_through_the_streamed_math(self):
         linear = torch.nn.Linear(16, 8, bias=True).eval()
         x = torch.randn(4, 16)
-        (weight, bias, scale), qualifies = resident_linear_tensors(linear)
+        tensors = resident_linear_tensors(linear)
+        operation = bind_storage_operation(
+            tensors,
+            device="cpu",
+            weight_leaf_count=1,
+            execution_key=linear_storage_binding(
+                linear.weight,
+                linear.bias,
+            ).execution_key,
+        )
+        weight, bias, scale = operation.functional_components(tensors)
         self.assertIsNone(scale)
-        self.assertFalse(qualifies)
         torch.testing.assert_close(
-            streamed_linear_tensors(x, weight, bias, scale, fp8_qualifies=False),
+            streamed_linear_tensors(
+                x, weight, bias, scale, operation=operation
+            ),
             linear(x),
         )
 

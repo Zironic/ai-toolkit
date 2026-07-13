@@ -30,6 +30,12 @@ class _Transformer(torch.nn.Module):
 
 
 class _TinyAdapter:
+    architecture_key = "test_quant_blocks"
+
+    def validate_transformer(self, transformer):
+        if not getattr(transformer, "blocks", None):
+            raise TypeError("expected blocks")
+
     def execution_blocks(self, transformer):
         return tuple(transformer.blocks)
 
@@ -38,6 +44,34 @@ class _TinyAdapter:
 
     def leaf_entries(self, block):
         return (("linear", block.linear),)
+
+    def collect_execution_adapters(self, _transformer, _network):
+        return {}
+
+    def build_adapter_args(self, _index, _adapters, multiplier=None):
+        del multiplier
+        return None
+
+    def can_run_current_call(self, _block_args, **_kwargs):
+        return True
+
+    def bind_block_operations(self, block, device):
+        del block, device
+        return (None,)
+
+    def forward_block(
+        self,
+        _block,
+        hidden,
+        _block_args,
+        _leaf_args,
+        _linear_operations,
+        _adapter_args,
+        *,
+        training,
+    ):
+        del training
+        return hidden
 
 
 class _QuantBlock(torch.nn.Module):
@@ -87,7 +121,7 @@ def test_arena_destination_key_maps_float_and_quantized_cache_leaves():
         "blocks.3", "attn.wq", "weight"
     )
     assert _arena_destination_key("blocks.3.attn.wq.weight._data") == (
-        "blocks.3", "attn.wq", "weight"
+        "blocks.3", "attn.wq", "qdata"
     )
     assert _arena_destination_key("blocks.3.attn.wq.weight._scale") == (
         "blocks.3", "attn.wq", "scale"

@@ -8,6 +8,7 @@ import torch.nn as nn
 from optimum.quanto import freeze
 
 from toolkit.util.quantize import get_qtype, quantize
+from toolkit.quantization.fp8_linear import bind_parameter_operation
 from toolkit.memory_management import pin_manager
 from toolkit.memory_management.ingraph_stream import (
     block_linear_views,
@@ -17,6 +18,15 @@ from toolkit.memory_management.ingraph_stream import (
 
 
 class InGraphPackTests(unittest.TestCase):
+    @staticmethod
+    def _views(pack, layer):
+        operation, _ = bind_parameter_operation(
+            layer.weight,
+            getattr(layer, "bias", None),
+            device=pack.host_flat.device,
+        )
+        return block_linear_views(pack.host_flat, pack, {"proj": operation})
+
     def _quanto_linear(self):
         model = nn.Sequential(torch.nn.Linear(8, 4, bias=False).to(torch.bfloat16))
         quantize(model, weights=get_qtype("qfloat8"))
@@ -42,7 +52,7 @@ class InGraphPackTests(unittest.TestCase):
     def test_block_linear_views_round_trip(self):
         layer = torch.nn.Linear(8, 4, bias=True)
         pack = pack_block_host("blocks.0", [("proj", layer)], repoint=False, pin=False)
-        views = block_linear_views(pack.host_flat, pack)
+        views = self._views(pack, layer)
         weight, bias = views["proj"]
         self.assertTrue(torch.equal(weight, layer.weight))
         self.assertTrue(torch.equal(bias, layer.bias))
@@ -65,11 +75,14 @@ class InGraphPackTests(unittest.TestCase):
         expected = layer.weight.data.dequantize().clone()
 
         pack = pack_block_host("blocks.0", [("proj", layer)], repoint=False, pin=False)
-        self.assertEqual(pack.linears[0].kind, "fp8_rowwise")
-        self.assertEqual(pack.linears[0].weight.role, "qdata")
-        self.assertEqual(pack.linears[0].weight_scale.role, "scale")
+        spec = pack.linears[0]
+        self.assertEqual(spec.weight_leaf_count, 2)
+        self.assertEqual(
+            tuple(item.role for item in spec.tensors),
+            ("qdata", "scale"),
+        )
 
-        weight, bias = block_linear_views(pack.host_flat, pack)["proj"]
+        weight, bias = self._views(pack, layer)["proj"]
         self.assertIsNone(bias)
         torch.testing.assert_close(weight, expected)
 

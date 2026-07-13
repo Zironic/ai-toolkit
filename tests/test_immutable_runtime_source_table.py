@@ -153,11 +153,11 @@ class ImmutableRuntimeSourceTableTests(unittest.TestCase):
             ImmutableRuntimeError,
             "immutable_execution_not_active",
         ):
-            executor.run("hidden", None, None, None)
+            executor.run("hidden", {"conditioning": None})
 
         with executor.execution(executor.TRAIN):
             self.assertEqual(
-                executor.run("hidden", None, None, None),
+                executor.run("hidden", {"conditioning": None}),
                 "hidden",
             )
 
@@ -167,7 +167,7 @@ class ImmutableRuntimeSourceTableTests(unittest.TestCase):
         with executor.execution(executor.TRAIN):
             with torch.no_grad():
                 self.assertEqual(
-                    executor.run("hidden", None, None, None),
+                    executor.run("hidden", {"conditioning": None}),
                     "hidden",
                 )
 
@@ -178,7 +178,7 @@ class ImmutableRuntimeSourceTableTests(unittest.TestCase):
                 ImmutableRuntimeError,
                 "immutable_execution_mode_mismatch:active=sample:call=train",
             ):
-                executor.run("hidden", None, None, None)
+                executor.run("hidden", {"conditioning": None})
 
     def test_structural_fingerprint_has_no_residency_input(self):
         parameters = inspect.signature(build_program_fingerprint).parameters

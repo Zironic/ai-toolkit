@@ -62,7 +62,7 @@ class BlockTransferPlan:
     block_key: str
     ranges: tuple[LeafRange, ...]
     compact_nbytes: int
-    # leaf_name -> {"weight" | "bias" | "weight_scale": CompactLeafSpec}
+    # leaf_name -> {declared tensor name: CompactLeafSpec}
     leaf_specs: dict
     streamed_leaf_names: tuple[str, ...]
     fully_streamed: bool
@@ -94,18 +94,13 @@ class BlockTransferPlan:
 
 def _leaf_items(block: BlockRecord, streamed_leaf_names: frozenset):
     """(src_offset, nbytes, leaf_name, role, LeafSpec) for every streamed
-    leaf's weight/bias/weight_scale sub-tensor, sorted by source offset."""
+    leaf's declared storage tensors, sorted by source offset."""
     items = []
     for spec in block.pack.linears:
         if spec.name not in streamed_leaf_names:
             continue
-        for role, leaf_spec in (
-            ("weight", spec.weight),
-            ("bias", spec.bias),
-            ("weight_scale", spec.weight_scale),
-        ):
-            if leaf_spec is None:
-                continue
+        for leaf_spec in spec.tensors:
+            role = leaf_spec.role
             items.append((leaf_spec.offset, leaf_spec.nbytes, spec.name, role, leaf_spec))
     items.sort(key=lambda item: item[0])
     for (off, n, *_), (noff, *_rest) in pairwise(items):

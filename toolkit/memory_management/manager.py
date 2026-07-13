@@ -6,6 +6,14 @@ import re
 import os
 import time
 import torch
+from toolkit.quantization.fp8_linear import (
+    FP8_STATS as _FP8_STATS,
+    bind_parameter_operation,
+    fp8_linear_inference,
+    native_device_supported,
+    set_fp8_grad_input_enabled,
+    weight_format_key,
+)
 from .manager_modules import (
     LinearLayerMemoryManager,
     ConvLayerMemoryManager,
@@ -15,11 +23,6 @@ from .manager_modules import (
     _profile_is_pinned,
     _unpin_inner_tensors,
     unpin_layer,
-    fp8_linear_inference,
-    fp8_sampling_qualifies,
-    _fp8_linear_compiled,
-    _fp8_linear_training,
-    _FP8_STATS,
     PIPELINE_DEPTH,
     summarize_offload_profile,
     set_offload_profile_enabled,
@@ -34,7 +37,6 @@ from .manager_modules import (
     invalidate_offload_trace_for_shape,
     invalidate_execution_trace,
     set_offload_trace_enabled,
-    set_fp8_grad_input_enabled,
     record_weight_access,
     set_block_stream_enabled,
     stage_block_forward,
@@ -424,8 +426,8 @@ class MemoryManager:
 
         Bytes are PHYSICAL storage bytes (``_tensor_storage_bytes`` walks
         wrapper leaves): a quanto/torchao FP8 weight reports the LOGICAL
-        dtype through ``numel()*element_size()`` (bf16, 2 bytes/elem) --
-        exactly 2x its real 1-byte qdata -- which produced a nonsense
+        dtype through ``numel()*element_size()`` (bf16, 2 bytes/elem) rather
+        than its physical wrapper storage, which produced a nonsense
         want=20.42 GiB request for a ~9.9 GiB model on a live run.
         """
         auto_pin = pinned_weight_gib is None
@@ -1202,7 +1204,7 @@ class MemoryManager:
             if _is_quantized_tensor(param.data):
                 if (
                     module.__class__.__name__ in LINEAR_MODULES
-                    and hasattr(param.data, "qdata")
+                    and weight_format_key(param) == "rowwise_fp8"
                 ):
                     # Sampling transfers FP8 bytes and computes directly in FP8.
                     total += cls._tensor_storage_bytes(param.data)
@@ -1373,11 +1375,21 @@ class MemoryManager:
             if include_ids is not None and id(child) not in include_ids:
                 continue
             weight = getattr(child, "weight", None)
-            if (
-                not isinstance(weight, torch.nn.Parameter)
-                or not hasattr(weight.data, "qdata")
-                or weight.data.qdata.dtype != torch.float8_e4m3fn
-            ):
+            if not isinstance(weight, torch.nn.Parameter):
+                continue
+            layer_manager = getattr(child, "_layer_memory_manager", None)
+            target_device = (
+                layer_manager.manager.process_device
+                if layer_manager is not None
+                else weight.device
+            )
+            bias_t = getattr(child, "bias", None)
+            operation, storage_tensors = bind_parameter_operation(
+                weight,
+                bias_t,
+                device=target_device,
+            )
+            if operation.format_key != "rowwise_fp8":
                 continue
             if hasattr(child, "_layer_memory_manager"):
                 child._memory_management_fp8_sampling = True
@@ -1403,7 +1415,7 @@ class MemoryManager:
             # math (no per-call capability query, try/except, stats, or Optional
             # return) and torch.compile traces it without graph breaks. Layers
             # that do not qualify keep their original (GPU dequant) forward.
-            if not fp8_sampling_qualifies(child.weight):
+            if not operation.native:
                 continue
 
             original_forward = getattr(container, attribute)
@@ -1412,20 +1424,18 @@ class MemoryManager:
             # row scale as plain tensors. Sampling weights are frozen and resident
             # for the life of this context, so the closure constants stay valid
             # and the compiled forward never touches the tensor subclass.
-            qdata_t = child.weight.qdata.t()
-            scale_row = child.weight.scale
-            bias_t = getattr(child, "bias", None)
-
             def _fp8_forward(
                 x, *args,
-                _qt=qdata_t, _sr=scale_row, _b=bias_t, _original=original_forward,
+                _operation=operation,
+                _storage_tensors=storage_tensors,
+                _original=original_forward,
                 **kwargs,
             ):
                 # The args/kwargs guard folds at trace time (compiled blocks call
                 # the layer as ``layer(x)``), so it is not a graph break.
                 if args or kwargs:
                     return _original(x, *args, **kwargs)
-                return _fp8_linear_compiled(x, _qt, _sr, _b)
+                return _operation.forward_sample(x, _storage_tensors)
 
             setattr(container, attribute, _fp8_forward)
             restores.append((container, attribute, original_forward, child))
@@ -1446,13 +1456,17 @@ class MemoryManager:
             weight = getattr(child, "weight", None)
             if (
                 not isinstance(weight, torch.nn.Parameter)
-                or not hasattr(weight.data, "qdata")
-                or weight.data.qdata.dtype != torch.float8_e4m3fn
                 or weight.requires_grad
                 or hasattr(child, "_layer_memory_manager")
             ):
                 continue
-            if not fp8_sampling_qualifies(child.weight):
+            bias_t = getattr(child, "bias", None)
+            operation, storage_tensors = bind_parameter_operation(
+                child.weight,
+                bias_t,
+                device=child.weight.device,
+            )
+            if operation.format_key != "rowwise_fp8" or not operation.native:
                 continue
 
             container = child
@@ -1471,18 +1485,16 @@ class MemoryManager:
                     container, attribute = owner, "org_forward"
 
             original_forward = getattr(container, attribute)
-            qdata_t = child.weight.qdata.t()
-            scale_row = child.weight.scale
-            bias_t = getattr(child, "bias", None)
-
             def _fp8_forward(
                 x, *args,
-                _qt=qdata_t, _sr=scale_row, _b=bias_t, _original=original_forward,
+                _operation=operation,
+                _storage_tensors=storage_tensors,
+                _original=original_forward,
                 **kwargs,
             ):
                 if args or kwargs:
                     return _original(x, *args, **kwargs)
-                return _fp8_linear_training(x, _qt, _sr, _b)
+                return _operation.forward_train(x, _storage_tensors)
 
             setattr(container, attribute, _fp8_forward)
             child._memory_management_training_compile_fp8 = True
@@ -1532,10 +1544,10 @@ class MemoryManager:
     def _release_fp8_sampling_for(child_ids, restores):
         """Restore the original forwards of specific layers, in place.
 
-        The resident FP8 sampling forwards hold the GPU qdata/scale as closure
-        constants (a deliberate compile optimization -- see _enable_fp8_sampling).
-        That closure is an untracked pin: demoting the layer moves param.data to
-        CPU but the closure view keeps the GPU storage alive, so the demote
+        The resident FP8 sampling forwards hold the ordered GPU storage tuple as
+        closure constants (a deliberate compile optimization -- see
+        _enable_fp8_sampling). That closure is an untracked pin: demoting the
+        layer moves param.data to CPU but the closure view keeps the GPU storage alive, so the demote
         frees NOTHING (observed at 2000px: 12 demote rounds, zero device-free
         gain). Any demote of an fp8-sampling layer must drop its closure first.
         Removes the released entries from ``restores`` so teardown does not
@@ -2916,12 +2928,19 @@ class MemoryManager:
                         hasattr(child, "_layer_memory_manager")
                         and child.__class__.__name__ in LINEAR_MODULES
                         and isinstance(weight, torch.nn.Parameter)
-                        and hasattr(weight.data, "qdata")
-                        and weight.data.qdata.dtype == torch.float8_e4m3fn
                         and not weight.requires_grad
                     ):
-                        child._memory_management_fp8_training = True
-                        fp8_training_layers += 1
+                        operation, _tensors = bind_parameter_operation(
+                            weight,
+                            getattr(child, "bias", None),
+                            device=device,
+                        )
+                        if (
+                            operation.format_key == "rowwise_fp8"
+                            and operation.native
+                        ):
+                            child._memory_management_fp8_training = True
+                            fp8_training_layers += 1
         _FP8_STATS["training_enabled"] = fp8_training_layers > 0
         _FP8_STATS["kernel_calls"] = 0
         _FP8_STATS["fallback_calls"] = 0
@@ -3086,7 +3105,7 @@ class MemoryManager:
         return old_plan
 
     @classmethod
-    def _refresh_training_fp8_flags(cls, module, mm):
+    def _refresh_training_fp8_bindings(cls, module, mm):
         enabled = bool(getattr(mm, "_fp8_training_requested", False))
         fp8_layers = 0
         for child in module.modules():
@@ -3097,13 +3116,16 @@ class MemoryManager:
             if not enabled or not hasattr(child, "_layer_memory_manager"):
                 continue
             weight = getattr(child, "weight", None)
-            if (
-                child.__class__.__name__ in LINEAR_MODULES
-                and isinstance(weight, torch.nn.Parameter)
-                and hasattr(weight.data, "qdata")
-                and weight.data.qdata.dtype == torch.float8_e4m3fn
-                and not weight.requires_grad
-            ):
+            if child.__class__.__name__ not in LINEAR_MODULES or not isinstance(
+                weight, torch.nn.Parameter
+            ) or weight.requires_grad:
+                continue
+            operation, _tensors = bind_parameter_operation(
+                weight,
+                getattr(child, "bias", None),
+                device=mm.process_device,
+            )
+            if operation.format_key == "rowwise_fp8" and operation.native:
                 child._memory_management_fp8_training = True
                 fp8_layers += 1
         mm._fp8_training_layers = fp8_layers
@@ -3199,7 +3221,7 @@ class MemoryManager:
 
         if changed:
             cls._register_training_prefetch_sources(module, mm)
-            cls._refresh_training_fp8_flags(module, mm)
+            cls._refresh_training_fp8_bindings(module, mm)
             cls._refresh_training_plan_from_layout(module, mm)
             cls._invalidate_manual_training_shape_peaks(mm)
             cls.reset_trace_due_to_execution_shape_change()
@@ -3282,13 +3304,13 @@ class MemoryManager:
                 free_after = stop_bytes
             if free_after < stop_bytes:
                 cls.demote_layer(child, mm, layer_key=item["name"])
-                cls._refresh_training_fp8_flags(module, mm)
+                cls._refresh_training_fp8_bindings(module, mm)
                 cls._refresh_training_plan_from_layout(module, mm)
                 cls._invalidate_manual_training_shape_peaks(mm)
                 cls.reset_trace_due_to_execution_shape_change()
                 cls._clear_cuda_pipeline_state()
                 return 0, "validated_low_free"
-            cls._refresh_training_fp8_flags(module, mm)
+            cls._refresh_training_fp8_bindings(module, mm)
             cls._refresh_training_plan_from_layout(module, mm)
             cls._invalidate_manual_training_shape_peaks(mm)
             cls.reset_trace_due_to_execution_shape_change()
@@ -3420,7 +3442,7 @@ class MemoryManager:
             consumed_bytes += int(item["resident_bytes"])
         if not promoted:
             return 0, "stop_line"
-        cls._refresh_training_fp8_flags(module, mm)
+        cls._refresh_training_fp8_bindings(module, mm)
         cls._refresh_training_plan_from_layout(module, mm)
         cls._invalidate_manual_training_shape_peaks(mm)
         cls.reset_trace_due_to_execution_shape_change()
@@ -4355,7 +4377,7 @@ class MemoryManager:
                     continue
                 if cls.promote_layer(item["module"]):
                     promoted += 1
-        cls._refresh_training_fp8_flags(root, mm)
+        cls._refresh_training_fp8_bindings(root, mm)
         plan = cls._refresh_training_plan_from_layout(root, mm)
         if promoted:
             cls._invalidate_manual_training_shape_peaks(mm)
@@ -5370,8 +5392,7 @@ class MemoryManager:
             weight = getattr(child, "weight", None)
             if (
                 isinstance(weight, torch.nn.Parameter)
-                and hasattr(weight.data, "qdata")
-                and weight.data.qdata.dtype == torch.float8_e4m3fn
+                and weight_format_key(weight) == "rowwise_fp8"
             ):
                 child._memory_management_fp8_sampling = True
         if (
@@ -5517,7 +5538,7 @@ class MemoryManager:
                     module._memory_manager._fp8_training_requested = (
                         original_fp8_training_requested
                     )
-                    cls._refresh_training_fp8_flags(module, module._memory_manager)
+                    cls._refresh_training_fp8_bindings(module, module._memory_manager)
 
                     if _OFFLOAD_PREFETCH_ENABLED and args.get("device") is not None:
                         cls._attach_prefetch_pool(module, args["device"])
@@ -5858,8 +5879,7 @@ class MemoryManager:
         fp8_resident_layers = fp8_streamed_layers = 0
         fp8_supported = False
         if fp8_sampling and target is not None and torch.device(target).type == "cuda":
-            major, minor = torch.cuda.get_device_capability(target)
-            fp8_supported = hasattr(torch, "_scaled_mm") and (major, minor) >= (8, 9)
+            fp8_supported = native_device_supported(target)
         if fp8_supported:
             (
                 fp8_restores,
@@ -6140,8 +6160,8 @@ class MemoryManager:
         def _sampling_step_trim():
             """Per-denoise-step cache trim, called before each forward.
 
-            Streaming FP8 layers re-allocate transient buffers (input cast,
-            _scaled_mm output, unpacked qdata) every forward; the caching
+            Streaming FP8 layers re-allocate transient execution buffers every
+            forward; the caching
             allocator keeps those freed blocks at its reserved high-water rather
             than returning them to the driver. The more blocks stream, the larger
             that idle high-water grows -- so a *bigger* working_reserve (which

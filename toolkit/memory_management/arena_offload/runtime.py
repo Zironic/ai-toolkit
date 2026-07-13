@@ -319,17 +319,21 @@ class ArenaOffloadRuntime:
         """Build the permanent train/sample programs, then activate TRAIN.
 
         Must run AFTER the training network is applied: the programs capture the
-        installed adapter leaves. `network` is accepted for the eventual generic
-        adapter protocol (see GENERIC_ADAPTER_IMMUTABLE_RUNTIME_PLAN.md); today
-        the model collects its own adapters.
+        installed adapter leaves. The architecture adapter obtains those entries
+        from the supplied network; finalization never rediscovers them through
+        patched module-forward ownership. ``network=None`` explicitly means no
+        trainable execution adapters (for example full-parameter training).
         """
         self._require_open()
         self._bind_training_cap()
         try:
-            adapters = self._adapter.collect_execution_adapters(self._model)
+            adapters = self._adapter.collect_execution_adapters(
+                self._model,
+                network,
+            )
             self._executor.finalize_execution(
-                loras_by_block=adapters,
-                lora_multiplier=None,
+                adapters_by_block=adapters,
+                adapter_multiplier=None,
             )
             if self._config.fp8_forward:
                 self._training_fp8_restores = enable_fp8(
@@ -369,13 +373,13 @@ class ArenaOffloadRuntime:
                 raise RuntimeError("arena_offload_transformer_disposed")
             raise RuntimeError("arena_offload_runtime_closed")
 
-    def can_run_model_call(self, block_args, **kwargs) -> bool:
+    def can_run_blocks(self, block_args, **kwargs) -> bool:
         self._require_open()
-        return self._executor.can_run_current_call(*block_args, **kwargs)
+        return self._executor.can_run_current_call(block_args, **kwargs)
 
-    def run_model(self, combined, tvec, freqs, mask):
+    def run_blocks(self, hidden, block_args):
         self._require_open()
-        return self._executor.run(combined, tvec, freqs, mask)
+        return self._executor.run(hidden, block_args)
 
     # ------------------------------------------------------------------
     # execution contexts

@@ -8,7 +8,7 @@ compute-wait was 0.8s -- so the fix is not a deeper GPU pipeline, it is moving
 the pageable->pinned copy off the training thread.
 
 This pool keeps the canonical weights pageable (as today) and, on background
-worker threads, copies the upcoming layers' FP8 qdata / scales / bias into a
+worker threads, copies the upcoming layers' ordered storage leaves into a
 bounded pool of reusable *pinned* buffers ahead of time. When the training
 thread reaches a layer it hands the H2D a pinned source, which transfers async
 without blocking. The "upcoming layers" come from the frozen slice-2A trace.

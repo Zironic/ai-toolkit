@@ -193,27 +193,26 @@ class PreparedCanonicalBuild:
                     if bias is not None:
                         module.bias = torch.nn.Parameter(bias, requires_grad=linear.bias_requires_grad)
                     published.append(module)
-                    leaves = linear.leaf_descriptors
-                    weight_role = (
-                        "qdata" if linear.leaf("scale") is not None else "float_weight"
-                    )
-                    weight_spec = LeafSpec(
-                        leaves[0].offset, leaves[0].nbytes, leaves[0].dtype,
-                        leaves[0].shape, weight_role,
-                    )
-                    bias_leaf = linear.leaf("bias")
-                    scale_leaf = linear.leaf("scale")
                     specs.append(LinearSpec(
-                        linear.name, weight_spec,
-                        None if bias_leaf is None else LeafSpec(**bias_leaf.__dict__),
-                        linear.weight_requires_grad, linear.bias_requires_grad,
-                        "fp8_rowwise" if scale_leaf is not None else "float",
-                        None if scale_leaf is None else LeafSpec(**scale_leaf.__dict__),
-                        linear.native_fp8_eligible,
+                        name=linear.name,
+                        tensors=tuple(
+                            LeafSpec(**leaf.__dict__)
+                            for leaf in linear.leaf_descriptors
+                        ),
+                        execution_key=linear.execution_key,
+                        weight_leaf_count=linear.weight_leaf_count,
+                        weight_template=linear.weight_template,
+                        weight_requires_grad=linear.weight_requires_grad,
+                        bias_requires_grad=linear.bias_requires_grad,
                     ))
-                pack = BlockPack(block.key, block.flat, tuple(specs), block.layout.nbytes, True,
-                                 tuple(x.native_fp8_eligible for x in block.layout.linears),
-                                 pin_handle=block.handle)
+                pack = BlockPack(
+                    block.key,
+                    block.flat,
+                    tuple(specs),
+                    block.layout.nbytes,
+                    True,
+                    pin_handle=block.handle,
+                )
                 pack.view_maker = make_block_view_maker(pack)
                 block.pack = pack
                 names = tuple(name for name, _ in block.entries)

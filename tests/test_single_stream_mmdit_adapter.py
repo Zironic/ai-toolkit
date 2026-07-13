@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from extensions_built_in.diffusion_models.krea2.src.mmdit import SingleStreamDiT
@@ -67,7 +68,7 @@ class _Runtime:
     def __init__(self):
         self.calls = []
 
-    def can_run_model_call(
+    def can_run_blocks(
         self,
         block_args,
         *,
@@ -77,8 +78,8 @@ class _Runtime:
         tvec, _freqs, _mask = block_args
         return not isinstance(tvec, tuple) and ref_kv_capture is None and blockcaches is None
 
-    def run_model(self, combined, tvec, freqs, mask):
-        self.calls.append((combined, tvec, freqs, mask))
+    def run_blocks(self, combined, block_args):
+        self.calls.append((combined, block_args))
         return combined + 1
 
 
@@ -148,7 +149,7 @@ def test_adapter_owns_lora_order_and_functional_block_call():
         b=torch.tensor(2.0),
         scale=torch.tensor(3.0),
     )
-    lora_args = adapter.build_lora_args(
+    lora_args = adapter.build_adapter_args(
         0,
         {0: {"attn.wq": entry}},
         torch.tensor(2.0),
@@ -173,3 +174,39 @@ def test_adapter_owns_lora_order_and_functional_block_call():
     assert result is hidden
     assert block.calls[0][1]["training"] is True
     assert block.calls[0][1]["loras"] is lora_args
+
+
+def test_adapter_finalization_uses_explicit_network_entries():
+    adapter = SingleStreamMMDiTAdapter()
+    block = _Block()
+    transformer = SimpleNamespace(blocks=[block])
+    network = SimpleNamespace(is_lorm=False)
+    owner_type = type("LoRAModule", (), {})
+    owner = owner_type()
+    owner.functional_forward = lambda *args: None
+    owner.orig_module_ref = lambda: block.attn.wq
+    owner.network_ref = lambda: network
+    network.unet_loras = [owner]
+
+    entries = adapter.collect_execution_adapters(transformer, network)
+
+    assert entries == {0: {"attn.wq": owner}}
+
+
+def test_adapter_rejects_multiple_network_entries_for_one_linear():
+    adapter = SingleStreamMMDiTAdapter()
+    block = _Block()
+    transformer = SimpleNamespace(blocks=[block])
+    network = SimpleNamespace(is_lorm=False)
+    owner_type = type("LoRAModule", (), {})
+    owners = []
+    for _ in range(2):
+        owner = owner_type()
+        owner.functional_forward = lambda *args: None
+        owner.orig_module_ref = lambda: block.attn.wq
+        owner.network_ref = lambda: network
+        owners.append(owner)
+    network.unet_loras = owners
+
+    with pytest.raises(RuntimeError, match="one adapter per canonical Linear"):
+        adapter.collect_execution_adapters(transformer, network)

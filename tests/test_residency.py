@@ -72,11 +72,15 @@ class _LinearBlockAdapter:
     def leaf_entries(self, block):
         return tuple(block.entries)
 
-    def build_lora_args(self, index, loras_by_block, multiplier=None):
+    def build_adapter_args(self, index, adapters_by_block, multiplier=None):
         return None
 
     def can_run_current_call(self, block_args, **kwargs):
         return True
+
+    def bind_block_operations(self, block, device):
+        del device
+        return (None,) * len(block.entries)
 
     def forward_block(self, *args, **kwargs):
         raise AssertionError("not used by residency policy test")

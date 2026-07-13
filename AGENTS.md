@@ -138,7 +138,24 @@ overrides that are not required for normal training.
 
 ## Validation
 
-Prefer focused tests and synthetic CUDA scripts over full training jobs.
+Tests are evidence-gathering tools, not a ritual. Run a test only when there is
+a concrete question it can answer about the change or diagnosis at hand. Before
+running it, be able to state what behavior it exercises and how a pass or failure
+would affect the next decision. If the result would not change the assessment,
+skip the test.
+
+Use the narrowest useful validation: a targeted test case or file, a syntax
+check for edited Python, or a focused synthetic CUDA script. Do not run the
+entire `tests/` suite by default, as a generic confidence check, or merely
+because code changed. A full-suite run is appropriate only when the change is
+genuinely cross-cutting, the user explicitly requests it, or a specific release
+gate requires it. Do not expand into unrelated tests after focused validation
+passes unless there is evidence of a broader interaction.
+
+Documentation, agent-instruction, comment-only, and similarly non-executable
+changes normally require inspection or diff review, not test execution. Prefer
+focused tests and synthetic CUDA scripts over full training jobs when runtime
+validation is actually warranted.
 
 ### No CPU compilation
 
@@ -157,11 +174,11 @@ that avoids the probe, or report the full-model compiled smoke as blocked by
 the incidental CPU probe while continuing CUDA validation through the focused
 CUDA seam.
 
-Useful commands:
+Examples of focused validation commands (choose only those relevant to the
+question being answered):
 
 ```powershell
 venv\Scripts\python.exe -m pytest tests\test_bounce_pool.py -q
-venv\Scripts\python.exe -m pytest tests\ -q
 venv\Scripts\python.exe -m py_compile toolkit\memory_management\manager.py toolkit\memory_management\manager_modules.py
 venv\Scripts\python.exe scripts\digest_perf_log.py output\...\performance_log.jsonl
 venv\Scripts\python.exe scripts\replay_prefetch_trace.py output\...\prefetch_capture.jsonl
@@ -200,4 +217,3 @@ right entries should not build real pinned packs.
 - Unsupported hardware/models must fall back cleanly when flags are off or
   unsupported paths are requested.
 - Add focused tests for memory-manager behavior; GPU CI is not available here.
-

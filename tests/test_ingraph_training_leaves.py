@@ -11,6 +11,7 @@ fullgraph variant with the ordering pass.
 import unittest
 
 import torch
+from toolkit.quantization.fp8_linear import bind_parameter_operation
 
 from toolkit.memory_management import ingraph_stream
 from toolkit.memory_management.ingraph_stream import (
@@ -40,14 +41,14 @@ def _quantized_linear(seed):
     return model[0]
 
 
-def _block_fn(x, host, pack, lora):
+def _block_fn(x, host, pack, operation, lora):
     compiling = torch.compiler.is_compiling()
     if compiling:
         token = torch.ops.mm.fetch_start_after(host, x)
     else:
         token = torch.ops.mm.fetch_start(host)
     flat = torch.ops.mm.fetch_wait(token, host.numel())
-    views = block_linear_views(flat, pack)
+    views = block_linear_views(flat, pack, {"proj": operation})
     if torch.is_grad_enabled():
         x = free_on_backward(x, token)
     out = torch.nn.functional.silu(
@@ -78,9 +79,16 @@ class TrainingLeavesTests(unittest.TestCase):
             pack_block_host(f"blocks.{i}", [("proj", layer)], repoint=False, pin=True)
             for i, layer in enumerate(self.layers)
         ]
-        for pack in self.packs:
+        self.operations = []
+        for layer, pack in zip(self.layers, self.packs):
             self.assertTrue(pack.pinned)
-            self.assertTrue(pack.linears[0].fp8_qualifies)
+            operation, _ = bind_parameter_operation(
+                layer.weight,
+                layer.bias,
+                device=self.device,
+            )
+            self.assertTrue(operation.native)
+            self.operations.append(operation)
         torch.manual_seed(5)
         self.loras = [
             LoraEntry(
@@ -97,12 +105,15 @@ class TrainingLeavesTests(unittest.TestCase):
             if torch.compiler.is_compiling()
             else ingraph_stream.checkpoint_recompute_context
         )
-        for layer, pack, lora in zip(self.layers, self.packs, self.loras):
+        for pack, operation, lora in zip(
+            self.packs, self.operations, self.loras
+        ):
             x = torch.utils.checkpoint.checkpoint(
                 _block_fn,
                 x,
                 pack.host_flat,
                 pack,
+                operation,
                 lora,
                 use_reentrant=False,
                 context_fn=context_fn,

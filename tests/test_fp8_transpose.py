@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from toolkit.memory_management.fp8_transpose import column_major
+from toolkit.quantization.fp8_transpose import column_major
 
 CUDA = torch.cuda.is_available()
 

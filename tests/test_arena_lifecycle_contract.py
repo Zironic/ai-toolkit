@@ -27,6 +27,12 @@ from toolkit.memory_management.arena_offload.resources import ArenaRuntimeResour
 
 
 class _Adapter:
+    architecture_key = "test_linear"
+
+    def validate_transformer(self, model):
+        if not isinstance(model, torch.nn.Linear):
+            raise TypeError("expected linear")
+
     def execution_blocks(self, model):
         return (model,)
 
@@ -35,6 +41,34 @@ class _Adapter:
 
     def leaf_entries(self, block):
         return (("linear", block),)
+
+    def collect_execution_adapters(self, _model, _network):
+        return {}
+
+    def build_adapter_args(self, _index, _adapters, multiplier=None):
+        del multiplier
+        return None
+
+    def can_run_current_call(self, _block_args, **_kwargs):
+        return True
+
+    def bind_block_operations(self, block, device):
+        del block, device
+        return (None,)
+
+    def forward_block(
+        self,
+        _block,
+        hidden,
+        _block_args,
+        _leaf_args,
+        _linear_operations,
+        _adapter_args,
+        *,
+        training,
+    ):
+        del training
+        return hidden
 
 
 def _frozen_linear():

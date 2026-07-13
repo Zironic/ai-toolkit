@@ -14,6 +14,7 @@ import torch.nn as nn
 from optimum.quanto import freeze
 
 from toolkit.util.quantize import get_qtype, quantize
+from toolkit.quantization.fp8_linear import bind_parameter_operation
 from toolkit.memory_management import pin_manager
 from toolkit.memory_management.ingraph_stream import (
     block_linear_views,
@@ -28,6 +29,17 @@ def _linear(in_f=8, out_f=4, bias=True):
     if bias:
         layer.bias.requires_grad_(False)
     return layer
+
+
+def _operations(entries, device):
+    return {
+        name: bind_parameter_operation(
+            layer.weight,
+            getattr(layer, "bias", None),
+            device=device,
+        )[0]
+        for name, layer in entries
+    }
 
 
 class TryBorrowPackTests(unittest.TestCase):
@@ -48,7 +60,11 @@ class TryBorrowPackTests(unittest.TestCase):
             pack.host_flat.untyped_storage().data_ptr(),
             arena.block_pack("blocks.0").host_flat.untyped_storage().data_ptr(),
         )
-        views = block_linear_views(pack.host_flat, pack)
+        views = block_linear_views(
+            pack.host_flat,
+            pack,
+            _operations((("attn.wq", a), ("attn.wk", b)), pack.host_flat.device),
+        )
         self.assertTrue(torch.equal(views["attn.wq"].weight, a.weight))
         self.assertTrue(torch.equal(views["attn.wq"].bias, a.bias))
         self.assertTrue(torch.equal(views["attn.wk"].weight, b.weight))
@@ -93,9 +109,13 @@ class TryBorrowPackTests(unittest.TestCase):
         arena.build({"blocks.0": [("lin", layer)]})
         pack = arena.try_borrow_pack("blocks.0", [("attn.proj", layer)])
         self.assertIsNotNone(pack)
-        self.assertEqual(pack.linears[0].kind, "fp8_rowwise")
+        self.assertEqual(pack.linears[0].weight_leaf_count, 2)
 
-        views = block_linear_views(pack.host_flat, pack)
+        views = block_linear_views(
+            pack.host_flat,
+            pack,
+            _operations((("attn.proj", layer),), pack.host_flat.device),
+        )
         torch.testing.assert_close(views["attn.proj"].materialized_weight(), expected.to(torch.bfloat16))
 
     def test_release_pack_on_borrowed_pack_never_touches_pin_manager(self):

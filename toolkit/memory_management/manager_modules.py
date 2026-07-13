@@ -18,8 +18,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import TYPE_CHECKING, Optional, Tuple
 from torch.overrides import has_torch_function_unary  # (ADD) torchao detection
+from toolkit.quantization.fp8_linear import (
+    FP8_STATS as _FP8_STATS,
+    _fp8_grad_input_compute,
+    _fp8_linear_compiled,
+    _fp8_linear_training,
+    dequantize_into as _dequantize_into,
+    dequantize_to as _dequantize_to,
+    fast_dequantize as _fast_fp8_dequant,
+    fast_dequantize_into as _fast_fp8_dequant_into,
+    fp8_linear_inference,
+    fp8_sampling_qualifies,
+    grad_input as _fp8_grad_input,
+    grad_input_supported_weight as _fp8_grad_input_supported,
+    reference_dequantize_to as _reference_dequantize_to,
+    set_fp8_grad_input_enabled,
+)
 from . import pin_manager
-from .fp8_transpose import column_major
 
 
 from .bounce_pool import (
@@ -43,14 +58,6 @@ _DEVICE_STATE = {}
 # enqueue several layers ahead so the H2D stream stays saturated instead of
 # stalling on a per-layer sync. Override with AI_TOOLKIT_OFFLOAD_DEPTH.
 PIPELINE_DEPTH = int(os.environ.get("AI_TOOLKIT_OFFLOAD_DEPTH", "4"))
-
-_FP8_STATS = {
-    "enabled": False,
-    "training_enabled": False,
-    "kernel_calls": 0,
-    "fallback_calls": 0,
-}
-
 
 def _fp8_stats_enabled():
     return _FP8_STATS["enabled"] or _FP8_STATS["training_enabled"]
@@ -945,8 +952,8 @@ def block_stream_stats(device):
 
 def _flatten_leaves(t):
     """Depth-first list of the physical leaf tensors of a (maybe wrapper) tensor.
-    A plain tensor is its own single leaf; a quantized wrapper yields its qdata,
-    scale, etc. in ``__tensor_flatten__`` order."""
+    A plain tensor is its own single leaf; a tensor subclass yields its physical
+    storage in ``__tensor_flatten__`` order."""
     try:
         names, _ = t.__tensor_flatten__()
     except Exception:
@@ -979,8 +986,8 @@ _BLOCK_LEAF_ALIGN = 256  # generous alignment so every leaf's uint8 slice .view(
 def stage_block_forward(device, block_key, linears, compute_dtype=None):
     """Stage a whole block's streamed weights with a SINGLE H2D copy.
 
-    The block's weight/bias leaves (qdata + scales for quantized, or the plain
-    tensor for float) are packed into one contiguous pinned host buffer, copied
+    The block's ordered weight/bias storage leaves are packed into one
+    contiguous pinned host buffer, copied
     to GPU in one ``cudaMemcpyAsync``, then sliced back into per-Linear tensors
     that view the single device buffer. This is the point of block streaming:
     one transfer (one CPU submit) per block instead of one per Linear.
@@ -1153,142 +1160,12 @@ def _is_quantized_tensor(t: Optional[torch.Tensor]) -> bool:
     return not t.dtype.is_floating_point
 
 
-def _reference_dequantize_to(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """The backend's own dequant. TorchAO transits fp32 internally, so the
-    transient is ~5x the output bytes even when output_dtype is honored."""
-    try:
-        return tensor.dequantize(output_dtype=dtype)
-    except TypeError:
-        value = tensor.dequantize()
-        return value if value.dtype == dtype else value.to(dtype=dtype)
-
-
-def _dequantize_to(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize directly to the compute dtype when the backend supports it.
-
-    For the rowwise / per-tensor float8 weights Krea uses, prefer the direct
-    fp8 -> dtype cast + row-scale multiply: it allocates only the output
-    (~0.19 GiB for a 16384x6144 linear) where TorchAO's dequantize transits
-    fp32 (~0.94 GiB transient for the same weight -- the OOM-spiral trigger
-    under the WDDM hard allocator cap, git-bug 1895607)."""
-    fast = _fast_fp8_dequant(tensor, dtype)
-    if fast is not None:
-        return fast
-    return _reference_dequantize_to(tensor, dtype)
-
-
-_FP8_GRAD_INPUT = os.environ.get("AI_TOOLKIT_FP8_GRAD_INPUT", "0").lower() not in (
-    "0",
-    "false",
-    "no",
-    "off",
-    "",
-)
-_FP8_GRAD_VERIFIED = None  # None=unchecked, True=ok, False=disabled after mismatch
-
-
-def set_fp8_grad_input_enabled(enabled: bool) -> None:
-    """Enable the native FP8 grad-input path (model.layer_offloading_fp8_grad_input).
-    Re-arms the one-time self-check so a fresh enable revalidates the kernel."""
-    global _FP8_GRAD_INPUT, _FP8_GRAD_VERIFIED
-    if bool(enabled) and not _FP8_GRAD_INPUT:
-        _FP8_GRAD_VERIFIED = None
-    _FP8_GRAD_INPUT = bool(enabled)
-
-
-def _fp8_grad_input_supported(w_q_gpu, grad_out):
-    """Whether grad_input can use the native FP8 path for this rowwise weight."""
-    if not _FP8_GRAD_INPUT or _FP8_GRAD_VERIFIED is False:
-        return False
-    try:
-        if (
-            not hasattr(torch, "_scaled_mm")
-            or torch.cuda.get_device_capability(grad_out.device) < (8, 9)
-        ):
-            return False
-    except Exception:
-        return False
-    qdata = getattr(w_q_gpu, "qdata", None)
-    scale = getattr(w_q_gpu, "scale", None)
-    if qdata is None or scale is None:
-        return False
-    if qdata.dtype != torch.float8_e4m3fn or qdata.ndim != 2:
-        return False
-    if grad_out.device.type != "cuda" or grad_out.dtype not in (
-        torch.bfloat16,
-        torch.float16,
-    ):
-        return False
-    if scale.numel() != qdata.shape[0]:  # rowwise (per output row) only
-        return False
-    if grad_out.shape[-1] != qdata.shape[0] or qdata.shape[0] % 16 or qdata.shape[1] % 16:
-        return False
-    return True
-
-
-def _fp8_grad_input_compute(grad_out, qdata, scale, target_dtype):
-    """grad_input = (grad_out * row_scale) @ qdata via _scaled_mm; raw fp8 weight.
-
-    The per-output-row weight scales lie on the reduction dim of grad_out @ W,
-    so we fold them into grad_out before quantizing the activation -- no bf16
-    weight is ever materialized."""
-    try:
-        shape = grad_out.shape
-        g = grad_out.reshape(-1, shape[-1]).to(torch.float32)
-        g = g * scale.reshape(1, -1).to(torch.float32)
-        fp8_info = torch.finfo(torch.float8_e4m3fn)
-        scale_g = torch.clamp(
-            g.abs().amax() / fp8_info.max, min=torch.finfo(torch.float32).tiny
-        )
-        g_fp8 = torch.clamp(
-            g / scale_g, min=fp8_info.min, max=fp8_info.max
-        ).to(torch.float8_e4m3fn)
-        one = torch.ones((), device=grad_out.device, dtype=torch.float32)
-        # need qdata [out,in] as a column-major operand: transpose a contiguous
-        # [in,out] fp8 copy (half the bytes of the bf16 weight we are avoiding).
-        # Tiled -- the elementwise clone this replaces moved 1-byte elements with
-        # uncoalesced writes at ~1/5 of the card's bandwidth.
-        b = column_major(qdata)
-        gi = torch._scaled_mm(
-            g_fp8, b, scale_a=scale_g, scale_b=one,
-            out_dtype=target_dtype, use_fast_accum=True,
-        )
-        return gi.reshape(*shape[:-1], qdata.shape[1])
-    except Exception:
-        return None
-
-
-def _fp8_grad_input(grad_out, w_bwd, target_dtype):
-    """Return grad_input for an fp8-wrapper w_bwd, or None to use the bf16 path.
-
-    Always returns a valid grad_input when w_bwd is an fp8 wrapper (falling back
-    to a dequant matmul if the native path is unverified/unsupported), so the
-    caller never feeds a wrapper into a bf16 matmul."""
-    qdata = getattr(w_bwd, "qdata", None)
-    scale = getattr(w_bwd, "scale", None)
-    if qdata is None or scale is None:
-        return None  # bf16 tensor: caller does grad_out @ w_bwd
-    global _FP8_GRAD_VERIFIED
-    out = _fp8_grad_input_compute(grad_out, qdata, scale, target_dtype)
-    if out is not None and _FP8_GRAD_VERIFIED is None:
-        try:
-            reference = grad_out.to(target_dtype) @ _dequantize_to(w_bwd, target_dtype)
-            _FP8_GRAD_VERIFIED = bool(
-                torch.allclose(out, reference, rtol=2e-2, atol=2e-2)
-            )
-        except Exception:
-            _FP8_GRAD_VERIFIED = False
-    if out is not None and _FP8_GRAD_VERIFIED:
-        return out
-    return grad_out.to(target_dtype) @ _dequantize_to(w_bwd, target_dtype)
-
-
 def _wrapper_to_async(t, device):
     """Move a tensor-subclass (e.g. TorchAO float8) to device, forwarding
     non_blocking=True to every inner leaf.
 
     TorchAO's own AffineQuantizedTensor.to(device, non_blocking=True) does not
-    propagate non_blocking to the inner qdata/scale moves, so even a fully
+    propagate non_blocking to its physical storage leaves, so even a fully
     pinned source copies synchronously and the training thread blocks inside the
     H2D enqueue (the measured ~13s/step of "pinned submit"). Rebuilding the
     wrapper here with explicit non_blocking leaf moves makes the transfer truly
@@ -1310,106 +1187,6 @@ def _wrapper_to_async(t, device):
     return type(t).__tensor_unflatten__(moved, ctx, t.size(), t.stride())
 
 
-# --- Slice 3: allocation-free dequant into a reusable destination ----------
-#
-# TorchAO's dequantize() allocates a fresh output tensor every call. Over ~700
-# fetches/step of varying shapes that churn fragments the CUDA allocator until
-# `reserved` overflows VRAM into WDDM shared memory (~0.4 GB/s). For the rowwise
-# / per-tensor float8 weights Krea uses, the dequant is just `qdata.to(bf16) *
-# scale`, which we can write straight into a preallocated buffer with no alloc.
-# Anything else (zero points, block/group scales, non-fp8) falls back to the
-# allocating path, and a one-time numerical self-check disables the fast path
-# globally if it ever disagrees with the reference dequant.
-
-_REUSE_DEQUANT = os.environ.get("AI_TOOLKIT_REUSE_DEQUANT", "1").lower() not in (
-    "0",
-    "false",
-    "no",
-    "off",
-    "",
-)
-_REUSE_VERIFIED = None  # None=unverified, True=ok, False=disabled after mismatch
-
-
-def _fast_fp8_dequant_into(qweight, dest):
-    """Write a rowwise/per-tensor float8 dequant into dest, or return None."""
-    qdata = getattr(qweight, "qdata", None)
-    scale = getattr(qweight, "scale", None)
-    if qdata is None or scale is None:
-        return None
-    if qdata.dtype != torch.float8_e4m3fn or qdata.shape != dest.shape:
-        return None
-    if getattr(qweight, "zero_point", None) is not None:
-        return None
-    if scale.numel() == qdata.shape[0]:
-        # per-output-row (linear [out,in] or conv [out,in,kh,kw])
-        view_shape = [qdata.shape[0]] + [1] * (qdata.ndim - 1)
-        dest.copy_(qdata)
-        dest.mul_(scale.reshape(view_shape).to(dest.dtype))
-        return dest
-    if scale.numel() == 1:
-        dest.copy_(qdata)
-        dest.mul_(scale.to(dest.dtype))
-        return dest
-    return None
-
-
-def _fast_fp8_dequant(qweight, dtype):
-    """Rowwise/per-tensor fp8 dequant allocating only the output, or None.
-
-    Same math and one-time verification as _dequantize_into, without a
-    preallocated destination -- for callers outside the staging slots
-    (block-resident consume, backward, CPU fallback)."""
-    global _REUSE_VERIFIED
-    if not _REUSE_DEQUANT or _REUSE_VERIFIED is False:
-        return None
-    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        return None
-    qdata = getattr(qweight, "qdata", None)
-    if qdata is None:
-        return None
-    dest = torch.empty(qdata.shape, dtype=dtype, device=qdata.device)
-    fast = _fast_fp8_dequant_into(qweight, dest)
-    if fast is None:
-        return None
-    if _REUSE_VERIFIED is None:
-        try:
-            reference = _reference_dequantize_to(qweight, dtype)
-            ok = reference.shape == fast.shape and torch.allclose(
-                fast, reference, rtol=1e-2, atol=1e-2
-            )
-        except Exception:
-            ok = False
-        _REUSE_VERIFIED = bool(ok)
-        if not ok:
-            return None
-    return fast
-
-
-def _dequantize_into(qweight, dest):
-    """Dequant qweight into the preallocated dest buffer, or None to fall back."""
-    global _REUSE_VERIFIED
-    if not _REUSE_DEQUANT or _REUSE_VERIFIED is False or dest is None:
-        return None
-    fast = _fast_fp8_dequant_into(qweight, dest)
-    if fast is None:
-        return None
-    if _REUSE_VERIFIED is None:
-        # Pay one allocation to confirm the elementwise path matches TorchAO's
-        # own dequant before we trust it for the rest of the run.
-        try:
-            reference = _reference_dequantize_to(qweight, dest.dtype)
-            ok = reference.shape == fast.shape and torch.allclose(
-                fast, reference, rtol=1e-2, atol=1e-2
-            )
-        except Exception:
-            ok = False
-        _REUSE_VERIFIED = bool(ok)
-        if not ok:
-            return None
-    return fast
-
-
 def _slot_bf16_dest(state, idx, shape, dtype, device):
     """Persistent per-slot buffer reused across fetches, grown to the max shape."""
     numel = 1
@@ -1420,190 +1197,6 @@ def _slot_bf16_dest(state, idx, shape, dtype, device):
         buf = torch.empty(numel, dtype=dtype, device=device)
         state["w_dest"][idx] = buf
     return buf.narrow(0, 0, numel).view(*shape)
-
-
-def fp8_linear_inference(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    """Native FP8 GEMM for TorchAO rowwise float8 weights on SM89+.
-
-    Ada cannot consume rowwise scales directly in torch._scaled_mm. Compute
-    with the raw FP8 bytes, then apply the existing per-output-row scales to
-    the bf16/fp16 result. Return None when the op is unsupported.
-    """
-    if (
-        x.device.type != "cuda"
-        or x.dtype not in (torch.bfloat16, torch.float16)
-        or not hasattr(weight, "qdata")
-        or not hasattr(weight, "scale")
-    ):
-        if _fp8_stats_enabled():
-            _FP8_STATS["fallback_calls"] += 1
-        return None
-    qdata = weight.qdata
-    scale = weight.scale
-    if (
-        not hasattr(torch, "_scaled_mm")
-        or torch.cuda.get_device_capability(x.device) < (8, 9)
-        or qdata.device != x.device
-        or scale.device != x.device
-        or (bias is not None and bias.device != x.device)
-        or qdata.dtype != torch.float8_e4m3fn
-        or qdata.ndim != 2
-        or scale.numel() != qdata.shape[0]
-        or x.shape[-1] != qdata.shape[1]
-        or qdata.shape[0] % 16
-        or qdata.shape[1] % 16
-        or x.numel() == 0
-    ):
-        if _fp8_stats_enabled():
-            _FP8_STATS["fallback_calls"] += 1
-        return None
-
-    original_shape = x.shape
-    x_2d = x.reshape(-1, original_shape[-1])
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    scale_x = torch.clamp(
-        x_2d.abs().amax().float() / fp8_info.max,
-        min=torch.finfo(torch.float32).tiny,
-    )
-    x_fp8 = torch.clamp(
-        x_2d / scale_x.to(x_2d.dtype),
-        min=fp8_info.min,
-        max=fp8_info.max,
-    ).to(torch.float8_e4m3fn)
-    one = torch.ones((), device=x.device, dtype=torch.float32)
-    try:
-        out = torch._scaled_mm(
-            x_fp8,
-            qdata.t(),
-            scale_a=scale_x,
-            scale_b=one,
-            out_dtype=x.dtype,
-            use_fast_accum=True,
-        )
-    except RuntimeError:
-        if _fp8_stats_enabled():
-            _FP8_STATS["fallback_calls"] += 1
-        return None
-
-    if _fp8_stats_enabled():
-        _FP8_STATS["kernel_calls"] += 1
-    out = out * scale.reshape(1, -1).to(out.dtype)
-    if bias is not None:
-        out = out + bias.to(device=x.device, dtype=out.dtype)
-    return out.reshape(*original_shape[:-1], qdata.shape[0])
-
-
-def fp8_sampling_qualifies(weight) -> bool:
-    """Install-time check that a resident layer can use the native FP8 GEMM.
-
-    This is every static precondition fp8_linear_inference checked per call —
-    capability, dtype, rank, 16-alignment, matching row-scale count. Hoisting
-    them here lets the compiled forward (_fp8_linear_compiled) be pure tensor
-    math with no branching, so torch.compile traces it without graph breaks.
-    The weight is already resident on its sampling device at install time.
-    """
-    qdata = getattr(weight, "qdata", None)
-    scale = getattr(weight, "scale", None)
-    if qdata is None or scale is None:
-        return False
-    if not hasattr(torch, "_scaled_mm"):
-        return False
-    if qdata.device.type != "cuda":
-        return False
-    if torch.cuda.get_device_capability(qdata.device) < (8, 9):
-        return False
-    return not (
-        qdata.dtype != torch.float8_e4m3fn
-        or qdata.ndim != 2
-        or scale.device != qdata.device
-        or scale.numel() != qdata.shape[0]
-        or qdata.shape[0] % 16
-        or qdata.shape[1] % 16
-    )
-
-
-def _fp8_linear_compiled(x, qdata_t, scale_row, bias):
-    """Compile-clean native FP8 GEMM for resident sampling layers.
-
-    Numerically equivalent to fp8_linear_inference, but every validation,
-    capability query, stats increment, try/except and Optional return has been
-    removed (validation is done once by fp8_sampling_qualifies at install time).
-    The body is pure tensor ops, so torch.compile traces it as a single graph.
-
-    ``qdata_t`` is the raw FP8 weight already transposed to (K, N); ``scale_row``
-    is the per-output-row fp32 scale; ``bias`` is a captured tensor or None
-    (the None test folds at trace time, it is not a data-dependent branch).
-    """
-    original_shape = x.shape
-    x_2d = x.reshape(-1, original_shape[-1])
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    scale_x = torch.clamp(
-        x_2d.abs().amax().float() / fp8_info.max,
-        min=torch.finfo(torch.float32).tiny,
-    )
-    x_fp8 = torch.clamp(
-        x_2d / scale_x.to(x_2d.dtype),
-        min=fp8_info.min,
-        max=fp8_info.max,
-    ).to(torch.float8_e4m3fn)
-    one = torch.ones((), device=x.device, dtype=torch.float32)
-    out = torch._scaled_mm(
-        x_fp8,
-        qdata_t,
-        scale_a=scale_x,
-        scale_b=one,
-        out_dtype=x.dtype,
-        use_fast_accum=True,
-    )
-    out = out * scale_row.reshape(1, -1).to(out.dtype)
-    if bias is not None:
-        out = out + bias.to(dtype=out.dtype)
-    return out.reshape(*original_shape[:-1], scale_row.shape[0])
-
-
-class _Fp8LinearTrainingFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, qdata_t, scale_row, bias):
-        ctx.save_for_backward(qdata_t, scale_row)
-        ctx.input_dtype = x.dtype
-        # layer_offloading_fp8_grad_input decides whether the backward may use the
-        # lossy native fp8 grad-input GEMM. Capture it in the *traced* forward so
-        # it becomes a compile guard: flipping the flag recompiles instead of
-        # silently keeping whichever branch was baked in first.
-        ctx.fp8_grad_input = bool(_FP8_GRAD_INPUT)
-        return _fp8_linear_compiled(x, qdata_t, scale_row, bias)
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        qdata_t, scale_row = ctx.saved_tensors
-        target_dtype = getattr(ctx, "input_dtype", grad_out.dtype)
-        qdata = qdata_t.t()
-        grad_input = None
-        if ctx.fp8_grad_input:
-            grad_input = _fp8_grad_input_compute(
-                grad_out,
-                qdata,
-                scale_row,
-                target_dtype,
-            )
-        if grad_input is None:
-            # Dequantize straight to the compute dtype. Transiting fp32 here would
-            # materialize a 4x-of-fp8 weight per Linear (the OOM-spiral shape that
-            # _dequantize_to exists to avoid), and the result is cast to
-            # target_dtype anyway. Row scales are applied in the compute dtype,
-            # matching the forward (_fp8_linear_compiled).
-            weight = qdata.to(target_dtype) * scale_row.reshape(-1, 1).to(target_dtype)
-            grad_input = grad_out.to(target_dtype) @ weight
-        return grad_input.to(dtype=grad_out.dtype), None, None, None
-
-
-def _fp8_linear_training(x, qdata_t, scale_row, bias):
-    """Grad-safe native FP8 Linear for frozen resident training weights."""
-    return _Fp8LinearTrainingFn.apply(x, qdata_t, scale_row, bias)
 
 
 _REGISTERED_HOST_PIN_LOCK = threading.Lock()
@@ -2102,10 +1695,8 @@ class _BouncingLinearFn(torch.autograd.Function):
                 w_q_gpu = _wrapper_to_async(cpu_w, device)
                 if profile_midpoint is not None:
                     profile_midpoint()
-                # FP8 grad-input: fold the per-output-row weight scales into
-                # grad_out, quantize it to fp8, and scaled_mm against the raw
-                # qdata -- no bf16 weight materialization. Returns the fp8
-                # wrapper so the matmul below can take the native path.
+                # Let the bound quantized operation decide whether it can keep
+                # the wrapped representation for grad-input execution.
                 if _fp8_grad_input_supported(w_q_gpu, grad_out):
                     return w_q_gpu
                 dest = dest_fn(w_q_gpu.shape, target_dtype) if dest_fn else None

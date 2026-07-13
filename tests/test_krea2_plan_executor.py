@@ -53,7 +53,7 @@ def _runtime(model, state, *, compile_blocks=True, **finalize_kwargs):
 def _run(executor, *args):
     mode = executor.TRAIN if torch.is_grad_enabled() else executor.SAMPLE
     with executor.execution(mode):
-        return executor.run(*args)
+        return executor.run(args[0], args[1:])
 
 def _model():
     torch.manual_seed(123)
@@ -97,7 +97,6 @@ def _fixture():
             (
                 child.weight.detach().clone().cuda(),
                 None if child.bias is None else child.bias.detach().clone().cuda(),
-                None,
             )
             for _name, child in entries_by_block[f"blocks.{index}"]
         )
@@ -171,8 +170,8 @@ def test_compiled_train_parity_lora_grads_and_zero_graph_breaks():
     executor = _runtime(
         model,
         state,
-        loras_by_block=loras,
-        lora_multiplier=torch.tensor(0.75, device="cuda"),
+        adapters_by_block=loras,
+        adapter_multiplier=torch.tensor(0.75, device="cuda"),
     )
     try:
         executor.activate(executor.TRAIN, _train_plan())
@@ -189,14 +188,17 @@ def test_compiled_train_parity_lora_grads_and_zero_graph_breaks():
         with torch.no_grad():
             expected = inputs[0].detach()
             for index in range(LAYERS):
-                lora_args = _ADAPTER.build_lora_args(
+                lora_args = _ADAPTER.build_adapter_args(
                     index, loras, torch.tensor(0.75, device="cuda")
                 )
                 expected = model.blocks[index].forward_streamed(
                     expected,
                     *inputs[1:],
                     reference_args[index],
-                    (False,) * 8,
+                    _ADAPTER.bind_block_operations(
+                        model.blocks[index],
+                        "cuda",
+                    ),
                     loras=lora_args,
                 )
         torch.testing.assert_close(
@@ -238,7 +240,7 @@ def test_compiled_train_accepts_functional_lokr_owner():
     ).cuda()
     lokr.apply_to()
     adapters = {0: {"attn.wq": lokr}}
-    executor = _runtime(model, state, loras_by_block=adapters)
+    executor = _runtime(model, state, adapters_by_block=adapters)
     try:
         executor.activate(executor.TRAIN, _train_plan())
         inputs = _inputs(model, requires_grad=True)
@@ -259,8 +261,8 @@ def test_phase_cycles_reuse_graphs_and_arena_fixed_across_boundaries():
     executor = _runtime(
         model,
         state,
-        loras_by_block=loras,
-        lora_multiplier=torch.tensor(0.5, device="cuda"),
+        adapters_by_block=loras,
+        adapter_multiplier=torch.tensor(0.5, device="cuda"),
     )
     train_plan, sample_plan = _train_plan(), _sample_plan()
     signature = _arena_signature(arena)
@@ -427,7 +429,8 @@ def test_run_fails_closed_without_activation_and_on_stale_plan():
                 ImmutableRuntimeError, match="residency_transition_during_execution"
             ):
                 executor.set_residency_plan(_train_plan())
-            assert executor.run(*_inputs(model)).shape == (1, 5, 32)
+            inputs = _inputs(model)
+            assert executor.run(inputs[0], inputs[1:]).shape == (1, 5, 32)
     finally:
         ingraph_stream.drain_fetch_runtime()
         arena.release()

@@ -9,6 +9,7 @@ reads it (silent numeric corruption if violated; hit in the Phase 0 spike).
 
 import pytest
 import torch
+from toolkit.quantization.fp8_linear import bind_storage_operation
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -52,25 +53,16 @@ def _heterogeneous_pack():
     return ingraph_stream.pack_block_host("heterogeneous", entries, repoint=False, pin=True)
 
 
-def _heterogeneous_streamed_block(x, host, nbytes, pack):
+def _heterogeneous_streamed_block(x, host, nbytes, pack, operations):
     token = torch.ops.mm.fetch_start_after(host, x)
     flat = torch.ops.mm.fetch_wait(token, nbytes)
     views = ingraph_stream.block_tensor_views(flat, pack)
-    q = ingraph_stream.streamed_linear_tensors(
-        x, views[0][0], views[0][1], views[0][2], fp8_qualifies=pack.fp8_flags[0]
-    )
-    gate = ingraph_stream.streamed_linear_tensors(
-        x, views[5][0], views[5][1], views[5][2], fp8_qualifies=pack.fp8_flags[5]
-    )
-    up = ingraph_stream.streamed_linear_tensors(
-        x, views[6][0], views[6][1], views[6][2], fp8_qualifies=pack.fp8_flags[6]
-    )
-    down = ingraph_stream.streamed_linear_tensors(
+    q = operations[0].forward_sample(x, views[0])
+    gate = operations[5].forward_sample(x, views[5])
+    up = operations[6].forward_sample(x, views[6])
+    down = operations[7].forward_sample(
         torch.nn.functional.silu(gate) * up,
-        views[7][0],
-        views[7][1],
-        views[7][2],
-        fp8_qualifies=pack.fp8_flags[7],
+        views[7],
     )
     y = q + down
     torch.ops.mm.fetch_free_after(token, y)
@@ -80,22 +72,38 @@ def _heterogeneous_streamed_block(x, host, nbytes, pack):
 def test_heterogeneous_pack_views_cause_zero_recompiles():
     _reset(depth=2)
     pack = _heterogeneous_pack()
-    compiled = torch.compile(_heterogeneous_streamed_block, fullgraph=True, dynamic=False)
+    views = ingraph_stream.block_tensor_views(pack.host_flat, pack)
+    operations = tuple(
+        bind_storage_operation(
+            tensors,
+            device=pack.host_flat.device,
+            weight_leaf_count=spec.weight_leaf_count,
+            execution_key=spec.execution_key,
+        )
+        for spec, tensors in zip(pack.linears, views)
+    )
+    compiled = torch.compile(
+        lambda x, host, nbytes: _heterogeneous_streamed_block(
+            x, host, nbytes, pack, operations
+        ),
+        fullgraph=True,
+        dynamic=False,
+    )
     x = torch.randn(4, 32, device="cuda")
 
-    first = compiled(x, pack.host_flat, int(pack.required_pin_bytes), pack)
+    first = compiled(x, pack.host_flat, int(pack.required_pin_bytes))
     torch.cuda.synchronize()
     graphs = _unique_graphs()
     assert graphs >= 1
     assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
 
-    again = compiled(x, pack.host_flat, int(pack.required_pin_bytes), pack)
+    again = compiled(x, pack.host_flat, int(pack.required_pin_bytes))
     torch.cuda.synchronize()
     torch.testing.assert_close(again, first)
     assert _unique_graphs() == graphs
 
     repacked_host = pack.host_flat.clone().pin_memory()
-    third = compiled(x, repacked_host, int(pack.required_pin_bytes), pack)
+    third = compiled(x, repacked_host, int(pack.required_pin_bytes))
     torch.cuda.synchronize()
     torch.testing.assert_close(third, first)
     assert _unique_graphs() == graphs

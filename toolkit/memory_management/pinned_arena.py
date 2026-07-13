@@ -311,21 +311,19 @@ class PinnedWeightArena:
         if not isinstance(param, torch.nn.Parameter):
             raise ValueError(f"{param_name} is not a Parameter on {entry_name!r}")
         if param_name == "weight":
-            leaf_spec, scale_spec = spec.weight, spec.weight_scale
+            tensor_specs = spec.tensors[:spec.weight_leaf_count]
         elif param_name == "bias":
-            leaf_spec, scale_spec = spec.bias, None
+            tensor_specs = spec.tensors[spec.weight_leaf_count:]
         else:
             raise ValueError(f"unsupported param_name {param_name!r}")
-        if leaf_spec is None:
+        if not tensor_specs:
             raise KeyError(f"{entry_name!r} has no {param_name} leaf in block {block_key!r}")
 
         flat = block.pack.host_flat
         src = param.data
         src_cpu = src if src.device.type == "cpu" else src.to("cpu")
         current_leaves = _flatten_leaves(src_cpu)
-        target_leaves = [leaf_view(flat, leaf_spec)]
-        if scale_spec is not None:
-            target_leaves.append(leaf_view(flat, scale_spec))
+        target_leaves = [leaf_view(flat, item) for item in tensor_specs]
         if len(current_leaves) != len(target_leaves):
             raise ArenaLayoutError(f"arena_layout_mismatch:{entry_name}:{param_name}")
         for current, target in zip(current_leaves, target_leaves):

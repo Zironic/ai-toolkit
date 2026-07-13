@@ -283,10 +283,24 @@ class PartialBlockResidencyTests(_StubbedPinMixin, unittest.TestCase):
         linear = nn.Linear(8, 5, bias=True).eval()
         x = torch.randn(3, 8)
 
-        (weight, bias, scale), qualifies = resident_linear_tensors(linear)
+        from toolkit.quantization.fp8_linear import bind_storage_operation
+        from toolkit.quantization.storage import linear_storage_binding
+
+        tensors = resident_linear_tensors(linear)
+        operation = bind_storage_operation(
+            tensors,
+            device="cpu",
+            weight_leaf_count=1,
+            execution_key=linear_storage_binding(
+                linear.weight,
+                linear.bias,
+            ).execution_key,
+        )
+        weight, bias, scale = operation.functional_components(tensors)
         self.assertIsNone(scale)
-        self.assertFalse(qualifies)
-        out = streamed_linear_tensors(x, weight, bias, scale, fp8_qualifies=False)
+        out = streamed_linear_tensors(
+            x, weight, bias, scale, operation=operation
+        )
 
         torch.testing.assert_close(out, linear(x))
 
@@ -313,8 +327,8 @@ class PartialBlockResidencyTests(_StubbedPinMixin, unittest.TestCase):
     def test_unsupported_resident_wrapper_fails_closed(self):
         model = _SynthModel(n=1)
         with mock.patch(
-            "toolkit.memory_management.arena_offload.layout._flatten_leaves",
-            return_value=[torch.zeros(2), torch.zeros(2), torch.zeros(2)],
+            "toolkit.memory_management.arena_offload.layout.linear_storage_binding",
+            side_effect=ValueError("unsupported storage declaration"),
         ):
             with self.assertRaises(IngraphPackError) as ctx:
                 build_block_leaf_plans(None, model.block_entries())

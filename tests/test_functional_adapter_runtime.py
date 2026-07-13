@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,6 +12,7 @@ from extensions_built_in.diffusion_models.krea2.src.mmdit import (
 )
 from toolkit.functional_adapter import FunctionalLinear
 from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
+from toolkit.quantization.fp8_linear import bind_linear_operation
 from toolkit.lora_special import FullModule, LoRAModule
 from toolkit.models.DoRA import DoRAModule
 from toolkit.models.lokr import LokrModule
@@ -43,6 +46,21 @@ def _functional_linear(linear):
 
 def _adapter_parameters(adapter):
     return tuple(parameter for parameter in adapter.parameters() if parameter.requires_grad)
+
+
+def _single_stream_transformer(wq):
+    other = torch.nn.Linear(2, 2)
+    block = SimpleNamespace(
+        attn=SimpleNamespace(
+            wq=wq,
+            wk=other,
+            wv=other,
+            gate=other,
+            wo=other,
+        ),
+        mlp=SimpleNamespace(gate=other, up=other, down=other),
+    )
+    return SimpleNamespace(blocks=(block,))
 
 
 @pytest.mark.parametrize(
@@ -96,17 +114,21 @@ def test_unsupported_forward_owner_reports_class_and_full_target():
 
     child = torch.nn.Linear(2, 2)
     owner = UnsupportedAdapter()
-    child.forward = owner.forward
+    network = _Network()
+    owner.orig_module_ref = lambda: child
+    owner.network_ref = lambda: network
+    network.unet_loras = [owner]
 
     with pytest.raises(RuntimeError) as exc:
-        SingleStreamMMDiTAdapter().collect_adapter_entry(
-            child, "blocks.3.attn.wq"
+        SingleStreamMMDiTAdapter().collect_execution_adapters(
+            _single_stream_transformer(child),
+            network,
         )
 
     message = str(exc.value)
     assert "arena offload supports" in message
     assert "UnsupportedAdapter" in message
-    assert "blocks.3.attn.wq" in message
+    assert "blocks.0.attn.wq" in message
 
 
 def test_supported_lokr_owner_is_collected_at_setup():
@@ -114,26 +136,36 @@ def test_supported_lokr_owner_is_collected_at_setup():
     child = torch.nn.Linear(4, 4)
     adapter = LokrModule("test", child, network=network, lora_dim=2, alpha=2)
     adapter.apply_to()
+    network.unet_loras = [adapter]
 
     assert (
-        SingleStreamMMDiTAdapter().collect_adapter_entry(
-            child, "blocks.0.attn.wq"
-        )
-        is adapter
+        SingleStreamMMDiTAdapter().collect_execution_adapters(
+            _single_stream_transformer(child),
+            network,
+        )[0]["attn.wq"] is adapter
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_lokr_functional_leaf_runs_under_block_compile():
+    device = torch.device("cuda")
     network = _Network()
-    child = torch.nn.Linear(4, 4)
+    network.torch_multiplier = network.torch_multiplier.to(device)
+    child = torch.nn.Linear(4, 4).to(device)
     adapter = LokrModule("test", child, network=network, lora_dim=2, alpha=2)
     adapter.apply_to()
-    arg = (child.weight.detach(), child.bias.detach(), None)
+    adapter.to(device)
+    operation = bind_linear_operation(
+        child.weight,
+        child.bias,
+        device=device,
+    )
+    arg = (child.weight.detach(), child.bias.detach())
 
     def leaf(x):
-        return _streamed_arg_linear_train(x, arg, False, adapter)
+        return _streamed_arg_linear_train(x, arg, operation, adapter)
 
-    x = torch.randn(2, 3, 4, requires_grad=True)
+    x = torch.randn(2, 3, 4, device=device, requires_grad=True)
     expected = leaf(x)
     compiled = torch.compile(leaf, backend="eager", fullgraph=True)
     actual = compiled(x)

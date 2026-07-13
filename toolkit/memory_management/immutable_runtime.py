@@ -15,7 +15,6 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from toolkit.memory_management import vram_budget
-from toolkit.memory_management.arena_offload.layout import _flatten_leaves
 from toolkit.memory_management.arena_offload.transfer import (
     checkpoint_recompute_context,
     compiled_checkpoint_context,
@@ -44,8 +43,7 @@ class ImmutableBlockABI:
 
     block_key: str
     leaf_names: tuple[str, ...]
-    fp8_flags: tuple[bool, ...]
-    leaf_layout: tuple[tuple[str, tuple[int, ...], str, bool, bool], ...]
+    leaf_layout: tuple
 
 
 @dataclass(frozen=True)
@@ -74,47 +72,24 @@ class ImmutableBlockSourceSnapshot:
                 sidecar = residency.resident_leaf((self.block_key, leaf_name))
                 if sidecar is None:
                     raise ImmutableRuntimeError(f"missing_resident_source:{self.block_key}.{leaf_name}")
-                args.append(_resident_args(sidecar, spec.kind))
+                args.append(sidecar.tensors)
                 continue
 
             if compact_flat is None or self.transfer is None:
                 raise ImmutableRuntimeError(f"missing_streamed_source:{self.block_key}.{leaf_name}")
 
-            weight = self.transfer.compact_leaf_view(
-                compact_flat,
-                leaf_name,
-                "weight",
-            )
-            bias = (
-                None
-                if spec.bias is None
-                else self.transfer.compact_leaf_view(
-                    compact_flat,
-                    leaf_name,
-                    "bias",
+            args.append(
+                tuple(
+                    self.transfer.compact_leaf_view(
+                        compact_flat,
+                        leaf_name,
+                        item.role,
+                    )
+                    for item in spec.tensors
                 )
             )
-            scale = (
-                None
-                if spec.weight_scale is None
-                else self.transfer.compact_leaf_view(
-                    compact_flat,
-                    leaf_name,
-                    "weight_scale",
-                )
-            )
-            args.append((weight, bias, scale))
 
         return tuple(args)
-
-
-def _resident_args(sidecar, kind: str):
-    leaves = _flatten_leaves(sidecar.weight)
-    if kind == "float" and len(leaves) == 1:
-        return leaves[0], sidecar.bias, None
-    if kind == "fp8_rowwise" and len(leaves) == 2:
-        return leaves[0], sidecar.bias, leaves[1]
-    raise ImmutableRuntimeError(f"resident_sidecar_layout_mismatch:{sidecar.key[0]}.{sidecar.key[1]}")
 
 
 def build_source_snapshot(
@@ -160,13 +135,14 @@ def build_program_fingerprint(
     architecture_key: str,
     depth: int,
     checkpoint_mode: str,
-    lora_shape=(),
+    adapter_shape=(),
     has_multiplier: bool = False,
 ) -> str:
     per_block = tuple(
         (
             abi.block_key,
             tuple(abi.leaf_names),
+            abi.leaf_layout,
         )
         for abi in block_abis
     )
@@ -178,7 +154,7 @@ def build_program_fingerprint(
             per_block,
             int(depth),
             str(checkpoint_mode),
-            tuple(lora_shape),
+            tuple(adapter_shape),
             bool(has_multiplier),
         )
     )
@@ -188,19 +164,17 @@ def build_program_fingerprint(
 def build_train_trunk(block_fns):
     block_fns = tuple(block_fns)
 
-    def immutable_train_trunk(combined, tvec, freqs, mask):
+    def immutable_train_trunk(hidden, block_args):
         context_fn = compiled_checkpoint_context if torch.compiler.is_compiling() else checkpoint_recompute_context
         for block_fn in block_fns:
-            combined = checkpoint(
+            hidden = checkpoint(
                 block_fn,
-                combined,
-                tvec,
-                freqs,
-                mask,
+                hidden,
+                block_args,
                 use_reentrant=False,
                 context_fn=context_fn,
             )
-        return combined
+        return hidden
 
     return immutable_train_trunk
 
@@ -208,10 +182,10 @@ def build_train_trunk(block_fns):
 def build_sample_trunk(block_fns):
     block_fns = tuple(block_fns)
 
-    def immutable_sample_trunk(combined, tvec, freqs, mask):
+    def immutable_sample_trunk(hidden, block_args):
         for block_fn in block_fns:
-            combined = block_fn(combined, tvec, freqs, mask)
-        return combined
+            hidden = block_fn(hidden, block_args)
+        return hidden
 
     return immutable_sample_trunk
 
@@ -306,10 +280,11 @@ def _leaf_layout(record) -> tuple:
         layout.append(
             (
                 leaf_name,
-                tuple(spec.weight.shape),
-                str(spec.weight.dtype),
-                spec.bias is not None,
-                spec.weight_scale is not None,
+                tuple(
+                    (item.role, tuple(item.shape), str(item.dtype))
+                    for item in spec.tensors
+                ),
+                spec.execution_key,
             )
         )
     return tuple(layout)
@@ -336,7 +311,6 @@ def build_block_abi(
     return ImmutableBlockABI(
         block_key=block_key,
         leaf_names=record.leaf_names,
-        fp8_flags=tuple(spec.fp8_qualifies for spec in record.pack.linears),
         leaf_layout=_leaf_layout(record),
     )
 
@@ -368,8 +342,15 @@ class ImmutableTransformerRuntime:
         self.residency = residency
         self.architecture_adapter = architecture_adapter
         self._blocks = self.architecture_adapter.execution_blocks(model)
-        self.loras_by_block = {}
-        self.lora_multiplier = None
+        self._block_operations = tuple(
+            self.architecture_adapter.bind_block_operations(
+                block,
+                self.residency.device,
+            )
+            for block in self._blocks
+        )
+        self.adapters_by_block = {}
+        self.adapter_multiplier = None
         self.depth = max(1, int(depth))
         self.compile_blocks = bool(compile_blocks)
         self.compile_dynamic = (
@@ -394,7 +375,7 @@ class ImmutableTransformerRuntime:
             for index in range(len(self._blocks))
         )
         self._sources = ImmutableRuntimeSourceTable(residency, self._block_abis)
-        self._block_kernels: dict[tuple[str, int, tuple[bool, ...]], object] = {}
+        self._block_kernels: dict[tuple[str, int], object] = {}
         self._block_fns: dict[str, tuple] = {}
         self._programs: dict[str, ImmutableProgram] = {}
         self._finalized = False
@@ -427,22 +408,22 @@ class ImmutableTransformerRuntime:
         return self._sources.source(block_index)
 
     @staticmethod
-    def _execution_signature(loras_by_block, lora_multiplier):
+    def _execution_signature(adapters_by_block, adapter_multiplier):
         entries = []
-        for index, loras in sorted((loras_by_block or {}).items()):
-            for name, entry in sorted(loras.items()):
+        for index, adapters in sorted((adapters_by_block or {}).items()):
+            for name, entry in sorted(adapters.items()):
                 entries.append((int(index), str(name), id(entry)))
-        return tuple(entries), id(lora_multiplier)
+        return tuple(entries), id(adapter_multiplier)
 
     def finalize_execution(
         self,
         *,
-        loras_by_block=None,
-        lora_multiplier=None,
+        adapters_by_block=None,
+        adapter_multiplier=None,
     ):
         signature = self._execution_signature(
-            loras_by_block,
-            lora_multiplier,
+            adapters_by_block,
+            adapter_multiplier,
         )
         if self._finalized:
             if signature != self._finalization_signature:
@@ -451,8 +432,8 @@ class ImmutableTransformerRuntime:
                 )
             return self
 
-        self.loras_by_block = dict(loras_by_block or {})
-        self.lora_multiplier = lora_multiplier
+        self.adapters_by_block = dict(adapters_by_block or {})
+        self.adapter_multiplier = adapter_multiplier
         configure_fetch_runtime(depth=self.depth, owner_token=self.owner_token)
         self._block_fns = {
             self.TRAIN: tuple(
@@ -516,19 +497,10 @@ class ImmutableTransformerRuntime:
                 self.finish_sampling_image(shape_key=shape_key)
             else:
                 self._sampling_baseline = None
-    def can_run_current_call(
-        self,
-        tvec,
-        freqs,
-        mask,
-        *,
-        ref_kv_capture=None,
-        blockcaches=None,
-    ) -> bool:
+    def can_run_current_call(self, block_args, **kwargs) -> bool:
         return self._finalized and self.architecture_adapter.can_run_current_call(
-            (tvec, freqs, mask),
-            ref_kv_capture=ref_kv_capture,
-            blockcaches=blockcaches,
+            block_args,
+            **kwargs,
         )
 
     def _assert_arena_stable(self, where: str) -> None:
@@ -539,31 +511,29 @@ class ImmutableTransformerRuntime:
                 "or registrations changed across a phase boundary"
             )
 
-    def _get_block_kernel(self, index: int, mode: str, fp8_flags):
-        fp8_flags = tuple(fp8_flags)
-        key = (str(mode), int(index), fp8_flags)
+    def _get_block_kernel(self, index: int, mode: str):
+        key = (str(mode), int(index))
         existing = self._block_kernels.get(key)
         if existing is not None:
             return existing
 
         block = self._blocks[index]
+        linear_operations = self._block_operations[index]
         training = mode == self.TRAIN
 
         def block_kernel(
             x,
-            tvec,
-            freqs,
-            mask,
+            block_args,
             leaf_args,
-            lora_args,
+            adapter_args,
         ):
             return self.architecture_adapter.forward_block(
                 block,
                 x,
-                (tvec, freqs, mask),
+                block_args,
                 leaf_args,
-                fp8_flags,
-                lora_args,
+                linear_operations,
+                adapter_args,
                 training=training,
             )
 
@@ -609,19 +579,19 @@ class ImmutableTransformerRuntime:
             "Widen compile_dynamic_hints to avoid the extra compile."
         )
 
-    def _current_lora_args(self, index: int):
-        return self.architecture_adapter.build_lora_args(
+    def _current_adapter_args(self, index: int):
+        return self.architecture_adapter.build_adapter_args(
             index,
-            self.loras_by_block,
-            self.lora_multiplier,
+            self.adapters_by_block,
+            self.adapter_multiplier,
         )
 
     def _make_stable_block_fn(self, index: int, mode: str):
         abi = self._block_abis[index]
-        kernel = self._get_block_kernel(index, mode, abi.fp8_flags)
+        kernel = self._get_block_kernel(index, mode)
         training = mode == self.TRAIN
 
-        def block_fn(x, tvec, freqs, mask):
+        def block_fn(x, block_args):
             source = self._sources.source(index)
             transfer = source.transfer
             token = None
@@ -669,11 +639,9 @@ class ImmutableTransformerRuntime:
                     _mark_dynamic_dim(x, dim)
             out = kernel(
                 x,
-                tvec,
-                freqs,
-                mask,
+                block_args,
                 leaf_args,
-                self._current_lora_args(index),
+                self._current_adapter_args(index),
             )
 
             if token is not None:
@@ -687,15 +655,18 @@ class ImmutableTransformerRuntime:
         return block_fn
 
     def _build_program(self, mode: str) -> ImmutableProgram:
-        lora_shape = tuple((index, tuple(sorted(entries))) for index, entries in sorted(self.loras_by_block.items()))
+        adapter_shape = tuple(
+            (index, tuple(sorted(entries)))
+            for index, entries in sorted(self.adapters_by_block.items())
+        )
         fingerprint = build_program_fingerprint(
             mode,
             self._block_abis,
             architecture_key=self.architecture_adapter.architecture_key,
             depth=self.depth,
             checkpoint_mode="full" if mode == self.TRAIN else "none",
-            lora_shape=lora_shape,
-            has_multiplier=self.lora_multiplier is not None,
+            adapter_shape=adapter_shape,
+            has_multiplier=self.adapter_multiplier is not None,
         )
         trunk = (
             build_train_trunk(self._block_fns[mode])
@@ -1143,7 +1114,7 @@ class ImmutableTransformerRuntime:
         )
         return observed
 
-    def run(self, combined, tvec, freqs, mask):
+    def run(self, hidden, block_args):
         self._require_finalized()
         if self._active_token is None:
             raise ImmutableRuntimeError("immutable_execution_not_active")
@@ -1164,7 +1135,7 @@ class ImmutableTransformerRuntime:
                 f"immutable_execution_mode_mismatch:"
                 f"active={self.SAMPLE}:call={self.TRAIN}"
             )
-        return self._programs[mode].trunk(combined, tvec, freqs, mask)
+        return self._programs[mode].trunk(hidden, block_args)
 
     def close(self) -> None:
         if self._sources.active_executions:

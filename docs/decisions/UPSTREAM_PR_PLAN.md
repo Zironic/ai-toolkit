@@ -70,11 +70,17 @@ MemoryManager  -> may import host_memory; must NOT import arena_offload
 
 ## The stack
 
+The first arena feature PR is Krea2-scoped: an optional block-arena backend
+for Krea2, structured around architecture adapters. The core repeated-block
+ABI is model-neutral, but the PR does not claim arbitrary-model support.
+Ideogram4 is the first planned production follow-up; Z-Image follows it.
+
 | Stage | Theme | Depends on |
 | --- | --- | --- |
 | 1 | Pinned-memory budget governance (bugfix framing; was PR P) | nothing |
 | 2 | Pre-PR refactor, in-fork only (no PR) | nothing |
-| 3 | Arena offload as an additional backend | 1 (hard), 2 |
+| 3a | Arena core, adapter protocol, and generic runtime facade | 1 (hard), 2 |
+| 3b | Krea2 adapter, direct loading, and trainer integration | 3a |
 | 4 | Resident + native-FP8 sampling (was PR A) | deferred |
 
 Stages 1 and 2 run in parallel. Step-by-step execution:
@@ -83,6 +89,10 @@ Stages 1 and 2 run in parallel. Step-by-step execution:
 The arena is an **additional** backend. Upstream's per-linear `MemoryManager`
 stays, recognizably unchanged - it is what other upstream models use, and the PR
 must not read as a rewrite of it.
+
+Stage 3a carries only an opaque `run_blocks(hidden, block_args)` seam. Complete
+model forwards remain owned by model integrations. Stage 3b is the first real
+consumer and supplies the Krea-specific block math and leaf layout.
 
 ## Do the extraction dry run early
 

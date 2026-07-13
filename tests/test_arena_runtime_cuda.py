@@ -27,6 +27,9 @@ class _Model(torch.nn.Module):
 class _Adapter:
     architecture_key = "test_linear"
 
+    def validate_transformer(self, model):
+        assert hasattr(model, "block")
+
     def execution_blocks(self, model):
         return (model.block,)
 
@@ -36,14 +39,18 @@ class _Adapter:
     def leaf_entries(self, block):
         return (("linear", block),)
 
-    def collect_execution_adapters(self, _model):
+    def collect_execution_adapters(self, _model, _network):
         return {}
 
     def can_run_current_call(self, _block_args, **_kwargs):
         return True
 
-    def build_lora_args(self, _index, _loras, _multiplier=None):
+    def build_adapter_args(self, _index, _adapters, _multiplier=None):
         return None
+
+    def bind_block_operations(self, block, device):
+        del block, device
+        return (None,)
 
     def forward_block(
         self,
@@ -51,7 +58,7 @@ class _Adapter:
         hidden,
         _block_args,
         _leaf_args,
-        _fp8_flags,
+        _linear_operations,
         _lora_args,
         *,
         training,
@@ -115,13 +122,13 @@ def test_compile_enabled_runtime_reuses_same_cuda_specialization():
     tvec = torch.randn(2, 16, device="cuda:0")
     try:
         with runtime.training_step(shape_key=(2, 16), step_num=1):
-            first = runtime.run_model(value, tvec, None, None)
+            first = runtime.run_blocks(value, {"conditioning": tvec})
         torch.cuda.synchronize()
         frames_after_first = int(
             torch._dynamo.utils.counters["frames"].get("total", 0)
         )
         with runtime.training_step(shape_key=(2, 16), step_num=2):
-            second = runtime.run_model(value, tvec, None, None)
+            second = runtime.run_blocks(value, {"conditioning": tvec})
         torch.cuda.synchronize()
         frames_after_second = int(
             torch._dynamo.utils.counters["frames"].get("total", 0)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from toolkit.quantization.storage import temporary_materialization_bytes
+
 from .. import vram_budget
 from .layout import flatten_leaves
 
@@ -49,7 +51,7 @@ def _singleton_stats(model, canonical_modules) -> tuple[int, int, set[int]]:
     canonical_ids = {id(module) for module in canonical_modules}
     seen_parameters = set()
     total = 0
-    largest_fp8_dequant = 0
+    largest_materialization = 0
     runtime_ids = set()
     for module in model.modules():
         if id(module) in canonical_ids:
@@ -62,10 +64,11 @@ def _singleton_stats(model, canonical_modules) -> tuple[int, int, set[int]]:
                 continue
             seen_parameters.add(id(parameter))
             total += _tensor_storage_bytes(parameter.data)
-            qdata = getattr(parameter.data, "qdata", None)
-            if isinstance(qdata, torch.Tensor) and qdata.dtype == torch.float8_e4m3fn:
-                largest_fp8_dequant = max(largest_fp8_dequant, qdata.numel() * 2)
-    return total, largest_fp8_dequant, runtime_ids
+            largest_materialization = max(
+                largest_materialization,
+                temporary_materialization_bytes(parameter.data),
+            )
+    return total, largest_materialization, runtime_ids
 
 
 def build_training_plan(model, arena, canonical_modules, device, config) -> dict:

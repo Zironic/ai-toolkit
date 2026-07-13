@@ -13,11 +13,6 @@ from typing import Iterable
 import torch
 import torch.nn.functional as F
 
-from toolkit.memory_management.manager_modules import (
-    _fp8_linear_compiled,
-    _fp8_linear_training,
-)
-
 
 
 from toolkit.memory_management.arena_offload.layout import (
@@ -27,17 +22,16 @@ from toolkit.memory_management.arena_offload.layout import (
     BlockPack,
     BlockPlanResult,
     IngraphPackError,
+    LayerStorageView,
     LeafSpec,
     LinearSpec,
-    LinearView,
     PackBuildResult,
     _aligned_offsets,
     _empty_host_flat,
     _flatten_leaves,
-    _fp8_rowwise_qualifies,
     _rebuild_from_leaves,
     assemble_leaf_args,
-    block_linear_views,
+    block_storage_views,
     block_tensor_views,
     build_block_leaf_plans,
     build_or_borrow_block_packs,
@@ -58,14 +52,61 @@ def functional_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor 
     return F.linear(x, weight, bias)
 
 
-def materialized_weight(
-    weight: torch.Tensor,
-    scale: torch.Tensor | None,
-) -> torch.Tensor:
-    if scale is None:
-        return weight
-    view_shape = [weight.shape[0]] + [1] * (weight.ndim - 1)
-    return weight.to(torch.bfloat16) * scale.reshape(view_shape).to(torch.bfloat16)
+@dataclass(frozen=True)
+class LinearView:
+    """Legacy execution-bound view layered over an opaque storage view.
+
+    The immutable arena itself publishes only ``LayerStorageView``. This
+    compatibility type remains here for the older in-graph streaming surface,
+    whose callers already bind operations outside storage movement.
+    """
+
+    storage: LayerStorageView
+    operation: object
+
+    @property
+    def spec(self):
+        return self.storage.spec
+
+    @property
+    def tensors(self):
+        return self.storage.tensors
+
+    @property
+    def weight(self):
+        return self.operation.functional_components(self.tensors)[0]
+
+    @property
+    def bias(self):
+        return self.operation.functional_components(self.tensors)[1]
+
+    @property
+    def scale(self):
+        return self.operation.functional_components(self.tensors)[2]
+
+    def materialized_weight(self) -> torch.Tensor:
+        return self.operation.materialize(self.tensors)
+
+    def __iter__(self):
+        yield self.materialized_weight()
+        yield self.bias
+
+
+def block_linear_views(flat: torch.Tensor, pack: BlockPack, operations):
+    """Bind caller-owned operations to storage-only arena views."""
+    storage_views = block_storage_views(flat, pack)
+    out = {}
+    for index, spec in enumerate(pack.linears):
+        operation = (
+            operations[spec.name]
+            if isinstance(operations, dict)
+            else operations[index]
+        )
+        out[spec.name] = LinearView(
+            storage=storage_views[spec.name],
+            operation=operation,
+        )
+    return out
 
 
 def streamed_linear_tensors(
@@ -74,18 +115,16 @@ def streamed_linear_tensors(
     bias: torch.Tensor | None,
     scale: torch.Tensor | None,
     *,
-    fp8_qualifies: bool,
+    operation,
     training: bool = False,
     lora_a: torch.Tensor | None = None,
     lora_b: torch.Tensor | None = None,
     lora_scale: "float | torch.Tensor | None" = None,
 ):
     """Pure traced Linear math from tensor views only."""
-    if scale is not None and fp8_qualifies:
-        fp8_linear = _fp8_linear_training if training else _fp8_linear_compiled
-        base = fp8_linear(x, weight.t(), scale.reshape(-1), bias)
-    else:
-        base = functional_linear(x, materialized_weight(weight, scale), bias)
+    tensors = operation.explicit_tensors(weight, bias, scale)
+    forward = operation.forward_train if training else operation.forward_sample
+    base = forward(x, tensors)
     if lora_a is not None:
         lora_out = (x.to(lora_a.dtype) @ lora_a.t() @ lora_b.t()) * lora_scale
         base = base + lora_out.to(base.dtype)
@@ -141,13 +180,8 @@ def streamed_linear(
         lora = view.lora
         training = True
         view = view.view
-    if view.spec.kind == "fp8_rowwise" and view.spec.fp8_qualifies:
-        if view.scale is None:
-            raise RuntimeError(f"missing scale for {view.spec.name}")
-        fp8_linear = _fp8_linear_training if training else _fp8_linear_compiled
-        base = fp8_linear(x, view.weight.t(), view.scale.reshape(-1), view.bias)
-    else:
-        base = functional_linear(x, view.materialized_weight(), view.bias)
+    forward = view.operation.forward_train if training else view.operation.forward_sample
+    base = forward(x, view.tensors)
     if lora is not None:
         # Same math as the compile-fast LoRA path: adapter computed in its
         # own dtype (fp32), scaled, cast back to the base dtype.

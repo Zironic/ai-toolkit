@@ -19,7 +19,9 @@ import unittest
 
 import torch
 
-from toolkit.memory_management.manager_modules import _fp8_linear_training
+from toolkit.quantization.fp8_linear import native_linear_training
+
+_fp8_linear_training = native_linear_training
 
 FP8 = torch.finfo(torch.float8_e4m3fn)
 

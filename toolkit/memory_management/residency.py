@@ -142,10 +142,24 @@ class ResidencyPlan:
 @dataclass(frozen=True)
 class ResidentLeaf:
     key: LeafKey
-    weight: torch.Tensor
-    bias: torch.Tensor | None
+    tensors: tuple[torch.Tensor, ...]
+    weight_leaf_count: int
+    weight_template: torch.Tensor
     ready_event: torch.cuda.Event | None
     nbytes: int
+
+    @property
+    def weight(self):
+        weight_tensors = self.tensors[:self.weight_leaf_count]
+        if self.weight_leaf_count == 1:
+            return weight_tensors[0]
+        return _rebuild_from_leaves(self.weight_template, iter(weight_tensors))
+
+    @property
+    def bias(self):
+        if len(self.tensors) == self.weight_leaf_count:
+            return None
+        return self.tensors[self.weight_leaf_count]
 
 
 @dataclass(frozen=True)
@@ -206,35 +220,18 @@ class ResidencyState:
         return block, spec, module
 
     def _build_sidecar(self, key: LeafKey) -> ResidentLeaf:
-        block, spec, module = self._canonical_leaf(key)
+        block, spec, _module = self._canonical_leaf(key)
         stream_context = (
             torch.cuda.stream(self._copy_stream)
             if self._copy_stream is not None
             else torch.no_grad()
         )
         with torch.no_grad(), stream_context:
-            weight_leaf = leaf_view(block.host_flat, spec.weight).to(
-                self.device, non_blocking=self.device.type == "cuda"
-            )
-            if spec.kind == "fp8_rowwise":
-                if spec.weight_scale is None:
-                    raise ResidencyError(f"missing_quant_scale:{key[0]}.{key[1]}")
-                scale_leaf = leaf_view(block.host_flat, spec.weight_scale).to(
+            tensors = tuple(
+                leaf_view(block.host_flat, item).to(
                     self.device, non_blocking=self.device.type == "cuda"
                 )
-                weight = _rebuild_from_leaves(
-                    module.weight.data, iter((weight_leaf, scale_leaf))
-                )
-            elif spec.kind == "float":
-                weight = weight_leaf
-            else:
-                raise ResidencyError(f"unsupported_sidecar_kind:{spec.kind}")
-            bias = (
-                None
-                if spec.bias is None
-                else leaf_view(block.host_flat, spec.bias).to(
-                    self.device, non_blocking=self.device.type == "cuda"
-                )
+                for item in spec.tensors
             )
             event = None
             if self._copy_stream is not None:
@@ -242,10 +239,11 @@ class ResidencyState:
                 event.record(self._copy_stream)
         return ResidentLeaf(
             key=key,
-            weight=weight,
-            bias=bias,
+            tensors=tensors,
+            weight_leaf_count=spec.weight_leaf_count,
+            weight_template=spec.weight_template,
             ready_event=event,
-            nbytes=_tensor_bytes(weight) + _tensor_bytes(bias),
+            nbytes=sum(_tensor_bytes(tensor) for tensor in tensors),
         )
 
     def reconcile(self, plan: ResidencyPlan) -> ResidencyDelta:
@@ -313,8 +311,8 @@ class ResidencyState:
         if sidecar.ready_event is not None:
             current = torch.cuda.current_stream(self.device)
             current.wait_event(sidecar.ready_event)
-            _record_stream(sidecar.weight, current)
-            _record_stream(sidecar.bias, current)
+            for tensor in sidecar.tensors:
+                _record_stream(tensor, current)
         return sidecar
 
     def resident_tensor(self, key: LeafKey) -> torch.Tensor | None:
@@ -338,4 +336,3 @@ class ResidencyState:
 
     def clear(self, *, phase: str = "clear") -> ResidencyDelta:
         return self.reconcile(ResidencyPlan.build(phase, ()))
-

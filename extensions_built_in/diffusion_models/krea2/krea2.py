@@ -314,7 +314,7 @@ def _arena_destination_key(state_key: str):
         return None
     tail = parts[-1]
     if tail in ("_data", "_scale") and len(parts) >= 5 and parts[-2] == "weight":
-        role = "weight" if tail == "_data" else "scale"
+        role = "qdata" if tail == "_data" else "scale"
         linear_parts = parts[2:-2]
     elif tail in ("weight", "bias"):
         role = tail
@@ -543,11 +543,19 @@ def _try_load_quantized_transformer_cache(
             canonical_keys = set()
             for key, value in state_dict.items():
                 destination_key = _arena_destination_key(key)
+                if (
+                    destination_key not in destinations
+                    and destination_key is not None
+                    and destination_key[2] == "weight"
+                ):
+                    qdata_key = (*destination_key[:2], "qdata")
+                    if qdata_key in destinations:
+                        destination_key = qdata_key
                 if destination_key not in destinations:
                     continue
                 leaves = tensor_subclass_leaves(value)
                 if (
-                    destination_key[2] == "weight"
+                    destination_key[2] == "qdata"
                     and len(leaves) == 2
                     and (*destination_key[:2], "scale") in destinations
                 ):

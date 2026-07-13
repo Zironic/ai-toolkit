@@ -11,9 +11,9 @@ import unittest.mock
 
 import torch
 
-from toolkit.memory_management import manager_modules
-from toolkit.memory_management.manager_modules import (
-    _fp8_linear_training,
+from toolkit.quantization import fp8_linear
+from toolkit.quantization.fp8_linear import (
+    native_linear_training,
     set_fp8_grad_input_enabled,
 )
 
@@ -41,14 +41,14 @@ class Fp8GradInputFlagTests(unittest.TestCase):
         self.device = torch.device("cuda")
         self.addCleanup(set_fp8_grad_input_enabled, False)
         self.calls = []
-        real = manager_modules._fp8_grad_input_compute
+        real = fp8_linear._grad_input_compute
 
         def counting(*args, **kwargs):
             self.calls.append(1)
             return real(*args, **kwargs)
 
         patched = unittest.mock.patch.object(
-            manager_modules, "_fp8_grad_input_compute", counting
+            fp8_linear, "_grad_input_compute", counting
         )
         patched.start()
         self.addCleanup(patched.stop)
@@ -60,7 +60,7 @@ class Fp8GradInputFlagTests(unittest.TestCase):
         x = torch.randn(
             8, 32, device=self.device, dtype=torch.bfloat16, requires_grad=True
         )
-        out = _fp8_linear_training(x, qdata_t, scale_row, None)
+        out = native_linear_training(x, qdata_t, scale_row, None)
         out.sum().backward()
         return x.grad
 
@@ -90,7 +90,7 @@ class Fp8GradInputFlagTests(unittest.TestCase):
         x = torch.randn(
             16, 256, device=self.device, dtype=torch.bfloat16, requires_grad=True
         )
-        out = _fp8_linear_training(x, qdata_t, scale_row, None)
+        out = native_linear_training(x, qdata_t, scale_row, None)
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         before = torch.cuda.memory_allocated()

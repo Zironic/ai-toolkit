@@ -29,6 +29,35 @@ The implementation should follow Toolkit’s current supported execution model:
 
 Auxiliary components such as the text encoder, VAE, adapters, LoRA network, and optimizer do not count as separate arena runtimes.
 
+## Upstream scope
+
+The first upstream feature PR is deliberately Krea2-scoped:
+
+> Add an optional block-arena offload backend for Krea2, structured around
+> architecture adapters.
+
+The arena core must be architecture-neutral at the repeated-block boundary,
+but the first PR does not claim arbitrary-model support. Ideogram4 is the next
+production adapter and Z-Image follows it; neither is a prerequisite for the
+Krea2 PR. A synthetic second adapter is required to prove that the core does
+not encode Krea's block container, leaf paths, or block-call arguments.
+
+Model integrations continue to own their complete forward. They prepare input
+embeddings, masks, rotary data, modulation inputs, and other shared values;
+delegate only the repeated block loop; then perform final normalization and
+projection.
+
+The upstream patch stack is:
+
+1. Host-memory and VRAM-budget prerequisites, independently justified for the
+   existing offloader.
+2. Arena core, architecture-adapter protocol, and generic runtime facade.
+3. Krea2 adapter, direct loaders, and trainer integration.
+4. Optional native FP8 execution and additional production architectures.
+
+Each layer must be reviewable without fork-only UI cleanup, diagnostics,
+workflow helpers, or unrelated trainer changes.
+
 Do not add concurrent multi-pipeline, multi-runtime, or multi-device-in-one-process support without a concrete caller. Toolkit does not currently provide the lifecycle, scheduling, memory ownership, or error-isolation architecture required for those modes; adding them would be a separate architectural redesign.
 
 
@@ -1230,6 +1259,103 @@ Document material differences rather than requiring bit-identical timings.
 
 ---
 
+# Phase 10 - Upstream extraction readiness
+
+## Outcome
+
+Make the Krea2-scoped backend reviewable without overstating model generality.
+This phase generalizes only the repeated-block seam and turns the acceptance
+plan into maintainer-runnable evidence.
+
+## 10.1 Opaque repeated-block ABI
+
+The public runtime seam is:
+
+```python
+runtime.can_run_blocks(block_args, **call_metadata)
+runtime.run_blocks(hidden, block_args)
+```
+
+`block_args` is an opaque tuple or pytree. The arena core, checkpoint trunks,
+sampling trunks, and compiled block kernel pass it through without naming or
+interpreting architecture-specific values. Only the architecture adapter may
+unpack it. Do not move the complete model forward into the runtime.
+
+## 10.2 Architecture-adapter protocol
+
+Define and validate an explicit contract covering:
+
+```text
+architecture_key
+validate_transformer(model)
+execution_blocks(model)
+block_key(model, index)
+leaf_entries(block)
+collect_execution_adapters(model, network)
+build_adapter_args(index, adapters_by_block, multiplier)
+can_run_current_call(block_args, **call_metadata)
+bind_block_operations(block, device)
+forward_block(block, hidden, block_args, leaf_args, linear_operations,
+              adapter_args, training=...)
+```
+
+Contract validation occurs before canonical commit. Unit tests provide a
+synthetic second adapter with a different block container, different leaf
+names, and mapping-shaped block arguments.
+
+## 10.3 Explicit finalization input
+
+`ArenaOffloadRuntime.finalize(network)` passes the supplied training network to
+the architecture adapter. The adapter obtains runtime adapter entries from
+that explicit object; finalization must not rediscover them by walking private
+patched-forward owner chains.
+
+Krea2 initially supports one LoRA, LoKr, DoRA, or full-layer adapter per
+canonical Linear. Reject multiple or unsupported entries clearly during
+finalization. `network=None` explicitly means no execution adapters.
+
+## 10.4 Maintainer-runnable test layers
+
+The upstream patch includes:
+
+1. CPU synthetic tests for lifecycle, adapter ABI, canonical population, and
+   pre/post-commit failure classification.
+2. Small opt-in CUDA tests for transfer, train/sample/train, and compile reuse.
+3. Opt-in full Krea2 training and sampling smoke scripts.
+4. Hardware-specific host-memory and performance measurements recorded in the
+   extraction ticket or PR evidence, not required by ordinary CI.
+
+The common adapter harness compares ordinary and arena execution for forward
+values, adapter gradients, one optimizer update, sampling shape and finite
+values, phase restoration, compile frames, peak CUDA memory, pinned bytes after
+close, sequential reacquisition, and incompatible-layout rejection.
+
+## 10.5 Recorded PR evidence
+
+Before declaring the patch extraction-ready, record exact commands and results
+for the lifecycle, direct-loader, functional, compile, and legacy-disabled
+matrix. Krea ranged and quantized-cache loading each require full-model memory
+evidence that no second model-sized payload exists. Unit reconstruction tests
+alone do not establish that claim.
+
+The BF16 lifecycle is sufficient for the core/Krea review. Native FP8 results
+are an optional later stack layer and must not be required to understand the
+ownership design.
+
+## Later production adapters
+
+Ideogram4 is the first follow-up adapter because its `.layers` loop and block
+interface are regular. Compatibility `populate_from_model()` is sufficient for
+initial functional proof; direct shard-to-canonical loading is required before
+claiming low-host-memory loading support.
+
+Z-Image follows Ideogram4. Start with basic BF16 text-to-image, batch size one,
+compile disabled, and no L2P/omni path. Its variable sequences, optional noise
+masks, assistant-adapter ordering, and list-shaped reconstruction remain in the
+model forward rather than expanding the arena runtime.
+
+---
+
 # Environment validation
 
 These checks are useful but are not part of the core architectural acceptance gate unless a relevant environment is available.
@@ -1260,7 +1386,7 @@ Do not include the following in this extraction:
 6. Automatic fallback from arena to eager execution.
 7. General cleanup or redesign of `MemoryManager`.
 8. Arena offload for the text encoder.
-9. Conversion of additional model architectures without a real integration target.
+9. Additional production model adapters in the Krea2-scoped first PR.
 10. Public memory-policy tuning controls.
 11. General SDPA policy cleanup.
 12. Prompt-budget estimation fixes.
@@ -1294,11 +1420,16 @@ Create separate tickets for unrelated static-review findings.
 13. Remove cross-boundary private-state publication and reads.
 14. Delete obsolete arena branches from the legacy manager.
 15. Settle configuration and compatibility aliases.
-16. Add direct-loader and fault-injection tests.
-17. Run the core functional and process matrix.
-18. Run compile and performance comparison.
-19. Run available environment validation.
-20. Close the extraction ticket only after the readiness checklist passes.
+16. Generalize the repeated-block ABI to opaque block arguments.
+17. Formalize and pre-commit validate the architecture-adapter protocol.
+18. Make runtime finalization consume the explicit training network.
+19. Add the synthetic second-adapter and maintainer-runnable seam tests.
+20. Add direct-loader and fault-injection tests.
+21. Run the core functional and process matrix.
+22. Record the exact extraction evidence commands and results.
+23. Run compile and performance comparison.
+24. Run available environment validation.
+25. Close the extraction ticket only after the readiness checklist passes.
 
 Do not combine legacy deletion with the façade cutover before proving there are no remaining callers.
 
@@ -1352,6 +1483,11 @@ Do not combine legacy deletion with the façade cutover before proving there are
 * [ ] Legacy-manager compatibility state is no longer published.
 * [ ] Arena-private metadata remains only where internally justified.
 * [ ] The transformer exposes one generic runtime façade.
+* [ ] The runtime block ABI carries opaque adapter-owned arguments.
+* [ ] A formal architecture-adapter protocol is validated before commit.
+* [ ] A synthetic non-Krea adapter passes the core block ABI tests.
+* [ ] Finalization consumes the supplied network rather than patched forwards.
+* [ ] The first upstream PR is described as Krea2-scoped.
 * [ ] Compile ownership is exclusive.
 
 ## Legacy behavior
@@ -1397,5 +1533,11 @@ The arena extraction is complete only when:
 10. Obsolete arena branches have been removed from the legacy manager.
 11. Legacy per-linear and text-encoder behavior remains intact.
 12. Core correctness, process, compile, memory, and performance validation passes.
+13. The repeated-block runtime ABI contains no Krea-specific argument names.
+14. The architecture-adapter contract is explicit and proven by a synthetic
+    second adapter.
+15. Finalization obtains adapter entries from its explicit network input.
+16. The upstream patch stack and exact maintainer-runnable evidence are
+    recorded without claiming unimplemented production architectures.
 
 Do not close the ticket based solely on phase commit titles or unit-test counts. Verify the final ownership boundaries and direct-loading behavior against the code.

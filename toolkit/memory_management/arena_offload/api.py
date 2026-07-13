@@ -27,6 +27,7 @@ from ..runtime import (
     unwrap_memory_model,
 )
 from .runtime import ArenaOffloadRuntime
+from ..adapters.protocol import validate_architecture_adapter
 
 _FP8_QTYPES = ("qfloat8", "float8")
 _COMPATIBILITY_ALIASES = {
@@ -190,9 +191,8 @@ def prepare_canonical_storage(
     from ..canonical_arena import CanonicalArena
     from .resources import ArenaRuntimeResources
 
-    validator = getattr(adapter, "validate_transformer", None)
-    if validator is not None:
-        validator(transformer)
+    validate_architecture_adapter(adapter)
+    adapter.validate_transformer(transformer)
     resources = None
     if device is not None:
         resources = ArenaRuntimeResources(transformer, device)
@@ -234,9 +234,8 @@ def prepare_arena_offload(
     """
     if not config.enabled:
         raise ValueError("arena_offload_not_enabled")
-    validator = getattr(adapter, "validate_transformer", None)
-    if validator is not None:
-        validator(transformer)
+    validate_architecture_adapter(adapter)
+    adapter.validate_transformer(transformer)
     return ArenaOffloadRuntime._prepare(
         transformer,
         device=device,
