@@ -82,17 +82,11 @@ class DesiredPinBytesForOffloadIdsTests(unittest.TestCase):
         self.assertEqual(got, int(expected_streamed * 1.03))
 
     def test_quantized_weights_are_counted_at_physical_not_logical_bytes(self):
-        """Regression (live run): a quanto FP8 weight reports its LOGICAL
-        dtype through numel()*element_size() (bf16 = 2 bytes/elem), exactly
-        2x its physical 1-byte qdata -- producing a nonsense want=20.42 GiB
-        auto-pin request for a ~9.9 GiB model. Physical leaf bytes
-        (_tensor_storage_bytes) must be used instead."""
-        from optimum.quanto import freeze
+        """The production layer-offload FP8 backend budgets storage leaves."""
         from toolkit.util.quantize import get_qtype, quantize
 
         model = nn.Sequential(nn.Linear(64, 64, bias=False).to(torch.bfloat16))
-        quantize(model, weights=get_qtype("qfloat8"))
-        freeze(model)
+        quantize(model, weights=get_qtype("float8"))
         layer = model[0]
 
         logical = layer.weight.numel() * layer.weight.element_size()

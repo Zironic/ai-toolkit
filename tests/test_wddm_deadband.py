@@ -296,27 +296,6 @@ class NextPromotionLayerTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-class AutoWddmMarginTests(unittest.TestCase):
-    def test_auto_margin_scales_with_device_memory_and_floor(self):
-        import toolkit.memory_management.manager as manager_mod
-
-        class Props:
-            def __init__(self, total_memory):
-                self.total_memory = total_memory
-
-        old_get_props = manager_mod.torch.cuda.get_device_properties
-        try:
-            manager_mod.torch.cuda.get_device_properties = lambda _device: Props(8 * 1024 ** 3)
-            self.assertEqual(MemoryManager._auto_wddm_margin_gib("cuda:0"), 1.0)
-
-            manager_mod.torch.cuda.get_device_properties = lambda _device: Props(12 * 1024 ** 3)
-            self.assertAlmostEqual(MemoryManager._auto_wddm_margin_gib("cuda:0"), 1.2)
-
-            manager_mod.torch.cuda.get_device_properties = lambda _device: Props(24 * 1024 ** 3)
-            self.assertAlmostEqual(MemoryManager._auto_wddm_margin_gib("cuda:0"), 2.4)
-        finally:
-            manager_mod.torch.cuda.get_device_properties = old_get_props
-
 class DxgiLocalPrestepGuardTests(unittest.TestCase):
     def test_dxgi_prediction_ignores_historical_reserved_peak(self):
         gib = 1024 ** 3

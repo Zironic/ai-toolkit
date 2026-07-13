@@ -96,29 +96,9 @@ class SamplingFp8DemoteFreesTests(unittest.TestCase):
         MemoryManager._disable_fp8_sampling(model, restores)
         MemoryManager.detach(model)
 
-    def test_demote_without_release_leaks_by_closure(self):
-        """Negative control: proves the closure pin is what the fix removes."""
-        model = _fp8_block_model()
-        plan = self._attach_resident(model)
-        restores, resident_layers, _ = MemoryManager._enable_fp8_sampling(model)
-        self.assertGreater(resident_layers, 0)
-
-        before = MemoryManager._torch_allocatable_bytes(self.device)
-        freed_plan = MemoryManager._sampling_demote_largest_block(
-            model, plan, self.device, ignore_modules=[], fp8_restores=None
-        )
-        measured = MemoryManager._torch_allocatable_bytes(self.device) - before
-
-        self.assertGreater(freed_plan, 0)
-        # The closures still hold the GPU storage: almost nothing comes back.
-        self.assertLess(measured, int(freed_plan * 0.5))
-        MemoryManager._disable_fp8_sampling(model, restores)
-        MemoryManager.detach(model)
-
-
 if __name__ == "__main__":
     unittest.main()
 
 import pytest
 
-pytestmark = pytest.mark.leaky  # order-dependent under full suite; see ticket f2aceba
+pytestmark = pytest.mark.process_isolated

@@ -1,3 +1,4 @@
+from jobs import BaseJob
 import toolkit.process_cleanup as process_cleanup
 
 def test_force_exit_uses_taskkill_for_windows_process_tree():
@@ -82,4 +83,53 @@ def test_cli_success_keeps_natural_interpreter_shutdown():
     )
 
     assert not did_exit
+    assert exits == []
+
+
+def test_ui_cleanup_exits_before_releasing_process_graph():
+    calls = []
+    process = _CleanupProcess("trainer", calls)
+    job = BaseJob.__new__(BaseJob)
+    job.process = [process]
+    exits = []
+
+    process_cleanup.cleanup_job_before_ui_exit(
+        job,
+        environ={"IS_AI_TOOLKIT_UI": "1"},
+        exit_func=exits.append,
+        stdout=_FlushRecorder(),
+        stderr=_FlushRecorder(),
+    )
+
+    assert calls == ["trainer"]
+    assert job.process == []
+    assert exits == [0]
+
+
+def test_cli_cleanup_does_not_retain_process_graph():
+    calls = []
+    job = BaseJob.__new__(BaseJob)
+    job.process = [_CleanupProcess("trainer", calls)]
+
+    process_cleanup.cleanup_job_before_ui_exit(job, environ={})
+
+    assert calls == ["trainer"]
+    assert job.process == []
+
+
+def test_failed_ui_job_cleanup_does_not_report_success_exit():
+    calls = []
+    job = BaseJob.__new__(BaseJob)
+    job.process = [_CleanupProcess("trainer", calls)]
+    exits = []
+
+    process_cleanup.cleanup_job_before_ui_exit(
+        job,
+        allow_ui_success_exit=False,
+        environ={"IS_AI_TOOLKIT_UI": "1"},
+        exit_func=exits.append,
+    )
+
+    assert calls == ["trainer"]
+    assert job.process == []
     assert exits == []

@@ -414,19 +414,21 @@ class Krea2Pipeline:
         # Collapse the streaming-churn reserved high-water before each forward so
         # device-used stays off the WDDM cliff (paging is silent, not an OOM, so
         # the except below never catches it). No-op when there is VRAM slack.
-        step_trim = getattr(transformer, "_mm_sampling_step_trim", None)
+        from toolkit.memory_management.runtime import (
+            memory_sampling_demote,
+            memory_sampling_step_trim,
+        )
 
         for tcurr, tprev in zip(ts[:-1], ts[1:]):
             t = torch.full((latents.shape[0],), tcurr, dtype=dtype, device=device)
-            if step_trim is not None:
-                try:
-                    if step_trim():
-                        # A mid-step demote attached a streaming hook to a block
-                        # whose compiled graph is now stale; drop the compiled set
-                        # so the next forward runs it eager (rebuilt next image).
-                        transformer.disable_compiled_sampling()
-                except Exception as error:  # never let the guard break sampling
-                    print(f"[MemoryManager] step trim failed (ignored): {error}")
+            try:
+                if memory_sampling_step_trim(transformer):
+                    # A mid-step demote attached a streaming hook to a block
+                    # whose compiled graph is now stale; drop the compiled set
+                    # so the next forward runs it eager (rebuilt next image).
+                    transformer.disable_compiled_sampling()
+            except Exception as error:  # never let the guard break sampling
+                print(f"[MemoryManager] step trim failed (ignored): {error}")
             # Retry until the step fits: each OOM streams a couple more resident
             # blocks (incremental demote), so one step may need several rounds
             # when the shortfall exceeds what one demote frees. Bounded: demote()
@@ -448,14 +450,13 @@ class Krea2Pipeline:
                     # contiguous activation under the WDDM cap.
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
-                    demote = getattr(transformer, "_mm_sampling_demote", None)
                     if not trim_retry_used:
                         # Transients are ALLOWED to spend the reserve buffer:
                         # first give the freed cache one retry before paying
                         # for relief with residency (demotion invalidates
                         # compiled state and mutates the ingraph pack set).
                         trim_retry_used = True
-                    elif demote is not None and demote(reason=oom):
+                    elif memory_sampling_demote(transformer, reason=oom):
                         transformer.disable_compiled_sampling()
                     elif do_batch_cfg:
                         # Batched CFG doubles the activation peak; drop to
@@ -499,11 +500,7 @@ class Krea2Pipeline:
                     # the fragmentation (reserved-but-unallocated) blocking a
                     # contiguous request under the WDDM cap.
                     trim_retry_used = True
-                elif (
-                    (demote := getattr(transformer, "_mm_sampling_demote", None))
-                    is not None
-                    and demote(reason=oom)
-                ):
+                elif memory_sampling_demote(transformer, reason=oom):
                     transformer.disable_compiled_sampling()
                 else:
                     raise

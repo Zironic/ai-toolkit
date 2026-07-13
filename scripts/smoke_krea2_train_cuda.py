@@ -98,12 +98,15 @@ def _immutable_arena_summary(transformer):
     fingerprint, transfer-plan range/copy counts, and the pin-ledger 'weights'
     tier. Reports ``{"present": False}`` when the transformer never built one,
     so it can sit alongside ``_arena_summary`` (only one is present per run)."""
-    arena = getattr(transformer, "_mm_canonical_arena", None)
-    if arena is None:
+    from toolkit.memory_management.runtime import get_memory_runtime
+
+    memory_runtime = get_memory_runtime(transformer)
+    if memory_runtime is None:
         return {"present": False}
+    arena = memory_runtime._arena
     stats = arena.stats()
-    residency = getattr(transformer, "_mm_residency_state", None)
-    runtime = getattr(transformer, "_immutable_runtime", None)
+    residency = memory_runtime._residency
+    runtime = memory_runtime._executor
     summary = {
         "present": True,
         "id": id(arena),
@@ -116,7 +119,7 @@ def _immutable_arena_summary(transformer):
     if residency is not None:
         summary["resident_sidecar_gib"] = _gib(residency.resident_bytes())
         summary["active_plan_fingerprint"] = residency.plan.fingerprint
-    train_plan = getattr(transformer, "_mm_immutable_training_plan", None)
+    train_plan = memory_runtime._training_plan
     if train_plan is not None:
         summary["training_plan_fingerprint"] = train_plan.fingerprint
     # Transfer-plan (compact multi-range) span/copy accounting per Invariant 8.
@@ -806,15 +809,15 @@ def main():
     # the TRAIN plan AFTER LoRA apply, so they capture the adapter leaves.
     print("[smoke] finalizing immutable runtime")
     t0 = time.perf_counter()
-    training_plan = transformer._mm_immutable_training_plan
-    runtime = transformer._immutable_runtime
-    if runtime is None:
+    from toolkit.memory_management.runtime import get_memory_runtime
+
+    memory_runtime = get_memory_runtime(transformer)
+    if memory_runtime is None:
         raise SystemExit(
-            "load_model did not prepare an immutable runtime "
-            "(_immutable_runtime is unset)"
+            "load_model did not prepare a memory runtime"
         )
-    transformer.finalize_immutable_runtime()
-    runtime.activate(runtime.TRAIN, training_plan)
+    memory_runtime.finalize(network)
+    runtime = memory_runtime._executor
     rows.append(
         {
             "event": "immutable_runtime_finalized",

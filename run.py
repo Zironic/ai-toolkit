@@ -76,7 +76,12 @@ import argparse
 from toolkit.job import get_job
 from toolkit.accelerator import get_accelerator
 from toolkit.print import print_acc, setup_log_to_file
-from toolkit.process_cleanup import arm_error_exit_watchdog, exit_ui_worker_successfully
+from toolkit.process_cleanup import (
+    arm_error_exit_watchdog,
+    cleanup_job_before_ui_exit,
+    exit_ui_worker_successfully,
+)
+from toolkit.memory_management.arena_offload.errors import recover_allows_next_job
 
 accelerator = get_accelerator()
 
@@ -164,7 +169,7 @@ def main():
                     job.process[0].on_error(e)
             except Exception as e2:
                 print_acc(f"Error running on_error: {e2}")
-            if not args.recover:
+            if not recover_allows_next_job(e, args.recover):
                 print_end_message(jobs_completed, jobs_failed)
                 raise
         except KeyboardInterrupt as e:
@@ -182,7 +187,9 @@ def main():
             cleanup_failed = False
             if job is not None:
                 try:
-                    job.cleanup()
+                    cleanup_job_before_ui_exit(
+                        job, allow_ui_success_exit=not job_failed
+                    )
                 except Exception as cleanup_error:
                     cleanup_failed = True
                     print_acc(f"Error cleaning up job: {cleanup_error}")
@@ -195,7 +202,8 @@ def main():
             ):
                 error_exit_watchdog.set()
 
+    exit_ui_worker_successfully()
+
 
 if __name__ == '__main__':
     main()
-    exit_ui_worker_successfully()

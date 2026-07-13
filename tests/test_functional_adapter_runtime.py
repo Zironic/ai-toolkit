@@ -9,6 +9,7 @@ from extensions_built_in.diffusion_models.krea2.src.mmdit import (
     _streamed_arg_linear_train,
 )
 from toolkit.functional_adapter import FunctionalLinear
+from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
 from toolkit.lora_special import FullModule, LoRAModule
 from toolkit.models.DoRA import DoRAModule
 from toolkit.models.lokr import LokrModule
@@ -98,7 +99,9 @@ def test_unsupported_forward_owner_reports_class_and_full_target():
     child.forward = owner.forward
 
     with pytest.raises(RuntimeError) as exc:
-        SingleStreamDiT._collect_adapter_entry(child, "blocks.3.attn.wq")
+        SingleStreamMMDiTAdapter().collect_adapter_entry(
+            child, "blocks.3.attn.wq"
+        )
 
     message = str(exc.value)
     assert "arena offload supports" in message
@@ -112,7 +115,12 @@ def test_supported_lokr_owner_is_collected_at_setup():
     adapter = LokrModule("test", child, network=network, lora_dim=2, alpha=2)
     adapter.apply_to()
 
-    assert SingleStreamDiT._collect_adapter_entry(child, "blocks.0.attn.wq") is adapter
+    assert (
+        SingleStreamMMDiTAdapter().collect_adapter_entry(
+            child, "blocks.0.attn.wq"
+        )
+        is adapter
+    )
 
 
 def test_lokr_functional_leaf_runs_under_block_compile():

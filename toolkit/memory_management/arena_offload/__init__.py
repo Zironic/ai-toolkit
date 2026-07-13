@@ -13,10 +13,8 @@ Dependency rule (three tiers):
     arena_offload  -> may import host_memory; must NOT import MemoryManager
     MemoryManager  -> may import host_memory; must NOT import arena_offload
 
-The `must NOT import MemoryManager` half is not true yet: Phase 1 is a
-behavior-preserving facade and still delegates planning to the legacy manager.
-Phase 2 (`policy.py`) cuts those calls. See
-`tasks/open/UPSTREAM_ARENA_EXTRACTION_PLAN.md`.
+Arena planning, transfer, FP8 transforms, and lifecycle cleanup are owned here;
+the legacy manager remains a separate backend.
 """
 
 from .api import (
@@ -31,13 +29,19 @@ from .api import (
     prepare_arena_offload,
 )
 from .runtime import ArenaOffloadRuntime
+from .errors import ArenaCleanupError, ArenaSetupFatalError
+from ..runtime import close_memory_runtime, get_memory_runtime
 
 __all__ = [
     "ArenaOffloadConfig",
+    "ArenaCleanupError",
     "ArenaOffloadRuntime",
+    "ArenaSetupFatalError",
     "LegacyPlannerOptions",
     "close_arena_offload",
+    "close_memory_runtime",
     "get_arena_runtime",
+    "get_memory_runtime",
     "is_arena_offloaded",
     "is_memory_managed",
     "memory_runtime_owns_compile",

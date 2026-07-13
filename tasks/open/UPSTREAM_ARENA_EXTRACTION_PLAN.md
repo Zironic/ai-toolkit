@@ -1,553 +1,896 @@
-# Arena offload: pre-PR refactor + upstream extraction
+# Arena Offload Extraction Refactor — Remaining Implementation Plan
 
-> **git-bug:** see the ticket titled "Arena offload: pre-PR refactor and upstream
-> extraction". Strategy/rationale: `../../docs/decisions/UPSTREAM_PR_PLAN.md`.
-> Status lives in the ticket; this file is the durable plan.
+> **git-bug:** umbrella ticket `553ffec` (“Arena offload: pre-PR refactor and
+> upstream extraction”). Mutable status, validation results, and next-agent
+> handoff notes live in git-bug; this file is the durable implementation plan.
 
-This plan replaces the retired A/P/C/D upstream stack and the four
-`MODEL_AGNOSTIC_SUBPLAN_*` docs (all in `tasks/done/`). It covers both the
-in-fork refactor and the upstream extraction, because the two constrain each
-other: the refactor exists only to make the extraction small.
+## Purpose
 
-## Goal
+Complete the arena-offload extraction after Phase 5.
 
-Ship the block-native arena offload implementation to `ostris/ai-toolkit` as a
-reviewable PR, without dragging in the fork's expanded legacy manager,
-profiling machinery, experimental per-linear compatibility paths, or
-Krea-specific orchestration.
+The remaining work must establish clear lifecycle ownership, remove cross-boundary access to arena internals, delete obsolete legacy-manager branches, and validate the extracted runtime.
 
-## Why the old stack died
+This plan supersedes:
 
-The retired stack led with PR C (bounded training streaming core) and stacked
-PR D (native FP8 training) on top of it. Both are built on `_BouncingLinearFn`,
-the per-linear streaming autograd function - D's own plan says "without C's
-hooks there is nowhere for this code to run".
+* the existing Phase 3 requirement that a failed committed build restore an eagerly executable transformer;
+* the existing Phases 6–8;
+* validation criteria requiring eager execution after destructive arena setup;
+* any implied automatic fallback from arena offload to eager or legacy offload.
 
-Commit `3dd7f38` retired that backend: the immutable runtime is now the sole
-transformer backend on the fork's active path. Upstreaming C would mean
-upstreaming code the fork no longer runs, and D would land inside it. The arena
-is the payload PR now.
+The implementation should follow Toolkit’s current supported execution model:
 
-PR P (DXGI probe + pin crash guard) was *not* wrong - it is preserved verbatim
-as Stage 1 below, including its upstream-consumer audit. PR A (resident
-sampling) is preserved as a deferred Stage 4; see the note about its collision
-with the two-timescale residency work.
+* one active training process and pipeline per worker process;
+* one arena-managed primary transformer per training process;
+* one local CUDA device per worker process;
+* one active arena runtime per worker process;
+* distributed training may use multiple worker processes, each owning its own local model, device, and arena runtime;
+* configured processes and jobs execute sequentially;
+* a later process or job may reuse the worker only after the previous arena runtime has closed successfully.
 
----
+Auxiliary components such as the text encoder, VAE, adapters, LoRA network, and optimizer do not count as separate arena runtimes.
 
-# The upstream stack
+Do not add concurrent multi-pipeline, multi-runtime, or multi-device-in-one-process support without a concrete caller. Toolkit does not currently provide the lifecycle, scheduling, memory ownership, or error-isolation architecture required for those modes; adding them would be a separate architectural redesign.
 
-| Stage | Theme | Depends on |
-| --- | --- | --- |
-| 1 | Pinned-memory budget governance (bugfix framing) | nothing |
-| 2 | Pre-PR refactor, in-fork only (no PR) | nothing |
-| 3 | Arena offload as an additional backend | 1 (hard), 2 |
-| 4 | Resident + native-FP8 sampling | deferred; reassess after 3 |
-
-Stage 1 can be built in parallel with Stage 2.
 
 ---
 
-# Stage 1 - Pinned-memory budget governance
+# Core lifecycle contract
 
-**This is a bugfix PR, not arena support infrastructure.** It stands alone and
-must be pitched alone.
+Arena preparation has two distinct failure boundaries.
 
-## The upstream bug
+## Before canonical commit
 
-Audited against upstream `main` (`f63221e`):
+Before canonical parameter views are published, setup remains transactional.
 
-- `MemoryManager.attach` (`toolkit/memory_management/manager.py`) selects
-  offload layers with `offload_percent` default 1.0 and **no size accounting of
-  any kind** - not model bytes, not host RAM, not any GPU/driver budget.
-- Every selected layer runs `_move_params_to_cpu_and_pin` ->
-  `_ensure_cpu_pinned` (`manager_modules.py:204`) -> `pin_memory()` /
-  `_pin_inner_tensors` (recursive for quantized subclasses). A 24 GB BF16 model
-  pins ~24 GB of host memory unconditionally.
-- The only guard is `except RuntimeError: pass` at the pin call, but the real
-  failure is deferred: pins commit against the WDDM shared budget, and
-  exhaustion surfaces later as a raw `cudaErrorMemoryAllocation` in an
-  unrelated allocation. On Linux the equivalent is pinning into RAM exhaustion
-  and thrashing the host.
+Failures during any of the following must leave the transformer unchanged:
 
-Measured locally: upstream's offloader **cannot run a 12 GB model on this box**
-without the over-pinning crash. This is the load-bearing justification for the
-sensor - it is not a policy refinement that can degrade to `mem_get_info`,
-because the degraded path is the crash.
+* architecture validation;
+* layout inspection;
+* destination allocation;
+* checkpoint or cache population;
+* quantization;
+* pin registration;
+* wrapper reconstruction validation;
+* process runtime ownership acquisition.
 
-**Pitch:** "unbounded pinning can hard-crash Windows runs and thrash Linux
-hosts; this adds a budget probe and refuses to pin past the real limit,
-degrading to pageable offload instead."
+Required behavior:
 
-## Contents
+1. Release all storage, pins, temporary tensors, and ownership tokens acquired by the attempt.
+2. Publish no arena runtime.
+3. Leave the model’s parameters and movement methods unchanged.
+4. Raise the original setup error.
+5. Fail the current job.
+6. Permit `--recover` to continue to another independent configured job.
 
-Four leaf modules (no `toolkit` imports today - verified extractable as-is):
+No fallback backend is attempted.
 
-```text
-pin_manager.py     752 lines   pinned-byte ledger, tiered budget, explicit release
-vram_budget.py     819 lines   cross-platform device-free (NVML-backed)
-nvml_meminfo.py    234 lines   cross-platform; the only true free-VRAM signal
-dxgi_meminfo.py    493 lines   Windows-only NON_LOCAL shared-budget probe
+## After canonical commit
+
+Canonical commit is destructive.
+
+Once the frozen model parameters have been replaced by views into canonical arena storage, the transformer is consumed by that setup attempt.
+
+Failures during any of the following are fatal to the worker process:
+
+* initial residency reconciliation;
+* transfer-runtime initialization;
+* immutable executor construction;
+* runtime publication;
+* permanent-module placement;
+* runtime finalization after LoRA or adapter attachment;
+* any later setup step that occurs before the runtime becomes usable.
+
+Required behavior:
+
+1. Perform best-effort release of every resource acquired by the attempt.
+2. Do not reconstruct the original model.
+3. Do not attempt eager execution.
+4. Do not fall back to `MemoryManager`.
+5. Do not continue to another configured job.
+6. Raise `ArenaSetupFatalError`, preserving the original exception as its cause.
+7. Terminate the worker process with a non-zero result.
+
+`--recover` does not apply after destructive canonical commit.
+
+## Closed transformer contract
+
+A transformer is disposable after arena runtime close.
+
+Normal close must:
+
+* drain or abandon runtime-owned transfer work;
+* release resident sidecars;
+* release canonical pinned storage;
+* restore intercepted movement methods;
+* remove externally published runtime state;
+* release process ownership;
+* mark the transformer as disposed.
+
+Normal close does not restore the pre-arena parameter objects and does not make the transformer eagerly executable.
+
+Any attempt to execute, move, or prepare a disposed transformer must fail clearly.
+
+---
+
+# Prerequisite — Correct quantization D2H behavior
+
+Port the upstream blocking CPU transfer fix before lifecycle work or memory validation.
+
+Replace the leaking asynchronous CPU transfer:
+
+```python
+block.to("cpu", non_blocking=True)
 ```
 
-`dxgi_meminfo` must no-op cleanly on non-Windows. Expect that to be the review
-question; answer it in the PR description, not in review.
+with the blocking form:
 
-## Scope discipline
+```python
+block.to("cpu")
+```
 
-The consumer stays a **minimal clamp**: a running pinned-bytes tally checked at
-`_ensure_cpu_pinned` / `_move_params_to_cpu_and_pin`; once headroom is
-exhausted, leave remaining tensors pageable and warn **once**. Nothing else -
-no transactional pin, no unpin relief, no margin governance. The intelligence
-arrives with Stage 3. The clamp survives as its last-resort floor guard.
+Use the exact upstream implementation where available.
 
-**Do not drag in `bounce_pool.py`** (1272 lines). `manager_modules` imports it,
-but it is a throughput optimization, not part of the crash fix. Before starting,
-check whether `pin_manager.plan_budgets` / `reconcile` have entangled the
-bounce-pool tiers with the weight tier (`manager.py:684-742`) - untangling that
-is the real work of this stage and should be scoped before the first commit.
+## Reason
+
+The asynchronous transfer may retain pinned staging allocations and contaminate:
+
+* pin-leak tests;
+* runtime teardown measurements;
+* sequential-job testing;
+* host-memory graphs;
+* performance baselines.
 
 ## Acceptance
 
-- Upstream `attach` with a model larger than the pin budget completes, degrades
-  to pageable, warns once, and does not crash.
-- No behavior change when the budget is not exhausted.
-- Clean no-op on Linux/non-DXGI; NVML absence degrades without raising.
+* The upstream change is ported as a dedicated small commit.
+* Existing quantization tests pass.
+* Quantization no longer leaves unexpected D2H staging allocations active after completion.
 
 ---
 
-# Stage 2 - Pre-PR refactor (in-fork, no PR)
+# Phase 6 — Fail-closed lifecycle and single-runtime ownership
 
-The arena implementation currently cannot be extracted: Krea constructs arena
-internals directly, the shared trainer reads private `_mm_*` fields, and the
-arena path calls into `MemoryManager` for planning, control, and diagnostics.
+## Outcome
 
-## Dependency rules (three tiers)
+Arena preparation, execution, and teardown share one explicit resource owner.
 
-The host-memory layer is shared by both backends. It is **not** part of the
-arena package - if it were, Stage 1's fix would be trapped inside a package
-upstream has not merged.
+The process supports one active arena runtime at a time.
 
-```text
-host_memory layer (pin_manager, vram_budget, nvml_meminfo, dxgi_meminfo)
-    imports neither backend
+Pre-commit failures are transactional. Post-commit failures are process-fatal.
 
-arena_offload  -> may import host_memory; must NOT import MemoryManager
-MemoryManager  -> may import host_memory; must NOT import arena_offload
-Krea2          -> must not construct arena internals
-shared trainer -> must not inspect arena private fields
-adapters       -> must not own memory policy
-```
+---
 
-An import-boundary test enforces the two "must not"s.
+## 6.1 Add minimal process runtime ownership
 
-## Target layout
+Introduce a small process-global ownership guard in the arena transfer/runtime package.
 
-```text
-toolkit/memory_management/
-├── manager.py            (unchanged upstream-compatible per-linear backend)
-├── manager_modules.py    (unchanged)
-├── pin_manager.py        (host_memory layer - Stage 1)
-├── vram_budget.py        (host_memory layer - Stage 1)
-├── nvml_meminfo.py       (host_memory layer - Stage 1)
-├── dxgi_meminfo.py       (host_memory layer - Stage 1)
-└── arena_offload/
-    ├── __init__.py
-    ├── api.py            (the only supported integration surface)
-    ├── arena.py          (from canonical_arena.py)
-    ├── layout.py         (static packing, split from ingraph_stream.py)
-    ├── transfer.py       (fetch ring, split from ingraph_stream.py)
-    ├── residency.py
-    ├── policy.py         (NEW - arena-native planner + controller)
-    ├── runtime.py        (from immutable_runtime.py)
-    └── adapters/
-        ├── base.py
-        └── single_stream_mmdit.py
-```
-
-No further decomposition. The objective is a coherent extractable package, not
-maximal file count.
-
-## Phase 0 - Baseline, then a throwaway dry run
-
-**0a. Record the behavioral baseline** from the current smart Krea path, using
-existing working configs (no new benchmark framework): arena block count and
-canonical bytes; initial resident bytes; streamed block count; first train and
-sample compile durations; steady-state step time at tested resolutions;
-sampling time; ring usage and transfer stall; FP8 modes; train->sample->train
-transition; OOM/WDDM relief behavior. Add one checked-in smoke config
-representing the supported arena path.
-
-**0b. Do the extraction dry run NOW, not at the end.** Branch from
-`ostris/main`, copy the arena files over, and see what fails to import. This is
-an afternoon's work and it is the cheapest, highest-information action
-available - the entire plan below is a *prediction* about what upstream will
-object to, and this tests the prediction before eight phases of work are spent
-on it. Let the breakage list re-order the phases below.
-
-## Phase 1 - Arena package + facade, behavior-preserving
-
-Move the components under `arena_offload/` with compatibility re-exports at the
-old paths. Add `api.py` and have it construct the same objects Krea constructs
-today. The facade may still delegate planning to legacy code at this point.
-
-Public surface:
+The ownership record contains only:
 
 ```python
-runtime = prepare_arena_offload(transformer, device=..., adapter=..., config=...)
-runtime.finalize(network)                        # after LoRA attach
-with runtime.training_step(shape_key=..., step_num=...): ...   # spans fwd+bwd
-with runtime.sampling_session():                 # one sampling run (all images)
-    with runtime.sampling_image(shape_key=..., cold_working_bytes=...): ...
-runtime.place_permanent_modules(device, dtype)   # Phase 5, when it has a caller
-runtime.diagnostics() -> dict
+active_owner_token
+device
+```
+
+Ring depth, statistics, streams, slots, and ticket state remain transfer-runtime state rather than ownership identity.
+
+### Acquisition
+
+Arena preparation acquires the process slot before any destructive model mutation.
+
+Acquisition must:
+
+* create a unique opaque owner token;
+* normalize the requested CUDA device;
+* reject a second active owner;
+* avoid resetting an existing runtime’s transfer state;
+* leave the model untouched on failure.
+
+A second active runtime should raise a clear pre-commit setup error such as:
+
+```text
+arena_runtime_already_active:
+active_device=cuda:0 requested_device=cuda:0
+```
+
+Do not add waiting, multiplexing, or automatic takeover.
+
+### Validation boundaries
+
+Validate the owner token at meaningful process-global boundaries:
+
+* ownership acquisition;
+* transfer-runtime configuration;
+* process-global custom operator entry points where stale compiled code could survive;
+* ticket drain or abandonment;
+* final ownership release;
+* callbacks that may outlive the runtime.
+
+Do not add repetitive token checks to every ordinary runtime method.
+
+### Release
+
+Ownership is released only after:
+
+* active transfer execution has ended;
+* live tickets have been drained or abandoned;
+* pending timing events have been cleared or finalized;
+* device ring buffers have been released;
+* runtime reporting-window state has been reset;
+* no runtime-owned work remains queued on transfer streams.
+
+A later sequential job may then acquire ownership, including for another CUDA device.
+
+---
+
+## 6.2 Introduce preparation-scoped resource ownership
+
+Create an explicit resource owner before process ownership is acquired.
+
+Suggested shape:
+
+```python
+class ArenaRuntimeResources:
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+
+        self.owner_token = None
+        self.canonical_build = None
+        self.arena = None
+        self.residency = None
+        self.executor = None
+
+        self.fp8_restores = []
+        self.published_attributes = []
+        self.movement_guard_installed = False
+        self.runtime_published = False
+        self.canonical_committed = False
+        self.disposed = False
+        self.released = False
+
+    def release(self) -> None:
+        ...
+```
+
+Exact fields may differ after inspecting the current implementation. Keep the object specific to the arena lifecycle; do not build a generic framework.
+
+### Ownership model
+
+Resources are adopted incrementally:
+
+```python
+resources = ArenaRuntimeResources(model, device)
+
+resources.acquire_process_owner()
+resources.adopt_canonical_build(build)
+resources.mark_canonical_committed(arena)
+resources.adopt_residency(residency)
+resources.adopt_executor(executor)
+resources.record_published_attribute(...)
+resources.record_fp8_restore(...)
+```
+
+After successful construction:
+
+```python
+runtime = ArenaOffloadRuntime(
+    resources=resources,
+    ...
+)
+```
+
+The runtime adopts the same resource owner. It does not copy ownership into separate fields that can drift from failure cleanup.
+
+### Why this is required
+
+Failures can happen after canonical commit but before an `ArenaOffloadRuntime` object exists.
+
+Therefore cleanup cannot depend on:
+
+```python
 runtime.close()
 ```
 
-Helpers: `get_arena_runtime`, `is_arena_offloaded`, `is_memory_managed`,
-`memory_runtime_owns_compile`, `close_arena_offload`. These unwrap
-Accelerator/DDP wrappers. `is_memory_managed()` is true for either
-`_memory_manager` or an arena runtime, replacing bare `hasattr` checks in shared
-code without touching the legacy manager.
+A preparation-scoped owner must exist throughout setup.
 
-The training context **must** span forward and backward - checkpoint
-recomputation re-enters the block runtime during backward.
+---
 
-Sampling needs **two** contexts, not one. The SAMPLE program is entered per
-image, but the TRAIN program must be restored once per *run*: re-activating
-TRAIN between images would reconcile residency back to the training plan and
-churn the sidecars for nothing. `sampling_session()` owns the restore;
-`sampling_image()` owns the per-image SAMPLE activation and is what the model
-calls.
+## 6.3 Implement one idempotent release operation
 
-One neutral attribute, `transformer._arena_offload_runtime`, is what **shared
-code** reads. It does not yet *replace* the eight `_mm_*` fields: the immutable
-runtime (`_mm_immutable_protected_training_leaf_keys`,
-`_mm_immutable_training_plan`) and the legacy manager (`_mm_immutable_backend`,
-`_mm_residency_state`, `_mm_immutable_smart_plan`, ...) both still read them
-directly, and cutting them is Phase 2 + Phase 7 work, not Phase 1's. Phase 1
-publishes both: the facade for shared code, the `_mm_*` fields for the internals
-that have not been cut over. No shared-code reader of a `_mm_*` field survives.
+Both failed preparation and normal runtime close delegate to:
 
-**Acceptance:** Krea no longer imports `CanonicalArena`, `ResidencyState`,
-`ResidencyPlan`, or `prepare_immutable_runtime`; no `_mm_*` or
-`_immutable_runtime` read survives in `BaseSDTrainProcess`, `SDTrainer`, or
-`krea2.py`. Existing smart Krea tests and the training smoke behave identically.
+```python
+resources.release()
+```
 
-## Phase 2 - Arena-native policy (the expensive phase)
+The release operation must tolerate:
 
-Phase 2 is complete. The arena runtime now owns block-granular planning and
-the live two-timescale controller without importing `MemoryManager`. The
-controller was validated on a compiled, mixed-resolution Krea2 run: 59 clean
-post-warmup windows (30 x 512-class, 29 x 768-class), zero allocator retries,
-zero new Dynamo frames, and zero policy errors. The durable controller design
-below is the starting contract for Phase 3; run details remain on git-bug
-ticket `0c577ef`.
+* failure before any resource was acquired;
+* partially created residency state;
+* partially initialized executor state;
+* already drained transfer state;
+* partially published model attributes;
+* repeated calls;
+* errors from individual cleanup steps.
 
-Create `arena_offload/policy.py` and cut these calls:
+### Release ordering
+
+Release in dependency order:
+
+1. Mark the resource owner as closing so no new execution begins.
+2. Exit or reject active runtime execution.
+3. Drain or abandon transfer tickets owned by this runtime.
+4. Close the immutable executor.
+5. Disable temporary FP8 training or sampling transformations.
+6. Clear resident sidecars.
+7. Remove externally published runtime and compatibility attributes.
+8. Restore the model’s original movement methods.
+9. Release canonical pin registrations and host storage.
+10. Reset transfer-runtime state owned by this token.
+11. Release the process ownership slot.
+12. Mark the transformer disposed when canonical commit occurred.
+13. Mark resources released.
+
+Where cleanup operations are independent, continue attempting later cleanup after one step fails.
+
+Aggregate cleanup errors for reporting, but preserve any original setup exception.
+
+### Normal close
+
+`ArenaOffloadRuntime.close()` becomes:
+
+```python
+def close(self) -> None:
+    self._resources.release()
+```
+
+It must be safe to call multiple times.
+
+### Failed preparation
+
+Preparation follows the structure:
+
+```python
+resources = ArenaRuntimeResources(transformer, device)
+
+try:
+    resources.acquire_process_owner()
+
+    validate_architecture(...)
+    build = prepare_canonical_storage(...)
+    resources.adopt_canonical_build(build)
+
+    populate(build)
+    build.commit()
+
+    resources.mark_canonical_committed(build.arena)
+
+    residency = prepare_residency(...)
+    resources.adopt_residency(residency)
+
+    executor = prepare_executor(...)
+    resources.adopt_executor(executor)
+
+    runtime = ArenaOffloadRuntime(
+        resources=resources,
+        ...
+    )
+
+    publish_runtime(transformer, runtime)
+    resources.mark_runtime_published()
+
+    return runtime
+
+except BaseException as error:
+    committed = resources.canonical_committed
+
+    try:
+        resources.release()
+    except BaseException as cleanup_error:
+        record_cleanup_failure(error, cleanup_error)
+
+    if committed:
+        raise ArenaSetupFatalError(
+            "arena setup failed after canonical commit"
+        ) from error
+
+    raise
+```
+
+Do not wrap pre-commit failures in `ArenaSetupFatalError`.
+
+---
+
+## 6.4 Add narrow fatal error classification
+
+Define:
+
+```python
+class ArenaSetupFatalError(RuntimeError):
+    """Arena setup failed after destructive canonical commit."""
+```
+
+Use this exception only when:
+
+* canonical commit completed;
+* setup did not reach a usable runtime;
+* the transformer can no longer be treated as an ordinary model.
+
+Do not use it for:
+
+* unsupported architecture;
+* invalid configuration;
+* checkpoint read failure before commit;
+* quantization failure before commit;
+* pin-budget rejection before commit;
+* another active runtime;
+* direct loader population failure before commit.
+
+The original exception must remain available through exception chaining.
+
+---
+
+## 6.5 Integrate fatal behavior into the job entry point
+
+Update the job runner so `ArenaSetupFatalError` overrides `--recover`.
+
+Required behavior:
+
+```python
+try:
+    job.run()
+except ArenaSetupFatalError:
+    run_best_effort_job_cleanup()
+    report_failure()
+    raise
+except Exception:
+    run_best_effort_job_cleanup()
+    if not args.recover:
+        raise
+```
+
+The exact exception may be raised through several wrapper layers. Preserve classification rather than flattening it into a generic string-only error.
+
+### Process termination
+
+Do not call `os._exit()` directly from arena setup.
+
+Preferred sequence:
+
+1. Propagate the fatal exception.
+2. Run best-effort normal cleanup in the existing `finally`.
+3. Allow the worker to terminate naturally with a non-zero status.
+4. Keep the existing error-exit watchdog armed during cleanup.
+5. If cleanup hangs, let the watchdog force-terminate the process tree.
+
+A fatal arena setup error must never start the next configured job.
+
+---
+
+## 6.6 Mark committed transformers as disposable
+
+After successful canonical commit, resource release must mark the transformer disposed.
+
+Use one clear mechanism.
+
+Preferred options:
+
+### Option A — Retain a closed runtime façade
+
+Leave the runtime marker installed after close, but mark it closed:
+
+```python
+runtime.closed = True
+runtime.disposed = True
+```
+
+Every public runtime operation raises:
 
 ```text
-MemoryManager.attach_smart_training_immutable
-MemoryManager.smart_training_plan
-MemoryManager.prepare_training_memory_for_shape
-MemoryManager.training_runtime_diagnostics
-MemoryManager.training_pinned_keys_for_keep_last
-MemoryManager.inference_resident          <- do not forget this one
+arena_offload_transformer_disposed
 ```
 
-`inference_resident` is easy to miss: Krea's sampling path routes through it,
-and `runtime.sampling_image()` must absorb it.
+This has the advantage that generic runtime discovery still sees why the model is unusable.
 
-`prepare_training_memory_for_shape` (the pre-step demote guard) is deliberately
-**still outside** `runtime.training_step()` after Phase 1, and moving it in is
-not free: today it runs *before* `torch.cuda.reset_peak_memory_stats`, so its
-own allocations are excluded from the measured step peak. Folding it into the
-context's `__enter__` silently changes what the learned per-shape peak means -
-and that peak is exactly what the residency controller consumes. Move it in
-deliberately, with the reset ordering fixed at the same time, not as a
-by-product of the refactor.
+### Option B — Publish a dedicated disposed marker
 
-**Two-timescale controller: no conflict, and a free head start.** Verified
-2026-07-12. The two-timescale policy is *already built and green* -
-`allocator_allowance_bytes`, `cap_bytes_for_live`, `cap_can_host_promotion`,
-`residency_promote_ok`, and `residency_fsm_step` all live in `vram_budget.py`,
-with `tests/test_residency_two_timescale.py` passing (20 tests).
-
-**It has no production caller.** Grep confirms the FSM and both gates are unwired
-dead code; only `cap_bytes_for_live` has a caller, in `inference_resident`
-(`manager.py:6024` - the sampling-side cap reclaim, Slice 1).
-
-**But there IS live training-side residency policy in `manager.py`** - the
-worst-shape promotion veto (`manager.py:4357-4421`), wired into the training
-autotune loop. Before committing a promotion it predicts the worst *measured*
-resolution's cohabitation peak and vetoes if that would page (residency is
-global, the working set is not, and no retry counter catches a WDDM page-out).
-
-So the picture splits cleanly, and Phase 2 must treat the halves differently:
-
-| Piece | Where | Wired? | Phase 2 action |
-| --- | --- | --- | --- |
-| FSM + promote precheck + climb gate | `vram_budget.py` (pure) | **no** | call as-is from `policy.py`; nothing to port |
-| `cap_bytes_for_live` | `inference_resident` | yes (1 call) | absorbed by `runtime.sampling_image()` |
-| Worst-shape promotion veto | `manager.py:4357` | **yes** | **port and rethink - see below** |
-
-The veto is the one real carry-over, and it does not port cleanly:
-`_next_promotion_layer_bytes` (`manager.py:3368`) mirrors
-`_promote_training_layer`'s pinned-first-then-smallest sort - it selects a
-**layer**, not a block. That is precisely the per-linear/block impedance mismatch
-Phase 2 exists to remove. In `policy.py` the unit of promotion is a whole
-canonical block, so the veto's "next promotion bytes" input becomes the next
-block's bytes and the guard/promoter agreement has to be re-established on that
-basis.
-
-The block-granular veto is now validated on the arena path. A compiled,
-mixed-resolution Krea2 run completed 59 clean post-warmup windows while the
-controller changed whole-block layouts: allocator retry delta remained zero,
-Dynamo added no frames, and policy errors remained zero. Keep the veto and the
-promoter coupled to the exact same candidate block; do not reintroduce the
-legacy per-Linear predictor during extraction.
-
-`policy.py` is therefore not a from-scratch controller: it is the *wiring* the
-two-timescale plan always called for (its step 2, "controller wiring at the
-existing phase-boundary hook"), built once against the arena's block records
-instead of retrofitted into `manager.py`. That plan's open questions (training
-slack-pad sizing, `Kclean` / `Kverify` / `N`) carry over to `policy.py` unchanged.
-
-Plan by stable block key, never by Python module identity:
+Remove the runtime marker and set:
 
 ```python
-ArenaBlockInfo(key="blocks.0", canonical_bytes=..., streamed_bytes=...,
-               order=0, protected=False)
+transformer._arena_offload_disposed = True
 ```
 
-The ring estimate must use the actual immutable transfer unit (canonical block
-compact-transfer size x active ring depth), not the legacy planner's
-largest-individual-Linear estimate.
+Generic model preparation and movement helpers must reject this marker.
 
-Protected (checkpoint-retained) blocks arrive as `protected_block_keys:
-frozenset[str]`, derived by the adapter/prep code. The policy must not search
-for `_checkpoint_keep_last` or `.blocks` through module traversal.
+Choose the smaller option after inspecting existing runtime discovery and cleanup code.
 
-Move only the controller behavior the immutable runtime uses: per-shape
-working-set peak learning, safety margin, whole-block promote/demote, and the
-WDDM dedicated-memory cliff accounting. Shape peaks are stored as
-layout-independent working bytes (peak allocated minus resident and ring
-bytes) so residency transitions preserve the worst-shape envelope;
-compile/retrace still invalidates it. A promotion remains provisional during
-verification, under a fixed cap. Allocator GC/retries immediately roll it back.
-Anti-chatter is a deadband in worst-shape allocator slack: promotion requires
-0.95 * cap minus predicted live bytes to exceed the candidate block plus the
-headband. Cooldown remains a separate, temporary settling mechanism.
+Do not leave a released transformer looking like an ordinary reusable model.
 
-Bootstrap avoids a long one-block climb. Accumulate monitored minimum
-physical free across the first two logical steps, then bootstrap at the third
-step boundary and compute
-``min_free - WDDM hard floor - 1 GiB``. Select as many whole blocks as
-fit and publish them in one provisional layout transaction under the unchanged
-cap. The normal first-window GC/retry verification rolls the entire bootstrap
-batch back if it overshoots.
-**This is a port of the WDDM controller, not a rewrite** - the
-hard-won cliff behavior is preserved as-is. Leave behind: per-linear
-promote/demote, `_layer_memory_manager`, bounce-pool trace recovery, resident
-per-linear hooks, random/interleaved Linear selection, per-linear offload IDs
-and FP8 wrapper flags, block prehooks around legacy bouncing Linears. The
-immutable runtime has a stable known block order and needs no execution-trace
-discovery.
+---
 
-`runtime.diagnostics()` returns one stable dict (canonical/resident/streamed/ring
-bytes, working-reserve estimate and measured peak, device total/free, plan
-fingerprint, last policy action). Shared logging prints it; it must not
-reconstruct it from private fields.
+## 6.7 Phase 6 tests
 
-**Acceptance:** `arena_offload/` imports no `MemoryManager`. Residency decisions
-use block keys. Controller actions add/remove complete blocks only. Legacy
-manager tests pass unchanged.
+Add focused tests for:
 
-## Phase 3 - Destination-first transactional arena construction
+### Ownership
 
-Today the arena canonicalizes and repoints blocks one at a time; on a mid-block
-failure the earlier Parameters stay repointed at released storage, and
-[canonical_arena.py](../../toolkit/memory_management/canonical_arena.py) says so
-in a comment ("cannot un-repoint a Parameter").
+* first runtime acquires the process slot;
+* simultaneous second runtime fails before model mutation;
+* closing the first runtime releases the slot;
+* a sequential second runtime can acquire it;
+* sequential acquisition on a different device identity is accepted after release;
+* stale owner tokens cannot release a newer runtime.
 
-This phase replaces that canonicalization path outright. Do not first make the
-existing full-model repack transactional and then replace it: that would retain
-a second model-sized copy as a knowingly temporary implementation.
+### Pre-commit failures
 
-### 3a - Extract the layout prerequisite
+Inject failures in:
 
-Move the static packing half of `ingraph_stream.py` into `layout.py` before
-building the transaction. It owns leaf inspection, final packed-layout
-descriptions, alignment and byte ranges, typed destination views, Parameter
-views, supported-wrapper reconstruction, and packed-storage release. It owns no
-CUDA streams, queues, profiling, traces, hooks, or transfer lifetime.
+* architecture validation;
+* layout inspection;
+* allocation;
+* direct population;
+* quantization;
+* pin registration;
+* wrapper reconstruction;
+* ownership acquisition.
 
-Make the leaf list data-driven while extracting it: carry `leaf_descriptors` +
-`native_fp8_eligible` instead of name-specific flags and string branches. This
-is the whole quantization cleanup; it is needed so the construction transaction
-can expose destinations for every supported weight, scale, and bias without
-encoding Krea2 internals.
+Assert:
 
-### 3b - Build the generic transaction
+* parameters unchanged;
+* movement methods unchanged;
+* no runtime marker;
+* no disposed marker;
+* no process owner;
+* no pin leak;
+* normal job failure classification;
+* `--recover` may continue.
 
-The arena package exposes a prepared build rather than making Krea2 construct
-arena internals:
+### Post-commit failures
+
+Inject failures in:
+
+* residency construction;
+* initial residency reconcile;
+* transfer initialization;
+* executor construction;
+* runtime publication;
+* permanent-module placement;
+* finalization.
+
+Assert:
+
+* `ArenaSetupFatalError`;
+* original error retained as cause;
+* no eager or legacy fallback;
+* resource cleanup attempted;
+* process owner released where cleanup succeeds;
+* transformer marked disposed;
+* `--recover` does not continue;
+* the next configured job does not start.
+
+### Close
+
+Assert:
+
+* close is idempotent;
+* movement interception is removed or converted into the disposed guard;
+* resident sidecars released;
+* executor closed;
+* transfer tickets drained or abandoned;
+* pin registrations released;
+* process owner released;
+* disposed transformer cannot execute or be prepared again.
+
+---
+
+## Phase 6 acceptance
+
+* Preparation and runtime close share one resource owner.
+* No cleanup path requires a fully constructed runtime object.
+* Pre-commit failures leave the model unchanged.
+* Post-commit setup failures raise `ArenaSetupFatalError`.
+* Fatal setup failure ignores `--recover`.
+* No automatic eager or legacy fallback exists.
+* Only one arena runtime may be active per process.
+* Sequential jobs may reacquire ownership after successful close.
+* A closed committed transformer is explicitly disposable and unusable.
+* Repeated cleanup does not leak or corrupt state.
+
+---
+
+# Phase 7 — Generic façade cutover
+
+## Outcome
+
+Shared trainer code and Krea-specific code interact only with the generic memory-runtime façade.
+
+Arena internals no longer leak through model attributes into shared or model-specific code.
+
+---
+
+## 7.1 Define the generic runtime interface
+
+Shared code should need only operations equivalent to:
 
 ```python
-build = runtime.prepare_canonical_storage(transformer, adapter)
-loader.populate(build.destinations)
-build.commit()
+runtime = get_memory_runtime(transformer)
+
+runtime.finalize(network)
+runtime.set_compile_dynamic_hints(hints)
+
+with runtime.training_step(
+    shape_key=shape_key,
+    step_num=step_num,
+):
+    forward_and_backward()
+
+with runtime.sampling_session():
+    with runtime.sampling_image(
+        shape_key=shape_key,
+        cold_working_bytes=working_bytes,
+    ):
+        sample()
+
+runtime.place_permanent_modules(device, dtype)
+runtime.diagnostics()
+runtime.close()
 ```
 
-The compatibility path for loaders that still materialize model tensors is:
+Compile integration should use one generic query:
 
 ```python
-build = runtime.prepare_canonical_storage(transformer, adapter)
-build.populate_from_model()
-build.commit()
+memory_runtime_owns_compile(transformer)
 ```
 
-The transaction has three explicit stages:
+Do not branch on arena-private fields.
 
-- **Prepare** (no model mutation): inspect the architecture adapter; calculate
-  every block's final packed layout; allocate the final page-exclusive host
-  flats; expose typed destination views for every weight, scale, and bias; and
-  retain the original Parameter objects. Populate the destinations from either
-  a direct checkpoint/cache loader or `populate_from_model()`. Register the
-  populated flats with `cudaHostRegister`, then validate wrapper reconstruction.
-  On any failure, release every prepared flat, unregister every pin, leave every
-  Parameter unchanged, leave no runtime marker, and raise a clear setup error.
-- **Commit** (only after all blocks prepare): construct quantized wrappers and
-  Parameter views over the final flats; repoint all canonical leaves as one
-  atomic publication; publish block records and the runtime marker; and install
-  the whole-model movement guard. If commit fails, restore the retained original
-  Parameters before releasing storage.
-- **Rollback:** if commit began, restore the original Parameters before releasing
-  prepared storage. If it did not, release the prepared flats and pins without
-  touching the model.
+The generic façade may be implemented by the existing runtime-discovery module if appropriate. Do not create a second overlapping façade.
 
-The direct source is the performance path: loaders write once into final arena
-storage and never materialize a second full canonical model copy. The
-`populate_from_model()` source is a compatibility path, not the implementation
-that direct-capable loaders should use. It keeps arena offload available to
-other supported models without requiring every loader to change at once.
+---
 
-**No silent fallback to per-linear** after the user explicitly selected arena
-offload. Fail clearly, leave the model intact and eagerly executable.
+## 7.2 Reduce shared trainer integration
 
-Failure-injection tests: unsupported layout mid-stack; pin failure mid-stack;
-allocation failure after earlier blocks prepared; direct population failure;
-wrapper validation failure; commit failure after the first repoint. Assert
-Parameter identity/storage restored, data pointers valid, no pin-ledger leak,
-no runtime marker, model still runs eagerly. Test both population sources and
-assert that the direct source does not allocate or copy a second canonical
-model-sized payload.
+Update shared trainer code so it:
 
-## Phase 4 - Split transfer out of `ingraph_stream`
+* discovers the runtime once through the generic API;
+* finalizes it after the training network or adapter is attached;
+* wraps the complete forward and backward region in one runtime context;
+* forwards dynamic compile hints through the runtime;
+* delegates teardown to generic runtime close;
+* obtains diagnostics through the runtime API;
+* does not import arena, residency, policy, layout, transfer, or architecture-adapter internals.
 
-Cheaper than it looks. Commit `3dd7f38` already retired the legacy in-graph
-paths, and Phase 3 has already moved packing/views/leaf plans into `layout.py`.
-Move the remaining fetch-ring half into `transfer.py`. The bouncing
-Linear execution, per-linear trace recording, sampling monkeypatches, and
-bounce-pool scheduling are **already gone**.
+Remove shared-code reads of:
 
-- `transfer.py`: compact transfer plans, range tensors, block fetch custom ops,
-  fetch ring alloc, start/wait/free lifetime, backward-recompute lifetime,
-  checkpoint context helpers for the immutable train trunk.
+```text
+_mm_canonical_arena
+_mm_residency_state
+_mm_immutable_training_plan
+_mm_immutable_smart_plan
+_mm_immutable_canonical_modules
+_mm_immutable_protected_training_leaf_keys
+_mm_immutable_backend
+_immutable_runtime
+```
 
-The one real link left to cut is `ingraph_stream.py:23` importing
-`manager_modules`, which feeds `is_streamed_module`'s `_layer_memory_manager`
-check. Also remove the process-global setup calls from
-`BaseSDTrainProcess.__init__` (trace/profile/prefetch); the runtime owns one
-transfer runtime. Legacy `MemoryManager` keeps its own process-global state.
+Remove legacy immutable tracing, execution-lease, pre-step, post-step, and private-plan calls when the runtime now owns those behaviors.
 
-## Phase 5 - Krea2 direct population and backend selection
+Generic behavior for non-arena models must remain unchanged.
+
+---
+
+## 7.3 Reduce Krea integration
+
+Krea-specific memory and compile code should be limited to:
+
+* selecting arena versus legacy backend;
+* selecting the architecture adapter;
+* converting model configuration into `ArenaOffloadConfig`;
+* preparing direct canonical destinations;
+* populating those destinations from Krea loader paths;
+* calling generic runtime lifecycle and sampling contexts;
+* providing actual sampling-shape information required by the runtime.
+
+Krea must not:
+
+* construct canonical arenas directly;
+* calculate packed layouts;
+* construct quantized wrappers;
+* manipulate residency state;
+* convert residency plans;
+* install compile trunks;
+* configure transfer rings;
+* publish compatibility attributes;
+* inspect runtime-private state.
+
+---
+
+## 7.4 Remove cross-boundary `_mm_*` publication
+
+The transformer should expose one externally meaningful arena runtime façade.
+
+Preferred external marker:
 
 ```python
-if model_config.arena_offload:
-    runtime = prepare_arena_offload(
-        transformer, device=self.device_torch,
-        adapter=SingleStreamMMDiTAdapter(),
-        config=ArenaOffloadConfig.from_model_config(model_config),
-    )
-else:
-    MemoryManager.attach(transformer, self.device_torch,
-                         offload_percent=..., ignore_modules=...)
+transformer._arena_offload_runtime
 ```
 
-Wire both Krea2 materialization paths - ranged checkpoint loading and quantized
-cache loading - to populate Phase 3's final typed destination views directly.
-They select and feed the generic arena transaction; they do not calculate
-layouts, allocate flats, construct wrappers, publish block records, or manage
-rollback. Retain `populate_from_model()` for arbitrary supported models whose
-loaders have not adopted direct population.
+or the existing generic memory-runtime marker if one already exists.
 
-Preserve the semantic load order: incorporate the assistant LoRA into the frozen
-base before its final canonical representation is committed; produce the final
-quantized or unquantized canonical values directly in prepared arena
-destinations; commit and freeze the canonical base; move permanent noncanonical
-modules; (trainer attaches network); finalize runtime; build optimizer; compile
-on first use. The compatibility path may continue to materialize and quantize
-the transformer before `populate_from_model()`, but Krea2's direct-capable paths
-must not take that second-copy route.
+Remove model-level publication used by shared, model-specific, or legacy-manager code to rediscover:
 
-Do not call `transformer.to(...)` after canonicalization; route whole-model moves
-through `runtime.place_permanent_modules(device, dtype)` and keep the arena's
-`.to()` guard. Audit every later whole-transformer move.
+* the arena;
+* residency;
+* training plans;
+* smart plans;
+* canonical module lists;
+* executor/backend state;
+* protected leaf sets.
 
-**Text encoder keeps using the existing per-linear `MemoryManager`.** Arena
-offload applies only to the supported transformer blocks.
+### Arena-private metadata
 
-**Acceptance:** Krea memory code = backend selection + adapter selection +
-config conversion + loader destination population + one sampling context call.
-No arena construction, layout calculation, wrapper construction, plan
-conversion, residency manipulation, or compile logic in the Krea folder. Both
-Krea loader paths populate final arena storage directly; the generic
-compatibility source remains covered independently.
+Do not delete an attribute merely because its name begins with `_mm_`.
 
-## Phase 6 - Shared trainer reduces to generic lifecycle calls
+For metadata such as:
 
-`BaseSDTrainProcess`, after the network is applied:
+```text
+_mm_canonical_leaf
+```
+
+first determine whether it is:
+
+* read outside the arena package;
+* used by the legacy manager;
+* required only because dependencies are not passed explicitly;
+* or genuinely the simplest arena-internal marker.
+
+Acceptance is based on ownership boundaries:
+
+* no shared code reads arena-private attributes;
+* no model-specific code reads arena-private attributes;
+* no legacy-manager compatibility state is published;
+* arena-private implementation metadata may remain if only the arena package consumes it.
+
+Rename internal metadata when useful, but do not introduce a larger registry solely to eliminate a private attribute.
+
+---
+
+## 7.5 Complete arena-native helper ownership
+
+Remove remaining imports and calls from `arena_offload` into:
+
+```text
+MemoryManager
+manager_modules
+```
+
+Move only the behavior the arena runtime actually requires into neutral or arena-owned modules.
+
+Likely remaining categories include:
+
+* WDDM margin resolution;
+* arena sampling reserve calculation;
+* FP8 training transforms;
+* FP8 sampling transforms;
+* singleton module selection;
+* immutable planner compatibility;
+* runtime diagnostics.
+
+Inspect each dependency before moving it.
+
+Rules:
+
+* Move the smallest pure helper or arena-specific behavior.
+* Do not duplicate the full manager.
+* Do not move unrelated per-linear logic.
+* Do not preserve manager access merely through a renamed wrapper.
+* Keep text-encoder memory management on the legacy manager.
+
+---
+
+## 7.6 Compile ownership
+
+Compile ownership must be exclusive.
+
+Arena models:
+
+* compile through the arena runtime;
+* skip generic block compile;
+* support compile-disabled eager arena execution through the runtime;
+* must not be compiled a second time by shared trainer paths.
+
+Non-arena models:
+
+* retain the existing generic block compile behavior;
+* retain legacy per-linear memory-management behavior.
+
+Replace private-field special cases with:
 
 ```python
-runtime = get_arena_runtime(self.sd.unet)
-if runtime is not None:
-    runtime.finalize(self.network)
+memory_runtime_owns_compile(transformer)
 ```
 
-Compile integration: `is_unet_offloaded = is_memory_managed(inner_unet)`, and
-skip generic block compile when `memory_runtime_owns_compile(inner_unet)`.
-Compile ownership must be **exclusive** - the current `_mm_immutable_backend`
-special case exists because it isn't. Generic block compile is unchanged for
-non-arena models.
+---
 
-Teardown: `close_arena_offload(self.sd.unet)` - drain streams, clear sidecars,
-unregister/release canonical host storage, restore guarded movement, remove the
-marker.
+## Phase 7 tests
 
-`SDTrainer`: one generic context around the whole per-batch forward/backward
-region, `contextlib.nullcontext()` when there is no runtime. Keep the diff that
-shape. Remove trainer calls into legacy offload-step tracing, execution leases,
-pre-step guards, post-step controller updates, and private arena attributes. The
-outer loop keeps catching OOMs as it does today.
+Add or update tests proving:
 
-**Acceptance:** no `_mm_immutable_*` or `_immutable_runtime` anywhere in shared
-trainer files; no arena/residency/planner/adapter imports there.
+* shared trainer files contain no arena implementation imports;
+* Krea code contains no arena construction, residency, or compile internals;
+* no shared or Krea code reads arena-private `_mm_*` state;
+* `arena_offload` imports neither `manager` nor `manager_modules`;
+* runtime finalization still occurs after LoRA or adapter attachment;
+* one runtime context spans forward and backward;
+* sampling returns to the training runtime state;
+* arena compile ownership is exclusive;
+* non-arena generic compile remains unchanged;
+* text-encoder offload still uses the legacy manager.
 
-## Phase 7 - Remove obsolete branches from the legacy manager
+---
 
-Only after parity. Delete `attach_smart_training_immutable`, the immutable
-branches in `attach_smart_training`, `offload_ids` -> `ResidencyPlan`
-conversions, canonical-sidecar relief through `MemoryManager`, immutable-runtime
-inspection in legacy diagnostics, `_mm_immutable_*` handling, and legacy planner
-state that existed only for the arena.
+## Phase 7 acceptance
 
-Retain `attach`, `detach`, the Linear/Conv/OstrisLinear managers, legacy
-transformer percentage offload, text-encoder offload, and every model that
-depends on per-linear management. **Do not** do a general cleanup of the manager
-as part of this work.
+* Shared trainer integration uses only the generic runtime façade.
+* Krea-specific integration is reduced to selection, configuration, direct population, and generic contexts.
+* Arena runtime code does not import the legacy manager.
+* No cross-boundary consumer reads arena-private model attributes.
+* Compile ownership is exclusive.
+* Legacy non-arena behavior remains intact.
 
-## Phase 8 - Configuration
+---
+
+# Phase 8 — Remove obsolete legacy branches and settle configuration
+
+## Outcome
+
+Delete only the legacy manager machinery that existed to support the now-extracted arena runtime.
+
+Do not perform a general `MemoryManager` rewrite.
+
+---
+
+## 8.1 Delete arena-only manager branches
+
+After Phase 7 leaves no consumers, remove:
+
+* `attach_smart_training_immutable`;
+* immutable branches inside `attach_smart_training`;
+* immutable planner conversion into arena residency plans;
+* arena canonical-sidecar relief routed through the manager;
+* immutable-runtime inspection in manager diagnostics;
+* `_mm_immutable_*` publication and handling;
+* legacy manager state used only by arena execution;
+* arena-specific per-linear compatibility hooks;
+* obsolete compile ownership special cases;
+* unused immutable execution tracing or leasing paths.
+
+Before deletion, grep all callers and prove they have moved to the runtime façade.
+
+---
+
+## 8.2 Retain supported legacy functionality
+
+Do not remove or broadly refactor:
+
+* `MemoryManager.attach`;
+* `MemoryManager.detach`;
+* Linear memory management;
+* Conv memory management;
+* OstrisLinear memory management;
+* legacy transformer percentage offload;
+* text-encoder offload;
+* generic block compile for non-arena models;
+* models that still depend on per-linear management;
+* unrelated memory-manager experiments.
+
+This phase is deletion of arena-specific compatibility code, not modernization of the whole manager.
+
+---
+
+## 8.3 Settle arena configuration
+
+Use a narrow configuration object equivalent to:
 
 ```python
 @dataclass(frozen=True)
@@ -556,185 +899,503 @@ class ArenaOffloadConfig:
     fp8_forward: bool
     fp8_backward: bool
     fp8_sampling: bool
-    compile_blocks: bool          # derived from existing compile settings
+    compile_blocks: bool
 ```
 
-User-facing (all default false):
+Keep compile behavior derived from existing compile settings. Do not create a second public compile system.
 
-```yaml
-model:
-  arena_offload: false
-  arena_fp8_forward: false
-  arena_fp8_backward: false
-  arena_fp8_sampling: false
+Internal automatic fields may include:
+
+* device;
+* compile dynamic mode;
+* compile dynamic hints;
+* adapter-derived protected blocks;
+* automatically selected transfer depth;
+* automatically calculated memory policy.
+
+Do not add public controls for:
+
+* ring depth;
+* residency percentage;
+* promotion cadence;
+* safety margins;
+* pinned-memory budget;
+* working reserve;
+* transfer profiling;
+* trace capture;
+* WDDM policy internals.
+
+Those remain implementation details unless a real user-facing requirement appears.
+
+---
+
+## 8.4 Configuration failure rules
+
+### Unsupported architecture
+
+Detect architecture support before canonical commit.
+
+Behavior:
+
+* fail the current job;
+* leave the transformer unchanged;
+* do not fall back;
+* permit `--recover` to continue.
+
+This is not `ArenaSetupFatalError`.
+
+### Invalid FP8 combination
+
+Choose the smallest semantically correct behavior:
+
+* fail validation when continuing would be incorrect;
+* otherwise disable an irrelevant option with one warning.
+
+Examples should be based on current kernel and weight support rather than hypothetical combinations.
+
+### Arena plus percentage offload
+
+Arena owns the transformer when explicitly enabled.
+
+Legacy transformer offload percentage remains meaningful only when the legacy backend is selected.
+
+Text-encoder offload remains independent.
+
+### Compatibility aliases
+
+Retain existing fork configuration aliases only long enough to validate migrated jobs.
+
+Document mappings explicitly.
+
+Remove aliases in a separate compatibility cleanup after extraction acceptance, unless current users require them for the extraction PR.
+
+---
+
+## Phase 8 tests
+
+Prove:
+
+* no deleted arena-manager branch has a caller;
+* legacy per-linear transformer offload still works;
+* text-encoder offload still works;
+* arena disabled behavior is unchanged;
+* unsupported architecture fails before model mutation;
+* unsupported architecture may recover to another job;
+* arena never silently falls back;
+* configuration aliases map correctly;
+* arena FP8 training and sampling controls remain independent;
+* non-arena generic compile still works.
+
+---
+
+## Phase 8 acceptance
+
+* The legacy manager contains no arena-specific execution path.
+* Per-linear and text-encoder memory management remain available.
+* Configuration has one clear backend selection.
+* Unsupported architectures fail before commit.
+* No automatic arena fallback exists.
+* Temporary compatibility mappings are explicit and bounded.
+
+---
+
+# Phase 9 — Core extraction acceptance
+
+## Outcome
+
+Prove the extracted runtime is correct, fail-closed, leak-free, and performance-equivalent or better.
+
+This phase blocks closure of the extraction ticket.
+
+---
+
+## 9.1 Direct loading
+
+Validate both Krea direct population paths:
+
+### Ranged checkpoint loading
+
+Assert:
+
+* weights are loaded into final canonical destinations;
+* no second full canonical model payload is created;
+* source blocks are released as soon as their final destinations are populated;
+* assistant LoRA or frozen-base composition occurs in the required semantic order;
+* final canonical values are correct.
+
+### Quantized cache loading
+
+Assert:
+
+* cached quantized values populate final arena destinations directly;
+* the full cache is not first assigned to the transformer and copied again;
+* wrapper reconstruction uses the final arena leaves;
+* no second model-sized canonical payload exists.
+
+### Compatibility loading
+
+Retain and test:
+
+```python
+build.populate_from_model()
 ```
 
-`arena_fp8_sampling` stays independent of the training toggles. `compile_blocks`
-is derived - arena offload must not introduce a second public compile system.
+for supported models whose loaders have not adopted direct destinations.
 
-**No new user-facing controls** for residency percentages, working reserves,
-WDDM margins, pinned budgets, prefetch depth, trace/profile capture, controller
-cadence, or ring size. Those are automatically selected implementation details.
-
-Temporary fork compatibility (remove only after the extraction validates):
-
-```text
-layer_offloading_smart          -> arena_offload
-layer_offloading_fp8_forward    -> arena_fp8_forward
-layer_offloading_fp8_grad_input -> arena_fp8_backward
-layer_offloading_fp8_sampling   -> arena_fp8_sampling
-```
-
-Existing manual reserve/WDDM/trace/profile/prefetch options may still be parsed
-for regression comparison, but they are not fields on `ArenaOffloadConfig`.
-
-Validation: `arena_fp8_*` without FP8 weights -> ignore with one warning.
-`arena_offload=true` on an unsupported architecture -> fail during preparation
-with an architecture-support message. `arena_offload=true` plus a transformer
-percentage -> arena wins for the transformer; the percentage stays meaningful
-only for the legacy backend.
+This remains a compatibility path, not Krea’s performance path.
 
 ---
 
-# Stage 3 - The arena PR
+## 9.2 Fault injection
 
-Extract onto a fresh branch from `ostris/main` after Stage 1 is open.
+### Pre-commit
 
-Expected diff:
+Inject failure at each meaningful boundary:
 
-- **New:** `toolkit/memory_management/arena_offload/**`
-- **Small edits:** `memory_management/__init__.py`, `config_modules.py`,
-  `krea2/krea2.py`, `jobs/process/BaseSDTrainProcess.py`,
-  `extensions_built_in/sd_trainer/SDTrainer.py`, UI config for the four toggles
+* architecture validation;
+* layout inspection;
+* allocation;
+* direct checkpoint population;
+* direct quantized-cache population;
+* compatibility population;
+* quantization;
+* pin registration;
+* wrapper validation;
+* process ownership acquisition.
 
-Because the host-memory layer lands in Stage 1, this claim is finally true. It
-was **not** true of the original plan, which quietly required ~2300 lines of
-NVML/DXGI/pin-ledger infrastructure that upstream does not have.
+Assert unchanged model state and complete resource cleanup.
 
-**Acceptance:** upstream tests pass with arena offload disabled; per-linear
-offload still works; generic block compile still works on non-arena models; Krea
-arena smoke training and sampling pass; upstream `manager.py` is not replaced or
-substantially rewritten; no fork profiling logs, DOP logic, checkpoint-writer
-changes, or unrelated trainer edits in the diff.
+### Post-commit
 
----
+Inject failure at:
 
-# Stage 4 - Resident + native-FP8 sampling (deferred)
+* initial residency creation;
+* residency reconcile;
+* transfer configuration;
+* executor construction;
+* runtime publication;
+* permanent-module placement;
+* finalization;
+* compile-program creation before first usable execution.
 
-Formerly PR A, and formerly the lead PR because it was independent and easy.
-It is no longer free: it centers on `inference_resident`, which Phase 2 rewrites
-and which the two-timescale residency work is actively changing. Reassess after
-Stage 3 lands, when there is exactly one owner of that code.
+Assert:
 
----
+* `ArenaSetupFatalError`;
+* no eager fallback;
+* no legacy fallback;
+* cleanup attempted;
+* disposed-transformer state;
+* no next job under `--recover`.
 
-# Validation
-
-## Unit
-
-- **Arena admission:** direct destination population without a second canonical
-  payload; compatibility population from an existing model; transactional
-  success; mid-block layout, population, wrapper, and pin failures; no Parameter
-  mutation on failed prepare; restored originals after failed commit; no pin
-  leak; safe close after partial prepare.
-- **Planner:** plans by block key; accounts for permanent singleton bytes;
-  accounts for actual block ring depth; protects requested trailing blocks; never
-  emits partial-block initial plans; deterministic for equal-size blocks.
-- **Controller:** layout-independent peak learning; worst-shape allocator-slack
-  headband; immediate rollback on allocator GC/retry; temporary cooldown;
-  demotion under pressure; arena-owned abnormal-exit fetch drain and OOM
-  rollback; compile invalidation; no per-linear state or actions.
-- **Lifecycle:** prepare before LoRA; finalize after LoRA; compatible double
-  finalize; incompatible double finalize fails; training context spans checkpoint
-  recompute; no residency publication during execution; train->sample->train.
-  Job teardown runs from `run.py` `finally` on success and failure, closes every
-  process-owned worker, releases resident sidecars and canonical pin/storage,
-  then clears process-global memory pools. Close rejects active execution. A
-  detached UI worker exits explicitly only after teardown and output flush;
-  CLI jobs retain natural interpreter shutdown.
-- **Compile ownership:** arena compiles functional kernels once; generic block
-  compile skipped; legacy per-linear models still use generic block compile;
-  compile-disabled arena runs eagerly with identical semantics.
-- **Import boundary:** nothing under `arena_offload` imports `manager` or
-  `manager_modules`; `manager` does not import the arena runtime.
-
-## Integration
-
-Krea arena BF16; arena + FP8 forward; arena + FP8 forward/backward; precise
-training + FP8 sampling; legacy per-linear transformer offload; arena transformer
-+ legacy TE offload; arena disabled; multiple resolution buckets; DOP /
-multi-forward; sampling before training and after several steps; OOM-induced
-whole-block demotion; Windows WDDM path; non-Windows CUDA fallback.
-
-## Performance
-
-Against the Phase 0a baseline: first train/sample compile duration, steady-state
-step time, H2D transfer time, transfer stall, GPU utilization, resident bytes,
-ring bytes, peak allocated/reserved. **Not ready for extraction** if it restores
-multi-minute compile behavior, introduces repeated recompilation, or materially
-worsens steady-state transfer overlap.
+Do not assert that the failed transformer runs eagerly.
 
 ---
 
-# Non-goals
+## 9.3 Resource lifecycle
 
-1. Removing upstream's per-linear manager.
-2. Converting other upstream models to arena offload.
-3. Arena-offloading the text encoder.
-4. ConvRot4 / ConvRot8.
-5. **A quantized-layout codec seam.** An earlier draft proposed a
-   `WeightLayoutCodec` Protocol with codec ids and a synthetic three-leaf test.
-   It has no real second consumer - non-goals 4 and 2 rule out the only
-   candidates - and it is the one change that touches the immutable ABI, source
-   assembly, and native-FP8 eligibility (i.e. real risk to a working fast path)
-   for zero behavior payoff. It also *hurts* the PR by adding surface area with
-   no use case. The legitimate kernel of the idea - not hardcoding FP8 in names -
-   is handled by the data-driven leaf list in Phase 4.
-6. Rewriting the WDDM controller. Phase 2 **ports** it.
-7. Replacing generic block compile for non-arena models.
-8. Cleaning up unrelated fork memory-manager experiments.
-9. Automatic fallback from arena to legacy offload.
-10. Exposing memory-policy tuning in the UI.
-11. Generalizing the architecture adapter beyond what a second real model needs.
-12. Moving unrelated Krea loading, scheduler, TE, or sampling code.
+Assert no leak of:
+
+* pin-manager handles;
+* registered arena storage;
+* prepared host flats;
+* resident sidecars;
+* transfer tickets;
+* pending H2D timing events;
+* device ring slots;
+* transfer streams that retain runtime-owned work;
+* process owner tokens;
+* temporary FP8 transformations;
+* runtime markers or compatibility publication.
+
+Test:
+
+* repeated close;
+* close after partial preparation;
+* close after finalization;
+* close after training;
+* close after sampling;
+* close after a handled runtime failure;
+* successful sequential runtime acquisition.
 
 ---
 
-# Order of work
+## 9.4 Job process behavior
 
-1. Baseline (0a) and the throwaway dry run (0b). Let 0b re-order what follows.
-2. Stage 1 in parallel: extract the host-memory layer, clamp upstream's pin sites.
-   (The two-timescale FSM is pure, unwired policy in `vram_budget.py` and rides
-   along with it. The worst-shape promotion veto does NOT - see Phase 2.)
-4. Phase 1 - arena package + facade.
-5. Phase 2 - arena-native policy; cut the `MemoryManager` calls.
-6. Phase 3a - extract layout and the data-driven leaf description API.
-7. Phase 3b - destination-first transactional construction, including the
-   `populate_from_model()` compatibility source.
-8. Phase 4 - split the remaining transfer runtime out of `ingraph_stream`.
-9. Phases 5-6 - wire Krea's direct loader population and collapse Krea/shared
-   trainer orchestration to the facade.
-10. Phase 7-8 - remove obsolete legacy branches; settle config.
-11. Full validation matrix.
-12. Stage 3 - real extraction, using the dry run's diff as the source.
+Core process tests:
+
+### Pre-commit error with `--recover`
+
+* current job fails;
+* cleanup runs;
+* next configured job begins.
+
+### Post-commit fatal error without `--recover`
+
+* current job fails;
+* cleanup runs where possible;
+* process exits non-zero.
+
+### Post-commit fatal error with `--recover`
+
+* current job fails;
+* cleanup runs where possible;
+* the next configured job does not begin;
+* process exits non-zero.
+
+### Cleanup failure
+
+* original setup failure remains the primary error;
+* cleanup failure is reported separately;
+* watchdog remains armed until process termination or successful cleanup completion.
+
+---
+
+## 9.5 Functional matrix
+
+Run the following representative paths:
+
+* arena BF16 training;
+* arena FP8 forward;
+* arena FP8 forward and backward;
+* precise training with FP8 sampling;
+* sampling before training;
+* sampling after multiple training steps;
+* train → sample → train transition;
+* arena transformer with legacy text-encoder offload;
+* arena disabled;
+* legacy per-linear transformer offload;
+* mixed-resolution training;
+* DOP or multiple-forward execution;
+* whole-block residency promotion;
+* whole-block residency demotion;
+* OOM-driven provisional-layout rollback;
+* compile enabled;
+* compile disabled;
+* Windows WDDM path;
+* non-Windows CUDA fallback.
+
+Use the smallest representative matrix sufficient to exercise each unique ownership and execution path. Do not multiply equivalent combinations without evidence.
+
+---
+
+## 9.6 Compile validation
+
+Verify:
+
+* arena functional kernels compile once per legitimate shape specialization;
+* generic block compile is skipped for arena models;
+* non-arena generic block compile remains unchanged;
+* sampling does not force unnecessary training recompilation;
+* training does not force unnecessary sampling recompilation;
+* compile-disabled arena execution remains correct;
+* dynamic compile options are forwarded through the runtime;
+* no new Dynamo frame or recompile storm appears relative to baseline.
+
+---
+
+## 9.7 Performance validation
+
+Compare with the established pre-extraction baseline.
+
+Measure:
+
+* first training compile duration;
+* first sampling compile duration;
+* steady-state training step time;
+* sampling step time;
+* H2D transfer duration;
+* transfer wait or stall duration;
+* transfer duty;
+* achieved transfer bandwidth;
+* GPU utilization;
+* resident bytes;
+* streamed bytes;
+* ring bytes;
+* peak allocated CUDA memory;
+* peak reserved CUDA memory;
+* pinned host bytes;
+* train-to-sample transition time;
+* sample-to-train transition time.
+
+The extraction is not ready to close if it:
+
+* restores multi-minute repeated compilation;
+* introduces repeated train/sample recompilation;
+* materially worsens steady-state transfer overlap;
+* reintroduces a model-sized temporary canonical payload;
+* leaks pinned storage between sequential jobs;
+* reduces functional coverage relative to the working pre-extraction path.
+
+Document material differences rather than requiring bit-identical timings.
+
+---
+
+# Environment validation
+
+These checks are useful but are not part of the core architectural acceptance gate unless a relevant environment is available.
+
+Run separately:
+
+* detached UI worker successful termination;
+* detached UI worker failure termination;
+* intentionally hung cleanup followed by watchdog process-tree termination;
+* Windows `taskkill` process-tree behavior;
+* broader legacy backend combinations;
+* distributed worker behavior;
+* uncommon platform or driver combinations.
+
+Failures here should create narrowly scoped follow-up tickets unless they expose a defect in the core lifecycle contract.
+
+---
+
+# Explicit non-goals
+
+Do not include the following in this extraction:
+
+1. Concurrent arena runtimes in one process.
+2. Multiple active CUDA devices in one process.
+3. Runtime ownership multiplexing.
+4. Restoring a committed or closed transformer to eager execution.
+5. Automatic fallback from arena to legacy offload.
+6. Automatic fallback from arena to eager execution.
+7. General cleanup or redesign of `MemoryManager`.
+8. Arena offload for the text encoder.
+9. Conversion of additional model architectures without a real integration target.
+10. Public memory-policy tuning controls.
+11. General SDPA policy cleanup.
+12. Prompt-budget estimation fixes.
+13. UI path-validation fixes.
+14. Checkpoint-saver timeout changes.
+15. LoRA vector explorer compatibility.
+16. Hook exit propagation.
+17. Atomic-write durability work.
+18. PID-reuse detection.
+19. General cleanup counters or telemetry not required by acceptance.
+20. A generic resource-management framework beyond the arena runtime’s needs.
+
+Create separate tickets for unrelated static-review findings.
+
+---
+
+# Required implementation order
+
+1. Port the upstream blocking quantization D2H fix.
+2. Add process-global single-runtime ownership.
+3. Add `ArenaRuntimeResources`.
+4. Route preparation ownership through the resource owner.
+5. Implement idempotent resource release.
+6. Add the pre-commit/post-commit failure boundary.
+7. Add `ArenaSetupFatalError`.
+8. Integrate fatal handling into the job entry point.
+9. Add disposed-transformer protection.
+10. Complete shared trainer façade cutover.
+11. Complete Krea façade cutover.
+12. Remove remaining arena imports of the legacy manager.
+13. Remove cross-boundary private-state publication and reads.
+14. Delete obsolete arena branches from the legacy manager.
+15. Settle configuration and compatibility aliases.
+16. Add direct-loader and fault-injection tests.
+17. Run the core functional and process matrix.
+18. Run compile and performance comparison.
+19. Run available environment validation.
+20. Close the extraction ticket only after the readiness checklist passes.
+
+Do not combine legacy deletion with the façade cutover before proving there are no remaining callers.
+
+---
 
 # Readiness checklist
 
-- [ ] Upstream per-linear `MemoryManager` behavior still available.
-- [ ] Arena installs no per-linear wrappers on canonical blocks.
-- [x] `arena_offload/` does not import the legacy manager (enforced by test).
-- [ ] Host-memory layer imports neither backend.
-- [ ] Krea constructs no arena or residency objects; setup is one facade call.
-- [ ] Shared trainer inspects no arena private state.
-- [ ] One context spans arena training forward and backward.
-- [ ] Arena runtime exclusively owns its functional compilation.
-- [ ] Generic block compile unchanged for non-arena models.
-- [x] Planning uses block keys and actual block transfer sizes.
-- [x] Controller transitions operate on complete blocks.
-- [ ] Canonicalization failure leaves the model untouched.
-- [ ] Whole-model movement cannot detach canonical weights.
-- [ ] Training and sampling FP8 controls independent.
-- [ ] Text-encoder offload still uses the existing manager.
-- [ ] Existing fork configs have a temporary migration path.
-- [ ] Stage 1 landed (or open) before the arena PR.
-- [ ] Extraction diff dominated by new arena package files.
+## Construction
+
+* [ ] Architecture support is validated before canonical commit.
+* [ ] Process ownership is acquired before destructive mutation.
+* [ ] A second active arena runtime is rejected before mutation.
+* [ ] Ranged checkpoint loading populates final arena destinations directly.
+* [ ] Quantized-cache loading populates final arena destinations directly.
+* [ ] Neither Krea direct path creates a second full canonical payload.
+* [ ] Compatibility population remains available independently.
+* [ ] Pre-commit failures leave model parameters unchanged.
+* [ ] Pre-commit failures release all temporary resources.
+* [ ] No automatic fallback path exists.
+
+## Fatal lifecycle
+
+* [ ] Canonical commit is the explicit destructive boundary.
+* [ ] Post-commit setup failures raise `ArenaSetupFatalError`.
+* [ ] The original setup exception is retained as the cause.
+* [ ] Fatal setup failure overrides `--recover`.
+* [ ] No later configured job starts after fatal setup failure.
+* [ ] Failed committed transformers are marked disposed.
+* [ ] Disposed transformers cannot execute or be prepared again.
+
+## Teardown
+
+* [ ] Preparation failure and runtime close use the same resource owner.
+* [ ] Runtime close does not assume eager-model restoration.
+* [ ] Runtime close is idempotent.
+* [ ] Movement interception is restored or replaced by a disposed guard.
+* [ ] Resident sidecars are released.
+* [ ] Executor resources are released.
+* [ ] Transfer tickets and timing events are drained or abandoned.
+* [ ] Device ring state is released.
+* [ ] Canonical pins and host storage are released.
+* [ ] Process ownership is released.
+* [ ] Sequential runtime acquisition succeeds after close.
+
+## Boundaries
+
+* [ ] `arena_offload` imports neither `manager` nor `manager_modules`.
+* [ ] Shared trainer code imports no arena implementation internals.
+* [ ] Krea code imports no arena construction or residency internals.
+* [ ] Shared and Krea code read no arena-private `_mm_*` state.
+* [ ] Legacy-manager compatibility state is no longer published.
+* [ ] Arena-private metadata remains only where internally justified.
+* [ ] The transformer exposes one generic runtime façade.
+* [ ] Compile ownership is exclusive.
+
+## Legacy behavior
+
+* [ ] Legacy per-linear transformer offload remains available.
+* [ ] Text-encoder offload remains on the legacy manager.
+* [ ] Generic block compile remains unchanged for non-arena models.
+* [ ] Arena-specific legacy-manager branches are removed.
+* [ ] Unsupported architectures fail before commit.
+* [ ] Unsupported architectures may recover to a later job.
+* [ ] Configuration aliases are explicit and tested.
+
+## Validation
+
+* [ ] Pre-commit fault-injection tests pass.
+* [ ] Post-commit fault-injection tests pass.
+* [ ] Fatal process behavior tests pass.
+* [ ] No pin, sidecar, ticket, timing-event, ring-slot, or owner leak remains.
+* [ ] Training and sampling transitions pass.
+* [ ] FP8 combinations pass.
+* [ ] DOP or multiple-forward paths pass.
+* [ ] Residency transitions pass.
+* [ ] Compile ownership tests pass.
+* [ ] Performance remains within the accepted baseline envelope.
+* [ ] No repeated compile regression appears.
+* [ ] No duplicate canonical payload appears.
+
+---
+
+# Definition of complete
+
+The arena extraction is complete only when:
+
+1. Both Krea direct loader paths populate final arena storage without a duplicate canonical payload.
+2. Pre-commit preparation is transactional.
+3. Post-commit setup failure is fail-closed and process-fatal.
+4. Normal close releases all runtime-owned resources without pretending to restore an eager model.
+5. A committed transformer is explicitly disposable after close.
+6. One active arena runtime per process is enforced.
+7. Sequential jobs can acquire a fresh runtime after successful release.
+8. Shared trainer and Krea code use only the generic runtime façade.
+9. The arena package has no dependency on the legacy manager.
+10. Obsolete arena branches have been removed from the legacy manager.
+11. Legacy per-linear and text-encoder behavior remains intact.
+12. Core correctness, process, compile, memory, and performance validation passes.
+
+Do not close the ticket based solely on phase commit titles or unit-test counts. Verify the final ownership boundaries and direct-loading behavior against the code.

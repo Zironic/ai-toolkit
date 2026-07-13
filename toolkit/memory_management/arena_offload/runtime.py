@@ -5,10 +5,8 @@ immutable block executor. Model integrations and the shared trainer hold a
 reference to it and nothing else -- no `_mm_*` field reads, no arena
 construction, no residency manipulation.
 
-Phase 1 is behavior-preserving: planning is still delegated to
-`MemoryManager`'s smart planner (imported lazily, and only from this file, so
-the seam is a single grep away). Phase 2 replaces those calls with
-`arena_offload/policy.py`. Every such call below is marked PHASE-2.
+Cold planning, live policy, FP8 transforms, and teardown are arena-owned. The
+legacy per-linear manager is deliberately outside this package.
 """
 
 from __future__ import annotations
@@ -20,11 +18,20 @@ from dataclasses import replace
 from typing import Any
 
 from .. import allocator_cap
+from ..canonical_arena import CanonicalArena
+from ..immutable_runtime import prepare_immutable_runtime
+from ..residency import ResidencyPlan, ResidencyState
 from ..vram_budget import apply_simulated_card
 from .policy import (
     ArenaResidencyController,
     TrainingSignalWindow,
 )
+from .errors import ArenaCleanupError, ArenaSetupFatalError
+from .fp8 import disable as disable_fp8
+from .fp8 import enable as enable_fp8
+from .fp8 import set_fp8_grad_input_enabled
+from .planner import build_training_plan, resolve_margin_gib
+from .resources import ArenaRuntimeResources
 
 RUNTIME_ATTR = "_arena_offload_runtime"
 
@@ -49,6 +56,7 @@ class ArenaOffloadRuntime:
         training_plan,
         smart_plan,
         canonical_modules,
+        resources,
     ) -> None:
         self._model = model
         self._device = device
@@ -60,7 +68,9 @@ class ArenaOffloadRuntime:
         self._training_plan = training_plan
         self._smart_plan = smart_plan
         self._canonical_modules = canonical_modules
+        self._resources = resources
         self._closed = False
+        self._disposed = False
 
         # Set by training_step(); the residency controller (git-bug 0c577ef)
         # reads these at the step boundary.
@@ -95,140 +105,118 @@ class ArenaOffloadRuntime:
         ignore_modules: Sequence[Any] | None = None,
         canonical_build=None,
     ) -> ArenaOffloadRuntime:
-        # PHASE-2: MemoryManager is the legacy smart planner; policy.py replaces it.
-        from ..canonical_arena import CanonicalArena
-        from ..immutable_runtime import prepare_immutable_runtime
-        from ..manager import MemoryManager
-        from ..residency import ResidencyPlan, ResidencyState
-
-
         existing = getattr(transformer, RUNTIME_ATTR, None)
+        if getattr(transformer, "_arena_offload_disposed", False):
+            raise RuntimeError("arena_offload_transformer_disposed")
         if existing is not None:
+            if getattr(existing, "disposed", False):
+                raise RuntimeError("arena_offload_transformer_disposed")
             raise RuntimeError("arena_offload_already_prepared")
 
-        # Before ANY planning reads a VRAM number: a simulated smaller card must
-        # be in force for the whole run, not just the phases we remember to ask.
-        apply_simulated_card(config.simulated_vram_gib, device=device)
-        MemoryManager.set_wddm_cap_strict(config.wddm_cap_strict)
-        allocator_cap.apply_wddm_hard_allocator_cap(
-            device, config.legacy.wddm_hard_gib, log_prefix="[ArenaOffload]"
-        )
-        # The fp8 Linear kernels read this as a process-global. Bind it from the
-        # config here so the arena path cannot disagree with what the job asked
-        # for -- an unbound config field is how the flag silently went dead.
-        MemoryManager.set_fp8_grad_input_enabled(config.fp8_backward)
+        resources = getattr(canonical_build, "_arena_resources", None)
+        if resources is None:
+            resources = ArenaRuntimeResources(transformer, device)
+            resources.acquire_process_owner()
 
-        transformer.requires_grad_(False)
-
-        blocks = adapter.execution_blocks(transformer)
-        entries_by_block = {
-            adapter.block_key(transformer, index): list(adapter.leaf_entries(block))
-            for index, block in enumerate(blocks)
-        }
-        if canonical_build is None:
-            arena = CanonicalArena()
-            canonical_build = arena.prepare(entries_by_block, model=transformer)
-            canonical_build.populate_from_model()
-        else:
-            if canonical_build.model is not transformer:
-                canonical_build.rollback()
-                raise RuntimeError("arena_canonical_build_model_mismatch")
-            prepared_entries = {
-                key: tuple(module for _name, module in entries)
-                for key, entries in canonical_build.entries_by_block.items()
-            }
-            expected_entries = {
-                key: tuple(module for _name, module in entries)
-                for key, entries in entries_by_block.items()
-            }
-            if prepared_entries != expected_entries:
-                canonical_build.rollback()
-                raise RuntimeError("arena_canonical_build_adapter_mismatch")
-            arena = canonical_build.arena
-        canonical_build.commit()
-
-        canonical_modules = []
-        for entries in entries_by_block.values():
-            for _name, child in entries:
-                child._mm_canonical_leaf = True
-                canonical_modules.append(child)
-
-        legacy = config.legacy
-        # PHASE-2: keep_last -> pinned resident block keys.
-        pinned_keys = MemoryManager.training_pinned_keys_for_keep_last(
-            transformer, legacy.checkpoint_keep_last
-        )
         try:
-            # PHASE-2: block-key-native planning lands in policy.py.
-            smart_plan = MemoryManager.attach_smart_training_immutable(
-                transformer,
-                device,
-                canonical_modules=canonical_modules,
-                working_reserve_gib=legacy.working_reserve_gib,
-                wddm_margin_gib=legacy.wddm_margin_gib,
-                wddm_hard_gib=legacy.wddm_hard_gib,
-                ignore_modules=ignore_modules,
-                pinned_resident_keys=pinned_keys,
-                block_stream_only=legacy.block_stream_only,
-                wddm_spill_reserve_pct=legacy.wddm_spill_reserve_pct,
-                fp8_training_forward=config.fp8_forward,
-                eager_promote_free_gib=legacy.eager_promote_free_gib,
-                eager_promote_max_blocks=legacy.eager_promote_max_blocks,
+            # Bind card simulation and allocator policy before any plan reads.
+            apply_simulated_card(config.simulated_vram_gib, device=device)
+            allocator_cap.apply_wddm_hard_allocator_cap(
+                device, config.legacy.wddm_hard_gib, log_prefix="[ArenaOffload]"
             )
-        except Exception:
-            canonical_build.rollback()
-            for child in canonical_modules:
-                if hasattr(child, "_mm_canonical_leaf"):
-                    del child._mm_canonical_leaf
+            set_fp8_grad_input_enabled(config.fp8_backward)
+
+            blocks = adapter.execution_blocks(transformer)
+            entries_by_block = {
+                adapter.block_key(transformer, index): list(adapter.leaf_entries(block))
+                for index, block in enumerate(blocks)
+            }
+            if canonical_build is None:
+                arena = CanonicalArena()
+                canonical_build = arena.prepare(entries_by_block, model=transformer)
+                resources.adopt_canonical_build(canonical_build)
+                canonical_build.populate_from_model()
+            else:
+                resources.adopt_canonical_build(canonical_build)
+                if canonical_build.model is not transformer:
+                    raise RuntimeError("arena_canonical_build_model_mismatch")
+                prepared_entries = {
+                    key: tuple(module for _name, module in entries)
+                    for key, entries in canonical_build.entries_by_block.items()
+                }
+                expected_entries = {
+                    key: tuple(module for _name, module in entries)
+                    for key, entries in entries_by_block.items()
+                }
+                if prepared_entries != expected_entries:
+                    raise RuntimeError("arena_canonical_build_adapter_mismatch")
+                arena = canonical_build.arena
+
+            canonical_build.commit()
+            resources.mark_canonical_committed()
+            canonical_modules = tuple(
+                child for entries in entries_by_block.values() for _name, child in entries
+            )
+            resources.canonical_modules = canonical_modules
+
+            smart_plan = build_training_plan(
+                transformer, arena, canonical_modules, device, config
+            )
+            residency = ResidencyState(arena, device)
+            resources.adopt_residency(residency)
+            training_plan = ResidencyPlan.from_smart_plan(
+                arena, smart_plan, phase="train"
+            )
+            residency.reconcile(training_plan)
+
+            legacy = config.legacy
+            executor = prepare_immutable_runtime(
+                transformer,
+                residency,
+                architecture_adapter=adapter,
+                depth=legacy.prefetch_depth,
+                compile_blocks=config.compile_blocks,
+                compile_dynamic=config.compile_dynamic,
+                compile_dynamic_hints=config.compile_dynamic_hints,
+                protected_training_leaf_keys=smart_plan.get(
+                    "protected_training_leaf_keys", ()
+                ),
+                owner_token=resources.owner_token,
+            )
+            resources.adopt_executor(executor)
+
+            runtime = cls(
+                transformer,
+                device=device,
+                adapter=adapter,
+                config=config,
+                arena=arena,
+                residency=residency,
+                executor=executor,
+                training_plan=training_plan,
+                smart_plan=smart_plan,
+                canonical_modules=canonical_modules,
+                resources=resources,
+            )
+            resources.adopt_runtime(runtime)
+            resources.record_published_attribute(
+                transformer, RUNTIME_ATTR, runtime
+            )
+            return runtime
+        except BaseException as error:
+            committed = resources.canonical_committed
+            try:
+                resources.release()
+            except ArenaCleanupError as cleanup_error:
+                try:
+                    error.add_note(str(cleanup_error))
+                except AttributeError:
+                    pass
+            if committed:
+                raise ArenaSetupFatalError(
+                    "arena setup failed after canonical commit"
+                ) from error
             raise
-
-        residency = ResidencyState(arena, device)
-        training_plan = ResidencyPlan.from_smart_plan(arena, smart_plan, phase="train")
-        residency.reconcile(training_plan)
-
-        # Phase 1 still publishes the legacy `_mm_*` fields: the immutable
-        # runtime and the legacy manager both read them today. Phase 2 (policy)
-        # and Phase 7 (legacy branch removal) retire them; the facade below is
-        # what shared code is allowed to use in the meantime.
-        transformer._mm_canonical_arena = arena
-        transformer._mm_residency_state = residency
-        transformer._mm_immutable_training_plan = training_plan
-        must_resident_names = set(smart_plan.get("must_resident_layer_keys", ()))
-        pinned_resident_blocks = set(smart_plan.get("pinned_resident_keys", ()))
-        transformer._mm_immutable_protected_training_leaf_keys = frozenset(
-            key
-            for key in training_plan.resident_leaf_keys
-            if key[0] in pinned_resident_blocks
-            or f"{key[0]}.{key[1]}" in must_resident_names
-        )
-        transformer._mm_immutable_smart_plan = smart_plan
-        transformer._mm_immutable_canonical_modules = tuple(canonical_modules)
-        transformer._mm_immutable_backend = True
-
-        executor = prepare_immutable_runtime(
-            transformer,
-            residency,
-            architecture_adapter=adapter,
-            depth=legacy.prefetch_depth,
-            compile_blocks=config.compile_blocks,
-            compile_dynamic=config.compile_dynamic,
-            compile_dynamic_hints=config.compile_dynamic_hints,
-        )
-
-        runtime = cls(
-            transformer,
-            device=device,
-            adapter=adapter,
-            config=config,
-            arena=arena,
-            residency=residency,
-            executor=executor,
-            training_plan=training_plan,
-            smart_plan=smart_plan,
-            canonical_modules=tuple(canonical_modules),
-        )
-        setattr(transformer, RUNTIME_ATTR, runtime)
-        return runtime
 
     # ------------------------------------------------------------------
     # read-only state
@@ -237,6 +225,18 @@ class ArenaOffloadRuntime:
     @property
     def model(self):
         return self._model
+
+    @property
+    def owns_compile(self) -> bool:
+        return True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def disposed(self) -> bool:
+        return self._disposed
 
     def place_permanent_modules(self, device, dtype=None) -> None:
         """Move only noncanonical subtrees, preserving arena Parameter views."""
@@ -273,8 +273,11 @@ class ArenaOffloadRuntime:
             for child in module.children():
                 move(child)
 
-        move(self._model)
-        self._permanent_placement = target
+        try:
+            move(self._model)
+            self._permanent_placement = target
+        except BaseException as error:
+            self._fatal_setup_failure(error)
 
     @property
     def device(self):
@@ -302,11 +305,15 @@ class ArenaOffloadRuntime:
         The trainer derives sequence bounds from the datasets, which do not exist
         when the runtime is prepared. Must be called before the first forward.
         """
-        self._executor.set_compile_dynamic_hints(hints)
-        self._config = replace(
-            self._config,
-            compile_dynamic_hints=self._executor.compile_dynamic_hints,
-        )
+        self._require_open()
+        try:
+            self._executor.set_compile_dynamic_hints(hints)
+            self._config = replace(
+                self._config,
+                compile_dynamic_hints=self._executor.compile_dynamic_hints,
+            )
+        except BaseException as error:
+            self._fatal_setup_failure(error)
 
     def finalize(self, network=None):
         """Build the permanent train/sample programs, then activate TRAIN.
@@ -318,86 +325,57 @@ class ArenaOffloadRuntime:
         """
         self._require_open()
         self._bind_training_cap()
-        finalize_fn = getattr(self._model, "finalize_immutable_runtime", None)
-        if finalize_fn is None:
-            raise RuntimeError(
-                "the model prepared an arena runtime but does not expose "
-                "finalize_immutable_runtime."
+        try:
+            adapters = self._adapter.collect_execution_adapters(self._model)
+            self._executor.finalize_execution(
+                loras_by_block=adapters,
+                lora_multiplier=None,
             )
-        finalize_fn()
-        if self._config.fp8_forward:
-            from ..manager import MemoryManager
-
-            (
-                self._training_fp8_restores,
-                self._training_fp8_singletons,
-            ) = MemoryManager._enable_fp8_training_compile(
-                self._model,
-                include_ids=self._singleton_runtime_ids(),
-            )
-        self._executor.activate(self._executor.TRAIN, self._training_plan)
-        return self
+            if self._config.fp8_forward:
+                self._training_fp8_restores = enable_fp8(
+                    self._model,
+                    include_ids=self._singleton_runtime_ids(),
+                    training=True,
+                )
+                self._training_fp8_singletons = len(self._training_fp8_restores)
+                self._resources.record_fp8_restore(
+                    "FP8 training restore",
+                    lambda restores=self._training_fp8_restores: disable_fp8(restores),
+                )
+            self._executor.activate(self._executor.TRAIN, self._training_plan)
+            return self
+        except BaseException as error:
+            self._fatal_setup_failure(error)
 
     def close(self) -> None:
-        """Release every runtime-owned execution, device, and host resource."""
-        if self._closed:
-            return
-        errors = []
+        """Release through the same owner used during preparation."""
+        self._resources.release()
 
-        def attempt(label, fn):
+    def _fatal_setup_failure(self, error):
+        try:
+            self._resources.release()
+        except ArenaCleanupError as cleanup_error:
             try:
-                fn()
-            except Exception as error:
-                errors.append(f"{label}: {type(error).__name__}: {error}")
-
-        model = self._model
-        if getattr(self, "_training_fp8_restores", None):
-            from ..manager import MemoryManager
-
-            attempt(
-                "FP8 training restore",
-                lambda: MemoryManager._disable_fp8_training_compile(
-                    model, self._training_fp8_restores
-                ),
-            )
-            self._training_fp8_restores = []
-
-        disable = getattr(model, "disable_immutable_runtime", None)
-        if disable is not None:
-            attempt("immutable runtime", disable)
-        else:
-            attempt("immutable runtime", self._executor.close)
-
-        attempt("resident sidecars", self._residency.clear)
-
-        if getattr(model, RUNTIME_ATTR, None) is self:
-            delattr(model, RUNTIME_ATTR)
-        for name in (
-            "_mm_canonical_arena",
-            "_mm_residency_state",
-            "_mm_immutable_training_plan",
-            "_mm_immutable_smart_plan",
-            "_mm_immutable_canonical_modules",
-            "_mm_immutable_backend",
-        ):
-            if hasattr(model, name):
-                delattr(model, name)
-        for child in self._canonical_modules:
-            if hasattr(child, "_mm_canonical_leaf"):
-                delattr(child, "_mm_canonical_leaf")
-
-        attempt("canonical arena", self._arena.release)
-        self._canonical_modules = ()
-        self._training_plan = None
-        self._smart_plan = None
-        self._closed = True
-
-        if errors:
-            raise RuntimeError("arena runtime cleanup failed: " + "; ".join(errors))
+                error.add_note(str(cleanup_error))
+            except AttributeError:
+                pass
+        raise ArenaSetupFatalError(
+            "arena setup failed after canonical commit"
+        ) from error
 
     def _require_open(self) -> None:
         if self._closed:
+            if self._disposed:
+                raise RuntimeError("arena_offload_transformer_disposed")
             raise RuntimeError("arena_offload_runtime_closed")
+
+    def can_run_model_call(self, block_args, **kwargs) -> bool:
+        self._require_open()
+        return self._executor.can_run_current_call(*block_args, **kwargs)
+
+    def run_model(self, combined, tvec, freqs, mask):
+        self._require_open()
+        return self._executor.run(combined, tvec, freqs, mask)
 
     # ------------------------------------------------------------------
     # execution contexts
@@ -557,10 +535,7 @@ class ArenaOffloadRuntime:
         }
 
     def _singleton_runtime_ids(self):
-        manager = getattr(self._model, "_memory_manager", None)
-        return set(
-            getattr(manager, "_training_runtime_candidate_ids", ())
-        )
+        return set((self._smart_plan or {}).get("singleton_runtime_ids", ()))
 
     @contextlib.contextmanager
     def sampling_session(self):
@@ -568,25 +543,17 @@ class ArenaOffloadRuntime:
         self._require_open()
         sampling_restores = []
         if self._config.fp8_sampling:
-            from ..manager import MemoryManager
-
-            (
-                sampling_restores,
-                self._sampling_fp8_singletons,
-                _streamed,
-            ) = MemoryManager._enable_fp8_sampling(
+            sampling_restores = enable_fp8(
                 self._model,
                 include_ids=self._singleton_runtime_ids(),
+                training=False,
             )
+            self._sampling_fp8_singletons = len(sampling_restores)
         try:
             yield self
         finally:
             if sampling_restores:
-                from ..manager import MemoryManager
-
-                MemoryManager._disable_fp8_sampling(
-                    self._model, sampling_restores
-                )
+                disable_fp8(sampling_restores)
             self._bind_training_cap()
             self._executor.activate(self._executor.TRAIN, self._training_plan)
 
@@ -610,14 +577,10 @@ class ArenaOffloadRuntime:
         allocator_cap.apply_wddm_hard_allocator_cap(
             self._device, hard_gib, log_prefix="[ArenaOffload]"
         )
-        # PHASE-2: margin resolution moves into policy.py.
-        from ..manager import MemoryManager
-
-        margin_gib = MemoryManager._resolve_wddm_margin_gib(
+        margin_gib = resolve_margin_gib(
             self._device,
             legacy.sampling_wddm_margin_gib,
             hard_gib=hard_gib,
-            env_name="AI_TOOLKIT_SAMPLING_WDDM_MARGIN_GIB",
         )
         dequant_reserve = (
             0
@@ -710,10 +673,8 @@ class ArenaOffloadRuntime:
     def _protected_training_blocks(self):
         return frozenset(
             str(block)
-            for block, _leaf in getattr(
-                self._model,
-                "_mm_immutable_protected_training_leaf_keys",
-                (),
+            for block, _leaf in (self._smart_plan or {}).get(
+                "protected_training_leaf_keys", ()
             )
         )
 

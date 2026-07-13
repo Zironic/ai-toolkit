@@ -495,4 +495,4 @@ if __name__ == "__main__":
 
 import pytest
 
-pytestmark = pytest.mark.leaky  # order-dependent under full suite; see ticket f2aceba
+pytestmark = pytest.mark.process_isolated

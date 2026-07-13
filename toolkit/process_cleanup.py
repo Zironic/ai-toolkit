@@ -29,6 +29,36 @@ def exit_ui_worker_successfully(
     exit_func(0)
     return True
 
+def cleanup_job_before_ui_exit(
+    job,
+    *,
+    allow_ui_success_exit=True,
+    environ=None,
+    exit_func=os._exit,
+    stdout=None,
+    stderr=None,
+) -> None:
+    """Clean a job and exit a detached UI worker before graph finalization.
+
+    Some trainer object graphs contain compiled CUDA objects whose recursive
+    reference-count teardown can stall after their owned resources have already
+    been closed. The callback runs only after every process cleanup succeeds,
+    while the job still holds its process references. CLI jobs retain their
+    normal interpreter-shutdown behavior.
+    """
+    environ = os.environ if environ is None else environ
+    if allow_ui_success_exit and environ.get("IS_AI_TOOLKIT_UI") == "1":
+        job.cleanup(
+            on_cleaned=lambda: exit_ui_worker_successfully(
+                environ=environ,
+                exit_func=exit_func,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        )
+        return
+    job.cleanup()
+
 def arm_error_exit_watchdog(grace_seconds: float = ERROR_EXIT_GRACE_SECONDS) -> threading.Event:
     """Prevent detached UI training from hanging forever in error cleanup."""
     disarmed = threading.Event()

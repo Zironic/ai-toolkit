@@ -6,7 +6,10 @@ from toolkit.memory_management.arena_offload import transfer as ingraph_stream
 from toolkit.memory_management.canonical_arena import CanonicalArena
 from toolkit.memory_management.transfer_plan import build_transfer_plan
 
-pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"), pytest.mark.leaky]
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.process_isolated,
+]
 
 
 def _linear(seed):

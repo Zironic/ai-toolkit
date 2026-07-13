@@ -274,4 +274,4 @@ def test_fp8_sidecar_preserves_wrapper_type_and_values():
     finally:
         arena.release()
 
-pytestmark = pytest.mark.leaky  # order-dependent under full suite; see ticket f2aceba
+pytestmark = pytest.mark.process_isolated

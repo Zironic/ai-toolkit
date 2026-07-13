@@ -357,6 +357,8 @@ class ImmutableTransformerRuntime:
         compile_blocks: bool = True,
         compile_dynamic: bool | None = True,
         compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = (),
+        protected_training_leaf_keys=(),
+        owner_token=None,
     ) -> None:
         self._sampling_working_bytes: dict[tuple, int] = {}
         self._sampling_baseline = None
@@ -374,6 +376,11 @@ class ImmutableTransformerRuntime:
             None if compile_dynamic is None else bool(compile_dynamic)
         )
         self.compile_dynamic_hints = tuple(compile_dynamic_hints or ())
+        self.protected_training_leaf_keys = frozenset(
+            (str(block), str(leaf))
+            for block, leaf in protected_training_leaf_keys
+        )
+        self.owner_token = owner_token
         self._hint_range_warned: set[tuple] = set()
         self._arena_signature = self.residency.arena.immutable_signature()
 
@@ -446,7 +453,7 @@ class ImmutableTransformerRuntime:
 
         self.loras_by_block = dict(loras_by_block or {})
         self.lora_multiplier = lora_multiplier
-        configure_fetch_runtime(depth=self.depth)
+        configure_fetch_runtime(depth=self.depth, owner_token=self.owner_token)
         self._block_fns = {
             self.TRAIN: tuple(
                 self._make_stable_block_fn(index, self.TRAIN)
@@ -735,14 +742,7 @@ class ImmutableTransformerRuntime:
                 f"training_block_transition_requires_train:{current.phase}"
             )
         requested = tuple(dict.fromkeys(str(key) for key in block_keys))
-        protected = frozenset(
-            (str(block), str(leaf))
-            for block, leaf in getattr(
-                self.model,
-                "_mm_immutable_protected_training_leaf_keys",
-                (),
-            )
-        )
+        protected = self.protected_training_leaf_keys
         next_keys = set(current.resident_leaf_keys)
         changed = []
         for key in requested:
@@ -778,7 +778,6 @@ class ImmutableTransformerRuntime:
             }
         next_plan = ResidencyPlan.build(self.TRAIN, next_keys)
         delta = self.set_residency_plan(next_plan)
-        self.model._mm_immutable_training_plan = next_plan
         return {
             "changed": True,
             "block_keys": tuple(changed),
@@ -811,14 +810,7 @@ class ImmutableTransformerRuntime:
                 "resident": want_resident,
                 "plan": current,
             }
-        protected = frozenset(
-            (str(block), str(leaf))
-            for block, leaf in getattr(
-                self.model,
-                "_mm_immutable_protected_training_leaf_keys",
-                (),
-            )
-        )
+        protected = self.protected_training_leaf_keys
         if not want_resident and any(item in protected for item in leaf_keys):
             raise ImmutableRuntimeError(f"protected_training_block:{key}")
 
@@ -829,7 +821,6 @@ class ImmutableTransformerRuntime:
             next_keys.difference_update(leaf_keys)
         next_plan = ResidencyPlan.build(self.TRAIN, next_keys)
         delta = self.set_residency_plan(next_plan)
-        self.model._mm_immutable_training_plan = next_plan
         return {
             "changed": True,
             "block_key": key,
@@ -843,14 +834,7 @@ class ImmutableTransformerRuntime:
         current = self._sources.plan or self.residency.plan
         if current.phase != self.TRAIN:
             return 0
-        protected = frozenset(
-            (str(block), str(leaf))
-            for block, leaf in getattr(
-                self.model,
-                "_mm_immutable_protected_training_leaf_keys",
-                (),
-            )
-        )
+        protected = self.protected_training_leaf_keys
         candidates = []
         for abi in self._block_abis:
             keys = tuple((abi.block_key, leaf) for leaf in abi.leaf_names)
@@ -874,14 +858,7 @@ class ImmutableTransformerRuntime:
                 f"training_residency_growth_requires_train:{current.phase}"
             )
 
-        protected = frozenset(
-            (str(block), str(leaf))
-            for block, leaf in getattr(
-                self.model,
-                "_mm_immutable_protected_training_leaf_keys",
-                (),
-            )
-        )
+        protected = self.protected_training_leaf_keys
         candidates = []
         for order, abi in enumerate(self._block_abis):
             keys = tuple((abi.block_key, leaf) for leaf in abi.leaf_names)
@@ -924,7 +901,6 @@ class ImmutableTransformerRuntime:
                 next_keys.update(keys)
             next_plan = ResidencyPlan.build(self.TRAIN, next_keys)
             self.set_residency_plan(next_plan)
-            self.model._mm_immutable_training_plan = next_plan
         else:
             next_plan = current
 
@@ -954,14 +930,7 @@ class ImmutableTransformerRuntime:
         if current.phase != self.TRAIN:
             raise ImmutableRuntimeError(f"training_residency_reduction_requires_train:{current.phase}")
 
-        protected = frozenset(
-            (str(block), str(leaf))
-            for block, leaf in getattr(
-                self.model,
-                "_mm_immutable_protected_training_leaf_keys",
-                (),
-            )
-        )
+        protected = self.protected_training_leaf_keys
         candidates = []
         for abi in self._block_abis:
             keys = tuple((abi.block_key, leaf) for leaf in abi.leaf_names)
@@ -984,7 +953,6 @@ class ImmutableTransformerRuntime:
             next_keys = set(current.resident_leaf_keys) - set(removed)
             next_plan = ResidencyPlan.build(self.TRAIN, next_keys)
             self.set_residency_plan(next_plan)
-            self.model._mm_immutable_training_plan = next_plan
         else:
             next_plan = current
 
@@ -1215,16 +1183,9 @@ def prepare_immutable_runtime(
     compile_blocks: bool = True,
     compile_dynamic: bool | None = True,
     compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = (),
+    protected_training_leaf_keys=(),
+    owner_token=None,
 ) -> ImmutableTransformerRuntime:
-    existing = getattr(transformer, "_immutable_runtime", None)
-    if existing is not None:
-        if (
-            existing.residency is residency
-            and existing.architecture_adapter is architecture_adapter
-        ):
-            return existing
-        raise ImmutableRuntimeError("immutable_runtime_already_prepared")
-
     runtime = ImmutableTransformerRuntime(
         transformer,
         residency,
@@ -1233,6 +1194,7 @@ def prepare_immutable_runtime(
         compile_blocks=compile_blocks,
         compile_dynamic=compile_dynamic,
         compile_dynamic_hints=compile_dynamic_hints,
+        protected_training_leaf_keys=protected_training_leaf_keys,
+        owner_token=owner_token,
     )
-    transformer._immutable_runtime = runtime
     return runtime

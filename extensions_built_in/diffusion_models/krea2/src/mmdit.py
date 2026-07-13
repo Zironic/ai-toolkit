@@ -31,6 +31,7 @@ from toolkit.memory_management.ingraph_stream import (
     streamed_linear,
     streamed_linear_tensors,
 )
+from toolkit.memory_management.runtime import get_memory_runtime
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from toolkit.sdpa_patch import can_use_native_cudnn_gqa, get_gqa_backend_mode
@@ -744,9 +745,6 @@ class SingleStreamDiT(nn.Module):
         self._runtime_lora_multiplier = None
         self._runtime_lora_multiplier_value = None
         self._runtime_lora_network = None
-        # Generic compile-neutral runtime for ordinary Krea train/sample calls.
-        # Reference-image/reference-K/V calls deliberately use the eager loop.
-        self._immutable_runtime = None
         headdim = config.features // config.heads
         axes = [
             headdim - 12 * (headdim // 16),
@@ -816,99 +814,6 @@ class SingleStreamDiT(nn.Module):
         self.gradient_checkpointing = False
         self._checkpoint_keep_last = 0
 
-    @staticmethod
-    def _forward_owners_on(child):
-        """Return bound owners in the installed forward chain, outermost first."""
-        owners = []
-        seen = set()
-        pending = [getattr(child, "__dict__", {}).get("forward")]
-        while pending:
-            owner = getattr(pending.pop(0), "__self__", None)
-            if owner is None or owner is child or id(owner) in seen:
-                continue
-            seen.add(id(owner))
-            owners.append(owner)
-            pending.append(getattr(owner, "org_forward", None))
-        return owners
-
-    @staticmethod
-    def _unsupported_adapter_error(owner, target_path):
-        adapter_name = type(owner).__name__ if owner is not None else "unknown forward owner"
-        raise RuntimeError(
-            "arena offload supports LoRAModule, LokrModule, DoRAModule, and "
-            f"linear FullModule adapters; found {adapter_name} on {target_path}"
-        )
-
-    @classmethod
-    def _collect_adapter_entry(cls, child, target_path):
-        owners = cls._forward_owners_on(child)
-        if not owners:
-            forward = getattr(child, "__dict__", {}).get("forward")
-            if forward is not None:
-                cls._unsupported_adapter_error(getattr(forward, "__self__", None), target_path)
-            return None
-        if len(owners) != 1:
-            raise RuntimeError(
-                "arena offload supports one adapter per canonical Linear; found "
-                f"{len(owners)} installed adapters on {target_path}"
-            )
-
-        owner = owners[0]
-        supported = {"LoRAModule", "LokrModule", "DoRAModule", "FullModule"}
-        if type(owner).__name__ not in supported or not callable(
-            getattr(owner, "functional_forward", None)
-        ):
-            cls._unsupported_adapter_error(owner, target_path)
-        network_ref = getattr(owner, "network_ref", None)
-        network = network_ref() if network_ref is not None else None
-        if network is None or getattr(network, "is_lorm", False):
-            cls._unsupported_adapter_error(owner, target_path)
-        return owner
-
-    def _collect_block_loras(self, block_indices):
-        runtime = self._immutable_runtime
-        if runtime is None:
-            raise RuntimeError("immutable runtime is not prepared")
-        architecture = runtime.architecture_adapter
-        blocks = architecture.execution_blocks(self)
-        adapters = {}
-        for index in block_indices:
-            block_adapters = {}
-            block_key = architecture.block_key(self, index)
-            for name, child in architecture.leaf_entries(blocks[index]):
-                entry = self._collect_adapter_entry(
-                    child,
-                    f"{block_key}.{name}",
-                )
-                if entry is not None:
-                    block_adapters[name] = entry
-            if block_adapters:
-                adapters[index] = block_adapters
-        return adapters, None
-
-    def finalize_immutable_runtime(self):
-        """Finalize permanent programs after the training network is installed."""
-        runtime = self._immutable_runtime
-        if runtime is None:
-            raise RuntimeError(
-                "immutable runtime was not prepared during model loading"
-            )
-
-        block_indices = tuple(range(len(self.blocks)))
-        adapters, _network = self._collect_block_loras(block_indices)
-        return runtime.finalize_execution(
-            loras_by_block=adapters,
-            lora_multiplier=None,
-        )
-
-    def disable_immutable_runtime(self):
-        if self._immutable_runtime is not None:
-            from toolkit.memory_management.ingraph_stream import drain_fetch_runtime
-
-            drain_fetch_runtime()
-            self._immutable_runtime.close()
-        self._immutable_runtime = None
-
     def forward(
         self,
         img: Tensor,
@@ -963,10 +868,8 @@ class SingleStreamDiT(nn.Module):
             or ref_kv_capture is not None
             or ref_kv_cache is not None
         )
-        use_runtime = (
-            self._immutable_runtime is not None
-            and not reference_mode
-        )
+        memory_runtime = get_memory_runtime(self)
+        use_runtime = memory_runtime is not None and not reference_mode
 
         # Permanent runtime programs use 256-token buckets. Reference calls
         # retain their native eager shapes and alternate block ABI.
@@ -1057,16 +960,14 @@ class SingleStreamDiT(nn.Module):
         ref_kv_capture: list | None = None,
         blockcaches: list | None = None,
     ) -> Tensor:
-        runtime = self._immutable_runtime
-        if runtime is not None and runtime.can_run_current_call(
-            tvec,
-            freqs,
-            mask,
+        runtime = get_memory_runtime(self)
+        if runtime is not None and runtime.can_run_model_call(
+            (tvec, freqs, mask),
             ref_kv_capture=ref_kv_capture,
             blockcaches=blockcaches,
         ):
             # run() picks the train/sample program from the active phase.
-            return runtime.run(combined, tvec, freqs, mask)
+            return runtime.run_model(combined, tvec, freqs, mask)
 
         # Pure eager block math: fallback, reference-image/reference-K/V calls,
         # and pre-runtime diagnostic calls.

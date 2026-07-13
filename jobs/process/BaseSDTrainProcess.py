@@ -26,8 +26,9 @@ import torch
 import torch.backends.cuda
 from huggingface_hub import HfApi, interpreter_login
 from toolkit.memory_management import MemoryManager, allocator_cap, vram_budget
-from toolkit.memory_management.arena_offload import (
-    get_arena_runtime,
+from toolkit.memory_management.runtime import (
+    close_memory_runtime_preparation,
+    get_memory_runtime,
     is_memory_managed,
     memory_runtime_owns_compile,
 )
@@ -618,7 +619,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # session below restores the TRAIN program once at the end. Because the
         # runtime owns residency, the legacy inference_resident sampling context
         # must NOT also re-plan the transformer -- null it out for this backend.
-        arena_runtime = get_arena_runtime(self.sd.unet)
+        arena_runtime = get_memory_runtime(self.sd.unet)
         if arena_runtime is not None:
             sampling_context = contextlib.nullcontext()
 
@@ -806,10 +807,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         runtime = self._arena_runtime
         if runtime is None:
             sd = getattr(self, "sd", None)
-            runtime = get_arena_runtime(getattr(sd, "unet", None)) if sd is not None else None
+            runtime = get_memory_runtime(getattr(sd, "unet", None)) if sd is not None else None
         if runtime is not None:
             attempt("arena runtime", runtime.close)
             self._arena_runtime = None
+        sd = getattr(self, "sd", None)
+        if sd is not None:
+            attempt(
+                "memory runtime preparation",
+                lambda: close_memory_runtime_preparation(sd),
+            )
 
         from toolkit.memory_management import MemoryManager
         attempt("memory manager", MemoryManager.reset_job_runtime)
@@ -1145,7 +1152,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.prepare_accelerator()
         if self.accelerator.is_main_process:
             memory = None
-            if get_arena_runtime(getattr(self.sd, 'unet', None)) is None:
+            if get_memory_runtime(getattr(self.sd, 'unet', None)) is None:
                 try:
                     from toolkit.memory_management import MemoryManager
                     memory = MemoryManager.training_runtime_diagnostics(
@@ -1386,7 +1393,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         tg=compile_counters['graphs_total'],
                     )
                 )
-        arena_runtime = get_arena_runtime(getattr(self.sd, 'unet', None))
+        arena_runtime = get_memory_runtime(getattr(self.sd, 'unet', None))
         smart_memory = None
         if arena_runtime is None:
             try:
@@ -2572,7 +2579,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return
         if not getattr(self.model_config, 'compile_dynamic_hints_auto', True):
             return
-        runtime = get_arena_runtime(unwrap_model(self.sd.unet))
+        runtime = get_memory_runtime(unwrap_model(self.sd.unet))
         if runtime is None or not runtime.config.compile_blocks:
             return
 
@@ -2776,7 +2783,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
-        arena_runtime = get_arena_runtime(unet)
+        arena_runtime = get_memory_runtime(unet)
         if arena_runtime is not None:
             arena_runtime.place_permanent_modules(self.device_torch, dtype)
         else:
@@ -2887,7 +2894,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_lorm:
                     self.network.is_lorm = True
                     # make sure it is on the right device
-                    arena_runtime = get_arena_runtime(self.sd.unet)
+                    arena_runtime = get_memory_runtime(self.sd.unet)
                     if arena_runtime is not None:
                         arena_runtime.place_permanent_modules(self.sd.device, dtype)
                     else:
@@ -3445,7 +3452,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
-        arena_runtime = get_arena_runtime(self.sd.unet)
+        arena_runtime = get_memory_runtime(self.sd.unet)
         if arena_runtime is not None:
             self._arena_runtime = arena_runtime
             # Two-phase lifecycle: the model prepared the arena (unfinalized)
@@ -3655,7 +3662,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
                 ),
             )
-            arena_runtime = get_arena_runtime(self.sd.unet)
+            arena_runtime = get_memory_runtime(self.sd.unet)
             if arena_runtime is None:
                 try:
                     MemoryManager.prepare_training_memory_for_shape(

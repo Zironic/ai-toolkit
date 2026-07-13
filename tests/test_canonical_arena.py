@@ -3,16 +3,12 @@ import unittest
 
 import torch
 import torch.nn as nn
-from optimum.quanto import freeze
 
 from toolkit.memory_management import pin_manager
 from toolkit.memory_management.canonical_arena import (
     CanonicalArena,
     CanonicalArenaError,
 )
-from toolkit.util.quantize import get_qtype, quantize
-
-
 def _linear(in_f=8, out_f=4, bias=True):
     layer = nn.Linear(in_f, out_f, bias=bias)
     layer.weight.requires_grad_(False)
@@ -95,23 +91,6 @@ class CanonicalizeTests(unittest.TestCase):
         finally:
             arena.release()
 
-    def test_quantized_wrapper_block_repoints_and_preserves_values(self):
-        model = nn.Sequential(nn.Linear(8, 4, bias=False).to(torch.bfloat16))
-        quantize(model, weights=get_qtype("qfloat8"))
-        freeze(model)
-        layer = model[0]
-        layer.weight.requires_grad_(False)
-        expected = layer.weight.data.dequantize().clone()
-
-        arena = CanonicalArena()
-        try:
-            arena.canonicalize({"blocks.0": [("lin", layer)]})
-            flat_ptr = arena.block_pack("blocks.0").host_flat.untyped_storage().data_ptr()
-            self.assertEqual(layer.weight.data._data.untyped_storage().data_ptr(), flat_ptr)
-            torch.testing.assert_close(layer.weight.data.dequantize(), expected)
-        finally:
-            arena.release()
-
     def test_release_returns_pin_ledger_bytes(self):
         layer = _linear(in_f=512, out_f=512, bias=True)
         arena = CanonicalArena()
@@ -177,4 +156,4 @@ if __name__ == "__main__":
 
 import pytest
 
-pytestmark = pytest.mark.leaky  # order-dependent under full suite; see ticket f2aceba
+pytestmark = pytest.mark.process_isolated

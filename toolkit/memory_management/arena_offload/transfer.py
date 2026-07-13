@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import torch
 from toolkit.memory_management import pin_manager
+from .ownership import validate_process_owner
 
 @dataclass
 class _Ticket:
@@ -78,6 +79,7 @@ _PENDING_H2D: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 # fetch_wait. Kept solely so a benchmark can A/B the cost of that host sync on
 # the same build; production always drains lazily.
 _BLOCKING_H2D_TIMING = False
+_RUNTIME_OWNER_TOKEN = None
 
 
 def set_h2d_timing_blocking(enabled: bool) -> None:
@@ -129,8 +131,10 @@ def raise_dynamo_recompile_limit(min_limit: int = 128) -> None:
             setattr(config, attribute, min_limit)
 
 
-def configure_fetch_runtime(*, depth: int = 2) -> None:
-    global _DEPTH, _NEXT_ID
+def configure_fetch_runtime(*, depth: int = 2, owner_token=None) -> None:
+    global _DEPTH, _NEXT_ID, _RUNTIME_OWNER_TOKEN
+    if owner_token is not None:
+        validate_process_owner(owner_token)
     if torch.cuda.is_available() and _SLOTS:
         # Slot buffers may still be in flight; settle before dropping them.
         torch.cuda.synchronize()
@@ -142,6 +146,7 @@ def configure_fetch_runtime(*, depth: int = 2) -> None:
         _SLOTS.clear()
         _FREE_SLOTS.clear()
         _NEXT_ID = 0
+        _RUNTIME_OWNER_TOKEN = owner_token
 
 
 def reset_fetch_stats() -> None:
@@ -277,7 +282,7 @@ def _release_slot(device: torch.device, index: int) -> None:
         _FREE_SLOTS.setdefault(device, collections.deque()).append(index)
 
 
-def drain_fetch_runtime() -> int:
+def drain_fetch_runtime(*, owner_token=None) -> int:
     """Abandon every outstanding fetch ticket (OOM-recovery path only).
 
     An OOM unwinds a forward between fetch_start and fetch_free, leaving
@@ -288,6 +293,9 @@ def drain_fetch_runtime() -> int:
     in-flight device buffers anymore, so waiting out the transfer streams and
     dropping the tickets is safe. Returns the number of tickets abandoned.
     """
+    token = _RUNTIME_OWNER_TOKEN if owner_token is None else owner_token
+    if token is not None:
+        validate_process_owner(token)
     with _STATE_LOCK:
         for stream in _TRANSFER_STREAMS.values():
             stream.synchronize()
@@ -305,7 +313,29 @@ def drain_fetch_runtime() -> int:
     return abandoned
 
 
+def release_fetch_runtime(owner_token) -> None:
+    """Release ring, streams, events, tickets, and reporting state for owner."""
+    global _NEXT_ID, _RUNTIME_OWNER_TOKEN
+    validate_process_owner(owner_token)
+    drain_fetch_runtime(owner_token=owner_token)
+    with _STATE_LOCK:
+        _drain_h2d(block=True)
+        _TICKETS.clear()
+        _LIVE.clear()
+        _PENDING_H2D.clear()
+        _SLOTS.clear()
+        _FREE_SLOTS.clear()
+        _TRANSFER_STREAMS.clear()
+        _NEXT_ID = 0
+        for key in _STATS:
+            _STATS[key] = 0
+            _LIFETIME_STATS[key] = 0
+        _RUNTIME_OWNER_TOKEN = None
+
+
 def _fetch_start_impl(host_flat: torch.Tensor) -> torch.Tensor:
+    if _RUNTIME_OWNER_TOKEN is not None:
+        validate_process_owner(_RUNTIME_OWNER_TOKEN)
     if host_flat.device.type != "cpu":
         raise RuntimeError("mm.fetch_start expected a CPU host_flat tensor")
     if torch.cuda.is_available() and not pin_manager.is_host_pinned(host_flat):

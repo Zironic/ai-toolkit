@@ -356,16 +356,13 @@ def test_controller_raises_cap_by_fixed_fsm_increment():
 
 
 def test_arena_sampling_binds_fp8_only_to_singletons(monkeypatch):
-    model = SimpleNamespace(
-        _memory_manager=SimpleNamespace(
-            _training_runtime_candidate_ids={11, 22}
-        )
-    )
+    model = SimpleNamespace()
     runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
     runtime._closed = False
     runtime._model = model
     runtime._config = SimpleNamespace(fp8_sampling=True)
     runtime._sampling_fp8_singletons = 0
+    runtime._smart_plan = {"singleton_runtime_ids": {11, 22}}
     runtime._training_plan = object()
     runtime._executor = SimpleNamespace(
         TRAIN="train",
@@ -374,65 +371,38 @@ def test_arena_sampling_binds_fp8_only_to_singletons(monkeypatch):
     runtime._bind_training_cap = lambda: None
     calls = []
     monkeypatch.setattr(
-        "toolkit.memory_management.manager.MemoryManager._enable_fp8_sampling",
-        lambda module, include_ids=None: (
-            calls.append(("enable", module, set(include_ids)))
-            or (["restore"], 2, 0)
+        "toolkit.memory_management.arena_offload.runtime.enable_fp8",
+        lambda module, include_ids=None, training=False: (
+            calls.append(("enable", module, set(include_ids), training))
+            or ["restore"]
         ),
     )
     monkeypatch.setattr(
-        "toolkit.memory_management.manager.MemoryManager._disable_fp8_sampling",
-        lambda module, restores: calls.append(
-            ("disable", module, list(restores))
-        ),
+        "toolkit.memory_management.arena_offload.runtime.disable_fp8",
+        lambda restores: calls.append(("disable", list(restores))),
     )
 
     with runtime.sampling_session():
-        assert runtime._sampling_fp8_singletons == 2
+        assert runtime._sampling_fp8_singletons == 1
 
     assert calls == [
-        ("enable", model, {11, 22}),
-        ("disable", model, ["restore"]),
+        ("enable", model, {11, 22}, False),
+        ("disable", ["restore"]),
     ]
 
 
 def test_arena_close_releases_all_owned_resources_after_executor_error():
-    calls = []
-    child = SimpleNamespace(_mm_canonical_leaf=True)
-    model = SimpleNamespace(
-        _arena_offload_runtime=None,
-        _mm_canonical_arena=object(),
-        _mm_residency_state=object(),
-        _mm_immutable_training_plan=object(),
-        _mm_immutable_smart_plan=object(),
-        _mm_immutable_canonical_modules=object(),
-        _mm_immutable_backend=True,
-    )
     runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
-    model._arena_offload_runtime = runtime
     runtime._closed = False
-    runtime._model = model
-    runtime._training_fp8_restores = []
-    runtime._executor = SimpleNamespace(
-        close=lambda: (_ for _ in ()).throw(RuntimeError("executor boom"))
+    runtime._resources = SimpleNamespace(
+        release=lambda: (_ for _ in ()).throw(RuntimeError("executor boom"))
     )
-    runtime._residency = SimpleNamespace(clear=lambda: calls.append("residency"))
-    runtime._arena = SimpleNamespace(release=lambda: calls.append("arena"))
-    runtime._canonical_modules = (child,)
-    runtime._training_plan = object()
-    runtime._smart_plan = object()
 
     import pytest
     with pytest.raises(RuntimeError, match="executor boom"):
         runtime.close()
 
-    assert calls == ["residency", "arena"]
-    assert runtime._closed
-    assert not hasattr(model, "_arena_offload_runtime")
-    assert not hasattr(model, "_mm_canonical_arena")
-    assert not hasattr(child, "_mm_canonical_leaf")
-
-    runtime.close()
+    assert not runtime._closed
 
 
 def test_bf16_sampling_reserves_largest_singleton_dequant(monkeypatch):

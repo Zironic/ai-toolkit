@@ -65,7 +65,7 @@ class BaseJob:
             else:
                 raise ValueError(f'config file is invalid. Unknown process type: {process["type"]}')
 
-    def cleanup(self):
+    def cleanup(self, on_cleaned=None):
         """Release every process owned by this job, even after a partial failure."""
         errors = []
         for process in reversed(getattr(self, "process", ())):
@@ -75,6 +75,13 @@ class BaseJob:
                 errors.append(f"{type(process).__name__}: {error}")
             finally:
                 process.job = None
-        self.process.clear()
         if errors:
+            self.process.clear()
             raise RuntimeError("job cleanup failed: " + "; ".join(errors))
+        if on_cleaned is not None:
+            # Detached UI workers use this boundary to exit after owned
+            # resources are closed but before CPython recursively finalizes the
+            # trainer object graph. A normal callback returns and cleanup keeps
+            # the existing reference-release behavior.
+            on_cleaned()
+        self.process.clear()

@@ -26,7 +26,10 @@ from toolkit.memory_management.ingraph_stream import LoraEntry
 from toolkit.memory_management.residency import ResidencyPlan, ResidencyState
 from toolkit.models.lokr import LokrModule
 
-pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"), pytest.mark.leaky]
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.process_isolated,
+]
 
 LAYERS = 2
 

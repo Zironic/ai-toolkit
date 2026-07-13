@@ -345,10 +345,14 @@ def main():
         if load_compile_cache(args.compile_cache_dir, compile_cache_key):
             print(f"[s0] loaded compile mega-cache ({compile_cache_key})")
 
-    transformer.finalize_immutable_runtime()
-    executor = transformer._immutable_runtime
-    baseline_plan = transformer._mm_immutable_training_plan
-    executor.activate(executor.TRAIN, baseline_plan)
+    from toolkit.memory_management.runtime import get_memory_runtime
+
+    memory_runtime = get_memory_runtime(transformer)
+    if memory_runtime is None:
+        raise RuntimeError("load_model did not prepare a memory runtime")
+    memory_runtime.finalize(network)
+    executor = memory_runtime._executor
+    baseline_plan = memory_runtime._training_plan
 
     total_blocks = len(executor.residency.arena.block_keys())
     full_resident_gib = executor.full_model_resident_bytes() / GIB
@@ -396,7 +400,7 @@ def main():
         ordered = arms if round_index % 2 == 0 else list(reversed(arms))
         for arm in ordered:
             executor.set_residency_plan(arm["plan"])
-            transformer._mm_immutable_training_plan = arm["plan"]
+            memory_runtime._training_plan = arm["plan"]
             for _ in range(args.warmup_steps):
                 _run_step(
                     model, transformer, network, embeds, optimizer, trainable,

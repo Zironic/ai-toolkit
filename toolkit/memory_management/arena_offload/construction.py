@@ -246,3 +246,6 @@ class PreparedCanonicalBuild:
         self.arena._blocks.clear()
         self.arena._canonicalized = False
         self._populated = False
+        resources = getattr(self, "_arena_resources", None)
+        if resources is not None and not resources.canonical_committed:
+            resources.release()

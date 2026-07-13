@@ -9,36 +9,36 @@ import pytest
 from _pytest.reports import TestReport
 
 # ---------------------------------------------------------------------------
-# 'leaky' marker: run the whole marked file in a fresh pytest subprocess.
+# 'process_isolated' marker: run the whole marked file in a disposable process.
 #
-# Several files pass alone but fail in the full suite because process-global
-# state (pin ledger, CUDA allocator / torch host-pin cache, qfloat8->torchao
-# shim) outlives a test (git-bug ticket f2aceba). The sanctioned fix is
-# per-test process isolation; pytest-forked/xdist --forked need os.fork and
-# don't exist on Windows, so this is a subprocess-based equivalent. One
-# subprocess per marked FILE (not per test) to amortize the ~10 s torch/CUDA
-# startup; per-test outcomes are recovered from the subprocess's -q output.
+# CUDA compilation, host registration, and torch's caching host allocator can
+# leave process-global state that cannot be safely scrubbed between tests
+# (git-bug ticket f2aceba). Files that exercise those mechanisms run in a
+# disposable child process. Process termination is the cleanup boundary.
+# pytest-forked/xdist --forked need os.fork and do not exist on Windows, so
+# this is a subprocess-based equivalent. One child per marked file amortizes
+# the ~10 s torch/CUDA startup; per-test outcomes are recovered from -q output.
 # ---------------------------------------------------------------------------
 
-_LEAKY_ENV = "AI_TOOLKIT_LEAKY_ISOLATED"
-_leaky_module_results = {}
+_ISOLATED_ENV = "AI_TOOLKIT_PROCESS_ISOLATED"
+_isolated_module_results = {}
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "leaky: order-dependent under process-global state; the whole file is "
-        "re-run in an isolated pytest subprocess (ticket f2aceba)",
+        "process_isolated: exercises process-global CUDA/host-registration "
+        "state; the whole file runs in a disposable subprocess (ticket f2aceba)",
     )
 
 
 def _run_module_isolated(item):
     path = str(item.path)
-    cached = _leaky_module_results.get(path)
+    cached = _isolated_module_results.get(path)
     if cached is not None:
         return cached
     env = dict(os.environ)
-    env[_LEAKY_ENV] = "1"
+    env[_ISOLATED_ENV] = "1"
     started = time.perf_counter()
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", path, "-q", "-p", "no:cacheprovider"],
@@ -58,16 +58,16 @@ def _run_module_isolated(item):
         "output": proc.stdout + proc.stderr,
         "duration": duration,
     }
-    _leaky_module_results[path] = result
+    _isolated_module_results[path] = result
     return result
 
 
 def pytest_terminal_summary(terminalreporter):
-    if not _leaky_module_results:
+    if not _isolated_module_results:
         return
     terminalreporter.section("isolated file durations")
     for path, result in sorted(
-        _leaky_module_results.items(),
+        _isolated_module_results.items(),
         key=lambda entry: entry[1]["duration"],
         reverse=True,
     ):
@@ -91,7 +91,7 @@ def _report(item, when, outcome, longrepr=None):
 
 
 def pytest_runtest_protocol(item, nextitem):
-    if os.environ.get(_LEAKY_ENV) or not item.get_closest_marker("leaky"):
+    if os.environ.get(_ISOLATED_ENV) or not item.get_closest_marker("process_isolated"):
         return None
     result = _run_module_isolated(item)
     # nodeids inside the subprocess are rootpath-relative with forward
@@ -108,7 +108,7 @@ def pytest_runtest_protocol(item, nextitem):
             item,
             "call",
             "failed",
-            longrepr="failed in isolated subprocess (marker: leaky)\n\n"
+            longrepr="failed in disposable subprocess (marker: process_isolated)\n\n"
             + result["output"],
         )
     else:

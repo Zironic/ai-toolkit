@@ -17,9 +17,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..runtime import (
+    RUNTIME_ATTR,
+    close_memory_runtime,
+    get_memory_runtime,
+    is_memory_managed,
+    memory_runtime_owns_compile,
+    unwrap_memory_model,
+)
 from .runtime import ArenaOffloadRuntime
-
-RUNTIME_ATTR = "_arena_offload_runtime"
 
 _FP8_QTYPES = ("qfloat8", "float8")
 
@@ -31,22 +37,7 @@ def unwrap(model):
     does not go through `toolkit.accelerator.unwrap_model` (which constructs a
     global `Accelerator`).
     """
-    seen = set()
-    while model is not None and id(model) not in seen:
-        seen.add(id(model))
-        orig = getattr(model, "_orig_mod", None)
-        if orig is not None and orig is not model:
-            model = orig
-            continue
-        if getattr(model, RUNTIME_ATTR, None) is not None:
-            return model
-        if hasattr(model, "_memory_manager"):
-            return model
-        inner = getattr(model, "module", None)
-        if inner is None or inner is model:
-            return model
-        model = inner
-    return model
+    return unwrap_memory_model(model)
 
 
 @dataclass(frozen=True)
@@ -166,18 +157,32 @@ class ArenaOffloadConfig:
 
 
 
-def prepare_canonical_storage(transformer, adapter, *, defer_blocks: bool = False):
+def prepare_canonical_storage(
+    transformer, adapter, *, device=None, defer_blocks: bool = False
+):
     """Prepare final arena destinations without publishing model Parameters."""
     from ..canonical_arena import CanonicalArena
+    from .resources import ArenaRuntimeResources
 
-    blocks = adapter.execution_blocks(transformer)
-    entries = {} if defer_blocks else {
-        adapter.block_key(transformer, index): list(adapter.leaf_entries(block))
-        for index, block in enumerate(blocks)
-    }
-    arena = CanonicalArena()
-    build = arena.prepare(entries, model=transformer)
-    return build
+    resources = None
+    if device is not None:
+        resources = ArenaRuntimeResources(transformer, device)
+        resources.acquire_process_owner()
+    try:
+        blocks = adapter.execution_blocks(transformer)
+        entries = {} if defer_blocks else {
+            adapter.block_key(transformer, index): list(adapter.leaf_entries(block))
+            for index, block in enumerate(blocks)
+        }
+        arena = CanonicalArena()
+        build = arena.prepare(entries, model=transformer)
+        if resources is not None:
+            resources.adopt_canonical_build(build)
+        return build
+    except BaseException:
+        if resources is not None:
+            resources.release()
+        raise
 
 def prepare_arena_offload(
     transformer,
@@ -210,37 +215,12 @@ def prepare_arena_offload(
 
 def get_arena_runtime(model) -> ArenaOffloadRuntime | None:
     """The arena runtime for `model`, or None. Unwraps Accelerate/DDP/compile."""
-    if model is None:
-        return None
-    return getattr(unwrap(model), RUNTIME_ATTR, None)
+    return get_memory_runtime(model)
 
 
 def is_arena_offloaded(model) -> bool:
     return get_arena_runtime(model) is not None
 
 
-def is_memory_managed(model) -> bool:
-    """True for either offload backend.
-
-    Replaces bare `hasattr(module, '_memory_manager')` checks in shared code,
-    which silently answer "not offloaded" for an arena model.
-    """
-    if model is None:
-        return False
-    inner = unwrap(model)
-    return hasattr(inner, "_memory_manager") or is_arena_offloaded(inner)
-
-
-def memory_runtime_owns_compile(model) -> bool:
-    """True when the memory runtime compiles the blocks itself.
-
-    Generic block compile must be skipped for these models -- compile ownership
-    is exclusive.
-    """
-    return is_arena_offloaded(model)
-
-
 def close_arena_offload(model) -> None:
-    runtime = get_arena_runtime(model)
-    if runtime is not None:
-        runtime.close()
+    close_memory_runtime(model)

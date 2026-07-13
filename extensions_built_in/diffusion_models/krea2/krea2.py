@@ -57,9 +57,9 @@ from toolkit.util.quantize import (
 from toolkit.memory_management import MemoryManager
 from toolkit.memory_management import vram_budget
 from toolkit.memory_management.arena_offload import (
-    get_arena_runtime,
     prepare_canonical_storage,
 )
+from toolkit.memory_management.runtime import get_memory_runtime
 from toolkit.compile_cache import load_compile_cache, save_compile_cache
 
 from .src.mmdit import (
@@ -750,7 +750,9 @@ class Krea2Model(BaseModel):
 
                     transformer.requires_grad_(False)
                     canonical_build = prepare_canonical_storage(
-                        transformer, SingleStreamMMDiTAdapter()
+                        transformer,
+                        SingleStreamMMDiTAdapter(),
+                        device=self.device_torch,
                     )
                     _populate_canonical_build_from_model(canonical_build)
             else:
@@ -762,7 +764,10 @@ class Krea2Model(BaseModel):
 
                         adapter = SingleStreamMMDiTAdapter()
                         canonical_build = prepare_canonical_storage(
-                            transformer, adapter, defer_blocks=True
+                            transformer,
+                            adapter,
+                            device=self.device_torch,
+                            defer_blocks=True,
                         )
                     _stream_and_quantize_checkpoint(
                         self,
@@ -788,7 +793,9 @@ class Krea2Model(BaseModel):
 
                         transformer.requires_grad_(False)
                         canonical_build = prepare_canonical_storage(
-                            transformer, SingleStreamMMDiTAdapter()
+                            transformer,
+                            SingleStreamMMDiTAdapter(),
+                            device=self.device_torch,
                         )
                     _stream_checkpoint(
                         transformer,
@@ -968,6 +975,12 @@ class Krea2Model(BaseModel):
         finally:
             self._prepared_canonical_build = None
 
+    def cleanup_memory_runtime_preparation(self):
+        build = getattr(self, "_prepared_canonical_build", None)
+        self._prepared_canonical_build = None
+        if build is not None:
+            build.rollback()
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Krea 2 model")
@@ -1122,7 +1135,7 @@ class Krea2Model(BaseModel):
     ):
         extra = extra or {}
         skip_sampling_guard = bool(extra.get("skip_sampling_guard", False))
-        arena_runtime = get_arena_runtime(self.model)
+        arena_runtime = get_memory_runtime(self.model)
         if arena_runtime is not None:
             arena_runtime.place_permanent_modules(self.device_torch, self.torch_dtype)
         elif self.model.device == torch.device("cpu"):
@@ -1324,7 +1337,7 @@ class Krea2Model(BaseModel):
         batch: "DataLoaderBatchDTO" = None,
         **kwargs,
     ):
-        arena_runtime = get_arena_runtime(self.model)
+        arena_runtime = get_memory_runtime(self.model)
         if arena_runtime is not None:
             arena_runtime.place_permanent_modules(self.device_torch, self.torch_dtype)
         elif self.model.device == torch.device("cpu"):

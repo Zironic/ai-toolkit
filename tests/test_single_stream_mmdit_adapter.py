@@ -67,18 +67,17 @@ class _Runtime:
     def __init__(self):
         self.calls = []
 
-    def can_run_current_call(
+    def can_run_model_call(
         self,
-        tvec,
-        freqs,
-        mask,
+        block_args,
         *,
         ref_kv_capture=None,
         blockcaches=None,
     ):
+        tvec, _freqs, _mask = block_args
         return not isinstance(tvec, tuple) and ref_kv_capture is None and blockcaches is None
 
-    def run(self, combined, tvec, freqs, mask):
+    def run_model(self, combined, tvec, freqs, mask):
         self.calls.append((combined, tvec, freqs, mask))
         return combined + 1
 
@@ -96,7 +95,7 @@ def _dispatch_fixture():
     runtime = _Runtime()
     block = _EagerBlock()
     transformer = SimpleNamespace(
-        _immutable_runtime=runtime,
+        _arena_offload_runtime=runtime,
         _checkpoint_keep_last=0,
         gradient_checkpointing=False,
         blocks=[block],
