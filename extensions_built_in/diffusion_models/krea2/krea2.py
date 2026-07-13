@@ -1017,6 +1017,24 @@ class Krea2Model(BaseModel):
         # tell the model to invert assistant on inference since we want remove lora effects
         self.invert_assistant_lora = True
 
+    def get_quantization_exclude_modules(self):
+        # sensitive modules kept in full precision (fnmatch patterns on module
+        # names within SingleStreamDiT):
+        #   first             - patchified latent input projection
+        #   tmlp* / tproj*    - timestep embedder + modulation projection; feed
+        #                       every block's DoubleSharedModulation and LastLayer
+        #   txtmlp*           - text feature -> model width projection
+        #   txtfusion.projector - tiny (num_txt_layers -> 1) encoder-layer mixer
+        #   last*             - final norm/modulated output projection
+        return [
+            "first",
+            "tmlp*",
+            "tproj*",
+            "txtmlp*",
+            "txtfusion.projector",
+            "last*",
+        ]
+
     def _attach_immutable_training_memory(self, transformer, ignore_modules):
         """Select the arena offload backend for the transformer.
 

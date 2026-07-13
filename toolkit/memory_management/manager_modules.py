@@ -1728,7 +1728,9 @@ def _unpin_module_weights(module: nn.Module, manager) -> int:
     changed = False
     with torch.no_grad():
         for name in ("weight", "bias"):
-            param = getattr(module, name, None)
+            # OstrisLinear.weight is a dequantizing property. Reading the
+            # registration table avoids materializing a full float weight.
+            param = module._parameters.get(name, None)
             if not isinstance(param, nn.Parameter):
                 continue
             data = param.data
@@ -1745,6 +1747,18 @@ def _unpin_module_weights(module: nn.Module, manager) -> int:
                     release_pinned_bytes(size, kind="weights")
                     param.data = data.clone()
                 changed = True
+        if getattr(module, "is_ostris_quantized", False):
+            for name, data in list(module._buffers.items()):
+                if not isinstance(data, torch.Tensor):
+                    continue
+                if _is_quantized_tensor(data) or hasattr(data, "__tensor_flatten__"):
+                    changed = _unpin_inner_tensors(data) or changed
+                elif data.device.type == "cpu" and data.is_pinned():
+                    size = data.numel() * data.element_size()
+                    if not _unpin_tensor_in_place(data):
+                        release_pinned_bytes(size, kind="weights")
+                        module._buffers[name] = data.clone()
+                    changed = True
     if not changed:
         return 0
     # Drop Python references to the old pinned tensors promptly. WDDM NON_LOCAL
@@ -2528,6 +2542,144 @@ class LinearLayerMemoryManager(BaseLayerMemoryManager):
 
         self._install_base_forward(_mm_forward)
         
+        self.module._memory_management_device = self.manager.process_device
+
+
+class OstrisLinearLayerMemoryManager(BaseLayerMemoryManager):
+    """Offload manager for OstrisLinear (custom-quantized) layers.
+
+    The generic linear bounce is wrong for these: module.weight is a property that
+    fully dequantizes on access, so bouncing it ships a full-precision weight over
+    PCIe every forward and bypasses the quantizer's hardware kernels. Instead this
+    keeps the (much smaller) quantized buffers pinned on CPU, stages them H2D into
+    the same forward ring the float path uses, swaps them onto the module, and runs
+    the quantizer's own forward on device — so fp4/int8 GEMM paths and the STE
+    training path work unchanged under offloading. Buffers are read live off the
+    module each forward (not cached) so requantize_ during merge/reset stays valid.
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        manager: "MemoryManager",
+    ):
+        super().__init__(module, manager)
+
+        # 1) Move quantized buffers + bias to CPU and pin within the same
+        # manager/DXGI budget used by ordinary streamed weights.
+        dxgi_before = _dxgi_signed_headroom_bytes(manager.process_device)
+        pinned_before = int(getattr(module, "_mm_pinned_bytes", 0) or 0)
+        with torch.no_grad():
+            for name, buf in list(module._buffers.items()):
+                if buf is None:
+                    continue
+                if buf.device.type != "cpu":
+                    buf = buf.to("cpu")
+                remaining = max(
+                    0,
+                    manager.pinned_weight_budget_bytes - manager.pinned_weight_bytes,
+                )
+                if dxgi_before is not None:
+                    remaining = min(remaining, max(0, int(dxgi_before)))
+                cpu_buf, pinned = _ensure_cpu_pinned(buf, remaining)
+                manager.pinned_weight_bytes += pinned
+                module._mm_pinned_bytes = (
+                    getattr(module, "_mm_pinned_bytes", 0) + pinned
+                )
+                module._buffers[name] = cpu_buf.detach()
+            bias = module._parameters.get("bias", None)
+            if bias is not None:
+                remaining = max(
+                    0,
+                    manager.pinned_weight_budget_bytes - manager.pinned_weight_bytes,
+                )
+                if dxgi_before is not None:
+                    remaining = min(remaining, max(0, int(dxgi_before)))
+                cpu_bias, pinned = _ensure_cpu_pinned(bias.data, remaining)
+                manager.pinned_weight_bytes += pinned
+                module._mm_pinned_bytes = (
+                    getattr(module, "_mm_pinned_bytes", 0) + pinned
+                )
+                bias.data = cpu_bias.detach()
+
+        pinned_delta = int(getattr(module, "_mm_pinned_bytes", 0) or 0) - pinned_before
+        if dxgi_before is not None and pinned_delta > 0:
+            dxgi_after = _dxgi_signed_headroom_bytes(manager.process_device)
+            if dxgi_after is not None and dxgi_after < 0:
+                _unpin_module_weights(module, manager)
+
+        # 2) Hijack forward
+        self._original_forward = self._capture_base_forward()
+
+        @torch.compiler.disable
+        def _mm_forward(x, *args, **kwargs):
+            # ensure we only use expected signature (Linear: x)
+            if args or kwargs:
+                return self._original_forward(x, *args, **kwargs)
+
+            module = self.module
+            device = self.manager.process_device
+            if device.type != "cuda":
+                return self._original_forward(x)
+
+            cpu_bufs = {
+                n: b
+                for n, b in module._buffers.items()
+                if b is not None and b.device.type == "cpu"
+            }
+            bias = module._parameters.get("bias", None)
+            bias_cpu = (
+                bias.data
+                if bias is not None and bias.data.device.type == "cpu"
+                else None
+            )
+            if not cpu_bufs and bias_cpu is None:
+                # already resident on device
+                return self._original_forward(x)
+
+            state = _get_device_state(device)
+            d = state["depth"]
+            idx = state["forward_clk"]
+            state["forward_clk"] = (idx + 1) % d
+            ts = state["transfer_stream"]
+            # the guard makes current_stream() resolve to the process device and
+            # keeps that device's context active for the quantizer's triton
+            # kernels (nothing sets the global current device, so it is 0 even
+            # when training on another gpu)
+            with torch.cuda.device(device):
+                with torch.cuda.stream(ts):
+                    ts.wait_event(state["fwd_slot_free"][idx])
+                    gpu_bufs = {
+                        n: b.to(device, non_blocking=True) for n, b in cpu_bufs.items()
+                    }
+                    gpu_bias = (
+                        bias_cpu.to(device, non_blocking=True)
+                        if bias_cpu is not None
+                        else None
+                    )
+                    state["w_buffers"][idx] = gpu_bufs
+                    state["b_buffers"][idx] = gpu_bias
+                    state["fwd_slot_ready"][idx].record()
+                torch.cuda.current_stream().wait_event(state["fwd_slot_ready"][idx])
+
+                # swap the quantized state onto the device, run the quantizer's own
+                # forward, then swap the pinned CPU state back
+                for n, t in gpu_bufs.items():
+                    module._buffers[n] = t
+                if gpu_bias is not None:
+                    bias.data = gpu_bias
+                try:
+                    out = self._original_forward(x)
+                finally:
+                    for n, t in cpu_bufs.items():
+                        module._buffers[n] = t
+                    if bias_cpu is not None:
+                        bias.data = bias_cpu
+                _release_forward_slot(state, idx)
+            return out
+
+        self._install_base_forward(_mm_forward)
+
         self.module._memory_management_device = self.manager.process_device
 
 

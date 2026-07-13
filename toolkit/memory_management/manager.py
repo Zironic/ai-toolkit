@@ -9,6 +9,7 @@ import torch
 from .manager_modules import (
     LinearLayerMemoryManager,
     ConvLayerMemoryManager,
+    OstrisLinearLayerMemoryManager,
     _DEVICE_STATE,
     _is_quantized_tensor,
     _profile_is_pinned,
@@ -80,11 +81,11 @@ def _env(name, default=None):
         return os.environ[old]
     return default
 
-
 LINEAR_MODULES = [
     "Linear",
     "LoRACompatibleLinear",
     "QLinear",
+    'OstrisLinear',
 ]
 CONV_MODULES = [
     "Conv2d",
@@ -728,7 +729,12 @@ class MemoryManager:
             key=lambda pair: cls._interleave_priority(pair[0], n_deferred),
         ):
             if kind == "linear":
-                LinearLayerMemoryManager.attach(child_module, module._memory_manager)
+                layer_manager = (
+                    OstrisLinearLayerMemoryManager
+                    if getattr(child_module, "is_ostris_quantized", False)
+                    else LinearLayerMemoryManager
+                )
+                layer_manager.attach(child_module, module._memory_manager)
                 # attach to ARA as well
                 if hasattr(child_module, "ara_lora_ref"):
                     ara = child_module.ara_lora_ref()
@@ -1008,7 +1014,9 @@ class MemoryManager:
             # persists across this detach/attach cycle by design.
             if getattr(child, "_mm_arena_block", None) is None:
                 for param_name in ("weight", "bias"):
-                    param = getattr(child, param_name, None)
+                    # OstrisLinear.weight is a property that materializes a full
+                    # dequantized weight, so inspect registered parameters directly.
+                    param = child._parameters.get(param_name, None)
                     if param is None or not isinstance(param, torch.nn.Parameter):
                         continue
                     try:
@@ -1030,6 +1038,20 @@ class MemoryManager:
                     except Exception:
                         pass
             child._mm_pinned_bytes = 0
+
+            if getattr(child, "is_ostris_quantized", False):
+                # move quantized buffers home and unpin them (clone drops pinning)
+                for buf_name, buf in list(child._buffers.items()):
+                    if buf is None:
+                        continue
+                    try:
+                        if buf.device.type != "cpu":
+                            buf = buf.to("cpu")
+                        if buf.is_pinned():
+                            buf = buf.clone()
+                        child._buffers[buf_name] = buf
+                    except Exception:
+                        pass
 
             del child._layer_memory_manager
             if hasattr(child, "_memory_management_device"):
@@ -1188,6 +1210,11 @@ class MemoryManager:
                     total += param.numel() * 2
             else:
                 total += cls._tensor_storage_bytes(param.data)
+        if getattr(module, "is_ostris_quantized", False):
+            total += sum(
+                cls._tensor_storage_bytes(buffer)
+                for buffer in module.buffers(recurse=False)
+            )
         return total
 
     @classmethod
@@ -1199,6 +1226,11 @@ class MemoryManager:
                 total += param.numel() * 2
             else:
                 total += cls._tensor_storage_bytes(param.data)
+        if getattr(module, "is_ostris_quantized", False):
+            total += sum(
+                cls._tensor_storage_bytes(buffer)
+                for buffer in module.buffers(recurse=False)
+            )
         return total
 
     @staticmethod
@@ -1219,6 +1251,22 @@ class MemoryManager:
 
     @staticmethod
     def _trace_bytes_for_module(module):
+        if getattr(module, "is_ostris_quantized", False):
+            storage = sum(
+                MemoryManager._tensor_storage_bytes(buffer)
+                for buffer in module.buffers(recurse=False)
+            )
+            materialized = storage
+            in_features = getattr(module, "in_features", None)
+            out_features = getattr(module, "out_features", None)
+            dtype = getattr(module, "ostris_orig_dtype", None)
+            if in_features is not None and out_features is not None and dtype is not None:
+                try:
+                    element_size = torch.empty((), dtype=dtype).element_size()
+                    materialized = int(in_features) * int(out_features) * element_size
+                except Exception:
+                    pass
+            return storage, materialized
         weight = getattr(module, "weight", None)
         if weight is None:
             return 0, 0
@@ -2539,7 +2587,12 @@ class MemoryManager:
         if lmm is None:
             return False
         device = lmm.manager.process_device
+        if getattr(child, "is_ostris_quantized", False):
+            # Release shared-budget pins while their CPU tensors are still
+            # installed; the resident form below owns device buffers instead.
+            unpin_layer(child)
         original_params = dict(child._parameters)
+        original_buffers = dict(child._buffers)
         original_data = {
             name: param.data for name, param in child._parameters.items()
             if param is not None
@@ -2568,6 +2621,10 @@ class MemoryManager:
                     param.data = param.data.to(device)
                 if hasattr(param, "_is_memory_managed"):
                     del param._is_memory_managed
+            if getattr(child, "is_ostris_quantized", False):
+                for name, buf in list(child._buffers.items()):
+                    if buf is not None:
+                        child._buffers[name] = buf.to(device)
         except Exception:
             for name, param in original_params.items():
                 if param is not None and name in original_data:
@@ -2580,6 +2637,8 @@ class MemoryManager:
                 child._parameters[name] = param
                 if param is not None and name in child.__dict__:
                     object.__setattr__(child, name, param)
+            child._buffers.clear()
+            child._buffers.update(original_buffers)
             raise
 
         # Same chain-aware unwind as detach: the recorded slot may hold a LoRA
@@ -2607,7 +2666,12 @@ class MemoryManager:
 
         name = child.__class__.__name__
         if name in LINEAR_MODULES:
-            LinearLayerMemoryManager.attach(child, manager)
+            layer_manager = (
+                OstrisLinearLayerMemoryManager
+                if getattr(child, "is_ostris_quantized", False)
+                else LinearLayerMemoryManager
+            )
+            layer_manager.attach(child, manager)
         elif name in CONV_MODULES:
             ConvLayerMemoryManager.attach(child, manager)
         else:
