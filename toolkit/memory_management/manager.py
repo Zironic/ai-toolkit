@@ -488,82 +488,6 @@ class MemoryManager:
                     target_device = arg
                     break
 
-        immutable_backend = bool(
-            getattr(self.module, "_mm_immutable_backend", False)
-        )
-
-        if immutable_backend:
-            # Canonical Parameters are permanent CPU arena views. A whole-model
-            # dtype conversion would mutate or replace those views, so dtype is
-            # intentionally ignored here. The checkpoint was already loaded and
-            # quantized/cast to its canonical storage dtype before arena creation.
-            if target_device is None:
-                return self.module
-
-            target_device = torch.device(target_device)
-
-            # Move only noncanonical singleton state:
-            #
-            #   - norms, embeddings, modulation layers, buffers, etc.
-            #   - singleton leaves selected as resident by the legacy singleton
-            #     manager
-            #
-            # Canonical leaves and streamed singleton leaves are skipped by
-            # _move_unmanaged_parameters().
-            MemoryManager._move_unmanaged_parameters(
-                self.module,
-                target_device,
-            )
-
-            # The first CUDA placement realizes the immutable cold-start residency
-            # plan. That plan was already computed from:
-            #
-            #   free VRAM
-            #   - WDDM planning margin
-            #   - cold-start working reserve
-            #   - stream/ring requirement
-            #
-            # Do not recompute residency here and do not infer it from
-            # unmanaged_modules.
-            if (
-                target_device.type == "cuda"
-                and not getattr(
-                    self,
-                    "_immutable_initial_placement_done",
-                    False,
-                )
-            ):
-                residency = getattr(
-                    self.module,
-                    "_mm_residency_state",
-                    None,
-                )
-                training_plan = getattr(
-                    self.module,
-                    "_mm_immutable_training_plan",
-                    None,
-                )
-
-                if residency is None or training_plan is None:
-                    raise RuntimeError(
-                        "Immutable arena is active, but its residency state or "
-                        "cold-start training plan is missing"
-                    )
-
-                # Another explicit phase boundary may already have activated a
-                # training or sampling plan. Never overwrite such a phase merely
-                # because generic framework code called model.to(cuda).
-                if residency.plan.phase == "empty":
-                    residency.reconcile(training_plan)
-
-                self._immutable_initial_placement_done = True
-
-            return self.module
-
-        # ------------------------------------------------------------------
-        # Legacy offload backends
-        # ------------------------------------------------------------------
-
         # Device-only moves need special handling for TorchAO Parameters.
         if target_device is not None and dtype is None:
             MemoryManager._move_unmanaged_parameters(
@@ -1139,8 +1063,6 @@ class MemoryManager:
         """Move tensor-subclass weights by replacing each complete Parameter."""
         target = torch.device(device)
         for child in module.modules():
-            if getattr(child, "_mm_canonical_leaf", False):
-                continue
             for name, param in list(child._parameters.items()):
                 if param is None or not _is_quantized_tensor(param.data):
                     continue
@@ -1168,8 +1090,6 @@ class MemoryManager:
         target = torch.device(device)
         MemoryManager._move_quantized_parameters(module, target)
         for child in module.modules():
-            if getattr(child, "_mm_canonical_leaf", False):
-                continue
             for param in child._parameters.values():
                 if param is None or _is_quantized_tensor(param.data):
                     continue
@@ -1185,11 +1105,6 @@ class MemoryManager:
         target = torch.device(device)
         for child in module.modules():
             if hasattr(child, "_layer_memory_manager"):
-                continue
-            if getattr(child, "_mm_canonical_leaf", False):
-                # Immutable-arena leaves are permanent CPU views. Device
-                # residency lives in manager-owned sidecars; every whole-model
-                # movement path must leave the canonical Parameter untouched.
                 continue
             if getattr(child, "_mm_ingraph_pack_source", False):
                 # Ingraph-streamed linear: its manager hijack was stripped for
@@ -2690,19 +2605,6 @@ class MemoryManager:
         if child is None or hasattr(child, "_layer_memory_manager"):
             return False
 
-        if (
-            getattr(manager, "_attach_args", {}).get("training_strategy")
-            == "smart_immutable"
-            and any(
-                parameter.requires_grad
-                for parameter in child.parameters(recurse=False)
-            )
-        ):
-            raise RuntimeError(
-                "immutable training attempted to demote a trainable module: "
-                f"{layer_key or child.__class__.__name__}"
-            )
-
         name = child.__class__.__name__
         if name in LINEAR_MODULES:
             LinearLayerMemoryManager.attach(child, manager)
@@ -2807,11 +2709,6 @@ class MemoryManager:
         wddm_spill_reserve_pct=None,
         use_pinned_arena=False,
     ):
-        if getattr(module, "_mm_immutable_backend", False):
-            mm = getattr(module, "_memory_manager", None)
-            if mm is None or getattr(mm, "_smart_training_plan", None) is None:
-                raise RuntimeError("immutable backend is missing its smart plan")
-            return mm._smart_training_plan
         cls._apply_wddm_hard_allocator_cap(device, wddm_hard_gib)
         ignore_modules = list(ignore_modules or [])
         pinned_resident_keys = set(pinned_resident_keys or ())
@@ -3000,152 +2897,6 @@ class MemoryManager:
             cls._attach_prefetch_pool(module, device)
         return plan
 
-
-    @classmethod
-    def attach_smart_training_immutable(
-        cls,
-        module,
-        device,
-        *,
-        canonical_modules,
-        working_reserve_gib=2.0,
-        ignore_modules=None,
-        wddm_margin_gib=None,
-        wddm_hard_gib=None,
-        fp8_training_forward=False,
-        pinned_resident_keys=None,
-        block_stream_only=False,
-        wddm_spill_reserve_pct=None,
-        eager_promote_free_gib=0.0,
-        eager_promote_max_blocks=4,
-    ):
-        """Attach the legacy manager only to non-canonical singleton leaves.
-
-        The planner still sees every Linear, so its per-Linear residency
-        decision feeds ``ResidencyPlan.from_smart_plan`` for canonical block
-        sidecars. The mutation mechanism is split: canonical leaves are ignored
-        by legacy attach/move paths, while singleton layers keep the established
-        manager behavior. Compiled canonical layouts are fixed after this cold
-        plan, so live legacy autotune is deliberately disabled for this backend.
-        """
-        cls._apply_wddm_hard_allocator_cap(device, wddm_hard_gib)
-        planner_ignore = list(ignore_modules or [])
-        canonical_modules = list(canonical_modules or [])
-        canonical_ids = {id(child) for child in canonical_modules}
-        pinned_resident_keys = set(pinned_resident_keys or ())
-        try:
-            auto_working_reserve = float(working_reserve_gib) < 0
-        except (TypeError, ValueError):
-            auto_working_reserve = str(working_reserve_gib).lower() == "auto"
-        if auto_working_reserve:
-            working_reserve_gib = cls._training_auto_seed_working_reserve_gib()
-        resolved_hard = (
-            float(_env("AI_TOOLKIT_TRAINING_WDDM_HARD_GIB", "1.0"))
-            if wddm_hard_gib is None
-            else float(wddm_hard_gib)
-        )
-        resolved_margin = cls._resolve_wddm_margin_gib(
-            device, wddm_margin_gib, hard_gib=resolved_hard
-        )
-        bounce_pool.set_spill_reserve_policy(
-            floor_gib=resolved_margin, pct=wddm_spill_reserve_pct
-        )
-        plan = cls.smart_training_plan(
-            module,
-            device,
-            working_reserve_gib,
-            planner_ignore,
-            wddm_margin_gib=resolved_margin,
-            wddm_hard_gib=resolved_hard,
-            pinned_resident_keys=pinned_resident_keys,
-            cold_growth=not auto_working_reserve,
-            block_stream_only=block_stream_only,
-        )
-        legacy_ignore = list(
-            dict.fromkeys(planner_ignore + canonical_modules)
-        )
-        legacy_ignore_ids = {id(child) for child in legacy_ignore}
-
-        runtime_candidate_ids = {
-            id(child)
-            for _name, child in module.named_modules()
-            if id(child) not in legacy_ignore_ids
-            and (
-                child.__class__.__name__ in LINEAR_MODULES
-                or child.__class__.__name__ in CONV_MODULES
-            )
-        }
-        plan["singleton_resident_bytes"] = int(sum(
-            cls._module_bytes(child)
-            for child in module.modules()
-            if id(child) in runtime_candidate_ids
-        ))
-        plan["largest_singleton_bf16_dequant_bytes"] = int(max(
-            (
-                child.weight.data.qdata.numel() * 2
-                for child in module.modules()
-                if id(child) in runtime_candidate_ids
-                and isinstance(getattr(child, "weight", None), torch.nn.Parameter)
-                and hasattr(child.weight.data, "qdata")
-                and child.weight.data.qdata.dtype == torch.float8_e4m3fn
-            ),
-            default=0,
-        ))
-
-        # The immutable runtime is the sole backend: the canonical blocks
-        # stream through the arena, and every non-canonical singleton module
-        # (tmlp, tproj, first/last projections, text fusion, ...) stays
-        # resident. Offloading singletons would install per-Linear streaming
-        # forwards (LinearLayerMemoryManager._mm_forward) that both defeat the
-        # resident-singleton design and crash compiled sampling. Keep them
-        # resident by streaming nothing here; the planner output still drives
-        # canonical block sidecars via ResidencyPlan.from_smart_plan.
-        if hasattr(module, "_memory_manager"):
-            raise RuntimeError(
-                "immutable backend requires exclusive memory-manager attachment"
-            )
-        mm = cls(module, device, pinned_weight_gib=0.0)
-        module._memory_manager = mm
-        mm._attach_args = {
-            "device": device,
-            "offload_percent": 0.0,
-            "ignore_modules": list(legacy_ignore),
-            "training_strategy": "smart_immutable",
-            "pinned_weight_gib": 0.0,
-            "use_pinned_arena": False,
-        }
-        module._mm_to = module.to
-        module.to = mm.memory_managed_to
-        mm.unmanaged_modules.extend(legacy_ignore)
-        mm._training_runtime_candidate_ids = set(runtime_candidate_ids)
-        mm._smart_training_plan = plan
-        mm._training_must_resident_keys = set(
-            plan.get("must_resident_layer_keys", ())
-        )
-
-        mm._training_pinned_resident_keys = pinned_resident_keys
-        mm._training_block_stream_only = bool(block_stream_only)
-        mm._training_autotune_enabled = bool(auto_working_reserve)
-        mm._training_eager_promote_free_gib = max(
-            0.0, float(eager_promote_free_gib or 0.0)
-        )
-        mm._training_eager_promote_max_blocks = max(
-            1, int(eager_promote_max_blocks or 1)
-        )
-        mm._immutable_planner_ignore_modules = planner_ignore
-        mm._canonical_leaf_ids = canonical_ids
-        module._mm_canonical_leaf_ids = canonical_ids
-        module._mm_immutable_planner_ignore_modules = planner_ignore
-        fp8_requested = bool(
-            fp8_training_forward
-            and torch.device(device).type == "cuda"
-            and torch.cuda.get_device_capability(device) >= (8, 9)
-        )
-        mm._fp8_training_requested = fp8_requested
-        cls._refresh_training_fp8_flags(module, mm)
-        if _OFFLOAD_PREFETCH_ENABLED and torch.device(device).type == "cuda":
-            cls._attach_prefetch_pool(module, device)
-        return plan
 
     @classmethod
     def _training_layout_candidates(cls, module, ignore_modules=None, pinned_resident_keys=None):
@@ -3400,16 +3151,7 @@ class MemoryManager:
 
     @classmethod
     def _next_promotion_layer_bytes(cls, module, mm):
-        """Return resident bytes for the next runtime block or legacy layer."""
-        runtime = getattr(module, "_immutable_runtime", None)
-        next_runtime_block = getattr(
-            runtime,
-            "next_training_promotion_bytes",
-            None,
-        )
-        if next_runtime_block is not None:
-            return int(next_runtime_block())
-
+        """Return resident bytes for the next legacy streamed layer."""
         args = getattr(mm, "_attach_args", {}) or {}
         pinned_keys = set(
             getattr(mm, "_training_pinned_resident_keys", set())
@@ -3437,69 +3179,6 @@ class MemoryManager:
     def _promote_training_layer(
         cls, module, mm, device, *, cache_pad_gib, wddm_stop_gib, max_blocks=1
     ):
-        runtime = getattr(module, "_immutable_runtime", None)
-        promote_runtime = getattr(
-            runtime,
-            "increase_training_residency",
-            None,
-        )
-        if promote_runtime is not None:
-            driver_free_bytes = vram_budget.device_free_bytes(device)
-            allocatable_bytes = cls._torch_allocatable_bytes(device)
-            allocator_cached_bytes = max(
-                0,
-                allocatable_bytes - driver_free_bytes,
-            )
-            gib = 1024 ** 3
-            cache_pad_bytes = int(float(cache_pad_gib) * gib)
-            stop_bytes = int(float(wddm_stop_gib) * gib)
-            available_growth_bytes = max(
-                0,
-                allocator_cached_bytes
-                + max(0, driver_free_bytes - stop_bytes)
-                - cache_pad_bytes,
-            )
-            result = promote_runtime(
-                available_growth_bytes,
-                max_blocks=max(1, int(max_blocks)),
-            )
-            if not result.get("added_blocks"):
-                return 0, "no_immutable_block_fits"
-
-            try:
-                torch.cuda.synchronize(device)
-                free_after = vram_budget.device_free_bytes(device)
-            except Exception:
-                free_after = stop_bytes
-            if free_after < stop_bytes:
-                previous_plan = result["previous_plan"]
-                runtime.set_residency_plan(previous_plan)
-                module._mm_immutable_training_plan = previous_plan
-                return 0, "validated_low_free"
-
-            actual_growth = int(
-                result.get("actual_growth_bytes", 0) or 0
-            )
-            updated_plan = dict(
-                getattr(mm, "_smart_training_plan", {}) or {}
-            )
-            updated_plan["resident_bytes"] = (
-                int(updated_plan.get("resident_bytes", 0))
-                + actual_growth
-            )
-            updated_plan["generic_resident_bytes"] = (
-                int(updated_plan.get("generic_resident_bytes", 0))
-                + actual_growth
-            )
-            updated_plan["offloaded_layers"] = max(
-                0,
-                int(updated_plan.get("offloaded_layers", 0))
-                - len(result.get("added_leaf_keys", ())),
-            )
-            mm._smart_training_plan = updated_plan
-            cls._invalidate_manual_training_shape_peaks(mm)
-            return len(result["added_blocks"]), "promote_immutable_block"
-
         args = getattr(mm, "_attach_args", {}) or {}
         pinned_keys = set(getattr(mm, "_training_pinned_resident_keys", set()))
         candidates = [
@@ -3820,7 +3499,6 @@ class MemoryManager:
                     "before": before,
                     "after": pressure,
                     "allocator_cache_reclaimed_bytes": cache_reclaimed,
-                    "canonical_relief": None,
                     "shape_peak_invalidated": False,
                 }
 
@@ -3845,76 +3523,8 @@ class MemoryManager:
             int(max(dxgi_gap_gib, physical_gap_gib) * gib),
         )
 
-        # Second relief rung: immutable canonical sidecars. The extension-owned
-        # executor reconciles a subset-only TRAIN plan and rebuilds its program;
-        # legacy demote_layer must never touch canonical host Parameters.
-        canonical_relief = None
-        canonical_relieved_bytes = 0
-        executor = getattr(module, "_immutable_runtime", None)
-        reduce_canonical = getattr(
-            executor, "reduce_training_residency", None
-        )
-        if reduce_canonical is not None and required_relief_bytes > 0:
-            canonical_relief = reduce_canonical(required_relief_bytes)
-            relieved_bytes = int(
-                canonical_relief.get("relieved_bytes", 0) or 0
-            )
-            canonical_relieved_bytes = relieved_bytes
-            if relieved_bytes:
-                cls._invalidate_manual_training_shape_peaks(mm)
-                updated_plan = dict(plan)
-                updated_plan["resident_bytes"] = max(
-                    0,
-                    int(updated_plan.get("resident_bytes", 0))
-                    - relieved_bytes,
-                )
-                updated_plan["generic_resident_bytes"] = max(
-                    0,
-                    int(updated_plan.get("generic_resident_bytes", 0))
-                    - relieved_bytes,
-                )
-                updated_plan["offloaded_layers"] = int(
-                    updated_plan.get("offloaded_layers", 0)
-                ) + len(canonical_relief.get("removed_leaf_keys", ()))
-                mm._smart_training_plan = updated_plan
-                plan = updated_plan
-
-                remaining_gap = max(
-                    0, required_relief_bytes - relieved_bytes
-                )
-                remaining_adjustable = int(
-                    canonical_relief.get(
-                        "remaining_adjustable_bytes", 0
-                    )
-                    or 0
-                )
-                if remaining_gap == 0 or remaining_adjustable > 0:
-                    pressure = {
-                        "source": before.get("source"),
-                        "pressure": None,
-                        "prediction_valid": False,
-                        "reason": "canonical_layout_changed_relearn_required",
-                    }
-                    return {
-                        "manual_safety": not bool(
-                            getattr(mm, "_training_autotune_enabled", False)
-                        ),
-                        "action": "prestep_reduce_canonical",
-                        "demoted_layers": 0,
-                        "source": before.get("source"),
-                        "before": before,
-                        "after": pressure,
-                        "allocator_cache_reclaimed_bytes": cache_reclaimed,
-                        "required_relief_bytes": required_relief_bytes,
-                        "canonical_relief": canonical_relief,
-                        "learned_peak_allocated_gib": learned_peak_gib,
-                        "learned_peak_reserved_gib": learned_peak_reserved_gib,
-                        "shape_peak_invalidated": True,
-                    }
-
-        # Final emergency rung: only non-canonical singleton leaves are eligible
-        # for the legacy manager. This runs only when canonical relief is absent
-        # or exhausted while a predicted hard-floor deficit remains.
+        # Final emergency rung: demote legacy-managed layers when reclaiming idle
+        # allocator cache did not restore the dedicated-memory safety floor.
         demoted = 0
         if max_demote > 0:
             demoted = cls._demote_training_layers(
@@ -3933,31 +3543,25 @@ class MemoryManager:
             print(
                 "[MemoryManager] pre-step training guard: "
                 f"cache_reclaimed={cache_reclaimed / gib:.2f} GiB "
-                f"canonical_relieved={canonical_relieved_bytes / gib:.2f} GiB "
-                f"singleton_demoted={demoted}; "
+                f"demoted={demoted}; "
                 + (
                     "layout changed, relearning"
-                    if demoted or canonical_relieved_bytes
+                    if demoted
                     else "no relief available"
                 )
             )
         return {
             "manual_safety": not bool(getattr(mm, "_training_autotune_enabled", False)),
-            "action": (
-                "prestep_reduce_canonical_and_demote_singleton"
-                if demoted and canonical_relieved_bytes
-                else ("prestep_demote_singleton" if demoted else "prestep_unavailable")
-            ),
+            "action": "prestep_demote" if demoted else "prestep_unavailable",
             "demoted_layers": demoted,
             "source": before.get("source"),
             "before": before,
             "after": pressure,
             "allocator_cache_reclaimed_bytes": cache_reclaimed,
             "required_relief_bytes": required_relief_bytes,
-            "canonical_relief": canonical_relief,
             "learned_peak_allocated_gib": learned_peak_gib,
             "learned_peak_reserved_gib": learned_peak_reserved_gib,
-            "shape_peak_invalidated": bool(demoted or canonical_relieved_bytes),
+            "shape_peak_invalidated": bool(demoted),
         }
 
     @classmethod
@@ -4280,54 +3884,10 @@ class MemoryManager:
         # cliff before ordinary prefetch repair or resident growth. Default relief
         # is unpin-to-pageable; promotion is allowed only with roomy dedicated VRAM.
         if move == "down":
-            runtime = getattr(module, "_immutable_runtime", None)
-            reduce_runtime = getattr(
-                runtime,
-                "reduce_training_residency",
-                None,
+            changed_layers = cls._demote_training_layers(
+                module, mm, retreat_layers, largest=True
             )
-            if reduce_runtime is not None:
-                relief = reduce_runtime(
-                    max(1, int(float(retreat_gib) * gib))
-                )
-                changed_layers = len(relief.get("removed_blocks", ()))
-                relieved_bytes = int(
-                    relief.get("relieved_bytes", 0) or 0
-                )
-                if relieved_bytes:
-                    updated_plan = dict(
-                        getattr(mm, "_smart_training_plan", {}) or {}
-                    )
-                    updated_plan["resident_bytes"] = max(
-                        0,
-                        int(updated_plan.get("resident_bytes", 0))
-                        - relieved_bytes,
-                    )
-                    updated_plan["generic_resident_bytes"] = max(
-                        0,
-                        int(updated_plan.get("generic_resident_bytes", 0))
-                        - relieved_bytes,
-                    )
-                    updated_plan["offloaded_layers"] = (
-                        int(updated_plan.get("offloaded_layers", 0))
-                        + len(relief.get("removed_leaf_keys", ()))
-                    )
-                    mm._smart_training_plan = updated_plan
-                    cls._invalidate_manual_training_shape_peaks(mm)
-                layout_action = (
-                    "demote_immutable_block"
-                    if changed_layers
-                    else "demote_unavailable"
-                )
-            else:
-                changed_layers = cls._demote_training_layers(
-                    module, mm, retreat_layers, largest=True
-                )
-                layout_action = (
-                    "demote"
-                    if changed_layers
-                    else "demote_unavailable"
-                )
+            layout_action = "demote" if changed_layers else "demote_unavailable"
             state["stopped"] = False
         elif shared_relief != "hold":
             changed_layers, layout_action, released_bytes = cls._relieve_shared_cliff(
@@ -4351,10 +3911,7 @@ class MemoryManager:
                     f"shared_margin={(shared_snapshot or {}).get('margin_gib')} GiB "
                     f"dedicated_free={min_device_free_gib:.2f} GiB"
                 )
-        elif (
-            prefetch_recovery_action is not None
-            and getattr(module, "_immutable_runtime", None) is None
-        ):
+        elif prefetch_recovery_action is not None:
             cls._invalidate_manual_training_shape_peaks(mm)
             if prefetch_invalid:
                 invalidate_offload_trace_for_shape(shape_key)
@@ -4877,17 +4434,11 @@ class MemoryManager:
             return bias is None or _profile_is_pinned(bias.data)
 
         if not sources:
-            # No legacy per-Linear streamed layers on this module at all (e.g.
-            # the immutable/arena backend, whose canonical block transfers go
-            # through pin_manager + the device-side fetch ring and MANDATE a
-            # pinned host source -- see ingraph_stream._fetch_start_impl,
-            # which raises rather than reading a pageable tensor). There is
-            # nothing this pool could ever bounce, so it would just burn WDDM
-            # shared-budget pinned buffers for no transfers. Don't create one.
+            # There is nothing this pool could ever bounce, so it would just
+            # burn WDDM shared-budget pinned buffers for no transfers.
             print(
                 "[MemoryManager] bounce pool disabled: no legacy-managed "
-                "streamed layers on this module (arena/immutable block "
-                "streaming requires pinned sources and never uses the pool)"
+                "streamed layers on this module"
             )
             return
         if all(_layer_pinned(child) for _, child in sources):

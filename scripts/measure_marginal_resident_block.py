@@ -59,6 +59,10 @@ from extensions_built_in.diffusion_models.krea2.krea2 import (  # noqa: E402
 from toolkit.basic import flush  # noqa: E402
 from toolkit.memory_management import ingraph_stream, vram_budget  # noqa: E402
 from toolkit.memory_management.manager import MemoryManager  # noqa: E402
+from toolkit.memory_management.runtime import (  # noqa: E402
+    close_memory_runtime,
+    get_memory_runtime,
+)
 from toolkit.util.quantize import quantize_model  # noqa: E402
 
 GIB = 1024 ** 3
@@ -195,13 +199,15 @@ def _run_step(model, transformer, network, embeds, optimizer, trainable, args, g
     )
     target = (noise.float() - latents.float()).detach()
 
-    executor = transformer._immutable_runtime
+    memory_runtime = get_memory_runtime(transformer)
+    if memory_runtime is None:
+        raise RuntimeError("arena runtime is not attached")
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
     retries_before = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
     frames_before = sum(torch._dynamo.utils.counters["frames"].values())
     t0 = time.perf_counter()
-    with executor.execution(executor.TRAIN), network:
+    with memory_runtime.training_step(), network:
         # Diff-output preservation, as SDTrainer runs it: a no-grad prior
         # prediction with the network switched OFF, then -- after the main
         # forward -- a SECOND grad-enabled forward whose output is pulled back
@@ -344,8 +350,6 @@ def main():
         compile_cache_key = _train_compile_cache_key(model)
         if load_compile_cache(args.compile_cache_dir, compile_cache_key):
             print(f"[s0] loaded compile mega-cache ({compile_cache_key})")
-
-    from toolkit.memory_management.runtime import get_memory_runtime
 
     memory_runtime = get_memory_runtime(transformer)
     if memory_runtime is None:
@@ -578,7 +582,7 @@ def main():
         out.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         print(f"[s0] wrote {out}")
 
-    transformer.disable_immutable_runtime()
+    close_memory_runtime(transformer)
 
 
 if __name__ == "__main__":

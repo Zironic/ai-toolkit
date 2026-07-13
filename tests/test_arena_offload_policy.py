@@ -196,7 +196,7 @@ def test_training_cap_binding_uses_configured_phase_margin(monkeypatch):
     runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
     runtime._device = "cuda:1"
     runtime._config = SimpleNamespace(
-        legacy=SimpleNamespace(wddm_hard_gib=1.25)
+        _policy=SimpleNamespace(wddm_hard_gib=1.25)
     )
 
     runtime._bind_training_cap()
@@ -417,7 +417,7 @@ def test_bf16_sampling_reserves_largest_singleton_dequant(monkeypatch):
     }
     runtime._config = SimpleNamespace(
         fp8_sampling=False,
-        legacy=SimpleNamespace(
+        _policy=SimpleNamespace(
             sampling_working_reserve_gib="auto",
             sampling_wddm_hard_gib=1.0,
             sampling_wddm_margin_gib=1.0,
@@ -468,11 +468,9 @@ def test_bootstrap_uses_min_physical_free_and_one_gib_margin():
     runtime._bootstrap_block_keys = ()
     runtime._last_step_num = 2
     runtime._config = SimpleNamespace(
-        legacy=SimpleNamespace(wddm_hard_gib=1.0)
+        _policy=SimpleNamespace(wddm_hard_gib=1.0)
     )
-    runtime._model = SimpleNamespace(
-        _mm_immutable_protected_training_leaf_keys=frozenset()
-    )
+    runtime._model = SimpleNamespace()
     runtime._arena = SimpleNamespace(
         block_keys=lambda: tuple(records),
         block_record=lambda key: records[key],
@@ -512,7 +510,7 @@ def test_arena_allocation_failure_drains_and_rolls_back(monkeypatch):
     runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
     runtime._device = "cpu"
     runtime._config = SimpleNamespace(
-        legacy=SimpleNamespace(wddm_hard_gib=1.0)
+        _policy=SimpleNamespace(wddm_hard_gib=1.0)
     )
     runtime._last_training_cap_target_bytes = None
     runtime._signals = TrainingSignalWindow()

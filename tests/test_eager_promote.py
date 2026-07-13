@@ -3,14 +3,12 @@
 The default climb promotes one block per cadence window and stops at the WDDM
 hold floor, which strands VRAM on a roomy card. The eager knob turns that into a
 bulk fill down to a configured free-margin target. These cover the pure block-count
-policy and the config plumbing that reaches it; the controller wiring itself is
-exercised on the GPU by the training smoke.
+policy. The arena runtime no longer exposes this legacy controller knob.
 """
 
 import unittest
 
 from toolkit.memory_management import vram_budget
-from toolkit.memory_management.arena_offload.api import ArenaOffloadConfig
 
 
 def _blocks(**overrides):
@@ -69,34 +67,6 @@ class EagerPromoteBlockCountTest(unittest.TestCase):
             total_gib=16.0,
         )
         self.assertGreaterEqual(predicted, 1.0)
-
-
-class _ModelConfig:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-class EagerPromoteConfigTest(unittest.TestCase):
-    def test_defaults_to_off(self):
-        legacy = ArenaOffloadConfig.from_model_config(_ModelConfig()).legacy
-        self.assertEqual(legacy.eager_promote_free_gib, 0.0)
-        self.assertEqual(legacy.eager_promote_max_blocks, 4)
-
-    def test_reads_the_model_config(self):
-        legacy = ArenaOffloadConfig.from_model_config(
-            _ModelConfig(
-                layer_offloading_eager_promote_free_gb=3.0,
-                layer_offloading_eager_promote_max_blocks=2,
-            )
-        ).legacy
-        self.assertEqual(legacy.eager_promote_free_gib, 3.0)
-        self.assertEqual(legacy.eager_promote_max_blocks, 2)
-
-    def test_negative_margin_is_clamped_off(self):
-        legacy = ArenaOffloadConfig.from_model_config(
-            _ModelConfig(layer_offloading_eager_promote_free_gb=-1.0)
-        ).legacy
-        self.assertEqual(legacy.eager_promote_free_gib, 0.0)
 
 
 if __name__ == "__main__":

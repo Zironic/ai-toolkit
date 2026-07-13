@@ -72,6 +72,13 @@ def test_outer_runtime_finalize_close_and_sequential_reacquire():
     first.finalize()
     assert active_process_owner() is not None
     assert first.finalized
+    with first.training_step(shape_key=(16,), step_num=1):
+        pass
+    with first.sampling_session():
+        with first.sampling_image(shape_key=(16,), cold_working_bytes=0):
+            pass
+    with first.training_step(shape_key=(16,), step_num=2):
+        pass
     first.close()
     first.close()
     assert active_process_owner() is None
@@ -88,3 +95,39 @@ def test_outer_runtime_finalize_close_and_sequential_reacquire():
     )
     second.close()
     assert active_process_owner() is None
+
+
+def test_compile_enabled_runtime_reuses_same_cuda_specialization():
+    config = ArenaOffloadConfig(
+        enabled=True,
+        compile_blocks=True,
+        _compile_dynamic=False,
+    )
+    model = _Model()
+    runtime = prepare_arena_offload(
+        model,
+        device="cuda:0",
+        adapter=_Adapter(),
+        config=config,
+    )
+    runtime.finalize()
+    value = torch.randn(2, 16, device="cuda:0")
+    tvec = torch.randn(2, 16, device="cuda:0")
+    try:
+        with runtime.training_step(shape_key=(2, 16), step_num=1):
+            first = runtime.run_model(value, tvec, None, None)
+        torch.cuda.synchronize()
+        frames_after_first = int(
+            torch._dynamo.utils.counters["frames"].get("total", 0)
+        )
+        with runtime.training_step(shape_key=(2, 16), step_num=2):
+            second = runtime.run_model(value, tvec, None, None)
+        torch.cuda.synchronize()
+        frames_after_second = int(
+            torch._dynamo.utils.counters["frames"].get("total", 0)
+        )
+        torch.testing.assert_close(first, value)
+        torch.testing.assert_close(second, value)
+        assert frames_after_second == frames_after_first
+    finally:
+        runtime.close()

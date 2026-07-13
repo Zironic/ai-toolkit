@@ -71,21 +71,21 @@ def _singleton_stats(model, canonical_modules) -> tuple[int, int, set[int]]:
 def build_training_plan(model, arena, canonical_modules, device, config) -> dict:
     """Choose an initial whole-block layout without the legacy manager."""
     device = torch.device(device)
-    legacy = config.legacy
+    policy = config._policy
     try:
-        working_value = float(legacy.working_reserve_gib)
+        working_value = float(policy.working_reserve_gib)
         automatic = working_value < 0
     except (TypeError, ValueError):
-        automatic = legacy.working_reserve_gib is None or str(
-            legacy.working_reserve_gib
+        automatic = policy.working_reserve_gib is None or str(
+            policy.working_reserve_gib
         ).strip().lower() == "auto"
         working_value = DEFAULT_AUTO_WORKING_RESERVE_GIB
     if automatic:
         working_value = DEFAULT_AUTO_WORKING_RESERVE_GIB
 
-    hard_gib = float(legacy.wddm_hard_gib or 1.0)
+    hard_gib = float(policy.wddm_hard_gib or 1.0)
     margin_gib = resolve_margin_gib(
-        device, legacy.wddm_margin_gib, hard_gib=hard_gib
+        device, policy.wddm_margin_gib, hard_gib=hard_gib
     )
     free_bytes, total_bytes = vram_budget.device_mem_info(device)
     working_bytes = int(max(0.0, working_value) * GIB)
@@ -98,12 +98,12 @@ def build_training_plan(model, arena, canonical_modules, device, config) -> dict
     records = [arena.block_record(key) for key in arena.block_keys()]
     records = [record for record in records if record is not None]
     pinned_keys = training_pinned_keys_for_keep_last(
-        model, legacy.checkpoint_keep_last
+        model, policy.checkpoint_keep_last
     )
     resident_keys = {record.block_key for record in records if record.block_key in pinned_keys}
     streamed = [record for record in records if record.block_key not in resident_keys]
     largest_stream = max((record.committed_bytes for record in streamed), default=0)
-    ring_bytes = largest_stream * max(1, int(legacy.prefetch_depth))
+    ring_bytes = largest_stream * max(1, int(policy.prefetch_depth))
     usable = max(0, int(free_bytes) - margin_bytes - working_bytes)
     resident_budget = max(0, usable - singleton_bytes - ring_bytes)
     resident_bytes = sum(

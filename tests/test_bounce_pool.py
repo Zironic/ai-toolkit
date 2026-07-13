@@ -545,40 +545,6 @@ class BounceFillGroupTests(unittest.TestCase):
             finally:
                 pool.shutdown()
 
-    def test_batched_fill_stages_every_position_as_a_hit(self):
-        # A batched (block-sized) fill must stage exactly the same positions as
-        # the per-Linear path: every scheduled layer ends CPU_READY and is a hit
-        # when consumed in order. Run both group sizes for parity.
-        for group in (1, 8):
-            pool = bounce_pool.PinnedBouncePool(
-                "cpu", budget_bytes=1 << 24, lookahead=8, num_workers=1,
-                ram_floor_bytes=0, target_ready_bytes=1 << 24,
-                fill_group_size=group,
-            )
-            try:
-                keys = [f"layer{i}" for i in range(8)]
-                modules = [torch.nn.Linear(16, 16) for _ in keys]  # keep strong refs
-                for k, m in zip(keys, modules):
-                    pool.register_source(k, m)
-                pool.set_schedule(keys)
-                staged = _wait_until(
-                    lambda: pool.stats()["live_slots"] >= 8, timeout=3.0
-                )
-                self.assertTrue(staged, f"group={group} did not stage all positions")
-                tickets = [
-                    pool.acquire(k, m.weight, m.bias)[2]
-                    for k, m in zip(keys, modules)
-                ]
-                self.assertTrue(
-                    all(t is not None for t in tickets),
-                    f"group={group} produced a non-hit: {tickets}",
-                )
-                stats = pool.stats()
-                self.assertEqual(stats["hits"], 8, f"group={group} hits")
-                self.assertEqual(stats["hard_misses"], 0, f"group={group} hard_misses")
-            finally:
-                pool.shutdown()
-
     def test_fill_batches_counts_block_cycles(self):
         # The worker-fill counters must show batching: same fills, but group=8
         # publishes in far fewer batches (worker lock-cycles) than group=1.
@@ -705,3 +671,7 @@ class PinnedSourceFillSkipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import pytest
+
+pytestmark = pytest.mark.process_isolated

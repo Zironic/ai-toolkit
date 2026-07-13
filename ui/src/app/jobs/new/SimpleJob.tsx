@@ -392,23 +392,13 @@ export default function SimpleJob({
                     {modelArch?.name === 'krea2' && (
                       <>
                         <Checkbox
-                          label="Smart Transformer Offloading (Comfy-style)"
+                          label="Arena Transformer Offloading"
                           checked={jobConfig.config.process[0].model.layer_offloading_smart || false}
                           onChange={value =>
                             setJobConfig(value, 'config.process[0].model.layer_offloading_smart')
                           }
                           docKey="model.layer_offloading_smart"
                         />
-                        {jobConfig.config.process[0].model.layer_offloading_smart && (
-                          <Checkbox
-                            label="Block-Only Streaming (lower CPU)"
-                            checked={jobConfig.config.process[0].model.layer_offloading_block_stream_only || false}
-                            onChange={value =>
-                              setJobConfig(value, 'config.process[0].model.layer_offloading_block_stream_only')
-                            }
-                            docKey="model.layer_offloading_block_stream_only"
-                          />
-                        )}
                         {jobConfig.config.process[0].model.layer_offloading_smart &&
                           jobConfig.config.process[0].model.quantize &&
                           ['qfloat8', 'float8'].includes(jobConfig.config.process[0].model.qtype || '') && (
@@ -452,14 +442,16 @@ export default function SimpleJob({
                       max={100}
                       step={1}
                     />
-                    <Checkbox
-                      label="Prefetch Offloaded Layers"
-                      checked={jobConfig.config.process[0].model.layer_offloading_prefetch || false}
-                      onChange={value =>
-                        setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch')
-                      }
-                      docKey="model.layer_offloading_prefetch"
-                    />
+                    {!jobConfig.config.process[0].model.layer_offloading_smart && (
+                      <Checkbox
+                        label="Prefetch Offloaded Layers"
+                        checked={jobConfig.config.process[0].model.layer_offloading_prefetch || false}
+                        onChange={value =>
+                          setJobConfig(value, 'config.process[0].model.layer_offloading_prefetch')
+                        }
+                        docKey="model.layer_offloading_prefetch"
+                      />
+                    )}
                     {jobConfig.config.process[0].model.layer_offloading_smart &&
                       jobConfig.config.process[0].model.quantize &&
                       ['qfloat8', 'float8'].includes(jobConfig.config.process[0].model.qtype || '') && (

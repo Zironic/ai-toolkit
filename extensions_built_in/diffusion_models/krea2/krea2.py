@@ -50,9 +50,12 @@ from toolkit.accelerator import unwrap_model
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.util.quantize import (
     assign_quantized_state_dict,
+    assign_quantized_state_dict_subset,
     get_qtype,
+    prepare_quantized_state_dict_model,
     quantize,
     quantize_model,
+    tensor_subclass_leaves,
 )
 from toolkit.memory_management import MemoryManager
 from toolkit.memory_management import vram_budget
@@ -495,26 +498,85 @@ def _quantized_transformer_cache_info(base_model, checkpoint_path: str, dtype, c
     return cache_root / f"krea2_transformer_{digest}.pt", metadata
 
 
-def _try_load_quantized_transformer_cache(base_model, transformer, cache_path: Path, metadata: dict) -> bool:
+def _try_load_quantized_transformer_cache(
+    base_model,
+    transformer,
+    cache_path: Path,
+    metadata: dict,
+    *,
+    canonical_build=None,
+    canonical_adapter=None,
+    canonical_device=None,
+) -> tuple[bool, object | None]:
+    created_build = False
     if cache_path is None or not cache_path.exists():
-        return False
+        return False, canonical_build
     try:
         base_model.print_and_status_update(f"  - loading cached quantized transformer state from {cache_path}")
         payload = torch.load(str(cache_path), map_location="cpu", weights_only=False)
         if payload.get("metadata") != metadata:
             base_model.print_and_status_update("  - cached quantized transformer metadata mismatch; ignoring")
-            return False
-        assign_quantized_state_dict(
-            transformer,
-            payload["state_dict"],
-            base_model.model_config.qtype,
-        )
+            return False, canonical_build
+        state_dict = payload["state_dict"]
+        if canonical_build is None and canonical_adapter is not None:
+            prepare_quantized_state_dict_model(
+                transformer,
+                state_dict,
+                base_model.model_config.qtype,
+            )
+            transformer.requires_grad_(False)
+            canonical_build = prepare_canonical_storage(
+                transformer,
+                canonical_adapter,
+                device=canonical_device,
+            )
+            created_build = True
+        if canonical_build is None:
+            assign_quantized_state_dict(
+                transformer,
+                state_dict,
+                base_model.model_config.qtype,
+            )
+        else:
+            destinations = canonical_build.destinations
+            canonical_values = {}
+            canonical_keys = set()
+            for key, value in state_dict.items():
+                destination_key = _arena_destination_key(key)
+                if destination_key not in destinations:
+                    continue
+                leaves = tensor_subclass_leaves(value)
+                if (
+                    destination_key[2] == "weight"
+                    and len(leaves) == 2
+                    and (*destination_key[:2], "scale") in destinations
+                ):
+                    canonical_values[destination_key] = leaves[0]
+                    canonical_values[(*destination_key[:2], "scale")] = leaves[1]
+                else:
+                    canonical_values[destination_key] = value
+                canonical_keys.add(key)
+            assign_quantized_state_dict_subset(
+                transformer,
+                state_dict,
+                base_model.model_config.qtype,
+                excluded_keys=canonical_keys,
+            )
+
+            def populate(final_destinations):
+                for destination_key, value in canonical_values.items():
+                    final_destinations[destination_key].copy_(value)
+
+            canonical_build.populate(populate)
+            transformer.requires_grad_(False)
         from toolkit.dequantize import patch_dequantization_on_save
         patch_dequantization_on_save(transformer)
-        return True
+        return True, canonical_build
     except Exception as error:
+        if created_build and canonical_build is not None:
+            canonical_build.rollback()
         base_model.print_and_status_update(f"  - failed to load cached quantized transformer; rebuilding ({error})")
-        return False
+        return False, None
 
 
 def _save_quantized_transformer_cache(base_model, transformer, cache_path: Path, metadata: dict) -> None:
@@ -737,25 +799,33 @@ class Krea2Model(BaseModel):
 
         canonical_build = None
         try:
-            cache_loaded = bool(
-                stream_quantized
-                and _try_load_quantized_transformer_cache(
-                    self, transformer, cache_path, cache_metadata
+            cache_adapter = None
+            if arena_requested:
+                from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
+
+                cache_adapter = SingleStreamMMDiTAdapter()
+            cache_loaded, canonical_build = (
+                _try_load_quantized_transformer_cache(
+                    self,
+                    transformer,
+                    cache_path,
+                    cache_metadata,
+                    canonical_adapter=cache_adapter,
+                    canonical_device=self.device_torch,
                 )
+                if stream_quantized
+                else (False, None)
             )
             if cache_loaded:
                 self._transformer_quantized_during_load = True
-                if arena_requested:
-                    from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
-
-                    transformer.requires_grad_(False)
-                    canonical_build = prepare_canonical_storage(
-                        transformer,
-                        SingleStreamMMDiTAdapter(),
-                        device=self.device_torch,
-                    )
-                    _populate_canonical_build_from_model(canonical_build)
             else:
+                if stream_quantized and cache_path is not None and cache_path.exists():
+                    # Cache validation can reconstruct wrapper metadata before a
+                    # later failure. Start the ranged fallback from a pristine
+                    # meta model so no partial cache state survives.
+                    with torch.device("meta"):
+                        transformer = SingleStreamDiT(config)
+                    canonical_build = None
                 self.print_and_status_update("  - loading transformer through ranged disk reads")
                 if stream_quantized:
                     adapter = None

@@ -269,12 +269,12 @@ const docs: { [key: string]: ConfigDoc } = {
     ),
   },
   'model.layer_offloading_smart': {
-    title: 'Smart Transformer Offloading',
+    title: 'Arena Transformer Offloading',
     description: (
       <>
-        Krea 2 experimental mode. Measures free VRAM and deterministically keeps as many transformer layers resident as
-        fit after reserving memory for training and the shared transfer ring. This replaces the Transformer Offload %
-        selection while enabled.
+        Krea 2 arena backend. It owns whole-block residency, transfer, FP8 execution, and compile integration while
+        enabled. Memory budgets and transfer depth are selected automatically; Transformer Offload % applies only to
+        the legacy backend.
       </>
     ),
   },

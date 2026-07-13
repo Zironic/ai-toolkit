@@ -16,7 +16,9 @@ from smoke_runtime import GpuBusy, gpu_lock
 
 class GpuLockTests(unittest.TestCase):
     def setUp(self):
-        self.path = Path(os.environ["TEMP"]) / f"test_gpu_lock_{os.getpid()}.lock"
+        temp_dir = Path(__file__).resolve().parent.parent / ".agent" / "tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        self.path = temp_dir / f"test_gpu_lock_{os.getpid()}.lock"
         os.environ["AI_TOOLKIT_GPU_LOCK_PATH"] = str(self.path)
         os.environ.pop("AI_TOOLKIT_GPU_LOCK", None)
         os.environ.pop("AI_TOOLKIT_GPU_LOCK_WAIT", None)

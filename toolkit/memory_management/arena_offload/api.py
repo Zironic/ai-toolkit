@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
+import warnings
 
 from ..runtime import (
     RUNTIME_ATTR,
@@ -28,6 +29,26 @@ from ..runtime import (
 from .runtime import ArenaOffloadRuntime
 
 _FP8_QTYPES = ("qfloat8", "float8")
+_COMPATIBILITY_ALIASES = {
+    "layer_offloading_smart_working_reserve_gb": (
+        "layer_offloading_smart_headroom_gb",
+    ),
+    "layer_offloading_smart_wddm_margin_gb": (
+        "layer_offloading_smart_buffer_gb",
+    ),
+    "layer_offloading_smart_wddm_hard_gb": (
+        "layer_offloading_smart_hard_buffer_gb",
+    ),
+    "layer_offloading_smart_sampling_working_reserve_gb": (
+        "layer_offloading_smart_sampling_headroom_gb",
+    ),
+    "layer_offloading_smart_sampling_wddm_margin_gb": (
+        "layer_offloading_smart_sampling_buffer_gb",
+    ),
+    "layer_offloading_smart_sampling_wddm_hard_gb": (
+        "layer_offloading_smart_sampling_hard_buffer_gb",
+    ),
+}
 
 
 def unwrap(model):
@@ -41,27 +62,14 @@ def unwrap(model):
 
 
 @dataclass(frozen=True)
-class LegacyPlannerOptions:
-    """Fork-only planner knobs the Phase-1 facade still forwards verbatim.
-
-    These are NOT part of the upstream configuration surface (see Phase 8: no
-    user-facing residency / reserve / WDDM / prefetch controls). They exist so
-    Phase 1 stays behavior-preserving while planning is still delegated to the
-    legacy manager. Phase 2 replaces the training half with `policy.py` and this
-    shrinks to whatever the arena planner genuinely needs.
-    """
+class _ArenaPolicyOptions:
+    """Internal policy inputs retained while fork job aliases are migrated."""
 
     working_reserve_gib: float | None = None
     wddm_margin_gib: float | None = None
     wddm_hard_gib: float | None = None
-    wddm_spill_reserve_pct: float = 0.10
-    block_stream_only: bool = False
     checkpoint_keep_last: int = 0
     prefetch_depth: int = 2
-    # Free-margin (GiB) the live residency climb should aim to KEEP. 0 = off (the
-    # conservative one-block-per-cadence climb).
-    eager_promote_free_gib: float = 0.0
-    eager_promote_max_blocks: int = 4
 
     sampling_working_reserve_gib: float | None = None
     sampling_wddm_margin_gib: float | None = None
@@ -70,79 +78,97 @@ class LegacyPlannerOptions:
 
 @dataclass(frozen=True)
 class ArenaOffloadConfig:
-    """The whole public configuration surface of arena offload."""
+    """The narrow public configuration surface of arena offload.
+
+    Fields prefixed with ``_`` are derived integration details, not additional
+    user-facing arena controls.
+    """
 
     enabled: bool = False
     fp8_forward: bool = False
     fp8_backward: bool = False
     fp8_sampling: bool = False
     compile_blocks: bool = False
-    compile_dynamic: bool | None = True
-    compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = ()
+    _compile_dynamic: bool | None = True
+    _compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = ()
     # Validation knob: pretend the card is this many GiB, so small-card
     # behaviour (deeper streaming, tighter caps, a residency plan that cannot
     # fit) is exercisable on a bigger one. 0/None = use the real card.
-    simulated_vram_gib: float | None = None
-    # Violating the allocator cap raises instead of widening the cap. Off in
-    # production: the cap is a lever, not a kill switch.
-    wddm_cap_strict: bool = False
-
-    legacy: LegacyPlannerOptions = field(default_factory=LegacyPlannerOptions)
+    _simulated_vram_gib: float | None = None
+    _policy: _ArenaPolicyOptions = field(
+        default_factory=_ArenaPolicyOptions, repr=False
+    )
 
     @classmethod
     def from_model_config(cls, model_config) -> ArenaOffloadConfig:
         def get(name: str, default: Any = None) -> Any:
-            return getattr(model_config, name, default)
+            if hasattr(model_config, name):
+                return getattr(model_config, name)
+            for alias in _COMPATIBILITY_ALIASES.get(name, ()):
+                if hasattr(model_config, alias):
+                    return getattr(model_config, alias)
+            return default
 
         fp8_weights = bool(get("quantize", False)) and get("qtype") in _FP8_QTYPES
+        requested_forward = bool(get("layer_offloading_fp8_forward", False))
+        requested_backward = bool(get("layer_offloading_fp8_grad_input", False))
+        requested_sampling = bool(get("layer_offloading_fp8_sampling", False))
+        ignored = []
+        if not fp8_weights:
+            ignored.extend(
+                name
+                for name, requested in (
+                    ("fp8_forward", requested_forward),
+                    ("fp8_backward", requested_backward),
+                    ("fp8_sampling", requested_sampling),
+                )
+                if requested
+            )
+        elif requested_backward and not requested_forward:
+            ignored.append("fp8_backward_without_fp8_forward")
+        if ignored:
+            warnings.warn(
+                "arena offload ignored irrelevant FP8 options: "
+                + ", ".join(ignored),
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         return cls(
             enabled=bool(
                 get("layer_offloading", False)
                 and get("layer_offloading_smart", False)
             ),
-            fp8_forward=fp8_weights and bool(get("layer_offloading_fp8_forward", False)),
+            fp8_forward=fp8_weights and requested_forward,
             fp8_backward=fp8_weights
-            and bool(get("layer_offloading_fp8_grad_input", False)),
+            and requested_forward
+            and requested_backward,
             fp8_sampling=fp8_weights
-            and bool(get("layer_offloading_fp8_sampling", False)),
+            and requested_sampling,
             compile_blocks=bool(
                 get("compile", False)
                 or get("compile_sample", False)
                 or get("train_compile_blocks", False)
             ),
-            compile_dynamic=(
+            _compile_dynamic=(
                 None
                 if get("compile_dynamic", True) is None
                 else bool(get("compile_dynamic", True))
             ),
-            compile_dynamic_hints=tuple(
+            _compile_dynamic_hints=tuple(
                 tuple(hint) for hint in (get("compile_dynamic_hints", ()) or ())
             ),
-            simulated_vram_gib=(
+            _simulated_vram_gib=(
                 float(get("layer_offloading_simulated_vram_gb") or 0.0) or None
             ),
-            wddm_cap_strict=bool(get("layer_offloading_wddm_cap_strict", False)),
-            legacy=LegacyPlannerOptions(
+            _policy=_ArenaPolicyOptions(
                 working_reserve_gib=get("layer_offloading_smart_working_reserve_gb"),
                 wddm_margin_gib=get("layer_offloading_smart_wddm_margin_gb"),
                 wddm_hard_gib=get("layer_offloading_smart_wddm_hard_gb"),
-                wddm_spill_reserve_pct=float(
-                    get("layer_offloading_wddm_spill_reserve_pct", 0.10) or 0.10
-                ),
-                block_stream_only=bool(get("layer_offloading_block_stream_only", False)),
                 checkpoint_keep_last=max(
                     0, int(get("layer_offloading_checkpoint_keep_last", 0) or 0)
                 ),
                 prefetch_depth=int(get("layer_offloading_prefetch_depth", 2) or 2),
-                eager_promote_free_gib=max(
-                    0.0,
-                    float(get("layer_offloading_eager_promote_free_gb", 0.0) or 0.0),
-                ),
-                eager_promote_max_blocks=max(
-                    1,
-                    int(get("layer_offloading_eager_promote_max_blocks", 4) or 4),
-                ),
                 sampling_working_reserve_gib=get(
                     "layer_offloading_smart_sampling_working_reserve_gb"
                 ),
@@ -164,6 +190,9 @@ def prepare_canonical_storage(
     from ..canonical_arena import CanonicalArena
     from .resources import ArenaRuntimeResources
 
+    validator = getattr(adapter, "validate_transformer", None)
+    if validator is not None:
+        validator(transformer)
     resources = None
     if device is not None:
         resources = ArenaRuntimeResources(transformer, device)
@@ -203,6 +232,11 @@ def prepare_arena_offload(
 
     The runtime is published on `transformer._arena_offload_runtime`.
     """
+    if not config.enabled:
+        raise ValueError("arena_offload_not_enabled")
+    validator = getattr(adapter, "validate_transformer", None)
+    if validator is not None:
+        validator(transformer)
     return ArenaOffloadRuntime._prepare(
         transformer,
         device=device,

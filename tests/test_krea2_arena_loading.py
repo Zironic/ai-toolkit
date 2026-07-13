@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest import mock
 
 import torch
 from safetensors.torch import save_file
@@ -180,6 +181,10 @@ def test_quantized_ranged_loader_releases_each_source_before_commit(tmp_path):
         CanonicalArena.unguard_whole_model_to(transformer)
         build.arena.release()
 
+import pytest
+
+pytestmark = pytest.mark.process_isolated
+
 
 def test_quantized_cache_load_reconstructs_quanto_wrappers_on_meta_model(tmp_path):
     from optimum.quanto import freeze
@@ -198,7 +203,7 @@ def test_quantized_cache_load_reconstructs_quanto_wrappers_on_meta_model(tmp_pat
     with torch.device("meta"):
         transformer = _QuantTransformer()
 
-    loaded = _try_load_quantized_transformer_cache(
+    loaded, _build = _try_load_quantized_transformer_cache(
         _QuantBaseModel(), transformer, cache, metadata
     )
 
@@ -207,3 +212,48 @@ def test_quantized_cache_load_reconstructs_quanto_wrappers_on_meta_model(tmp_pat
     torch.testing.assert_close(
         transformer.blocks[0].linear.weight.dequantize(), expected
     )
+
+
+def test_quantized_cache_populates_final_arena_without_model_sized_assignment(tmp_path):
+    from optimum.quanto import freeze
+    from toolkit.util.quantize import get_qtype, quantize
+
+    source = _QuantTransformer()
+    quantize(source, weights=get_qtype("qfloat8"))
+    freeze(source)
+    source.requires_grad_(False)
+    expected = source.blocks[0].linear.weight.dequantize().clone()
+    metadata = {"schema": "test-direct-arena"}
+    cache = tmp_path / "tiny_quantized_arena.pt"
+    torch.save(
+        {"metadata": metadata, "state_dict": source.state_dict()}, str(cache)
+    )
+    with torch.device("meta"):
+        transformer = _QuantTransformer()
+
+    with mock.patch(
+        "extensions_built_in.diffusion_models.krea2.krea2."
+        "assign_quantized_state_dict",
+        side_effect=AssertionError("full-model cache assignment is forbidden"),
+    ):
+        loaded, build = _try_load_quantized_transformer_cache(
+            _QuantBaseModel(),
+            transformer,
+            cache,
+            metadata,
+            canonical_adapter=_TinyAdapter(),
+            canonical_device="cpu",
+        )
+
+    assert loaded
+    assert build is not None
+    assert transformer.blocks[0].linear.weight.device.type == "meta"
+    build.commit()
+    try:
+        assert transformer.blocks[0].linear.weight.device.type == "cpu"
+        torch.testing.assert_close(
+            transformer.blocks[0].linear.weight.dequantize(), expected
+        )
+    finally:
+        CanonicalArena.unguard_whole_model_to(transformer)
+        build.arena.release()

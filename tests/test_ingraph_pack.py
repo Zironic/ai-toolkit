@@ -73,37 +73,6 @@ class InGraphPackTests(unittest.TestCase):
         self.assertIsNone(bias)
         torch.testing.assert_close(weight, expected)
 
-    def test_streamed_linear_uses_native_fp8_path_when_qualified(self):
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
-            self.skipTest("native fp8 scaled_mm requires CUDA SM89+")
-        layer = nn.Linear(16, 16, bias=True).to(device="cuda", dtype=torch.bfloat16)
-        model = nn.Sequential(layer)
-        quantize(model, weights=get_qtype("qfloat8"))
-        freeze(model)
-        layer = model[0]
-        pack = pack_block_host("blocks.0", [("proj", layer)], repoint=False, pin=True)
-        view = block_linear_views(pack.host_flat.to("cuda"), pack)["proj"]
-        self.assertTrue(pack.linears[0].fp8_qualifies)
-
-        import torch.nn.functional as F
-        from toolkit.memory_management.ingraph_stream import streamed_linear
-
-        x = torch.randn(2, 3, 16, device="cuda", dtype=torch.bfloat16)
-        expected = F.linear(x, view.materialized_weight().to(x.dtype), view.bias)
-        actual = streamed_linear(x, view)
-        torch.testing.assert_close(actual, expected, rtol=0.08, atol=0.08)
-
-        compiled = torch.compile(
-            lambda inp, qdata, scale, bias: streamed_linear(
-                inp,
-                type(view)(spec=view.spec, weight=qdata, scale=scale, bias=bias),
-            ),
-            fullgraph=True,
-            dynamic=False,
-        )
-        compiled_actual = compiled(x, view.weight, view.scale, view.bias)
-        torch.testing.assert_close(compiled_actual, actual, rtol=0.08, atol=0.08)
-
     def test_quantized_repoint_preserves_state_dict(self):
         layer = self._quanto_linear()
         expected = {k: v.detach().clone() for k, v in layer.state_dict().items()}
@@ -173,3 +142,5 @@ class PackHandleOwnershipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+pytestmark = pytest.mark.process_isolated

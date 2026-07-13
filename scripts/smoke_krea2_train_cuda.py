@@ -40,6 +40,7 @@ from toolkit.basic import flush  # noqa: E402
 from toolkit.config_modules import ModelConfig, NetworkConfig  # noqa: E402
 from toolkit.lora_special import LoRASpecialNetwork  # noqa: E402
 from toolkit.memory_management import MemoryManager, bounce_pool, dxgi_meminfo, pin_manager  # noqa: E402
+from toolkit.memory_management.runtime import close_memory_runtime, get_memory_runtime  # noqa: E402
 from toolkit.prompt_utils import PromptEmbeds  # noqa: E402
 from toolkit.util.quantize import quantize_model  # noqa: E402
 from scripts.smoke_runtime import add_contention_args, fail_if_vram_contended  # noqa: E402
@@ -956,12 +957,12 @@ def main():
 
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
-        # Mirror BaseSDTrainProcess: the immutable runtime pins its source table
+        # Mirror BaseSDTrainProcess: the arena runtime pins its source table
         # for the duration of a step, and run() fails closed outside one.
-        immutable_runtime = getattr(transformer, "_immutable_runtime", None)
+        memory_runtime = get_memory_runtime(transformer)
         execution_context = (
-            immutable_runtime.execution(immutable_runtime.TRAIN)
-            if immutable_runtime is not None
+            memory_runtime.training_step(step_num=step)
+            if memory_runtime is not None
             else contextlib.nullcontext()
         )
         # Backward MUST stay inside the network context (multiplier is zeroed on
@@ -1153,14 +1154,13 @@ def main():
     # True unload (a genuine model unload, not a phase boundary): the runtime
     # closes and every pinned byte returns to the pre-arena baseline.
     ledger_before_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
-    transformer.disable_immutable_runtime()
+    close_memory_runtime(transformer)
     ledger_after_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
     teardown_row = {
         "event": "immutable_runtime_closed",
         "ledger_weights_gib_before": _gib(ledger_before_destroy),
         "ledger_weights_gib_after": _gib(ledger_after_destroy),
-        "runtime_present_after": getattr(transformer, "_immutable_runtime", None)
-        is not None,
+        "runtime_present_after": get_memory_runtime(transformer) is not None,
     }
     rows.append(teardown_row)
     _print_json(teardown_row)

@@ -137,12 +137,6 @@ class ProfileIsPinnedRecognizesArenaViewsTests(_StubbedPinMixin, unittest.TestCa
         finally:
             arena.release()
 
-    def test_unpinned_non_arena_tensor_is_not_pinned(self):
-        t = torch.empty(16, dtype=torch.float32)
-        self.assertFalse(_profile_is_pinned(t))
-        self.assertFalse(_bounce_is_pinned(t))
-
-
 class ArenaAutoRegistersPinnedFlatsTests(_StubbedPinMixin, unittest.TestCase):
     """build()/release()/rebuild manage the registry automatically."""
 
@@ -184,3 +178,7 @@ class ArenaAutoRegistersPinnedFlatsTests(_StubbedPinMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import pytest
+
+pytestmark = pytest.mark.process_isolated

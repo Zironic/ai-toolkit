@@ -120,9 +120,9 @@ class ArenaOffloadRuntime:
 
         try:
             # Bind card simulation and allocator policy before any plan reads.
-            apply_simulated_card(config.simulated_vram_gib, device=device)
+            apply_simulated_card(config._simulated_vram_gib, device=device)
             allocator_cap.apply_wddm_hard_allocator_cap(
-                device, config.legacy.wddm_hard_gib, log_prefix="[ArenaOffload]"
+                device, config._policy.wddm_hard_gib, log_prefix="[ArenaOffload]"
             )
             set_fp8_grad_input_enabled(config.fp8_backward)
 
@@ -169,15 +169,15 @@ class ArenaOffloadRuntime:
             )
             residency.reconcile(training_plan)
 
-            legacy = config.legacy
+            policy = config._policy
             executor = prepare_immutable_runtime(
                 transformer,
                 residency,
                 architecture_adapter=adapter,
-                depth=legacy.prefetch_depth,
+                depth=policy.prefetch_depth,
                 compile_blocks=config.compile_blocks,
-                compile_dynamic=config.compile_dynamic,
-                compile_dynamic_hints=config.compile_dynamic_hints,
+                compile_dynamic=config._compile_dynamic,
+                compile_dynamic_hints=config._compile_dynamic_hints,
                 protected_training_leaf_keys=smart_plan.get(
                     "protected_training_leaf_keys", ()
                 ),
@@ -310,7 +310,7 @@ class ArenaOffloadRuntime:
             self._executor.set_compile_dynamic_hints(hints)
             self._config = replace(
                 self._config,
-                compile_dynamic_hints=self._executor.compile_dynamic_hints,
+                _compile_dynamic_hints=self._executor.compile_dynamic_hints,
             )
         except BaseException as error:
             self._fatal_setup_failure(error)
@@ -472,7 +472,7 @@ class ArenaOffloadRuntime:
                 if decision.target_cap_bytes is not None:
                     allocator_cap.apply_wddm_hard_allocator_cap(
                         self._device,
-                        self._config.legacy.wddm_hard_gib,
+                        self._config._policy.wddm_hard_gib,
                         target_cap_bytes=decision.target_cap_bytes,
                         log_prefix="[ArenaOffload]",
                     )
@@ -495,8 +495,8 @@ class ArenaOffloadRuntime:
             peak_reserved = 0
             physical_free = 0
         active_cap = allocator_cap.applied_cap_bytes(self._device)
-        legacy = getattr(getattr(self, "_config", None), "legacy", None)
-        hard_gib = getattr(legacy, "wddm_hard_gib", None)
+        policy = getattr(getattr(self, "_config", None), "_policy", None)
+        hard_gib = getattr(policy, "wddm_hard_gib", None)
         hard_bytes = int(max(1.0, float(hard_gib or 1.0)) * GIB)
         classification = "non_allocation_failure"
         if allocation_failure:
@@ -566,20 +566,20 @@ class ArenaOffloadRuntime:
         `sampling_session()`.
         """
         self._require_open()
-        legacy = self._config.legacy
+        policy = self._config._policy
 
-        fixed_working_bytes = _fixed_working_bytes(legacy.sampling_working_reserve_gib)
+        fixed_working_bytes = _fixed_working_bytes(policy.sampling_working_reserve_gib)
         hard_gib = (
             1.0
-            if legacy.sampling_wddm_hard_gib is None
-            else float(legacy.sampling_wddm_hard_gib)
+            if policy.sampling_wddm_hard_gib is None
+            else float(policy.sampling_wddm_hard_gib)
         )
         allocator_cap.apply_wddm_hard_allocator_cap(
             self._device, hard_gib, log_prefix="[ArenaOffload]"
         )
         margin_gib = resolve_margin_gib(
             self._device,
-            legacy.sampling_wddm_margin_gib,
+            policy.sampling_wddm_margin_gib,
             hard_gib=hard_gib,
         )
         dequant_reserve = (
@@ -619,7 +619,7 @@ class ArenaOffloadRuntime:
             or int(self._last_step_num or 0) < BOOTSTRAP_MIN_STEP
         ):
             return False
-        hard_gib = self._config.legacy.wddm_hard_gib
+        hard_gib = self._config._policy.wddm_hard_gib
         hard_bytes = int(
             (1.0 if hard_gib is None else max(1.0, float(hard_gib))) * GIB
         )
@@ -745,7 +745,7 @@ class ArenaOffloadRuntime:
             - int(signal.get("device_free_bytes", 0) or 0)
             - int(signal.get("peak_reserved_bytes", 0) or 0),
         )
-        hard_gib = self._config.legacy.wddm_hard_gib
+        hard_gib = self._config._policy.wddm_hard_gib
         hard_bytes = int(
             (1.0 if hard_gib is None else max(1.0, float(hard_gib))) * GIB
         )
@@ -790,7 +790,7 @@ class ArenaOffloadRuntime:
         candidate = self._promotion_candidate()
         demote_candidate = self._demotion_candidate()
         cliff_cap = allocator_cap.wddm_cliff_cap_bytes(
-            self._device, self._config.legacy.wddm_hard_gib
+            self._device, self._config._policy.wddm_hard_gib
         )
         signal = self._signals.last_signal
         current_cap = min(
@@ -830,7 +830,7 @@ class ArenaOffloadRuntime:
             ):
                 allocator_cap.apply_wddm_hard_allocator_cap(
                     self._device,
-                    self._config.legacy.wddm_hard_gib,
+                    self._config._policy.wddm_hard_gib,
                     target_cap_bytes=decision.target_cap_bytes,
                     log_prefix="[ArenaOffload]",
                 )
@@ -840,7 +840,7 @@ class ArenaOffloadRuntime:
         elif decision.action == "raise_cap":
             allocator_cap.apply_wddm_hard_allocator_cap(
                 self._device,
-                self._config.legacy.wddm_hard_gib,
+                self._config._policy.wddm_hard_gib,
                 target_cap_bytes=decision.target_cap_bytes,
                 log_prefix="[ArenaOffload]",
             )
@@ -869,7 +869,7 @@ class ArenaOffloadRuntime:
     def _bind_training_cap(self) -> None:
         allocator_cap.apply_wddm_hard_allocator_cap(
             self._device,
-            self._config.legacy.wddm_hard_gib,
+            self._config._policy.wddm_hard_gib,
             log_prefix="[ArenaOffload]",
         )
 
@@ -894,7 +894,7 @@ class ArenaOffloadRuntime:
             "plan_fingerprint": getattr(active_plan, "fingerprint", None),
             "prefetch_depth": int(getattr(self._executor, "depth", 0)),
             "compile_blocks": bool(self._config.compile_blocks),
-            "compile_dynamic": bool(self._config.compile_dynamic),
+            "compile_dynamic": bool(self._config._compile_dynamic),
             "fp8_forward": bool(self._config.fp8_forward),
             "fp8_backward": bool(self._config.fp8_backward),
             "fp8_sampling": bool(self._config.fp8_sampling),
@@ -997,21 +997,6 @@ class ArenaOffloadRuntime:
                 (self._smart_plan or {}).get("working_reserve_bytes", 0)
             ),
         )
-
-    # ------------------------------------------------------------------
-    # escape hatches (Phase 1 only -- each has a phase that removes it)
-    # ------------------------------------------------------------------
-
-    @property
-    def _legacy_executor(self):
-        """PHASE-2/5: direct executor access, for call sites not yet migrated."""
-        return self._executor
-
-    @property
-    def _legacy_training_plan(self):
-        """PHASE-2: the TRAIN ResidencyPlan, for call sites not yet migrated."""
-        return self._training_plan
-
 
 def _compile_counter_snapshot(torch_module):
     try:

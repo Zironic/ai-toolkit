@@ -2,12 +2,12 @@
 
 These test the seam, not the machine: the helpers shared code now relies on
 (`get_arena_runtime`, `is_memory_managed`, `memory_runtime_owns_compile`) and
-the config mapping. Building a real arena needs CUDA and a real model; the
-lifecycle itself is covered by tests/test_immutable_arena_lifecycle.py and the
-Krea2 train smoke.
+the config mapping. Building a real arena needs CUDA and a real model; lifecycle
+is covered by the arena contract tests and the Krea2 train smoke.
 """
 
 import ast
+from dataclasses import fields
 from pathlib import Path
 import unittest
 
@@ -162,8 +162,21 @@ class ArenaOffloadConfigTest(unittest.TestCase):
         self.assertTrue(config.fp8_sampling)
         # compile_blocks is derived, not its own public knob.
         self.assertTrue(config.compile_blocks)
-        self.assertEqual(config.legacy.prefetch_depth, 3)
-        self.assertEqual(config.legacy.checkpoint_keep_last, 2)
+        self.assertEqual(config._policy.prefetch_depth, 3)
+        self.assertEqual(config._policy.checkpoint_keep_last, 2)
+
+    def test_public_surface_is_narrow(self):
+        public = {field.name for field in fields(ArenaOffloadConfig) if not field.name.startswith("_")}
+        self.assertEqual(
+            public,
+            {
+                "enabled",
+                "fp8_forward",
+                "fp8_backward",
+                "fp8_sampling",
+                "compile_blocks",
+            },
+        )
 
     def test_fp8_flags_require_fp8_weights(self):
         """An fp8_* toggle on a non-fp8 model is a no-op, not a crash."""
@@ -171,7 +184,8 @@ class ArenaOffloadConfigTest(unittest.TestCase):
         class NoQuant(_FakeModelConfig):
             quantize = False
 
-        config = ArenaOffloadConfig.from_model_config(NoQuant())
+        with self.assertWarnsRegex(RuntimeWarning, "ignored irrelevant FP8 options"):
+            config = ArenaOffloadConfig.from_model_config(NoQuant())
         self.assertFalse(config.fp8_forward)
         self.assertFalse(config.fp8_backward)
         self.assertFalse(config.fp8_sampling)
@@ -181,7 +195,28 @@ class ArenaOffloadConfigTest(unittest.TestCase):
         config = ArenaOffloadConfig.from_model_config(object())
         self.assertFalse(config.enabled)
         self.assertFalse(config.compile_blocks)
-        self.assertEqual(config.legacy.prefetch_depth, 2)
+        self.assertEqual(config._policy.prefetch_depth, 2)
+
+    def test_compatibility_aliases_map_to_internal_policy(self):
+        class Aliases:
+            layer_offloading_smart_headroom_gb = 4.0
+            layer_offloading_smart_buffer_gb = 1.5
+            layer_offloading_smart_hard_buffer_gb = 0.75
+
+        policy = ArenaOffloadConfig.from_model_config(Aliases())._policy
+        self.assertEqual(policy.working_reserve_gib, 4.0)
+        self.assertEqual(policy.wddm_margin_gib, 1.5)
+        self.assertEqual(policy.wddm_hard_gib, 0.75)
+
+    def test_backward_without_fp8_forward_is_ignored_once(self):
+        class Invalid:
+            quantize = True
+            qtype = "qfloat8"
+            layer_offloading_fp8_grad_input = True
+
+        with self.assertWarnsRegex(RuntimeWarning, "fp8_backward_without_fp8_forward"):
+            config = ArenaOffloadConfig.from_model_config(Invalid())
+        self.assertFalse(config.fp8_backward)
 
 
 class SamplingReserveTest(unittest.TestCase):

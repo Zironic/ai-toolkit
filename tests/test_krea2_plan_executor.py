@@ -375,37 +375,6 @@ def test_actual_arena_flat_unregistration_still_fails_closed():
         arena.release()
 
 
-def test_training_residency_reduction_is_subset_only_and_preserves_protected():
-    model, arena, state, _reference_args = _fixture()
-    executor = _runtime(model, state, compile_blocks=False)
-    train_plan = _train_plan()
-    protected = ("blocks.0", "attn.wq")
-    model._mm_immutable_protected_training_leaf_keys = frozenset({protected})
-    model._mm_immutable_training_plan = train_plan
-    signature = _arena_signature(arena)
-    parameter_ids = _parameter_ids(model)
-    try:
-        executor.activate(executor.TRAIN, train_plan)
-        before_keys = state.plan.resident_leaf_keys
-        before_bytes = state.resident_bytes()
-
-        result = executor.reduce_training_residency(1)
-
-        assert result["relieved_bytes"] > 0
-        assert len(result["removed_blocks"]) == 1
-        assert set(result["removed_leaf_keys"]) < set(before_keys)
-        assert protected not in result["removed_leaf_keys"]
-        assert protected in state.plan.resident_leaf_keys
-        assert state.plan.resident_leaf_keys < before_keys
-        assert state.resident_bytes() < before_bytes
-        assert model._mm_immutable_training_plan is state.plan
-        assert _arena_signature(arena) == signature
-        assert _parameter_ids(model) == parameter_ids
-    finally:
-        ingraph_stream.drain_fetch_runtime()
-        arena.release()
-
-
 def test_all_streamed_sampling_fallback_needs_no_host_rebuild():
     model, arena, state, _reference_args = _fixture()
     executor = _runtime(model, state, compile_blocks=False)

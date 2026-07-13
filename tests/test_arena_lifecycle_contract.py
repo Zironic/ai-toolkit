@@ -12,6 +12,7 @@ from toolkit.memory_management.arena_offload import (
     prepare_canonical_storage,
     prepare_arena_offload,
 )
+from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
 from toolkit.memory_management.arena_offload.errors import (
     ArenaCleanupError,
     is_fatal_arena_setup,
@@ -79,6 +80,29 @@ def test_precommit_failure_preserves_original_classification_and_model():
     assert not hasattr(model, "_arena_offload_disposed")
 
 
+def test_disabled_config_and_unsupported_architecture_fail_before_mutation():
+    model = _frozen_linear()
+    original = model.weight
+    with pytest.raises(ValueError, match="arena_offload_not_enabled"):
+        prepare_arena_offload(
+            model,
+            device="cpu",
+            adapter=_Adapter(),
+            config=ArenaOffloadConfig(enabled=False),
+        )
+    with pytest.raises(TypeError, match="transformer.blocks"):
+        prepare_arena_offload(
+            model,
+            device="cpu",
+            adapter=SingleStreamMMDiTAdapter(),
+            config=ArenaOffloadConfig(enabled=True),
+        )
+    assert model.weight is original
+    assert active_process_owner() is None
+    assert not hasattr(model, "_arena_offload_runtime")
+    assert not hasattr(model, "_arena_offload_disposed")
+
+
 def test_direct_loader_rollback_releases_preparation_owner():
     model = _frozen_linear()
     build = prepare_canonical_storage(model, _Adapter(), device="cpu")
@@ -115,6 +139,41 @@ def test_postcommit_failure_is_fatal_disposes_and_releases_owner():
         model(torch.randn(1, 4))
     with pytest.raises(RuntimeError, match="transformer_disposed"):
         model.to("cpu")
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "toolkit.memory_management.arena_offload.runtime.ResidencyState",
+        "toolkit.memory_management.arena_offload.runtime.prepare_immutable_runtime",
+    ),
+)
+def test_postcommit_fault_boundaries_are_fatal_and_never_fall_back(target):
+    model = _frozen_linear()
+    failure = RuntimeError(f"injected:{target.rsplit('.', 1)[-1]}")
+    plan = {
+        "offload_ids": set(),
+        "protected_training_leaf_keys": frozenset(),
+    }
+    patches = [
+        mock.patch(
+            "toolkit.memory_management.arena_offload.runtime.build_training_plan",
+            return_value=plan,
+        ),
+        mock.patch(target, side_effect=failure),
+    ]
+    with patches[0], patches[1]:
+        with pytest.raises(ArenaSetupFatalError) as caught:
+            prepare_arena_offload(
+                model,
+                device="cpu",
+                adapter=_Adapter(),
+                config=ArenaOffloadConfig(enabled=True),
+            )
+    assert caught.value.__cause__ is failure
+    assert active_process_owner() is None
+    assert model._arena_offload_disposed
+    assert not hasattr(model, "_memory_manager")
 
 
 def test_resource_release_continues_after_cleanup_error_and_is_idempotent():
@@ -169,3 +228,19 @@ def test_phase7_import_and_private_state_boundaries():
         source = path.read_text(encoding="utf-8")
         assert "_mm_" not in source, path
         assert "_immutable_runtime" not in source, path
+
+
+def test_phase8_legacy_manager_has_no_arena_execution_bridge():
+    root = Path(__file__).parents[1]
+    manager = (
+        root / "toolkit" / "memory_management" / "manager.py"
+    ).read_text(encoding="utf-8")
+    for obsolete in (
+        "attach_smart_training_immutable",
+        "smart_immutable",
+        "_mm_immutable_",
+        "_immutable_runtime",
+        "_mm_canonical_leaf",
+        "canonical_relief",
+    ):
+        assert obsolete not in manager

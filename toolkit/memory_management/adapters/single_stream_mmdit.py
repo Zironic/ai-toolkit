@@ -23,6 +23,33 @@ class SingleStreamMMDiTAdapter:
         "mlp.down",
     )
 
+    def validate_transformer(self, transformer):
+        blocks = getattr(transformer, "blocks", None)
+        if blocks is None:
+            raise TypeError("arena offload requires a transformer.blocks sequence")
+        try:
+            blocks = tuple(blocks)
+        except TypeError as error:
+            raise TypeError(
+                "arena offload requires a transformer.blocks sequence"
+            ) from error
+        if not blocks:
+            raise ValueError("arena offload requires at least one execution block")
+        for index, block in enumerate(blocks):
+            try:
+                entries = self.leaf_entries(block)
+            except (AttributeError, TypeError) as error:
+                raise TypeError(
+                    "unsupported single-stream MMDiT layout at "
+                    f"blocks.{index}"
+                ) from error
+            for path, child in entries:
+                if not hasattr(child, "weight"):
+                    raise TypeError(
+                        "unsupported single-stream MMDiT leaf at "
+                        f"blocks.{index}.{path}"
+                    )
+
     def execution_blocks(self, transformer):
         return tuple(transformer.blocks)
 

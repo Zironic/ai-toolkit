@@ -19,7 +19,6 @@ the legacy manager remains a separate backend.
 
 from .api import (
     ArenaOffloadConfig,
-    LegacyPlannerOptions,
     close_arena_offload,
     get_arena_runtime,
     is_arena_offloaded,
@@ -37,7 +36,6 @@ __all__ = [
     "ArenaCleanupError",
     "ArenaOffloadRuntime",
     "ArenaSetupFatalError",
-    "LegacyPlannerOptions",
     "close_arena_offload",
     "close_memory_runtime",
     "get_arena_runtime",
