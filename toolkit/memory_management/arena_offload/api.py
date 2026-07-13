@@ -165,6 +165,20 @@ class ArenaOffloadConfig:
         )
 
 
+
+def prepare_canonical_storage(transformer, adapter, *, defer_blocks: bool = False):
+    """Prepare final arena destinations without publishing model Parameters."""
+    from ..canonical_arena import CanonicalArena
+
+    blocks = adapter.execution_blocks(transformer)
+    entries = {} if defer_blocks else {
+        adapter.block_key(transformer, index): list(adapter.leaf_entries(block))
+        for index, block in enumerate(blocks)
+    }
+    arena = CanonicalArena()
+    build = arena.prepare(entries, model=transformer)
+    return build
+
 def prepare_arena_offload(
     transformer,
     *,
@@ -172,13 +186,15 @@ def prepare_arena_offload(
     adapter,
     config: ArenaOffloadConfig,
     ignore_modules: Sequence[Any] | None = None,
+    canonical_build=None,
 ) -> ArenaOffloadRuntime:
     """Canonicalize the model's execution blocks and prepare the arena runtime.
 
-    Call after the base weights are final (loaded, assistant-LoRA merged,
-    quantized, frozen) and BEFORE the training network is applied. The runtime
-    comes back unfinalized; the trainer calls `finalize()` once the network is
-    installed.
+    Call after the base weights are final and BEFORE the training network is
+    applied. Loaders that populate final arena destinations directly pass their
+    populated ``canonical_build``; other models use the compatibility source,
+    which copies from the already-materialized model. The runtime comes back
+    unfinalized; the trainer calls ``finalize()`` once the network is installed.
 
     The runtime is published on `transformer._arena_offload_runtime`.
     """
@@ -188,6 +204,7 @@ def prepare_arena_offload(
         adapter=adapter,
         config=config,
         ignore_modules=ignore_modules,
+        canonical_build=canonical_build,
     )
 
 

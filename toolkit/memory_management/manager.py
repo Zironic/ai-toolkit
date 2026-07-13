@@ -5786,6 +5786,18 @@ class MemoryManager:
         )
         return freed
 
+    @staticmethod
+    @contextlib.contextmanager
+    def sampling_image(module):
+        """Run the legacy per-image cohabitation guard, when installed."""
+        guard = getattr(module, "_mm_sampling_guard", None)
+        if guard is not None:
+            try:
+                guard()
+            except Exception as error:
+                print(f"[MemoryManager] sampling cohabitation guard failed: {error}")
+        yield
+
     @classmethod
     @contextlib.contextmanager
     def inference_resident(

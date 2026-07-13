@@ -10,6 +10,16 @@ from toolkit import sdpa_patch
 class SdpaGqaPatchTests(unittest.TestCase):
     """Global native-cuDNN or KV-expansion dispatch for GQA SDPA calls."""
 
+    def tearDown(self):
+        sdpa_patch.set_gqa_backend_mode("auto")
+
+    def test_backend_mode_validation(self):
+        for mode in ("auto", "cudnn", "expanded_efficient"):
+            sdpa_patch.set_gqa_backend_mode(mode)
+            self.assertEqual(sdpa_patch.get_gqa_backend_mode(), mode)
+        with self.assertRaisesRegex(ValueError, "Invalid sdpa_gqa_backend"):
+            sdpa_patch.set_gqa_backend_mode("math")
+
     def test_patch_installed_and_idempotent(self):
         fn = F.scaled_dot_product_attention
         self.assertTrue(getattr(fn, "_aitk_gqa_patch", False))

@@ -339,6 +339,34 @@ export default function SimpleJob({
                 onChange={value => setJobConfig(value, 'config.process[0].model.model_kwargs.kv_cache')}
               />
             )}
+            {modelArch?.additionalSections?.includes('model.model_kwargs.prompt_overflow_policy') && (
+              <>
+                <SelectInput
+                  label="Prompt Length"
+                  docKey="model.model_kwargs.prompt_overflow_policy"
+                  value={jobConfig.config.process[0].model.model_kwargs.prompt_overflow_policy || 'unlimited'}
+                  onChange={value =>
+                    setJobConfig(value, 'config.process[0].model.model_kwargs.prompt_overflow_policy')
+                  }
+                  options={[
+                    { value: 'unlimited', label: 'Unlimited' },
+                    { value: 'error', label: 'Error when too long' },
+                  ]}
+                />
+                {jobConfig.config.process[0].model.model_kwargs.prompt_overflow_policy === 'error' && (
+                  <NumberInput
+                    label="Maximum Prompt Tokens"
+                    docKey="model.model_kwargs.max_text_length"
+                    value={jobConfig.config.process[0].model.model_kwargs.max_text_length ?? 512}
+                    onChange={value =>
+                      setJobConfig(value, 'config.process[0].model.model_kwargs.max_text_length')
+                    }
+                    min={1}
+                    required
+                  />
+                )}
+              </>
+            )}
             {modelArch?.additionalSections?.includes('model.qie.match_target_res') && (
               <Checkbox
                 label="Match Target Res"

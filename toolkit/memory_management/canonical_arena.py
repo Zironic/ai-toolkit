@@ -10,10 +10,9 @@ transitions must never repoint a Parameter again once ``canonicalize()``
 has run -- that is the job of the residency sidecars (Slice 3), not this
 module.
 
-Reuses ``ingraph_stream.pack_block_host`` for the actual build (it already
-implements populate-then-register (Invariant 3, I1) and Parameter
-repointing); this module only adds the "exactly once, sequencing-asserted,
-fail-closed" discipline Invariant 4 requires on top of it.
+Construction is destination-first and transactional: preparation allocates
+the final host flats without mutating Parameters, population fills those flats,
+and commit publishes all Parameter views atomically or restores the originals.
 """
 
 from __future__ import annotations
@@ -23,12 +22,8 @@ from dataclasses import dataclass
 import torch
 
 from toolkit.memory_management import pin_manager
-from toolkit.memory_management.ingraph_stream import (
-    BlockPack,
-    LinearSpec,
-    pack_block_host,
-    release_pack,
-)
+from toolkit.memory_management.arena_offload.layout import BlockPack, LinearSpec, release_pack
+
 
 ARENA_KIND = "weights"
 
@@ -159,45 +154,20 @@ class CanonicalArena:
             _assert_entries_frozen(entries)
             normalized[block_key] = entries
 
-        stats = CanonicalArenaStats()
-        try:
-            for block_key, entries in normalized.items():
-                pack = pack_block_host(
-                    block_key, entries, repoint=True, pin=True, kind=kind,
-                    pin_mechanism="register",
-                )
-                if not pack.pinned:
-                    release_pack(pack)
-                    raise CanonicalArenaError(
-                        f"canonical_arena_pin_budget_exceeded:{block_key}"
-                    )
-                normalized_entries = tuple(
-                    _entry_module_and_leaves(entry) for entry in entries
-                )
-                leaf_names = tuple(entry[0] for entry in normalized_entries)
-                modules = tuple(entry[1] for entry in normalized_entries)
-                self._blocks[block_key] = BlockRecord(
-                    block_key=block_key,
-                    pack=pack,
-                    leaf_names=leaf_names,
-                    modules=modules,
-                )
-                pin_manager.register_arena_storage(pack.host_flat)
-                stats.blocks += 1
-                stats.pinned_bytes += pack.required_pin_bytes
-        except Exception:
-            # Blocks built earlier in THIS call may already have repointed
-            # Parameters onto their (now-being-released) flats -- release()
-            # unregisters/unpins them but cannot un-repoint a Parameter
-            # (original tensor identity isn't retained). The arena is left
-            # un-canonicalized (self._canonicalized stays False) so a
-            # caller checking that flag treats the whole attach as failed;
-            # it must not proceed to LoRA/optimizer/compile on a
-            # partially-repointed model.
-            self.release()
-            raise
-        self._canonicalized = True
-        return stats
+        from toolkit.memory_management.arena_offload.construction import PreparedCanonicalBuild
+
+        build = PreparedCanonicalBuild(self, normalized, kind=kind)
+        build.populate_from_model()
+        return build.commit()
+
+    def prepare(self, entries_by_block: dict, *, model=None, kind: str = ARENA_KIND):
+        """Prepare final destinations without mutating model Parameters."""
+        from toolkit.memory_management.arena_offload.construction import PreparedCanonicalBuild
+
+        normalized = {key: list(entries) for key, entries in entries_by_block.items()}
+        for entries in normalized.values():
+            _assert_entries_frozen(entries)
+        return PreparedCanonicalBuild(self, normalized, model=model, kind=kind)
 
     # -- whole-model .to() interception (Invariant 5) ----------------------
 

@@ -31,7 +31,9 @@ from toolkit.memory_management.ingraph_stream import (
     streamed_linear,
     streamed_linear_tensors,
 )
-from toolkit.sdpa_patch import can_use_native_cudnn_gqa
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from toolkit.sdpa_patch import can_use_native_cudnn_gqa, get_gqa_backend_mode
 
 
 def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
@@ -144,7 +146,18 @@ def attention(
     # signatures. Expand only when cuDNN is unavailable or rejects this call;
     # that makes the memory-efficient backend eligible as the fallback. Masked
     # calls and builds without Flash otherwise need this fallback.
-    native_cudnn_gqa = gqa and can_use_native_cudnn_gqa(q, k, v, mask)
+    backend_mode = get_gqa_backend_mode()
+    requested_gqa = gqa and k.shape[1] != q.shape[1]
+    native_cudnn_gqa = (
+        requested_gqa
+        and backend_mode != "expanded_efficient"
+        and can_use_native_cudnn_gqa(q, k, v, mask)
+    )
+    if gqa and backend_mode == "cudnn" and not native_cudnn_gqa:
+        raise RuntimeError(
+            "sdpa_gqa_backend=cudnn was requested, but cuDNN rejected the "
+            "unexpanded Krea2 GQA signature"
+        )
     if gqa and not native_cudnn_gqa and k.shape[1] != q.shape[1] and (
         mask is not None or not _FLASH_SDP_AVAILABLE
     ):
@@ -156,9 +169,15 @@ def attention(
     # constants), so compiled graphs stay print-free and break-free.
     if _SDPA_DEBUG and not torch.compiler.is_compiling():
         _sdpa_debug_report(q, k, v, mask, gqa)
-    x = F.scaled_dot_product_attention(
-        q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
-    )
+    if backend_mode == "expanded_efficient" and requested_gqa:
+        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, scale=scale, enable_gqa=False
+            )
+    else:
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
+        )
     return _merge_heads(x)
 
 

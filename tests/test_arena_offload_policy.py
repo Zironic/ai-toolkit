@@ -396,6 +396,45 @@ def test_arena_sampling_binds_fp8_only_to_singletons(monkeypatch):
     ]
 
 
+def test_arena_close_releases_all_owned_resources_after_executor_error():
+    calls = []
+    child = SimpleNamespace(_mm_canonical_leaf=True)
+    model = SimpleNamespace(
+        _arena_offload_runtime=None,
+        _mm_canonical_arena=object(),
+        _mm_residency_state=object(),
+        _mm_immutable_training_plan=object(),
+        _mm_immutable_smart_plan=object(),
+        _mm_immutable_canonical_modules=object(),
+        _mm_immutable_backend=True,
+    )
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    model._arena_offload_runtime = runtime
+    runtime._closed = False
+    runtime._model = model
+    runtime._training_fp8_restores = []
+    runtime._executor = SimpleNamespace(
+        close=lambda: (_ for _ in ()).throw(RuntimeError("executor boom"))
+    )
+    runtime._residency = SimpleNamespace(clear=lambda: calls.append("residency"))
+    runtime._arena = SimpleNamespace(release=lambda: calls.append("arena"))
+    runtime._canonical_modules = (child,)
+    runtime._training_plan = object()
+    runtime._smart_plan = object()
+
+    import pytest
+    with pytest.raises(RuntimeError, match="executor boom"):
+        runtime.close()
+
+    assert calls == ["residency", "arena"]
+    assert runtime._closed
+    assert not hasattr(model, "_arena_offload_runtime")
+    assert not hasattr(model, "_mm_canonical_arena")
+    assert not hasattr(child, "_mm_canonical_leaf")
+
+    runtime.close()
+
+
 def test_bf16_sampling_reserves_largest_singleton_dequant(monkeypatch):
     gib = 1024 ** 3
     dequant = 864 * 1024 ** 2
@@ -520,7 +559,7 @@ def test_arena_allocation_failure_drains_and_rolls_back(monkeypatch):
         lambda keys, resident: transitions.append((tuple(keys), resident))
     )
     monkeypatch.setattr(
-        "toolkit.memory_management.ingraph_stream.drain_fetch_runtime",
+        "toolkit.memory_management.arena_offload.transfer.drain_fetch_runtime",
         lambda: 2,
     )
     cap_calls = []

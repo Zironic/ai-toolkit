@@ -1,8 +1,8 @@
 import pytest
 
 from scripts.digest_perf_log import summarize_record, summarize_records
-from toolkit.memory_management import ingraph_stream
-from toolkit.memory_management.ingraph_stream import fetch_performance_metrics
+from toolkit.memory_management.arena_offload import transfer as ingraph_stream
+from toolkit.memory_management.arena_offload.transfer import fetch_performance_metrics
 
 
 def test_lifetime_fetch_stats_survive_report_reset(monkeypatch):

@@ -27,6 +27,7 @@ from .api import (
     is_arena_offloaded,
     is_memory_managed,
     memory_runtime_owns_compile,
+    prepare_canonical_storage,
     prepare_arena_offload,
 )
 from .runtime import ArenaOffloadRuntime
@@ -40,5 +41,6 @@ __all__ = [
     "is_arena_offloaded",
     "is_memory_managed",
     "memory_runtime_owns_compile",
+    "prepare_canonical_storage",
     "prepare_arena_offload",
 ]

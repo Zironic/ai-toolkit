@@ -15,8 +15,8 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from toolkit.memory_management import vram_budget
-from toolkit.memory_management.ingraph_stream import (
-    _flatten_leaves,
+from toolkit.memory_management.arena_offload.layout import _flatten_leaves
+from toolkit.memory_management.arena_offload.transfer import (
     checkpoint_recompute_context,
     compiled_checkpoint_context,
     configure_fetch_runtime,

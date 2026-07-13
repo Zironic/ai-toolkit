@@ -13,6 +13,7 @@ from torchao.quantization.quant_api import (
     Int8WeightOnlyConfig
 )
 from optimum.quanto import freeze
+from optimum.quanto.tensor.qbytes import QBytesTensor
 from tqdm import tqdm
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
@@ -211,6 +212,50 @@ def quantize(
         except Exception as e:
             print(f"Failed to quantize {name}: {e}")
             # raise e
+
+
+def assign_quantized_state_dict(
+    model: torch.nn.Module,
+    state_dict: dict,
+    weights,
+) -> None:
+    """Assign a cached quantized state without copying its model-sized leaves."""
+    resolved = get_qtype(weights)
+    quanto_data_suffix = ".weight._data"
+    quanto_prefixes = [
+        key[: -len(quanto_data_suffix)]
+        for key in state_dict
+        if key.endswith(quanto_data_suffix)
+    ]
+    if quanto_prefixes:
+        if isinstance(resolved, (aotype, ostristype)):
+            raise ValueError("cached_quanto_state_qtype_mismatch")
+        quantize(model, weights=resolved)
+        modules = dict(model.named_modules())
+        for prefix in quanto_prefixes:
+            module = modules[prefix]
+            data = state_dict[f"{prefix}.weight._data"]
+            scale = state_dict[f"{prefix}.weight._scale"]
+            template = module.weight
+            meta_data = torch.empty_like(data, device="meta")
+            meta_scale = torch.empty_like(scale, device="meta")
+            wrapper = QBytesTensor(
+                resolved,
+                0,
+                template.size(),
+                template.stride(),
+                meta_data,
+                meta_scale,
+                requires_grad=False,
+            )
+            module.weight = torch.nn.Parameter(wrapper, requires_grad=False)
+            bias = getattr(module, "bias", None)
+            if bias is not None:
+                bias.requires_grad_(False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=True, assign=True)
+    if missing or unexpected:
+        raise RuntimeError(f"missing={missing[:5]} unexpected={unexpected[:5]}")
+    model.requires_grad_(False)
 
 
 def quantize_model(

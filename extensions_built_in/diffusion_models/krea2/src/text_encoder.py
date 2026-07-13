@@ -43,6 +43,7 @@ def encode_krea_prompt(
     processor,
     prompt: str,
     max_length: int = 512,
+    overflow_policy: str = "unlimited",
     select_layers: tuple[int, ...] = SELECT_LAYERS,
     prefix_idx: int = PROMPT_TEMPLATE_ENCODE_START_IDX,
     images: Optional[List[Tensor]] = None,
@@ -65,7 +66,32 @@ def encode_krea_prompt(
     The system prefix is unchanged, so ``prefix_idx`` slicing stays valid and the
     image + prompt tokens all survive the slice.
     """
+    if overflow_policy not in ("unlimited", "error"):
+        raise ValueError(
+            "Krea2 prompt overflow policy must be 'unlimited' or 'error', "
+            f"got {overflow_policy!r}"
+        )
+
     device = qwen.device
+
+    # Tokenize without truncation in both modes. The strict policy is a setup-time
+    # validation option, not permission to silently alter the prompt.
+    text = PROMPT_TEMPLATE_ENCODE_PREFIX + prompt
+    prompt_inputs = tokenizer(
+        [text],
+        truncation=False,
+        return_length=False,
+        return_overflowing_tokens=False,
+        return_tensors="pt",
+    )
+    prompt_token_count = max(int(prompt_inputs["input_ids"].shape[1]) - prefix_idx, 0)
+    if overflow_policy == "error" and prompt_token_count > max_length:
+        raise ValueError(
+            "Krea2 prompt is too long: "
+            f"{prompt_token_count} tokens exceeds model.model_kwargs.max_text_length="
+            f"{max_length}. Shorten the prompt or set "
+            "model.model_kwargs.prompt_overflow_policy to 'unlimited'."
+        )
 
     # The suffix ("...assistant\n") is tokenized without the BOS/template extras
     # the main tokenizer adds, matching the reference's separate processor pass.
@@ -100,16 +126,8 @@ def encode_krea_prompt(
                 v = v.to(dtype)
             extra_inputs[k] = v
     else:
-        # Prefix + prompt at natural length (no padding); truncate very long prompts.
-        text = PROMPT_TEMPLATE_ENCODE_PREFIX + prompt
-        inputs = tokenizer(
-            [text],
-            truncation=True,
-            return_length=False,
-            return_overflowing_tokens=False,
-            max_length=max_length + prefix_idx,
-            return_tensors="pt",
-        ).to(device, non_blocking=True)
+        # Prefix + prompt at natural length (no padding and no truncation).
+        inputs = prompt_inputs.to(device, non_blocking=True)
 
     input_ids = torch.cat([inputs["input_ids"], suffix_ids], dim=1)
     mask = torch.cat([inputs["attention_mask"].bool(), suffix_mask], dim=1)

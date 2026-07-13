@@ -28,6 +28,25 @@ except Exception:
     _CUDNN_AVAILABLE = False
 
 
+_GQA_BACKEND_MODE = "auto"
+
+
+def set_gqa_backend_mode(mode: str) -> None:
+    """Select GQA dispatch for a real job; benchmark modes fail closed."""
+    normalized = str(mode).strip().lower()
+    allowed = {"auto", "cudnn", "expanded_efficient"}
+    if normalized not in allowed:
+        raise ValueError(
+            f"Invalid sdpa_gqa_backend {mode!r}; expected one of {sorted(allowed)}"
+        )
+    global _GQA_BACKEND_MODE
+    _GQA_BACKEND_MODE = normalized
+
+
+def get_gqa_backend_mode() -> str:
+    return _GQA_BACKEND_MODE
+
+
 def can_use_native_cudnn_gqa(
     query, key, value, attn_mask, dropout_p=0.0, is_causal=False
 ) -> bool:
@@ -85,8 +104,20 @@ def apply_sdpa_gqa_patch() -> None:
             and key.shape[-3] != query.shape[-3]
             and (attn_mask is not None or not _FLASH_AVAILABLE)
         )
-        if needs_fast_gqa and can_use_native_cudnn_gqa(
+        mode = get_gqa_backend_mode()
+        if needs_fast_gqa and mode == "cudnn" and not can_use_native_cudnn_gqa(
             query, key, value, attn_mask, dropout_p, is_causal
+        ):
+            raise RuntimeError(
+                "sdpa_gqa_backend=cudnn was requested, but cuDNN rejected the "
+                "unexpanded GQA signature"
+            )
+        if (
+            needs_fast_gqa
+            and mode != "expanded_efficient"
+            and can_use_native_cudnn_gqa(
+                query, key, value, attn_mask, dropout_p, is_causal
+            )
         ):
             with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
                 return original(
@@ -104,6 +135,18 @@ def apply_sdpa_gqa_patch() -> None:
             key = key.repeat_interleave(groups, dim=-3)
             value = value.repeat_interleave(groups, dim=-3)
             enable_gqa = False
+            if mode == "expanded_efficient":
+                with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                    return original(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attn_mask,
+                        dropout_p=dropout_p,
+                        is_causal=is_causal,
+                        scale=scale,
+                        enable_gqa=False,
+                    )
         return original(
             query,
             key,

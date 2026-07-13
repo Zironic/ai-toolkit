@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 from _pytest.reports import TestReport
@@ -38,6 +39,7 @@ def _run_module_isolated(item):
         return cached
     env = dict(os.environ)
     env[_LEAKY_ENV] = "1"
+    started = time.perf_counter()
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", path, "-q", "-p", "no:cacheprovider"],
         capture_output=True,
@@ -45,6 +47,7 @@ def _run_module_isolated(item):
         env=env,
         cwd=str(item.config.rootpath),
     )
+    duration = time.perf_counter() - started
     failed = set()
     for line in proc.stdout.splitlines():
         if line.startswith(("FAILED ", "ERROR ")):
@@ -53,9 +56,22 @@ def _run_module_isolated(item):
         "failed": failed,
         "returncode": proc.returncode,
         "output": proc.stdout + proc.stderr,
+        "duration": duration,
     }
     _leaky_module_results[path] = result
     return result
+
+
+def pytest_terminal_summary(terminalreporter):
+    if not _leaky_module_results:
+        return
+    terminalreporter.section("isolated file durations")
+    for path, result in sorted(
+        _leaky_module_results.items(),
+        key=lambda entry: entry[1]["duration"],
+        reverse=True,
+    ):
+        terminalreporter.write_line(f'{result["duration"]:.2f}s {path}')
 
 
 def _report(item, when, outcome, longrepr=None):

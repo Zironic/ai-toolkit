@@ -166,7 +166,7 @@ class SharedHelperPolicyTests(_StubbedPinMixin, unittest.TestCase):
 
         with mock.patch.object(pin_manager, "pin_tensor_in_place", return_value=False):
             with mock.patch(
-                "toolkit.memory_management.ingraph_stream.release_pack",
+                "toolkit.memory_management.arena_offload.layout.release_pack",
                 wraps=release_pack,
             ) as released:
                 with self.assertRaises(IngraphPackError) as ctx:
@@ -243,7 +243,7 @@ class PartialBlockResidencyTests(_StubbedPinMixin, unittest.TestCase):
         model = _SynthModel(n=1)  # nothing marked streamed
 
         with mock.patch(
-            "toolkit.memory_management.ingraph_stream.pack_block_host"
+            "toolkit.memory_management.arena_offload.layout.pack_block_host"
         ) as packed:
             result = build_block_leaf_plans(None, model.block_entries())
 
@@ -313,7 +313,7 @@ class PartialBlockResidencyTests(_StubbedPinMixin, unittest.TestCase):
     def test_unsupported_resident_wrapper_fails_closed(self):
         model = _SynthModel(n=1)
         with mock.patch(
-            "toolkit.memory_management.ingraph_stream._flatten_leaves",
+            "toolkit.memory_management.arena_offload.layout._flatten_leaves",
             return_value=[torch.zeros(2), torch.zeros(2), torch.zeros(2)],
         ):
             with self.assertRaises(IngraphPackError) as ctx:

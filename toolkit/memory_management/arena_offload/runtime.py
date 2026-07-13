@@ -78,6 +78,7 @@ class ArenaOffloadRuntime:
         self._training_fp8_restores = []
         self._training_fp8_singletons = 0
         self._sampling_fp8_singletons = 0
+        self._permanent_placement = None
 
     # ------------------------------------------------------------------
     # construction
@@ -92,6 +93,7 @@ class ArenaOffloadRuntime:
         adapter,
         config,
         ignore_modules: Sequence[Any] | None = None,
+        canonical_build=None,
     ) -> ArenaOffloadRuntime:
         # PHASE-2: MemoryManager is the legacy smart planner; policy.py replaces it.
         from ..canonical_arena import CanonicalArena
@@ -123,8 +125,27 @@ class ArenaOffloadRuntime:
             adapter.block_key(transformer, index): list(adapter.leaf_entries(block))
             for index, block in enumerate(blocks)
         }
-        arena = CanonicalArena()
-        arena.canonicalize(entries_by_block)
+        if canonical_build is None:
+            arena = CanonicalArena()
+            canonical_build = arena.prepare(entries_by_block, model=transformer)
+            canonical_build.populate_from_model()
+        else:
+            if canonical_build.model is not transformer:
+                canonical_build.rollback()
+                raise RuntimeError("arena_canonical_build_model_mismatch")
+            prepared_entries = {
+                key: tuple(module for _name, module in entries)
+                for key, entries in canonical_build.entries_by_block.items()
+            }
+            expected_entries = {
+                key: tuple(module for _name, module in entries)
+                for key, entries in entries_by_block.items()
+            }
+            if prepared_entries != expected_entries:
+                canonical_build.rollback()
+                raise RuntimeError("arena_canonical_build_adapter_mismatch")
+            arena = canonical_build.arena
+        canonical_build.commit()
 
         canonical_modules = []
         for entries in entries_by_block.values():
@@ -155,7 +176,7 @@ class ArenaOffloadRuntime:
                 eager_promote_max_blocks=legacy.eager_promote_max_blocks,
             )
         except Exception:
-            arena.release()
+            canonical_build.rollback()
             for child in canonical_modules:
                 if hasattr(child, "_mm_canonical_leaf"):
                     del child._mm_canonical_leaf
@@ -216,6 +237,44 @@ class ArenaOffloadRuntime:
     @property
     def model(self):
         return self._model
+
+    def place_permanent_modules(self, device, dtype=None) -> None:
+        """Move only noncanonical subtrees, preserving arena Parameter views."""
+        self._require_open()
+        import torch
+
+        target = (torch.device(device), dtype)
+        if getattr(self, "_permanent_placement", None) == target:
+            return
+        canonical = set(self._canonical_modules)
+
+        def contains_canonical(module):
+            return any(child in canonical for child in module.modules())
+
+        def has_wrapped_parameter(module):
+            for parameter in module.parameters(recurse=True):
+                try:
+                    names, _context = parameter.__tensor_flatten__()
+                except Exception:
+                    continue
+                if names:
+                    return True
+            return False
+
+        def move(module):
+            if module in canonical:
+                return
+            if not contains_canonical(module):
+                if dtype is None or has_wrapped_parameter(module):
+                    module.to(device=device)
+                else:
+                    module.to(device=device, dtype=dtype)
+                return
+            for child in module.children():
+                move(child)
+
+        move(self._model)
+        self._permanent_placement = target
 
     @property
     def device(self):
@@ -280,23 +339,61 @@ class ArenaOffloadRuntime:
         return self
 
     def close(self) -> None:
+        """Release every runtime-owned execution, device, and host resource."""
         if self._closed:
             return
+        errors = []
+
+        def attempt(label, fn):
+            try:
+                fn()
+            except Exception as error:
+                errors.append(f"{label}: {type(error).__name__}: {error}")
+
+        model = self._model
         if getattr(self, "_training_fp8_restores", None):
             from ..manager import MemoryManager
 
-            MemoryManager._disable_fp8_training_compile(
-                self._model, self._training_fp8_restores
+            attempt(
+                "FP8 training restore",
+                lambda: MemoryManager._disable_fp8_training_compile(
+                    model, self._training_fp8_restores
+                ),
             )
             self._training_fp8_restores = []
-        disable = getattr(self._model, "disable_immutable_runtime", None)
+
+        disable = getattr(model, "disable_immutable_runtime", None)
         if disable is not None:
-            disable()
+            attempt("immutable runtime", disable)
         else:
-            self._executor.close()
-        if getattr(self._model, RUNTIME_ATTR, None) is self:
-            delattr(self._model, RUNTIME_ATTR)
+            attempt("immutable runtime", self._executor.close)
+
+        attempt("resident sidecars", self._residency.clear)
+
+        if getattr(model, RUNTIME_ATTR, None) is self:
+            delattr(model, RUNTIME_ATTR)
+        for name in (
+            "_mm_canonical_arena",
+            "_mm_residency_state",
+            "_mm_immutable_training_plan",
+            "_mm_immutable_smart_plan",
+            "_mm_immutable_canonical_modules",
+            "_mm_immutable_backend",
+        ):
+            if hasattr(model, name):
+                delattr(model, name)
+        for child in self._canonical_modules:
+            if hasattr(child, "_mm_canonical_leaf"):
+                delattr(child, "_mm_canonical_leaf")
+
+        attempt("canonical arena", self._arena.release)
+        self._canonical_modules = ()
+        self._training_plan = None
+        self._smart_plan = None
         self._closed = True
+
+        if errors:
+            raise RuntimeError("arena runtime cleanup failed: " + "; ".join(errors))
 
     def _require_open(self) -> None:
         if self._closed:
@@ -372,10 +469,10 @@ class ArenaOffloadRuntime:
         """Clean arena-owned state after the executor has unwound."""
         import torch
 
-        from .. import ingraph_stream
+        from . import transfer
         from ..vram_budget import device_free_bytes
 
-        abandoned = ingraph_stream.drain_fetch_runtime()
+        abandoned = transfer.drain_fetch_runtime()
         text = str(error)
         allocation_failure = (
             isinstance(error, torch.cuda.OutOfMemoryError)
@@ -467,12 +564,7 @@ class ArenaOffloadRuntime:
 
     @contextlib.contextmanager
     def sampling_session(self):
-        """Wraps a whole sampling run (all images), restoring TRAIN at the end.
-
-        The TRAIN program is restored once per session, not once per image:
-        re-activating it between images would reconcile residency back to the
-        training plan and churn the sidecars for nothing.
-        """
+        """Wrap a sampling run and restore TRAIN once at the end."""
         self._require_open()
         sampling_restores = []
         if self._config.fp8_sampling:
@@ -882,7 +974,7 @@ class ArenaOffloadRuntime:
         """Collect the completed step's policy signals."""
         import torch
 
-        from .. import ingraph_stream
+        from . import transfer
         from ..vram_budget import device_free_bytes
 
         if torch.device(self._device).type != "cuda" or not torch.cuda.is_available():
@@ -895,8 +987,8 @@ class ArenaOffloadRuntime:
             key: int(stats.get(key, 0) or 0)
             for key in ("num_alloc_retries", "num_device_alloc", "num_device_free")
         }
-        transfer = (
-            ingraph_stream.lifetime_fetch_stats()
+        transfer_stats = (
+            transfer.lifetime_fetch_stats()
             if self._signals.transfer_snapshot_due
             else None
         )
@@ -913,7 +1005,7 @@ class ArenaOffloadRuntime:
             ),
             ring_bytes=self._training_ring_bytes(),
             compile_counters=_compile_counter_snapshot(torch),
-            transfer_counters=transfer,
+            transfer_counters=transfer_stats,
             step_wall_ms=step_wall_ms,
         )
 

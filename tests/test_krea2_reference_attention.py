@@ -1,4 +1,5 @@
 import copy
+from types import SimpleNamespace
 import unittest
 
 import torch
@@ -8,6 +9,10 @@ from extensions_built_in.diffusion_models.krea2.src.mmdit import (
     SingleStreamDiT,
 )
 from extensions_built_in.diffusion_models.krea2.src.pipeline import predict_velocity
+from extensions_built_in.diffusion_models.krea2.src.text_encoder import (
+    SELECT_LAYERS,
+    encode_krea_prompt,
+)
 
 
 class Krea2ReferenceAttentionTests(unittest.TestCase):
@@ -210,6 +215,76 @@ class Krea2ReferenceAttentionTests(unittest.TestCase):
                             atol=1e-6,
                             msg=lambda message, name=name: f"{name}: {message}",
                         )
+
+
+class _TextInputs(dict):
+    def to(self, *args, **kwargs):
+        return self
+
+
+class _Tokenizer:
+    def __init__(self, length):
+        self.length = length
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(kwargs)
+        return _TextInputs(
+            input_ids=torch.zeros((1, self.length), dtype=torch.long),
+            attention_mask=torch.ones((1, self.length), dtype=torch.long),
+        )
+
+
+class _SuffixProcessor:
+    def __call__(self, *args, **kwargs):
+        return _TextInputs(
+            input_ids=torch.zeros((1, 2), dtype=torch.long),
+            attention_mask=torch.ones((1, 2), dtype=torch.long),
+        )
+
+
+class _TextEncoder:
+    device = torch.device("cpu")
+
+    def __call__(self, input_ids, **kwargs):
+        shape = (1, input_ids.shape[1], 3)
+        hidden_states = [torch.zeros(shape) for _ in range(max(SELECT_LAYERS) + 1)]
+        return SimpleNamespace(hidden_states=hidden_states)
+
+
+class Krea2PromptLengthTests(unittest.TestCase):
+    def test_unlimited_prompt_is_not_truncated(self):
+        tokenizer = _Tokenizer(length=700)
+
+        result = encode_krea_prompt(
+            _TextEncoder(),
+            tokenizer,
+            _SuffixProcessor(),
+            "long prompt",
+            max_length=512,
+        )
+
+        self.assertEqual(result.shape[0], 700 + 2 - 34)
+        self.assertEqual(len(tokenizer.calls), 1)
+        self.assertFalse(tokenizer.calls[0]["truncation"])
+        self.assertNotIn("max_length", tokenizer.calls[0])
+
+    def test_strict_prompt_length_raises_instead_of_truncating(self):
+        tokenizer = _Tokenizer(length=34 + 513)
+
+        with self.assertRaisesRegex(
+            ValueError, r"513 tokens exceeds .*max_text_length=512"
+        ):
+            encode_krea_prompt(
+                _TextEncoder(),
+                tokenizer,
+                _SuffixProcessor(),
+                "long prompt",
+                max_length=512,
+                overflow_policy="error",
+            )
+
+        self.assertFalse(tokenizer.calls[0]["truncation"])
 
 
 if __name__ == "__main__":

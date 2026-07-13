@@ -533,7 +533,13 @@ class SDTrainer(BaseSDTrainProcess):
         super().hook_before_train_loop()
         if self.is_caching_text_embeddings and not self._use_cached_te:
             # make sure model is on cpu for this part so we don't oom.
-            self.sd.unet.to('cpu')
+            from toolkit.memory_management.arena_offload import get_arena_runtime
+
+            arena_runtime = get_arena_runtime(self.sd.unet)
+            if arena_runtime is not None:
+                arena_runtime.place_permanent_modules("cpu")
+            else:
+                self.sd.unet.to('cpu')
 
         # cache unconditional embeds (blank prompt). When a TE worker has already cached
         # everything, self.unconditional_embeds was populated from disk and the text

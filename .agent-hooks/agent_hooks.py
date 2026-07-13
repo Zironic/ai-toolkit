@@ -71,6 +71,11 @@ ERROR_LINE_RE = re.compile(
     r"(?i)(error|failed|failure|exception|traceback|panic|fatal|segmentation|assert|cannot|denied|not found|timeout)"
 )
 
+GIT_CRLF_WARNING_RE = re.compile(
+    r"^(?:git\s*:\s*)?warning: in the working copy of .+ "
+    r"LF will be replaced by CRLF the next time Git touches it$"
+)
+
 NOISY_COMMAND_RE = re.compile(
     r"(?ix)"
     r"(\bpytest\b|\bnpm\s+(run\s+)?test\b|\bpnpm\s+test\b|\byarn\s+test\b|"
@@ -1090,6 +1095,36 @@ def first_last_lines(text: str, head: int, tail: int) -> tuple[list[str], list[s
     return lines[:head], lines[-tail:], len(lines)
 
 
+def strip_git_crlf_noise(text: str) -> str:
+    """Hide Git's harmless line-ending warning and its PowerShell error record.
+
+    Windows PowerShell 5.1 promotes the first native stderr line to an
+    ErrorRecord when the capped wrapper merges streams. Keep real stderr in the
+    raw log, but do not surface this known warning or the wrapper metadata in
+    the bounded summary.
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    skip_powershell_record = False
+    for line in lines:
+        if GIT_CRLF_WARNING_RE.match(line.strip()):
+            skip_powershell_record = line.lstrip().lower().startswith("git ")
+            continue
+        if skip_powershell_record:
+            stripped = line.strip()
+            if (
+                not stripped
+                or re.match(r"^At line:\d+ char:\d+$", stripped)
+                or stripped.startswith("+")
+                or stripped.startswith("CategoryInfo")
+                or stripped.startswith("FullyQualifiedErrorId")
+            ):
+                continue
+            skip_powershell_record = False
+        out.append(line)
+    return "\n".join(out)
+
+
 def summarize_output(stdout: str, stderr: str, *, log_path: Path, returncode: int | None) -> str:
     combined = ""
     if stdout:
@@ -1097,6 +1132,7 @@ def summarize_output(stdout: str, stderr: str, *, log_path: Path, returncode: in
     if stderr:
         combined += ("\n" if combined else "") + "[stderr]\n" + stderr
 
+    combined = strip_git_crlf_noise(combined)
     head, tail, total = first_last_lines(combined, VISIBLE_HEAD_LINES, VISIBLE_TAIL_LINES)
     error_lines = [ln for ln in combined.splitlines() if ERROR_LINE_RE.search(ln)]
     # Keep unique-ish first 80 error lines.
@@ -1146,7 +1182,7 @@ def resolve_powershell_exe(requested: str) -> str | None:
 
 
 def build_powershell_wrapper(script: str) -> str:
-    prelude = "$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n$InformationPreference = 'Continue'\n$WarningPreference = 'Continue'\ntry {\n    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)\n    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n    if ($PSVersionTable.PSVersion.Major -ge 7) { $PSStyle.OutputRendering = 'PlainText' }\n} catch {}\ntry {\n    & {\n"
+    prelude = "$ErrorActionPreference = 'Continue'\n$ProgressPreference = 'SilentlyContinue'\n$InformationPreference = 'Continue'\n$WarningPreference = 'Continue'\ntry {\n    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)\n    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n    if ($PSVersionTable.PSVersion.Major -ge 7) { $PSStyle.OutputRendering = 'PlainText' }\n} catch {}\ntry {\n    & {\n"
     postlude = '} *>&1 | Out-String -Width 4096\n    if ($global:LASTEXITCODE -is [int] -and $global:LASTEXITCODE -ne 0) { exit $global:LASTEXITCODE }\n} catch {\n    [Console]::Error.WriteLine(($_ | Out-String -Width 4096))\n    exit 1\n}\n'
     return prelude + script + "\n" + postlude
 

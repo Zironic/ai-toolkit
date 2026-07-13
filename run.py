@@ -76,6 +76,7 @@ import argparse
 from toolkit.job import get_job
 from toolkit.accelerator import get_accelerator
 from toolkit.print import print_acc, setup_log_to_file
+from toolkit.process_cleanup import arm_error_exit_watchdog, exit_ui_worker_successfully
 
 accelerator = get_accelerator()
 
@@ -146,30 +147,55 @@ def main():
         print_acc(f"Running {len(config_file_list)} job{'' if len(config_file_list) == 1 else 's'}")
 
     for config_file in config_file_list:
+        job = None
+        job_failed = False
+        error_exit_watchdog = None
         try:
             job = get_job(config_file, args.name)
             job.run()
-            job.cleanup()
             jobs_completed += 1
         except Exception as e:
+            job_failed = True
             print_acc(f"Error running job: {e}")
             jobs_failed += 1
+            error_exit_watchdog = arm_error_exit_watchdog()
             try:
-                job.process[0].on_error(e)
+                if job is not None and job.process:
+                    job.process[0].on_error(e)
             except Exception as e2:
                 print_acc(f"Error running on_error: {e2}")
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
-                raise e
+                raise
         except KeyboardInterrupt as e:
+            job_failed = True
+            error_exit_watchdog = arm_error_exit_watchdog()
             try:
-                job.process[0].on_error(e)
+                if job is not None and job.process:
+                    job.process[0].on_error(e)
             except Exception as e2:
                 print_acc(f"Error running on_error: {e2}")
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
-                raise e
+                raise
+        finally:
+            cleanup_failed = False
+            if job is not None:
+                try:
+                    job.cleanup()
+                except Exception as cleanup_error:
+                    cleanup_failed = True
+                    print_acc(f"Error cleaning up job: {cleanup_error}")
+                    if not job_failed:
+                        raise
+            if (
+                error_exit_watchdog is not None
+                and args.recover
+                and not cleanup_failed
+            ):
+                error_exit_watchdog.set()
 
 
 if __name__ == '__main__':
     main()
+    exit_ui_worker_successfully()

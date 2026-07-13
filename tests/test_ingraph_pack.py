@@ -159,12 +159,12 @@ class PackHandleOwnershipTests(unittest.TestCase):
         release_pack(None)
 
     def test_build_failure_after_flat_alloc_releases_handle(self):
-        from toolkit.memory_management import ingraph_stream
+        from toolkit.memory_management.arena_offload import layout
 
         layer = torch.nn.Linear(8, 4, bias=True)
         with mock.patch.object(pin_manager, "release") as released:
             with mock.patch.object(
-                ingraph_stream, "LinearSpec", side_effect=RuntimeError("boom")
+                layout, "LinearSpec", side_effect=RuntimeError("boom")
             ):
                 with self.assertRaises(RuntimeError):
                     pack_block_host("blocks.0", [("proj", layer)], repoint=False, pin=True)

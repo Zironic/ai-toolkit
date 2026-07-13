@@ -26,7 +26,8 @@ from types import MappingProxyType
 import torch
 
 from toolkit.memory_management.canonical_arena import BlockRecord
-from toolkit.memory_management.ingraph_stream import LEAF_ALIGN
+from toolkit.memory_management.arena_offload.layout import LEAF_ALIGN
+
 
 
 class TransferPlanError(ValueError):

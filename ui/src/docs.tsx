@@ -647,6 +647,19 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.model_kwargs.prompt_overflow_policy': {
+    title: 'Prompt Length',
+    description: (
+      <>
+        Krea 2 accepts prompts of any token length by default. Select the strict option to stop setup with an error
+        when a prompt exceeds the configured maximum instead of silently truncating it.
+      </>
+    ),
+  },
+  'model.model_kwargs.max_text_length': {
+    title: 'Maximum Prompt Tokens',
+    description: <>Maximum Krea 2 prompt length when the strict prompt-length policy is selected.</>,
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

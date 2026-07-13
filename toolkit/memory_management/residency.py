@@ -14,7 +14,8 @@ from dataclasses import dataclass
 import torch
 
 from toolkit.memory_management.canonical_arena import CanonicalArena
-from toolkit.memory_management.ingraph_stream import (
+from toolkit.memory_management.arena_offload.layout import (
+
     _flatten_leaves,
     _rebuild_from_leaves,
     leaf_view,

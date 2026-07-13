@@ -272,6 +272,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # save so non-training uses of this class never spin up the thread.
         self._async_saver = None
         self._save_stager = None
+        self._arena_runtime = None
+        self._cleanup_started = False
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
         # if true, then we do not do an optimizer step. We are accumulating gradients
@@ -305,26 +307,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 "[MemoryManager] native FP8 options ignored: transformer weights "
                 "are not configured as FP8"
             )
-        MemoryManager.set_offload_profile_enabled(
-            self.model_config.layer_offloading_profile
-        )
-        # Prefetch (slice 2B) needs the frozen access trace to know what to
-        # pre-pin, so enabling it implies tracing.
-        prefetch_enabled = self.model_config.layer_offloading_prefetch
-        MemoryManager.set_offload_trace_enabled(
-            self.model_config.layer_offloading_trace or prefetch_enabled
-        )
-        MemoryManager.set_offload_prefetch_enabled(prefetch_enabled)
-        prefetch_capture_path = self._resolve_job_jsonl_path(
-            self.model_config.layer_offloading_prefetch_trace_capture,
-            'prefetch_trace_capture.jsonl',
-        )
-        if prefetch_capture_path:
-            self._archive_previous_jsonl(prefetch_capture_path, 'prefetch trace capture')
-        MemoryManager.set_offload_prefetch_trace_capture(
-            prefetch_capture_path,
-            self.model_config.layer_offloading_prefetch_trace_capture_steps,
-        )
         MemoryManager.set_fp8_grad_input_enabled(
             fp8_weights_configured
             and self.model_config.layer_offloading_fp8_grad_input
@@ -777,6 +759,70 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         pass
     
+    def cleanup(self):
+        """Release threads, pins, CUDA sidecars, and process-global job state."""
+        if self._cleanup_started:
+            return
+        self._cleanup_started = True
+        errors = []
+
+        def attempt(label, fn):
+            try:
+                fn()
+            except Exception as error:
+                errors.append(f"{label}: {type(error).__name__}: {error}")
+
+        saver = self._async_saver
+        if saver is not None:
+            attempt("async saver wait", lambda: saver.wait_idle(timeout=10.0))
+            attempt("async saver close", lambda: saver.close(timeout=5.0))
+            self._async_saver = None
+
+        stager = self._save_stager
+        if stager is not None:
+            attempt("save stager", stager.close)
+            self._save_stager = None
+
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            attempt("logger", logger.finish)
+
+        dop_executor = getattr(self, "_dop_cache_executor", None)
+        if dop_executor is not None:
+            attempt(
+                "DOP cache executor",
+                lambda: dop_executor.shutdown(wait=False, cancel_futures=True),
+            )
+            self._dop_cache_executor = None
+
+        db_executor = getattr(self, "thread_pool", None)
+        if db_executor is not None:
+            attempt(
+                "UI database executor",
+                lambda: db_executor.shutdown(wait=False, cancel_futures=True),
+            )
+            self.thread_pool = None
+
+        runtime = self._arena_runtime
+        if runtime is None:
+            sd = getattr(self, "sd", None)
+            runtime = get_arena_runtime(getattr(sd, "unet", None)) if sd is not None else None
+        if runtime is not None:
+            attempt("arena runtime", runtime.close)
+            self._arena_runtime = None
+
+        from toolkit.memory_management import MemoryManager
+        attempt("memory manager", MemoryManager.reset_job_runtime)
+
+        host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+        if host_empty_cache is not None:
+            attempt("pinned host cache", host_empty_cache)
+        if torch.cuda.is_available():
+            attempt("CUDA cache", torch.cuda.empty_cache)
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
     def done_hook(self):
         pass
     
@@ -2730,7 +2776,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
-        unet.to(self.device_torch, dtype=dtype)
+        arena_runtime = get_arena_runtime(unet)
+        if arena_runtime is not None:
+            arena_runtime.place_permanent_modules(self.device_torch, dtype)
+        else:
+            unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
         vae = vae.to(torch.device('cpu'), dtype=dtype)
@@ -2837,7 +2887,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_lorm:
                     self.network.is_lorm = True
                     # make sure it is on the right device
-                    self.sd.unet.to(self.sd.device, dtype=dtype)
+                    arena_runtime = get_arena_runtime(self.sd.unet)
+                    if arena_runtime is not None:
+                        arena_runtime.place_permanent_modules(self.sd.device, dtype)
+                    else:
+                        self.sd.unet.to(self.sd.device, dtype=dtype)
                     original_unet_param_count = count_parameters(self.sd.unet)
                     self.network.setup_lorm()
                     new_unet_param_count = original_unet_param_count - self.network.calculate_lorem_parameter_reduction()
@@ -3393,6 +3447,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc("Continuing without compilation")
         arena_runtime = get_arena_runtime(self.sd.unet)
         if arena_runtime is not None:
+            self._arena_runtime = arena_runtime
             # Two-phase lifecycle: the model prepared the arena (unfinalized)
             # during load_model, BEFORE LoRA. The permanent train/sample programs
             # must be FINALIZED HERE, after the network is applied, so they

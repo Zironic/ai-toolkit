@@ -66,6 +66,15 @@ class BaseJob:
                 raise ValueError(f'config file is invalid. Unknown process type: {process["type"]}')
 
     def cleanup(self):
-        # if you implement this in child clas,
-        # be sure to call super().cleanup() LAST
-        del self
+        """Release every process owned by this job, even after a partial failure."""
+        errors = []
+        for process in reversed(getattr(self, "process", ())):
+            try:
+                process.cleanup()
+            except Exception as error:
+                errors.append(f"{type(process).__name__}: {error}")
+            finally:
+                process.job = None
+        self.process.clear()
+        if errors:
+            raise RuntimeError("job cleanup failed: " + "; ".join(errors))

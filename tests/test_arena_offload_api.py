@@ -22,6 +22,7 @@ from toolkit.memory_management.arena_offload import (
 )
 from toolkit.memory_management.arena_offload.api import RUNTIME_ATTR, unwrap
 from toolkit.memory_management.arena_offload.runtime import _fixed_working_bytes
+from toolkit.memory_management.arena_offload.runtime import ArenaOffloadRuntime
 
 GIB = 1024**3
 
@@ -131,6 +132,24 @@ class ArenaOffloadHelpersTest(unittest.TestCase):
         model = torch.nn.Linear(4, 4)
         model.module = model  # a module that is its own `.module`
         self.assertIs(unwrap(model), model)
+
+    def test_place_permanent_modules_does_not_move_canonical_leaf(self):
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.canonical = torch.nn.Linear(4, 4)
+                self.permanent = torch.nn.Linear(4, 4)
+
+        model = Model()
+        runtime = object.__new__(ArenaOffloadRuntime)
+        runtime._model = model
+        runtime._canonical_modules = (model.canonical,)
+        runtime._closed = False
+
+        runtime.place_permanent_modules("cpu", torch.float64)
+
+        self.assertEqual(model.canonical.weight.dtype, torch.float32)
+        self.assertEqual(model.permanent.weight.dtype, torch.float64)
 
 
 class ArenaOffloadConfigTest(unittest.TestCase):

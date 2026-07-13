@@ -48,10 +48,18 @@ from toolkit.basic import flush
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.accelerator import unwrap_model
 from toolkit.metadata import get_meta_for_safetensors
-from toolkit.util.quantize import quantize, get_qtype, quantize_model
+from toolkit.util.quantize import (
+    assign_quantized_state_dict,
+    get_qtype,
+    quantize,
+    quantize_model,
+)
 from toolkit.memory_management import MemoryManager
 from toolkit.memory_management import vram_budget
-from toolkit.memory_management.arena_offload import get_arena_runtime
+from toolkit.memory_management.arena_offload import (
+    get_arena_runtime,
+    prepare_canonical_storage,
+)
 from toolkit.compile_cache import load_compile_cache, save_compile_cache
 
 from .src.mmdit import (
@@ -296,20 +304,67 @@ def _load_checkpoint_tensor(handle, data_start, header, key, expected_shape, dty
     return tensor
 
 
-def _stream_checkpoint(transformer, checkpoint_path: str, dtype) -> None:
+def _arena_destination_key(state_key: str):
+    """Map a Krea checkpoint leaf to the generic arena destination key."""
+    parts = state_key.split(".")
+    if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit():
+        return None
+    tail = parts[-1]
+    if tail in ("_data", "_scale") and len(parts) >= 5 and parts[-2] == "weight":
+        role = "weight" if tail == "_data" else "scale"
+        linear_parts = parts[2:-2]
+    elif tail in ("weight", "bias"):
+        role = tail
+        linear_parts = parts[2:-1]
+    else:
+        return None
+    if not linear_parts:
+        return None
+    return (f"blocks.{parts[1]}", ".".join(linear_parts), role)
+
+
+def _stream_checkpoint(transformer, checkpoint_path: str, dtype, *, canonical_build=None) -> None:
     header, data_start = _read_safetensors_header(checkpoint_path)
     target_state = transformer.state_dict()
     target_keys = _validate_checkpoint_keys(transformer, header, checkpoint_path)
-    with open(checkpoint_path, "rb", buffering=0) as handle:
-        for key in tqdm(target_keys, desc="Loading Krea 2 tensors"):
-            tensor = _load_checkpoint_tensor(
-                handle, data_start, header, key, target_state[key].shape, dtype
-            )
-            _assign_tensor_by_name(transformer, key, tensor)
-            del tensor
+
+    def populate(destinations):
+        with open(checkpoint_path, "rb", buffering=0) as handle:
+            for key in tqdm(target_keys, desc="Loading Krea 2 tensors"):
+                tensor = _load_checkpoint_tensor(
+                    handle, data_start, header, key, target_state[key].shape, dtype
+                )
+                destination_key = _arena_destination_key(key)
+                if destination_key is not None and destination_key in destinations:
+                    destinations[destination_key].copy_(tensor)
+                else:
+                    _assign_tensor_by_name(transformer, key, tensor)
+                del tensor
+
+    if canonical_build is None:
+        populate({})
+    else:
+        canonical_build.populate(populate)
 
 
-def _stream_and_quantize_checkpoint(base_model, transformer, checkpoint_path, dtype) -> None:
+def _populate_canonical_build_from_model(canonical_build) -> None:
+    """Feed a loaded quantized cache into final typed arena destinations."""
+    def populate(destinations):
+        for destination_key, source in canonical_build.model_source_leaves():
+            destinations[destination_key].copy_(source)
+
+    canonical_build.populate(populate)
+
+
+def _stream_and_quantize_checkpoint(
+    base_model,
+    transformer,
+    checkpoint_path,
+    dtype,
+    *,
+    canonical_build=None,
+    adapter=None,
+) -> None:
     """Materialize, quantize, and release one bounded submodule at a time."""
     header, data_start = _read_safetensors_header(checkpoint_path)
     target_state = transformer.state_dict()
@@ -336,7 +391,16 @@ def _stream_and_quantize_checkpoint(base_model, transformer, checkpoint_path, dt
             unit.to(base_model.device_torch, dtype=dtype)
             quantize(unit, weights=quantization_type)
             freeze(unit)
+            unit.requires_grad_(False)
             unit.to("cpu")
+            if canonical_build is not None and unit_name.startswith("blocks."):
+                block_index = int(unit_name.split(".")[1])
+                block_key = adapter.block_key(transformer, block_index)
+                canonical_build.add_block(block_key, adapter.leaf_entries(unit))
+                canonical_build.populate_block_from_model(block_key)
+                canonical_build.release_block_sources_to_meta(block_key)
+    if canonical_build is not None:
+        canonical_build.finish_population()
     base_model.print_and_status_update("  - finished streaming and quantizing transformer units")
     flush(garbage_collect=False)
 
@@ -440,9 +504,11 @@ def _try_load_quantized_transformer_cache(base_model, transformer, cache_path: P
         if payload.get("metadata") != metadata:
             base_model.print_and_status_update("  - cached quantized transformer metadata mismatch; ignoring")
             return False
-        missing, unexpected = transformer.load_state_dict(payload["state_dict"], strict=True, assign=True)
-        if missing or unexpected:
-            raise RuntimeError(f"missing={missing[:5]} unexpected={unexpected[:5]}")
+        assign_quantized_state_dict(
+            transformer,
+            payload["state_dict"],
+            base_model.model_config.qtype,
+        )
         from toolkit.dequantize import patch_dequantization_on_save
         patch_dequantization_on_save(transformer)
         return True
@@ -489,11 +555,23 @@ class Krea2Model(BaseModel):
 
         self.patch_size = KREA2_MMDIT_CONFIG["patch"]
         self.vae_scale_factor = 8  # Qwen-Image VAE is f8
-        # Safety cap on prompt token length (truncation only); embeds are stored
-        # per-sample at natural length and padded to the batch max at the model call.
+        # Prompts are unlimited by default. Strict mode rejects prompts over the
+        # configured threshold during text-embedding setup instead of truncating.
         self.max_text_length = int(
             self.model_config.model_kwargs.get("max_text_length", 512)
         )
+        self.prompt_overflow_policy = str(
+            self.model_config.model_kwargs.get(
+                "prompt_overflow_policy", "unlimited"
+            )
+        ).lower()
+        if self.prompt_overflow_policy not in ("unlimited", "error"):
+            raise ValueError(
+                "model.model_kwargs.prompt_overflow_policy must be "
+                "'unlimited' or 'error'"
+            )
+        if self.max_text_length < 1:
+            raise ValueError("model.model_kwargs.max_text_length must be at least 1")
         # Qwen2TokenizerFast used to tokenize the assistant suffix (matches the
         # reference's separate processor pass).
         self.processor = None
@@ -524,6 +602,13 @@ class Krea2Model(BaseModel):
         # trained with kv_cache enabled for kv-cached inference (the ComfyUI
         # node / hub pipeline kv_cache toggles) to work properly.
         self.kv_cache = bool(self.model_config.model_kwargs.get("kv_cache", False))
+
+    @property
+    def text_embedding_space_version(self):
+        # v2 invalidates embeddings created by the old silent 512-token truncation.
+        if self.prompt_overflow_policy == "error":
+            return f"krea2-v2-error-{self.max_text_length}"
+        return "krea2-v2-unlimited"
 
     @staticmethod
     def get_train_scheduler(model_config: Optional[ModelConfig] = None):
@@ -614,6 +699,12 @@ class Krea2Model(BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading transformer (SingleStreamDiT)")
 
+        from toolkit.sdpa_patch import set_gqa_backend_mode
+
+        gqa_backend = self.model_config.model_kwargs.get("sdpa_gqa_backend", "auto")
+        set_gqa_backend_mode(gqa_backend)
+        self.print_and_status_update(f"  - SDPA GQA backend: {gqa_backend}")
+
         mmdit_kwargs = dict(KREA2_MMDIT_CONFIG)
         mmdit_kwargs.update(self.model_config.model_kwargs.get("mmdit_config", {}))
         config = SingleMMDiTConfig(**mmdit_kwargs)
@@ -630,22 +721,87 @@ class Krea2Model(BaseModel):
             and self.model_config.accuracy_recovery_adapter is None
             and self.model_config.assistant_lora_path is None
         )
+        arena_requested = bool(
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_smart
+        )
+        direct_ranged_population = bool(
+            arena_requested
+            and not self.model_config.quantize
+            and self.model_config.assistant_lora_path is None
+        )
         cache_path, cache_metadata = _quantized_transformer_cache_info(self, checkpoint_path, dtype, config)
         # Build on meta, then materialize either from the quantized cache or the checkpoint.
         with torch.device("meta"):
             transformer = SingleStreamDiT(config)
 
-        if stream_quantized and _try_load_quantized_transformer_cache(self, transformer, cache_path, cache_metadata):
-            self._transformer_quantized_during_load = True
-        else:
-            self.print_and_status_update("  - loading transformer through ranged disk reads")
-            if stream_quantized:
-                _stream_and_quantize_checkpoint(self, transformer, checkpoint_path, dtype)
-                _save_quantized_transformer_cache(self, transformer, cache_path, cache_metadata)
+        canonical_build = None
+        try:
+            cache_loaded = bool(
+                stream_quantized
+                and _try_load_quantized_transformer_cache(
+                    self, transformer, cache_path, cache_metadata
+                )
+            )
+            if cache_loaded:
                 self._transformer_quantized_during_load = True
-            else:
-                _stream_checkpoint(transformer, checkpoint_path, dtype)
+                if arena_requested:
+                    from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
 
+                    transformer.requires_grad_(False)
+                    canonical_build = prepare_canonical_storage(
+                        transformer, SingleStreamMMDiTAdapter()
+                    )
+                    _populate_canonical_build_from_model(canonical_build)
+            else:
+                self.print_and_status_update("  - loading transformer through ranged disk reads")
+                if stream_quantized:
+                    adapter = None
+                    if arena_requested:
+                        from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
+
+                        adapter = SingleStreamMMDiTAdapter()
+                        canonical_build = prepare_canonical_storage(
+                            transformer, adapter, defer_blocks=True
+                        )
+                    _stream_and_quantize_checkpoint(
+                        self,
+                        transformer,
+                        checkpoint_path,
+                        dtype,
+                        canonical_build=canonical_build,
+                        adapter=adapter,
+                    )
+                    if canonical_build is None:
+                        _save_quantized_transformer_cache(
+                            self, transformer, cache_path, cache_metadata
+                        )
+                    else:
+                        self._pending_quantized_transformer_cache = (
+                            cache_path,
+                            cache_metadata,
+                        )
+                    self._transformer_quantized_during_load = True
+                else:
+                    if direct_ranged_population:
+                        from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
+
+                        transformer.requires_grad_(False)
+                        canonical_build = prepare_canonical_storage(
+                            transformer, SingleStreamMMDiTAdapter()
+                        )
+                    _stream_checkpoint(
+                        transformer,
+                        checkpoint_path,
+                        dtype,
+                        canonical_build=canonical_build,
+                    )
+        except Exception:
+            if canonical_build is not None:
+                canonical_build.rollback()
+            raise
+
+        self._prepared_canonical_build = canonical_build
         flush()
         return transformer
 
@@ -656,13 +812,11 @@ class Krea2Model(BaseModel):
 
         tokenizer = AutoTokenizer.from_pretrained(
             te_path,
-            max_length=self.max_text_length,
             token=HF_TOKEN,
             local_files_only=_hf_local_files_only(self.model_config),
         )
         processor = Qwen2TokenizerFast.from_pretrained(
             te_path,
-            max_length=self.max_text_length,
             token=HF_TOKEN,
             local_files_only=_hf_local_files_only(self.model_config),
         )
@@ -801,13 +955,18 @@ class Krea2Model(BaseModel):
             prepare_arena_offload,
         )
 
-        return prepare_arena_offload(
-            transformer,
-            device=self.device_torch,
-            adapter=SingleStreamMMDiTAdapter(),
-            config=ArenaOffloadConfig.from_model_config(self.model_config),
-            ignore_modules=ignore_modules,
-        )
+        canonical_build = getattr(self, "_prepared_canonical_build", None)
+        try:
+            return prepare_arena_offload(
+                transformer,
+                device=self.device_torch,
+                adapter=SingleStreamMMDiTAdapter(),
+                config=ArenaOffloadConfig.from_model_config(self.model_config),
+                ignore_modules=ignore_modules,
+                canonical_build=canonical_build,
+            )
+        finally:
+            self._prepared_canonical_build = None
 
     def load_model(self):
         dtype = self.torch_dtype
@@ -830,6 +989,7 @@ class Krea2Model(BaseModel):
                 quantize_model(self, transformer)
                 flush()
 
+            arena_runtime = None
             if (
                 self.model_config.layer_offloading
                 and (
@@ -849,7 +1009,7 @@ class Krea2Model(BaseModel):
                     # singleton module resident. It also checkpoints each block
                     # in its own train trunk, so the model's gradient
                     # checkpointing stays off here.
-                    self._attach_immutable_training_memory(
+                    arena_runtime = self._attach_immutable_training_memory(
                         transformer, ignore_modules
                     )
                 else:
@@ -860,7 +1020,17 @@ class Krea2Model(BaseModel):
                         ignore_modules=ignore_modules,
                     )
 
-            if self.model_config.low_vram:
+            if arena_runtime is not None:
+                pending_cache = getattr(
+                    self, "_pending_quantized_transformer_cache", None
+                )
+                if pending_cache is not None:
+                    _save_quantized_transformer_cache(
+                        self, transformer, pending_cache[0], pending_cache[1]
+                    )
+                    self._pending_quantized_transformer_cache = None
+                arena_runtime.place_permanent_modules(self.device_torch, dtype)
+            elif self.model_config.low_vram:
                 self.print_and_status_update("Moving transformer to CPU")
                 transformer.to("cpu")
             elif self.model_config.quantize:
@@ -880,13 +1050,11 @@ class Krea2Model(BaseModel):
             te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
             tokenizer = AutoTokenizer.from_pretrained(
                 te_path,
-                max_length=self.max_text_length,
                 token=HF_TOKEN,
                 local_files_only=_hf_local_files_only(self.model_config),
             )
             processor = Qwen2TokenizerFast.from_pretrained(
                 te_path,
-                max_length=self.max_text_length,
                 token=HF_TOKEN,
                 local_files_only=_hf_local_files_only(self.model_config),
             )
@@ -900,6 +1068,7 @@ class Krea2Model(BaseModel):
                 quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
                 freeze(text_encoder)
                 flush()
+            arena_runtime = None
             if (
                 self.model_config.layer_offloading
                 and self.model_config.layer_offloading_text_encoder_percent > 0
@@ -953,7 +1122,10 @@ class Krea2Model(BaseModel):
     ):
         extra = extra or {}
         skip_sampling_guard = bool(extra.get("skip_sampling_guard", False))
-        if self.model.device == torch.device("cpu"):
+        arena_runtime = get_arena_runtime(self.model)
+        if arena_runtime is not None:
+            arena_runtime.place_permanent_modules(self.device_torch, self.torch_dtype)
+        elif self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
 
         sc = self.get_bucket_divisibility()
@@ -985,16 +1157,6 @@ class Krea2Model(BaseModel):
 
         # CFG is zero-normalized for Krea 2.
         guidance = max(0.0, gen_config.guidance_scale - 1.0)
-        # Reactive cohabitation guard: if external VRAM growth (Windows desktop,
-        # another app) since the last image would push this forward's peak within
-        # the WDDM spill margin, stream one resident block back to CPU first.
-        # Paging is silent (not an OOM), so this must be proactive.
-        guard = getattr(self.model, "_mm_sampling_guard", None)
-        if guard is not None and not skip_sampling_guard:
-            try:
-                guard()
-            except Exception as error:
-                print(f"[MemoryManager] sampling cohabitation guard failed: {error}")
         compile_cache_dir = getattr(self.model_config, 'compile_cache_dir', None)
         compile_cache_key = _compile_cache_key(self)
         if (
@@ -1027,7 +1189,6 @@ class Krea2Model(BaseModel):
             if self.model_config.compile_sample
             else contextlib.nullcontext()
         )
-        arena_runtime = get_arena_runtime(self.model)
         immutable_context = (
             arena_runtime.sampling_image(
                 shape_key=_sampling_shape_key(gen_config),
@@ -1037,7 +1198,11 @@ class Krea2Model(BaseModel):
                 ),
             )
             if arena_runtime is not None
-            else contextlib.nullcontext()
+            else (
+                MemoryManager.sampling_image(self.model)
+                if not skip_sampling_guard
+                else contextlib.nullcontext()
+            )
         )
         with immutable_context:
             with compile_stance:
@@ -1159,7 +1324,10 @@ class Krea2Model(BaseModel):
         batch: "DataLoaderBatchDTO" = None,
         **kwargs,
     ):
-        if self.model.device == torch.device("cpu"):
+        arena_runtime = get_arena_runtime(self.model)
+        if arena_runtime is not None:
+            arena_runtime.place_permanent_modules(self.device_torch, self.torch_dtype)
+        elif self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
 
         # Clean reference latents from the batch's control images (if any); they
@@ -1272,6 +1440,7 @@ class Krea2Model(BaseModel):
                 self.processor,
                 p,
                 max_length=self.max_text_length,
+                overflow_policy=self.prompt_overflow_policy,
                 select_layers=SELECT_LAYERS,
                 images=images,
                 vl_processor=self.vl_processor,
@@ -1296,8 +1465,10 @@ class Krea2Model(BaseModel):
         )
 
     def get_text_length_bounds(self) -> Optional[tuple]:
-        # Prompt features are padded to the batch max (pad_text_features), never
-        # to a fixed length, so any batch can reach the tokenizer cap.
+        # Unlimited prompts cannot provide a safe finite compile bound. Strict
+        # mode uses its configured setup-time limit.
+        if self.prompt_overflow_policy == "unlimited":
+            return None
         return (0, int(self.max_text_length))
 
     def get_loss_target(self, *args, **kwargs):

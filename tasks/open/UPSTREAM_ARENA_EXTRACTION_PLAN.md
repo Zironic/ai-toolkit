@@ -646,8 +646,12 @@ Stage 3 lands, when there is exactly one owner of that code.
   rollback; compile invalidation; no per-linear state or actions.
 - **Lifecycle:** prepare before LoRA; finalize after LoRA; compatible double
   finalize; incompatible double finalize fails; training context spans checkpoint
-  recompute; no residency publication during execution; train->sample->train;
-  close rejects active execution.
+  recompute; no residency publication during execution; train->sample->train.
+  Job teardown runs from `run.py` `finally` on success and failure, closes every
+  process-owned worker, releases resident sidecars and canonical pin/storage,
+  then clears process-global memory pools. Close rejects active execution. A
+  detached UI worker exits explicitly only after teardown and output flush;
+  CLI jobs retain natural interpreter shutdown.
 - **Compile ownership:** arena compiles functional kernels once; generic block
   compile skipped; legacy per-linear models still use generic block compile;
   compile-disabled arena runs eagerly with identical semantics.
