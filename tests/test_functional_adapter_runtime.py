@@ -12,7 +12,10 @@ from extensions_built_in.diffusion_models.krea2.src.mmdit import (
 )
 from toolkit.functional_adapter import FunctionalLinear
 from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
-from toolkit.quantization.fp8_linear import bind_linear_operation
+from toolkit.quantization.fp8_linear import (
+    bind_linear_operation,
+    bind_parameter_operation,
+)
 from toolkit.lora_special import FullModule, LoRAModule
 from toolkit.models.DoRA import DoRAModule
 from toolkit.models.lokr import LokrModule
@@ -40,7 +43,9 @@ def _functional_linear(linear):
         bias=linear.bias,
         scale=None,
         call_fn=call_fn,
-        materialize_fn=lambda weight, scale: weight,
+        materialize_fn=lambda weight, scale, dtype: (
+            weight if dtype is None else weight.to(dtype)
+        ),
     )
 
 
@@ -146,6 +151,31 @@ def test_supported_lokr_owner_is_collected_at_setup():
     )
 
 
+def test_lokr_dense_replacement_bypasses_fp8_storage_execution():
+    from torchao.quantization import Float8Tensor
+
+    torch.manual_seed(23)
+    network = _Network()
+    dense_weight = torch.randn(4, 4, dtype=torch.float32)
+    quantized_weight = Float8Tensor.from_hp(dense_weight)
+    operation, arg = bind_parameter_operation(quantized_weight, device="cpu")
+
+    child = torch.nn.Linear(4, 4, bias=False)
+    child.weight.data.copy_(operation.materialize(arg, dtype=torch.float32))
+    child.weight.requires_grad_(False)
+    adapter = LokrModule("test", child, network=network, lora_dim=2, alpha=2)
+    for parameter in _adapter_parameters(adapter):
+        torch.nn.init.normal_(parameter, std=0.2)
+    adapter.apply_to()
+
+    x = torch.randn(2, 3, 4, dtype=torch.float32)
+    expected = adapter(x)
+    actual = _streamed_arg_linear_train(x, arg, operation, adapter)
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == torch.float32
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_lokr_functional_leaf_runs_under_block_compile():
     device = torch.device("cuda")
@@ -166,7 +196,8 @@ def test_lokr_functional_leaf_runs_under_block_compile():
         return _streamed_arg_linear_train(x, arg, operation, adapter)
 
     x = torch.randn(2, 3, 4, device=device, requires_grad=True)
-    expected = leaf(x)
+    expected_x = x.detach().clone().requires_grad_(True)
+    expected = adapter(expected_x)
     compiled = torch.compile(leaf, backend="eager", fullgraph=True)
     actual = compiled(x)
     torch.testing.assert_close(actual, expected)

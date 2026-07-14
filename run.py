@@ -78,7 +78,7 @@ from toolkit.accelerator import get_accelerator
 from toolkit.print import print_acc, setup_log_to_file
 from toolkit.process_cleanup import (
     arm_error_exit_watchdog,
-    cleanup_job_before_ui_exit,
+    cleanup_job_before_recovery,
     exit_ui_worker_successfully,
 )
 from toolkit.memory_management.arena_offload.errors import recover_allows_next_job
@@ -184,23 +184,16 @@ def main():
                 print_end_message(jobs_completed, jobs_failed)
                 raise
         finally:
-            cleanup_failed = False
-            if job is not None:
-                try:
-                    cleanup_job_before_ui_exit(
-                        job, allow_ui_success_exit=not job_failed
-                    )
-                except Exception as cleanup_error:
-                    cleanup_failed = True
-                    print_acc(f"Error cleaning up job: {cleanup_error}")
-                    if not job_failed:
-                        raise
-            if (
-                error_exit_watchdog is not None
-                and args.recover
-                and not cleanup_failed
-            ):
-                error_exit_watchdog.set()
+            try:
+                cleanup_job_before_recovery(
+                    job,
+                    job_failed=job_failed,
+                    recover=args.recover,
+                    error_exit_watchdog=error_exit_watchdog,
+                )
+            except Exception as cleanup_error:
+                print_acc(f"Error cleaning up job: {cleanup_error}")
+                raise
 
     exit_ui_worker_successfully()
 

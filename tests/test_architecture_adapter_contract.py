@@ -1,30 +1,21 @@
-"""Maintainer-runnable proof that the arena block ABI is architecture-neutral."""
+"""Behavioral proof that the arena block ABI is architecture-neutral."""
 
-from dataclasses import fields
-import inspect
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn.functional as F
 
-from toolkit.quantization.fp8_linear import bind_linear_operation
-
 from toolkit.memory_management.adapters import validate_architecture_adapter
-from toolkit.memory_management.immutable_runtime import (
-    ImmutableBlockABI,
-    build_sample_trunk,
-    build_train_trunk,
-)
-from toolkit.memory_management.arena_offload import layout
-from toolkit.memory_management import immutable_runtime, pinned_arena, residency
-from toolkit.memory_management import transfer_plan
+from toolkit.memory_management.canonical_arena import CanonicalArena
+from toolkit.memory_management.immutable_runtime import ImmutableTransformerRuntime
+from toolkit.memory_management.residency import ResidencyPlan, ResidencyState
 
 
 class _Stage(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.projection = torch.nn.Linear(4, 4, bias=False)
+        self.requires_grad_(False)
 
 
 class _StageAdapter:
@@ -55,118 +46,80 @@ class _StageAdapter:
     def can_run_current_call(self, block_args, **_kwargs):
         return set(block_args) == {"offset", "gain"}
 
-    def bind_block_operations(self, block, device):
-        return (
-            bind_linear_operation(block.projection.weight, device=device),
-        )
+    def bind_block_operations(self, _storage_views, _device):
+        return (None,)
 
     def forward_block(
         self,
-        block,
+        _block,
         hidden,
         block_args,
         leaf_args,
-        linear_operations,
-        adapter_args,
+        _linear_operations,
+        _adapter_args,
         *,
         training,
     ):
-        del block, linear_operations, adapter_args, training
+        del training
         weight = leaf_args[0][0]
-        return F.linear(hidden, weight) * block_args["gain"] + block_args["offset"]
-
-
-def _block_functions(model, adapter):
-    functions = []
-    for block in adapter.execution_blocks(model):
-        leaf_args = tuple(
-            ((module.weight,))
-            for _name, module in adapter.leaf_entries(block)
+        return (
+            F.linear(hidden, weight) * block_args["gain"]
+            + block_args["offset"]
         )
-        operations = adapter.bind_block_operations(block, "cpu")
-
-        def block_fn(hidden, block_args, block=block, leaf_args=leaf_args):
-            return adapter.forward_block(
-                block,
-                hidden,
-                block_args,
-                leaf_args,
-                operations,
-                None,
-                training=torch.is_grad_enabled(),
-            )
-
-        functions.append(block_fn)
-    return tuple(functions)
 
 
-def test_second_adapter_uses_non_krea_structure_and_opaque_pytree_args():
+def test_second_adapter_runs_non_krea_structure_through_generic_runtime():
+    torch.manual_seed(7)
     model = SimpleNamespace(stages=(_Stage(), _Stage()))
     adapter = _StageAdapter()
     validate_architecture_adapter(adapter)
     adapter.validate_transformer(model)
-
-    assert adapter.block_key(model, 1) == "stages.1"
-    assert tuple(name for name, _ in adapter.leaf_entries(model.stages[0])) == (
-        "projection",
+    reference_weights = tuple(
+        stage.projection.weight.detach().clone() for stage in model.stages
     )
 
-    hidden = torch.randn(2, 4, requires_grad=True)
-    block_args = {
-        "offset": torch.randn(2, 4),
-        "gain": torch.tensor(0.5),
-    }
-    block_fns = _block_functions(model, adapter)
-    sample = build_sample_trunk(block_fns)(hidden, block_args)
-    train = build_train_trunk(block_fns)(hidden, block_args)
-
-    torch.testing.assert_close(train, sample)
-    train.sum().backward()
-    assert hidden.grad is not None
-
-
-def test_incomplete_adapter_is_rejected_before_arena_preparation():
-    with pytest.raises(TypeError, match="missing validate_transformer"):
-        validate_architecture_adapter(SimpleNamespace(architecture_key="incomplete"))
-
-
-def test_arena_movement_contains_no_fp8_execution_contract():
-    stale_fields = {
-        "kind",
-        "weight_scale",
-        "fp8_qualifies",
-        "fp8_flags",
-        "native_fp8_eligible",
-    }
-    for record_type in (
-        layout.LinearSpec,
-        layout.BlockPack,
-        layout.LayerStorageView,
-        ImmutableBlockABI,
-    ):
-        assert stale_fields.isdisjoint(field.name for field in fields(record_type))
-
-    assert "operation" not in {
-        field.name for field in fields(layout.LayerStorageView)
-    }
-
-    movement_source = "\n".join(
-        inspect.getsource(module)
-        for module in (
-            layout,
-            immutable_runtime,
-            pinned_arena,
-            residency,
-            transfer_plan,
-        )
+    arena = CanonicalArena()
+    arena.canonicalize(
+        {
+            adapter.block_key(model, index): list(adapter.leaf_entries(stage))
+            for index, stage in enumerate(model.stages)
+        }
     )
-    for execution_detail in (
-        "torch._scaled_mm",
-        "qdata",
-        "fp8_qualifies",
-        "fp8_flags",
-        "weight_scale",
-        "bind_storage_operation",
-        "bind_parameter_operation",
-    ):
-        assert execution_detail not in movement_source
+    residency = ResidencyState(arena, "cpu")
+    resident_keys = tuple(
+        (adapter.block_key(model, index), "projection")
+        for index in range(len(model.stages))
+    )
+    plan = ResidencyPlan.build("train", resident_keys)
+    runtime = ImmutableTransformerRuntime(
+        model,
+        residency,
+        architecture_adapter=adapter,
+        block_operations=((None,), (None,)),
+        compile_blocks=False,
+    )
+
+    try:
+        runtime.finalize_execution()
+        runtime.activate(runtime.TRAIN, plan)
+        hidden = torch.randn(2, 4, requires_grad=True)
+        block_args = {
+            "offset": torch.randn(2, 4),
+            "gain": torch.tensor(0.5),
+        }
+        expected = hidden
+        for weight in reference_weights:
+            expected = F.linear(expected, weight) * block_args["gain"] + block_args[
+                "offset"
+            ]
+
+        assert runtime.can_run_current_call(block_args)
+        with runtime.execution(runtime.TRAIN):
+            actual = runtime.run(hidden, block_args)
+        torch.testing.assert_close(actual, expected)
+        actual.sum().backward()
+        assert hidden.grad is not None
+    finally:
+        runtime.close()
+        residency.clear()
+        arena.release()

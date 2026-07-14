@@ -1294,7 +1294,7 @@ leaf_entries(block)
 collect_execution_adapters(model, network)
 build_adapter_args(index, adapters_by_block, multiplier)
 can_run_current_call(block_args, **call_metadata)
-bind_block_operations(block, device)
+bind_block_operations(storage_views, device)
 forward_block(block, hidden, block_args, leaf_args, linear_operations,
               adapter_args, training=...)
 ```
@@ -1302,6 +1302,13 @@ forward_block(block, hidden, block_args, leaf_args, linear_operations,
 Contract validation occurs before canonical commit. Unit tests provide a
 synthetic second adapter with a different block container, different leaf
 names, and mapping-shaped block arguments.
+
+Every block operation is also bound before canonical commit from the populated
+immutable storage declaration (`tensors`, `execution_key`, and
+`weight_leaf_count`). The prepared operation tuples are passed into the
+executor after commit; operation selection must not rediscover semantics from
+the temporary wrapper installed at `module.weight`. Unsupported storage formats
+therefore remain ordinary pre-commit setup rejections.
 
 ## 10.3 Explicit finalization input
 
@@ -1312,7 +1319,9 @@ patched-forward owner chains.
 
 Krea2 initially supports one LoRA, LoKr, DoRA, or full-layer adapter per
 canonical Linear. Reject multiple or unsupported entries clearly during
-finalization. `network=None` explicitly means no execution adapters.
+finalization. `network=None` explicitly means frozen-base execution with no
+functional training adapters. It does not mean full-parameter training;
+canonical arena leaves reject trainable weights and biases during construction.
 
 ## 10.4 Maintainer-runnable test layers
 

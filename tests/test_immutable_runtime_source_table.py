@@ -53,6 +53,7 @@ class ImmutableRuntimeSourceTableTests(unittest.TestCase):
             _EmptyModel(),
             _FakeResidency(),
             architecture_adapter=SingleStreamMMDiTAdapter(),
+            block_operations=(),
             compile_blocks=False,
         )
         executor.finalize_execution()

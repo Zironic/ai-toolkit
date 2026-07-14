@@ -71,6 +71,17 @@ class LayerStorageView:
     tensors: tuple[torch.Tensor, ...]
 
 
+def layer_storage_views(pack: BlockPack) -> tuple[LayerStorageView, ...]:
+    """Expose a block's immutable execution declarations in leaf order."""
+    return tuple(
+        LayerStorageView(
+            spec=spec,
+            tensors=tuple(typed_view(pack.host_flat, leaf) for leaf in spec.tensors),
+        )
+        for spec in pack.linears
+    )
+
+
 def _rebuild_from_leaves(src, leaves_iter):
     try:
         names, ctx = src.__tensor_flatten__()

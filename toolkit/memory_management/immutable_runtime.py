@@ -327,6 +327,7 @@ class ImmutableTransformerRuntime:
         residency: ResidencyState,
         *,
         architecture_adapter,
+        block_operations,
         depth: int = 2,
         compile_blocks: bool = True,
         compile_dynamic: bool | None = True,
@@ -342,13 +343,6 @@ class ImmutableTransformerRuntime:
         self.residency = residency
         self.architecture_adapter = architecture_adapter
         self._blocks = self.architecture_adapter.execution_blocks(model)
-        self._block_operations = tuple(
-            self.architecture_adapter.bind_block_operations(
-                block,
-                self.residency.device,
-            )
-            for block in self._blocks
-        )
         self.adapters_by_block = {}
         self.adapter_multiplier = None
         self.depth = max(1, int(depth))
@@ -374,6 +368,14 @@ class ImmutableTransformerRuntime:
             )
             for index in range(len(self._blocks))
         )
+        self._block_operations = tuple(tuple(items) for items in block_operations)
+        if len(self._block_operations) != len(self._block_abis):
+            raise ImmutableRuntimeError("immutable_block_operation_count_mismatch")
+        for abi, operations in zip(self._block_abis, self._block_operations):
+            if len(operations) != len(abi.leaf_names):
+                raise ImmutableRuntimeError(
+                    f"immutable_leaf_operation_count_mismatch:{abi.block_key}"
+                )
         self._sources = ImmutableRuntimeSourceTable(residency, self._block_abis)
         self._block_kernels: dict[tuple[str, int], object] = {}
         self._block_fns: dict[str, tuple] = {}
@@ -1150,6 +1152,7 @@ def prepare_immutable_runtime(
     residency: ResidencyState,
     *,
     architecture_adapter,
+    block_operations,
     depth: int = 2,
     compile_blocks: bool = True,
     compile_dynamic: bool | None = True,
@@ -1161,6 +1164,7 @@ def prepare_immutable_runtime(
         transformer,
         residency,
         architecture_adapter=architecture_adapter,
+        block_operations=block_operations,
         depth=depth,
         compile_blocks=compile_blocks,
         compile_dynamic=compile_dynamic,

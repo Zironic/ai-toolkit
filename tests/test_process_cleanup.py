@@ -1,4 +1,5 @@
 from jobs import BaseJob
+import threading
 import toolkit.process_cleanup as process_cleanup
 
 def test_force_exit_uses_taskkill_for_windows_process_tree():
@@ -133,3 +134,24 @@ def test_failed_ui_job_cleanup_does_not_report_success_exit():
     assert calls == ["trainer"]
     assert job.process == []
     assert exits == []
+
+
+def test_cleanup_failure_keeps_watchdog_armed_and_blocks_recovery():
+    calls = []
+    job = BaseJob.__new__(BaseJob)
+    job.process = [
+        _CleanupProcess("trainer", calls, RuntimeError("transfer cleanup failed"))
+    ]
+    watchdog = threading.Event()
+
+    import pytest
+    with pytest.raises(RuntimeError, match="transfer cleanup failed"):
+        process_cleanup.cleanup_job_before_recovery(
+            job,
+            job_failed=True,
+            recover=True,
+            error_exit_watchdog=watchdog,
+        )
+
+    assert calls == ["trainer"]
+    assert not watchdog.is_set()

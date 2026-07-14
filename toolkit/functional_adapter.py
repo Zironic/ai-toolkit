@@ -44,8 +44,7 @@ class FunctionalLinear:
         )
 
     def materialized_weight(self, dtype=None) -> torch.Tensor:
-        weight = self.materialize_fn(self.weight, self.scale)
-        return weight if dtype is None else weight.to(dtype)
+        return self.materialize_fn(self.weight, self.scale, dtype)
 
 
 def functional_base_weight(inner, *, dtype=None):

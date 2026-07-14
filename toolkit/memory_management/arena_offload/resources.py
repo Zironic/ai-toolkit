@@ -102,13 +102,13 @@ class ArenaRuntimeResources:
         from . import transfer
 
         try:
+            transfer_cleanup_failed = False
             if self.owner_token is not None:
-                attempt(
-                    "transfer tickets",
-                    lambda: transfer.drain_fetch_runtime(
-                        owner_token=self.owner_token
-                    ),
-                )
+                try:
+                    transfer.drain_fetch_runtime(owner_token=self.owner_token)
+                except BaseException as error:
+                    transfer_cleanup_failed = True
+                    failures.append(("transfer tickets", error))
             if self.executor is not None:
                 attempt("immutable executor", self.executor.close)
             for label, restore in reversed(self.fp8_restores):
@@ -142,16 +142,18 @@ class ArenaRuntimeResources:
                 attempt("canonical build", self.canonical_build.rollback)
 
             if self.owner_token is not None:
-                attempt(
-                    "transfer runtime",
-                    lambda: transfer.release_fetch_runtime(self.owner_token),
-                )
                 try:
-                    release_process_owner(self.owner_token)
+                    transfer.release_fetch_runtime(self.owner_token)
                 except BaseException as error:
-                    failures.append(("process ownership", error))
-                else:
-                    self.owner_token = None
+                    transfer_cleanup_failed = True
+                    failures.append(("transfer runtime", error))
+                if not transfer_cleanup_failed:
+                    try:
+                        release_process_owner(self.owner_token)
+                    except BaseException as error:
+                        failures.append(("process ownership", error))
+                    else:
+                        self.owner_token = None
         finally:
             self.closing = False
             self.released = self.owner_token is None

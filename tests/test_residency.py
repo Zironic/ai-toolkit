@@ -78,9 +78,9 @@ class _LinearBlockAdapter:
     def can_run_current_call(self, block_args, **kwargs):
         return True
 
-    def bind_block_operations(self, block, device):
+    def bind_block_operations(self, storage_views, device):
         del device
-        return (None,) * len(block.entries)
+        return (None,) * len(storage_views)
 
     def forward_block(self, *args, **kwargs):
         raise AssertionError("not used by residency policy test")
@@ -96,6 +96,7 @@ def test_runtime_training_transitions_are_whole_block(arena_layers):
         model,
         state,
         architecture_adapter=_LinearBlockAdapter(),
+        block_operations=((None,) * len(layers),),
         compile_blocks=False,
     )
     runtime.finalize_execution()
@@ -123,6 +124,7 @@ def test_exact_training_block_transaction_uses_stable_key(arena_layers):
         model,
         state,
         architecture_adapter=_LinearBlockAdapter(),
+        block_operations=((None,) * len(layers),),
         compile_blocks=False,
     )
     runtime.finalize_execution()

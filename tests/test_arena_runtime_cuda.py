@@ -48,8 +48,8 @@ class _Adapter:
     def build_adapter_args(self, _index, _adapters, _multiplier=None):
         return None
 
-    def bind_block_operations(self, block, device):
-        del block, device
+    def bind_block_operations(self, storage_views, device):
+        del storage_views, device
         return (None,)
 
     def forward_block(

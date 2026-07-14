@@ -219,16 +219,20 @@ def _streamed_arg_linear(
     from toolkit.functional_adapter import FunctionalLinear
     weight, bias, scale = operation.functional_components(arg)
     def call_fn(value, explicit_weight, explicit_bias, explicit_scale):
-        tensors = operation.explicit_tensors(
+        return operation.forward_explicit(
+            value,
             explicit_weight,
             explicit_bias,
             explicit_scale,
+            training=training,
         )
-        return forward(value, tensors)
 
-    def materialize_fn(explicit_weight, explicit_scale):
+    def materialize_fn(explicit_weight, explicit_scale, dtype):
         tensors = operation.explicit_tensors(explicit_weight, None, explicit_scale)
-        return operation.materialize(tensors, dtype=torch.bfloat16)
+        return operation.materialize(
+            tensors,
+            dtype=torch.bfloat16 if dtype is None else dtype,
+        )
 
     base = FunctionalLinear(
         weight=weight,

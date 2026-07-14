@@ -564,6 +564,14 @@ def _try_load_quantized_transformer_cache(
                 else:
                     canonical_values[destination_key] = value
                 canonical_keys.add(key)
+            required = set(destinations)
+            provided = set(canonical_values)
+            if provided != required:
+                raise RuntimeError(
+                    "cached arena payload mismatch: "
+                    f"missing={sorted(required - provided)[:5]} "
+                    f"unexpected={sorted(provided - required)[:5]}"
+                )
             assign_quantized_state_dict_subset(
                 transformer,
                 state_dict,

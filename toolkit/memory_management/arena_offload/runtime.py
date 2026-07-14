@@ -152,6 +152,22 @@ class ArenaOffloadRuntime:
                     raise RuntimeError("arena_canonical_build_adapter_mismatch")
                 arena = canonical_build.arena
 
+            block_operations = []
+            for index, _block in enumerate(blocks):
+                block_key = adapter.block_key(transformer, index)
+                operations = tuple(
+                    adapter.bind_block_operations(
+                        canonical_build.storage_views(block_key),
+                        device,
+                    )
+                )
+                if len(operations) != len(entries_by_block[block_key]):
+                    raise ValueError(
+                        f"arena_leaf_operation_count_mismatch:{block_key}"
+                    )
+                block_operations.append(operations)
+            block_operations = tuple(block_operations)
+
             canonical_build.commit()
             resources.mark_canonical_committed()
             canonical_modules = tuple(
@@ -174,6 +190,7 @@ class ArenaOffloadRuntime:
                 transformer,
                 residency,
                 architecture_adapter=adapter,
+                block_operations=block_operations,
                 depth=policy.prefetch_depth,
                 compile_blocks=config.compile_blocks,
                 compile_dynamic=config._compile_dynamic,
@@ -321,12 +338,13 @@ class ArenaOffloadRuntime:
         Must run AFTER the training network is applied: the programs capture the
         installed adapter leaves. The architecture adapter obtains those entries
         from the supplied network; finalization never rediscovers them through
-        patched module-forward ownership. ``network=None`` explicitly means no
-        trainable execution adapters (for example full-parameter training).
+        patched module-forward ownership. ``network=None`` explicitly means
+        frozen-base execution with no functional training adapter. Canonical
+        arena leaves cannot be used for full-parameter training.
         """
         self._require_open()
-        self._bind_training_cap()
         try:
+            self._bind_training_cap()
             adapters = self._adapter.collect_execution_adapters(
                 self._model,
                 network,

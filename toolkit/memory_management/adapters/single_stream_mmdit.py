@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from toolkit.quantization.fp8_linear import bind_linear_operation
+from toolkit.quantization.fp8_linear import bind_storage_operation
 
 
 class SingleStreamMMDiTAdapter:
@@ -169,14 +169,15 @@ class SingleStreamMMDiTAdapter:
                 args.append((entry.a, entry.b, entry.scale * multiplier))
         return tuple(args)
 
-    def bind_block_operations(self, block, device):
+    def bind_block_operations(self, storage_views, device):
         return tuple(
-            bind_linear_operation(
-                module.weight,
-                getattr(module, "bias", None),
+            bind_storage_operation(
+                view.tensors,
+                execution_key=view.spec.execution_key,
+                weight_leaf_count=view.spec.weight_leaf_count,
                 device=device,
             )
-            for _name, module in self.leaf_entries(block)
+            for view in storage_views
         )
 
     def forward_block(

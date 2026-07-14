@@ -24,7 +24,9 @@ from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
 from toolkit.memory_management.canonical_arena import CanonicalArena
 from toolkit.memory_management.ingraph_stream import LoraEntry
 from toolkit.memory_management.residency import ResidencyPlan, ResidencyState
+from toolkit.memory_management.arena_offload.layout import layer_storage_views
 from toolkit.models.lokr import LokrModule
+from toolkit.quantization.fp8_linear import bind_linear_operation
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
@@ -40,10 +42,19 @@ def _runtime(model, state, *, compile_blocks=True, **finalize_kwargs):
     Phase A (construct) sees no LoRA; phase B (finalize_execution) installs the
     LoRA metadata and builds the permanent programs.
     """
+    architecture_adapter = SingleStreamMMDiTAdapter()
+    block_operations = tuple(
+        architecture_adapter.bind_block_operations(
+            layer_storage_views(state.arena.block_record(f"blocks.{index}").pack),
+            state.device,
+        )
+        for index in range(LAYERS)
+    )
     runtime = ImmutableTransformerRuntime(
         model,
         state,
-        architecture_adapter=SingleStreamMMDiTAdapter(),
+        architecture_adapter=architecture_adapter,
+        block_operations=block_operations,
         compile_blocks=compile_blocks,
     )
     runtime.finalize_execution(**finalize_kwargs)
@@ -195,9 +206,15 @@ def test_compiled_train_parity_lora_grads_and_zero_graph_breaks():
                     expected,
                     *inputs[1:],
                     reference_args[index],
-                    _ADAPTER.bind_block_operations(
-                        model.blocks[index],
-                        "cuda",
+                    tuple(
+                        bind_linear_operation(
+                            child.weight,
+                            child.bias,
+                            device="cuda",
+                        )
+                        for _name, child in _ADAPTER.leaf_entries(
+                            model.blocks[index]
+                        )
                     ),
                     loras=lora_args,
                 )

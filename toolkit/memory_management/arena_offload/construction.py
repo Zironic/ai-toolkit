@@ -13,6 +13,7 @@ from .layout import (
     LinearSpec,
     flatten_leaves,
     inspect_block,
+    LayerStorageView,
     linear_views,
     make_block_view_maker,
     typed_view,
@@ -145,6 +146,38 @@ class PreparedCanonicalBuild:
         except Exception:
             self.rollback()
             raise
+
+    def storage_views(self, block_key: str) -> tuple[LayerStorageView, ...]:
+        """Return populated immutable storage declarations before commit."""
+        if not self._populated:
+            raise CanonicalBuildError("canonical_build_not_populated")
+        try:
+            block = next(item for item in self.blocks if item.key == block_key)
+        except StopIteration as error:
+            raise CanonicalBuildError(
+                f"canonical_build_unknown_block:{block_key}"
+            ) from error
+        return tuple(
+            LayerStorageView(
+                spec=LinearSpec(
+                    name=linear.name,
+                    tensors=tuple(
+                        LeafSpec(**leaf.__dict__)
+                        for leaf in linear.leaf_descriptors
+                    ),
+                    execution_key=linear.execution_key,
+                    weight_leaf_count=linear.weight_leaf_count,
+                    weight_template=linear.weight_template,
+                    weight_requires_grad=linear.weight_requires_grad,
+                    bias_requires_grad=linear.bias_requires_grad,
+                ),
+                tensors=tuple(
+                    typed_view(block.flat, leaf)
+                    for leaf in linear.leaf_descriptors
+                ),
+            )
+            for linear in block.layout.linears
+        )
 
     def model_source_leaves(self, *, block_key: str | None = None):
         """Yield loaded model leaves keyed exactly like final destinations."""

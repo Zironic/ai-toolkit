@@ -594,6 +594,14 @@ class BoundFp8LinearOperation:
             )
         return materialized_linear(x, self.spec, qdata, scale, bias)
 
+    def forward_explicit(self, x, weight, bias, scale, *, training):
+        """Execute either the original FP8 tuple or a dense replacement."""
+        if scale is None:
+            return BoundDenseLinearOperation()._forward(x, weight, bias)
+        tensors = self.explicit_tensors(weight, bias, scale)
+        forward = self.forward_train if training else self.forward_sample
+        return forward(x, tensors)
+
     def materialize(self, tensors, dtype=torch.bfloat16):
         qdata, scale, _bias = self._unpack(tensors)
         return materialize_fp8_weight(self.spec, qdata, scale, dtype)
@@ -660,6 +668,10 @@ class BoundDenseLinearOperation:
         bias = None if self.bias_index is None else tensors[self.bias_index]
         return self._forward(x, weight, bias)
 
+    def forward_explicit(self, x, weight, bias, scale, *, training):
+        del scale, training
+        return self._forward(x, weight, bias)
+
     def materialize(self, tensors, dtype=None):
         weight = tensors[0]
         return weight if dtype is None or weight.dtype == dtype else weight.to(dtype=dtype)
@@ -720,7 +732,16 @@ def bind_storage_operation(
             device=device,
             has_bias=len(tensors) > 2,
         )
-    if int(weight_leaf_count) == 1:
+    dense_declaration = False
+    try:
+        declared_weight_leaves = tuple(execution_key[2])
+        dense_declaration = (
+            len(declared_weight_leaves) == 1
+            and declared_weight_leaves[0][0] == "weight"
+        )
+    except (IndexError, TypeError):
+        pass
+    if int(weight_leaf_count) == 1 and dense_declaration:
         return BoundDenseLinearOperation(bias_index=1 if len(tensors) > 1 else None)
     raise ValueError("unsupported_linear_storage_operation")
 

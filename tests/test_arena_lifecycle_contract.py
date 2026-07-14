@@ -24,6 +24,8 @@ from toolkit.memory_management.arena_offload.ownership import (
     release_process_owner,
 )
 from toolkit.memory_management.arena_offload.resources import ArenaRuntimeResources
+from toolkit.memory_management.arena_offload.runtime import ArenaOffloadRuntime
+from toolkit.quantization.fp8_linear import bind_storage_operation
 
 
 class _Adapter:
@@ -52,8 +54,8 @@ class _Adapter:
     def can_run_current_call(self, _block_args, **_kwargs):
         return True
 
-    def bind_block_operations(self, block, device):
-        del block, device
+    def bind_block_operations(self, storage_views, device):
+        del storage_views, device
         return (None,)
 
     def forward_block(
@@ -69,6 +71,67 @@ class _Adapter:
     ):
         del training
         return hidden
+
+
+class _UnsupportedTensor(torch.Tensor):
+    @staticmethod
+    def __new__(cls, payload):
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            payload.shape,
+            strides=payload.stride(),
+            storage_offset=payload.storage_offset(),
+            dtype=payload.dtype,
+            layout=payload.layout,
+            device=payload.device,
+            requires_grad=False,
+        )
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __tensor_flatten__(self):
+        return ["payload"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, _context, _size, _stride):
+        return _UnsupportedTensor(inner_tensors["payload"])
+
+    @classmethod
+    def __torch_dispatch__(cls, func, _types, args=(), kwargs=None):
+        if func in (torch.ops.aten.detach.default, torch.ops.aten.alias.default):
+            return cls(args[0].payload)
+        raise NotImplementedError(func)
+
+
+class _UnsupportedLeaf(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._parameters["weight"] = _UnsupportedTensor(torch.randn(4, 4))
+        self._parameters["bias"] = None
+
+
+class _UnsupportedStorageAdapter(_Adapter):
+    def validate_transformer(self, model):
+        if not hasattr(model, "leaf"):
+            raise TypeError("expected leaf")
+
+    def execution_blocks(self, model):
+        return (model.leaf,)
+
+    def leaf_entries(self, block):
+        return (("linear", block),)
+
+    def bind_block_operations(self, storage_views, device):
+        return tuple(
+            bind_storage_operation(
+                view.tensors,
+                execution_key=view.spec.execution_key,
+                weight_leaf_count=view.spec.weight_leaf_count,
+                device=device,
+            )
+            for view in storage_views
+        )
 
 
 def _frozen_linear():
@@ -109,6 +172,25 @@ def test_precommit_failure_preserves_original_classification_and_model():
         )
 
     assert model.weight is original
+    assert active_process_owner() is None
+    assert not hasattr(model, "_arena_offload_runtime")
+    assert not hasattr(model, "_arena_offload_disposed")
+
+
+def test_unsupported_storage_operation_fails_before_canonical_commit():
+    model = torch.nn.Module()
+    model.leaf = _UnsupportedLeaf()
+    original = model.leaf.weight
+
+    with pytest.raises(ValueError, match="unsupported_linear_storage_operation"):
+        prepare_arena_offload(
+            model,
+            device="cpu",
+            adapter=_UnsupportedStorageAdapter(),
+            config=ArenaOffloadConfig(enabled=True),
+        )
+
+    assert model.leaf.weight is original
     assert active_process_owner() is None
     assert not hasattr(model, "_arena_offload_runtime")
     assert not hasattr(model, "_arena_offload_disposed")
@@ -234,6 +316,41 @@ def test_resource_release_continues_after_cleanup_error_and_is_idempotent():
     assert resources.released
     assert resources.disposed
     assert active_process_owner() is None
+
+
+def test_transfer_cleanup_failure_retains_process_owner_until_retry():
+    model = _frozen_linear()
+    resources = ArenaRuntimeResources(model, "cpu")
+    resources.acquire_process_owner()
+    token = resources.owner_token
+
+    with mock.patch(
+        "toolkit.memory_management.arena_offload.transfer.release_fetch_runtime",
+        side_effect=RuntimeError("transfer cleanup failed"),
+    ):
+        with pytest.raises(ArenaCleanupError, match="transfer cleanup failed"):
+            resources.release()
+
+    assert active_process_owner() is token
+    assert not resources.released
+    resources.release()
+    assert active_process_owner() is None
+    assert resources.released
+
+
+def test_finalize_cap_failure_is_fatal_after_runtime_publication():
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._closed = False
+    runtime._disposed = False
+    runtime._resources = SimpleNamespace(release=mock.Mock())
+    failure = RuntimeError("allocator cap failed")
+    runtime._bind_training_cap = mock.Mock(side_effect=failure)
+
+    with pytest.raises(ArenaSetupFatalError) as caught:
+        runtime.finalize()
+
+    assert caught.value.__cause__ is failure
+    runtime._resources.release.assert_called_once_with()
 
 
 def test_phase7_import_and_private_state_boundaries():

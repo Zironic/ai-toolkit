@@ -59,6 +59,23 @@ def cleanup_job_before_ui_exit(
         return
     job.cleanup()
 
+
+def cleanup_job_before_recovery(
+    job,
+    *,
+    job_failed: bool,
+    recover: bool,
+    error_exit_watchdog=None,
+) -> None:
+    """Clean completely before allowing the sequential job loop to recover."""
+    if job is not None:
+        cleanup_job_before_ui_exit(
+            job,
+            allow_ui_success_exit=not job_failed,
+        )
+    if error_exit_watchdog is not None and recover:
+        error_exit_watchdog.set()
+
 def arm_error_exit_watchdog(grace_seconds: float = ERROR_EXIT_GRACE_SECONDS) -> threading.Event:
     """Prevent detached UI training from hanging forever in error cleanup."""
     disarmed = threading.Event()

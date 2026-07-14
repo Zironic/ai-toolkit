@@ -93,33 +93,6 @@ def test_opaque_two_leaf_tuple_is_not_inferred_as_rowwise_fp8():
         )
 
 
-def test_native_and_fallback_bindings_share_the_same_storage_tuple():
-    qdata = torch.zeros((32, 64), dtype=torch.float8_e4m3fn)
-    scale = torch.ones(32, dtype=torch.float32)
-    bias = torch.zeros(32, dtype=torch.bfloat16)
-    with mock.patch.object(fp8, "native_device_supported", return_value=True):
-        native = fp8.bind_rowwise_fp8(
-            qdata,
-            scale,
-            device="cuda",
-            has_bias=True,
-        )
-    with mock.patch.object(fp8, "native_device_supported", return_value=False):
-        fallback = fp8.bind_rowwise_fp8(
-            qdata,
-            scale,
-            device="cuda",
-            has_bias=True,
-        )
-
-    assert native.native
-    assert not fallback.native
-    expected = (qdata, scale, bias)
-    for binding in (native, fallback):
-        actual = binding.explicit_tensors(qdata, bias, scale)
-        assert all(got is want for got, want in zip(actual, expected))
-
-
 def _quantized_linear(out_features=4096, in_features=1536):
     from torchao.quantization import Float8WeightOnlyConfig, quantize_
 

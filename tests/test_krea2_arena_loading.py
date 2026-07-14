@@ -55,8 +55,8 @@ class _TinyAdapter:
     def can_run_current_call(self, _block_args, **_kwargs):
         return True
 
-    def bind_block_operations(self, block, device):
-        del block, device
+    def bind_block_operations(self, storage_views, device):
+        del storage_views, device
         return (None,)
 
     def forward_block(
@@ -291,3 +291,32 @@ def test_quantized_cache_populates_final_arena_without_model_sized_assignment(tm
     finally:
         CanonicalArena.unguard_whole_model_to(transformer)
         build.arena.release()
+
+
+def test_quantized_cache_rejects_incomplete_canonical_payload(tmp_path):
+    from optimum.quanto import freeze
+    from toolkit.util.quantize import get_qtype, quantize
+
+    source = _QuantTransformer()
+    quantize(source, weights=get_qtype("qfloat8"))
+    freeze(source)
+    state_dict = source.state_dict()
+    del state_dict["blocks.0.linear.bias"]
+    metadata = {"schema": "test-incomplete-arena"}
+    cache = tmp_path / "incomplete_quantized_arena.pt"
+    torch.save({"metadata": metadata, "state_dict": state_dict}, str(cache))
+    with torch.device("meta"):
+        transformer = _QuantTransformer()
+
+    loaded, build = _try_load_quantized_transformer_cache(
+        _QuantBaseModel(),
+        transformer,
+        cache,
+        metadata,
+        canonical_adapter=_TinyAdapter(),
+        canonical_device="cpu",
+    )
+
+    assert not loaded
+    assert build is None
+    assert transformer.blocks[0].linear.weight.device.type == "meta"
