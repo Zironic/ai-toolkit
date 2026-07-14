@@ -7,7 +7,7 @@ snapshots, compile counters, JSON output, common assertions, and teardown.
 Architecture specifics (model construction, transformer loading, valid fake
 inputs, conditioning validation) come from scripts/smoke_profiles.py:
 
-    --profile krea2 | zimage | ideogram4
+    --profile krea2 | zimage | ideogram4 | anima
 
 The default phase sequence `train,train,sample,train` proves training ->
 sampling -> training survival: sample state publication, checkpoint state
@@ -58,8 +58,10 @@ from scripts.smoke_profiles import (  # noqa: E402
     audit_quantized_representation,
 )
 from scripts.smoke_runtime import (  # noqa: E402
+    CudaPhysicalFreeMonitor,
     LOAD_MODES,
     PAGING_LOAD_MODE,
+    PRODUCTION_LOAD_MODE,
     SMOKE_DIRECT_LOAD_MODE,
     add_contention_args,
     add_lock_args,
@@ -368,7 +370,7 @@ def _parse_args():
     parser.add_argument("--wddm-margin-gib", type=float, default=1.0)
     parser.add_argument("--wddm-hard-gib", type=float, default=1.0)
     parser.add_argument("--checkpoint-keep-last", type=int, default=0)
-    parser.add_argument("--prefetch-depth", type=int, default=2)
+    parser.add_argument("--prefetch-depth", type=int, default=3)
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument(
         "--compile-dynamic", choices=("true", "false", "none"), default="true"
@@ -391,16 +393,26 @@ def _parse_args():
     if args.load_mode is None:
         if args.profile == "krea2":
             args.load_mode = SMOKE_DIRECT_LOAD_MODE
+        elif args.profile == "anima":
+            args.load_mode = PRODUCTION_LOAD_MODE
         else:
             parser.error(
                 "this profile requires explicit --load-mode "
                 f"{PAGING_LOAD_MODE!r} because ordinary loading can cause "
                 "terabytes of paging"
             )
-    if args.profile != "krea2" and args.load_mode != PAGING_LOAD_MODE:
+    if (
+        args.profile not in ("krea2", "anima")
+        and args.load_mode != PAGING_LOAD_MODE
+    ):
         parser.error(
             "safe load modes are currently supported only by Krea2 for this "
             "multi-architecture harness"
+        )
+    if args.profile == "anima" and args.load_mode == SMOKE_DIRECT_LOAD_MODE:
+        parser.error(
+            "the anima profile supports production-model-load or the explicit "
+            "legacy paging mode, not smoke-direct-to-arena"
         )
     args.compile_dynamic_resolved = (
         None if args.compile_dynamic == "none" else args.compile_dynamic == "true"
@@ -437,16 +449,21 @@ def _train_phase(
     )
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    with execution_context, network:
-        runtime_accounting = (
-            memory_runtime.diagnostics().get("accounting")
-            if memory_runtime is not None
-            else None
-        )
-        pred = model.get_noise_prediction(noisy, timestep, embeds)
-        loss = torch.nn.functional.mse_loss(pred.float(), target)
-        loss.backward()
-    torch.cuda.synchronize(device)
+    physical_free_monitor = CudaPhysicalFreeMonitor(device).start()
+    try:
+        with execution_context, network:
+            runtime_accounting = (
+                memory_runtime.diagnostics().get("accounting")
+                if memory_runtime is not None
+                else None
+            )
+            pred = model.get_noise_prediction(noisy, timestep, embeds)
+            loss = torch.nn.functional.mse_loss(pred.float(), target)
+            loss.backward()
+        torch.cuda.synchronize(device)
+    except BaseException:
+        physical_free_monitor.stop()
+        raise
     return {
         "seconds": time.perf_counter() - started,
         "loss": loss.item(),
@@ -454,6 +471,7 @@ def _train_phase(
         "pred_finite": bool(torch.isfinite(pred.detach().float()).all()),
         "pred_shape": tuple(pred.shape),
         "runtime_accounting": runtime_accounting,
+        "_physical_free_monitor": physical_free_monitor,
     }
 
 
@@ -600,6 +618,10 @@ def main():
         rows.append({"event": "representation", **representation})
         _print_json(rows[-1])
 
+        # The canonical arena accepts immutable base storage only. Model-specific
+        # loaders such as Krea2 already freeze before attach, but the generic
+        # architecture path must establish the same lifecycle explicitly.
+        transformer.requires_grad_(False)
         model_ckpt = profile.enable_model_checkpointing(
             transformer, keep_last=args.checkpoint_keep_last
         )
@@ -690,13 +712,19 @@ def main():
         failures.append("generic dispatcher runtime is not model-checkpoint-owned")
     if not accounting.get("payload_reconciled"):
         failures.append("canonical resident + streamed payload bytes do not reconcile")
-    if not accounting.get("mixed_residency"):
+    if (
+        not accounting.get("mixed_residency")
+        and not runtime_diagnostics.get("all_resident_fit")
+    ):
         failures.append("production smoke did not establish mixed residency")
     if not accounting.get("protected_training_blocks_resident"):
         failures.append("model keep-last checkpoint blocks are not fully resident")
 
     # --- conditioning + fixed latents -------------------------------------
     embeds = profile.load_conditioning(args.cond_cache, args.batch_size)
+    # Match SDTrainer: cached conditioning is stored on CPU and moved to the
+    # training device/dtype immediately before the model prediction.
+    embeds.to(device, dtype=model.torch_dtype)
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
     latents_cpu = profile.make_latents(resolution, args.batch_size, generator, model)
     expected_pred_shape = profile.prediction_shape_reference(latents_cpu)
@@ -741,11 +769,18 @@ def main():
             )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize(device)
+            physical_free_sample = result.pop("_physical_free_monitor").stop()
+            if memory_runtime is not None and physical_free_sample is not None:
+                memory_runtime.record_training_physical_free_min(
+                    physical_free_sample["min_free_bytes"]
+                )
             result.update(
                 {
                     "grad_tensors": grads_present,
                     "grad_norm": grad_norm,
                     "grad_finite": grad_finite,
+                    "physical_free_sample": physical_free_sample,
                 }
             )
             loss_series.append(result["loss"])

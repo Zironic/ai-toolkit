@@ -472,6 +472,8 @@ def _train_compile_cache_key(base_model) -> str:
     compile_identity = {
         "compile_dynamic": config.compile_dynamic,
         "compile_dynamic_hints": tuple(config.compile_dynamic_hints or ()),
+        "fp8_forward": bool(config.layer_offloading_fp8_forward),
+        "fp8_grad_input": bool(config.layer_offloading_fp8_grad_input),
     }
     compile_tag = hashlib.sha256(
         json.dumps(compile_identity, sort_keys=True, default=str).encode("utf-8")

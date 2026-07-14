@@ -668,7 +668,6 @@ class ModelConfig:
         self.is_v3: bool = kwargs.get('is_v3', False)
         self.is_flux: bool = kwargs.get('is_flux', False)
         self.is_lumina2: bool = kwargs.get('is_lumina2', False)
-        self.is_anima: bool = kwargs.get('is_anima', False)
         if self.is_pixart_sigma:
             self.is_pixart = True
         self.use_flux_cfg = kwargs.get('use_flux_cfg', False)
@@ -862,11 +861,11 @@ class ModelConfig:
         )
         # How many blocks ahead the immutable runtime issues host->device
         # weight fetches. Since the ring recycles slots device-side the host
-        # never waits on it (depth_waits=0 at depth 2), so deeper rings buy
-        # nothing measurable and only cost a slot buffer of VRAM each: 2/3/4
-        # measured 2.13/2.12/2.09 s per step on Krea2, inside run-to-run noise.
+        # never waits on it. Keep three slots: generic block graphs can retain
+        # two tickets across a nested checkpoint/phase boundary before the
+        # next fetch is submitted.
         self.layer_offloading_prefetch_depth = kwargs.get(
-            "layer_offloading_prefetch_depth", 2
+            "layer_offloading_prefetch_depth", 3
         )
         # Eager residency fill (auto working_reserve only). The default climb is
         # deliberately timid -- one block every few steps, stopping as soon as the
@@ -1002,8 +1001,6 @@ class ModelConfig:
                 self.is_flux = True
             elif self.arch == 'lumina2':
                 self.is_lumina2 = True
-            elif self.arch == 'anima':
-                self.is_anima = True
             elif self.arch == 'vega':
                 self.is_vega = True
             elif self.arch == 'ssd':
@@ -1027,8 +1024,6 @@ class ModelConfig:
                 self.arch = 'flux'
             elif kwargs.get('is_lumina2', False):
                 self.arch = 'lumina2'
-            elif kwargs.get('is_anima', False):
-                self.arch = 'anima'
             elif kwargs.get('is_vega', False):
                 self.arch = 'vega'
             elif kwargs.get('is_ssd', False):

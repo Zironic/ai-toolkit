@@ -69,15 +69,6 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         torch.nn.Module.__init__(self)
         self.lora_name = lora_name
         self.orig_module_ref = weakref.ref(org_module)
-        # read the device off a param/buffer directly: OstrisLinear.weight is a
-        # property that dequantizes the whole weight just to answer .device
-        org_tensor = next(
-            (t for t in org_module._parameters.values() if t is not None),
-            next((t for t in org_module._buffers.values() if t is not None), None),
-        )
-        self.scalar = torch.tensor(
-            1.0, device=org_tensor.device if org_tensor is not None else None
-        )
 
         # if is ara lora module, mark it on the layer so memory manager can handle it
         if is_ara:
@@ -125,7 +116,7 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
             # otherwise CUDA-only block emit an Inductor C++ kernel on Windows.
             alpha = float(alpha.detach().float().item())
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
-        self.scale = float(alpha) / self.lora_dim
+        self._set_runtime_scale(float(alpha) / self.lora_dim)
         self.register_buffer("alpha", torch.tensor(alpha))  # 定数として扱える
 
         # same as microsoft's
@@ -339,7 +330,6 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             is_auraflow: bool = False,
             is_flux: bool = False,
             is_lumina2: bool = False,
-            is_anima: bool = False,
             use_bias: bool = False,
             is_lorm: bool = False,
             ignore_if_contains = None,
@@ -415,7 +405,6 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         self.is_auraflow = is_auraflow
         self.is_flux = is_flux
         self.is_lumina2 = is_lumina2
-        self.is_anima = is_anima
         self.network_type = network_type
         self.is_assistant_adapter = is_assistant_adapter
         self.full_rank = network_type.lower() == "fullrank"
@@ -440,7 +429,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             self.use_old_lokr_format = False
 
         # always do peft for flux only for now
-        if self.is_flux or self.is_v3 or self.is_lumina2 or self.is_anima or is_transformer:
+        if self.is_flux or self.is_v3 or self.is_lumina2 or is_transformer:
             # don't do peft format for lokr if using old format
             if self.network_type.lower() != "lokr" or not self.use_old_lokr_format:
                 self.peft_format = True
@@ -483,7 +472,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             unet_prefix = self.LORA_PREFIX_UNET
             if self.peft_format:
                 unet_prefix = self.PEFT_PREFIX_UNET
-            if is_pixart or is_v3 or is_auraflow or is_flux or is_lumina2 or self.is_anima or self.is_transformer:
+            if is_pixart or is_v3 or is_auraflow or is_flux or is_lumina2 or self.is_transformer:
                 unet_prefix = f"lora_transformer"
                 if self.peft_format:
                     unet_prefix = "transformer"
@@ -720,9 +709,6 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         
         if is_lumina2:
             target_modules = ["Lumina2Transformer2DModel"]
-
-        if self.is_anima:
-            target_modules = ["CosmosTransformer3DModel"]
 
         if train_unet:
             self.unet_loras, skipped_un = create_modules(True, None, unet, target_modules)

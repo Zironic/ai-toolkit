@@ -54,6 +54,89 @@ def _frozen_transformer():
     return model
 
 
+def _fp8_transformer(device, count=3, width=32):
+    from optimum.quanto import freeze
+
+    from toolkit.util.quantize import get_qtype, quantize
+
+    class Fp8Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(width, width, bias=False)
+
+        def forward(self, value):
+            return torch.nn.functional.silu(self.proj(value))
+
+    class Fp8Transformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Linear(width, width, bias=False)
+            self.blocks = torch.nn.ModuleList(Fp8Block() for _ in range(count))
+            self.gradient_checkpointing = True
+            self._checkpoint_keep_last = 1
+
+        def forward(self, value):
+            value = self.first(value)
+            cutoff = len(self.blocks) - self._checkpoint_keep_last
+            for index, block in enumerate(self.blocks):
+                if torch.is_grad_enabled() and index < cutoff:
+                    value = checkpoint(block, value, use_reentrant=False)
+                else:
+                    value = block(value)
+            return value
+
+    model = Fp8Transformer().to(device=device, dtype=torch.bfloat16)
+    quantize(model, weights=get_qtype("float8"))
+    freeze(model)
+    return model
+
+
+def _fp8_runtime(model, device, *, forward, backward, compile_blocks):
+    config = ArenaOffloadConfig(
+        enabled=True,
+        fp8_forward=forward,
+        fp8_backward=backward,
+        compile_blocks=compile_blocks,
+        _compile_dynamic=False,
+    )
+    config = replace(
+        config,
+        _policy=replace(
+            config._policy,
+            working_reserve_gib=0.0,
+            wddm_margin_gib=0.0,
+            wddm_hard_gib=1.0,
+            checkpoint_keep_last=1,
+        ),
+    )
+    with mock.patch(
+        "toolkit.memory_management.arena_offload.planner.vram_budget.device_mem_info",
+        return_value=(1 * 1024**3, 12 * 1024**3),
+    ):
+        return prepare_arena_offload(
+            model,
+            device=device,
+            block_names=("blocks",),
+            config=config,
+        )
+
+
+def _fp8_train_once(model, runtime, device, step, network=None):
+    import contextlib
+
+    value = torch.randn(
+        2, 3, 32, device=device, dtype=torch.bfloat16, requires_grad=True
+    )
+    network_context = network if network is not None else contextlib.nullcontext()
+    with runtime.training_step(shape_key=(2, 3, 32), step_num=step), network_context:
+        output = model(value)
+        output.float().square().mean().backward()
+    assert value.grad is not None
+    if network is not None:
+        assert all(parameter.grad is not None for parameter in network.parameters())
+    return output.detach()
+
+
 def test_declared_container_discovery_accounts_all_block_state():
     model = _frozen_transformer()
     selection = discover_blocks(model, container_paths=("blocks",))
@@ -256,3 +339,110 @@ def test_cuda_streamed_compiled_train_sample_train():
     assert torch.isfinite(second).all()
     close_arena_offload(model)
     assert active_process_owner() is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_fp8_gates_select_distinct_canonical_arena_paths():
+    from toolkit.quantization import fp8_linear
+
+    device = torch.device("cuda")
+    real_scaled_mm = torch._scaled_mm
+    real_grad_input = fp8_linear._grad_input_compute
+    results = {}
+
+    for name, forward, backward in (
+        ("baseline", False, False),
+        ("forward", True, False),
+        ("forward_backward", True, True),
+    ):
+        scaled_calls = []
+        grad_input_calls = []
+
+        def counted_scaled_mm(*args, **kwargs):
+            scaled_calls.append(1)
+            return real_scaled_mm(*args, **kwargs)
+
+        def counted_grad_input(*args, **kwargs):
+            grad_input_calls.append(1)
+            return real_grad_input(*args, **kwargs)
+
+        model = _fp8_transformer(device)
+        runtime = _fp8_runtime(
+            model,
+            device,
+            forward=forward,
+            backward=backward,
+            compile_blocks=False,
+        )
+        try:
+            with mock.patch.object(torch, "_scaled_mm", counted_scaled_mm), mock.patch.object(
+                fp8_linear, "_grad_input_compute", counted_grad_input
+            ):
+                runtime.finalize()
+                _fp8_train_once(model, runtime, device, 1)
+            diagnostics = runtime.diagnostics()
+            results[name] = {
+                "scaled": len(scaled_calls),
+                "grad_input": len(grad_input_calls),
+                "canonical": diagnostics["training_fp8_canonical"],
+                "singletons": diagnostics["training_fp8_singletons"],
+            }
+        finally:
+            close_arena_offload(model)
+
+    assert results["baseline"] == {
+        "scaled": 0,
+        "grad_input": 0,
+        "canonical": 0,
+        "singletons": 0,
+    }
+    assert results["forward"]["scaled"] > 0
+    assert results["forward"]["grad_input"] == 0
+    assert results["forward"]["canonical"] == 3
+    assert results["forward"]["singletons"] == 1
+    assert results["forward_backward"]["scaled"] > 0
+    assert results["forward_backward"]["grad_input"] > 0
+    assert results["forward_backward"]["canonical"] == 3
+    assert results["forward_backward"]["singletons"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_compiled_fp8_canonical_arena_emits_scaled_mm():
+    from scripts.smoke_quantized_linear_cuda import _apply_adapter
+
+    device = torch.device("cuda")
+    model = _fp8_transformer(device)
+    runtime = _fp8_runtime(
+        model,
+        device,
+        forward=True,
+        backward=True,
+        compile_blocks=True,
+    )
+    network = _apply_adapter(
+        model,
+        device,
+        torch.bfloat16,
+        "lora",
+        target_lin_modules=[model.__class__.__name__],
+    )
+    try:
+        runtime.finalize(network)
+        _fp8_train_once(model, runtime, device, 1, network)
+        for parameter in network.parameters():
+            parameter.grad = None
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as profiler:
+            _fp8_train_once(model, runtime, device, 2, network)
+        scaled_mm = [
+            event
+            for event in profiler.key_averages()
+            if "_scaled_mm" in event.key
+        ]
+        assert sum(event.count for event in scaled_mm) > 0
+        assert runtime.diagnostics()["training_fp8_canonical"] == 3
+        assert runtime.diagnostics()["training_fp8_singletons"] == 1
+    finally:
+        close_arena_offload(model)
+        torch.cuda.empty_cache()

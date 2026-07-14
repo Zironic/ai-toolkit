@@ -70,7 +70,7 @@ ARMS = (
         fp8_backward=True,
     ),
     Arm("convrot8", "convrot8"),
-    Arm("convrot4", "convrot4"),
+    Arm("convrotint4", "convrotint4"),
 )
 ARM_BY_NAME = {arm.name: arm for arm in ARMS}
 
@@ -337,6 +337,17 @@ def _event(rows, name):
 def normalize_run(run, out_dir: Path):
     path = out_dir / run["raw_json"]
     log_path = out_dir / run["stdout_log"]
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log_text = ""
+    compile_fallback = "WON'T CONVERT" in log_text
+    compile_failure = "InductorError" in log_text
+    invalid_reason = (
+        "compile_fallback"
+        if compile_fallback
+        else "compile_failure" if compile_failure else None
+    )
     base = {
         "run_id": run["run_id"],
         "arm": run["arm"],
@@ -345,11 +356,25 @@ def normalize_run(run, out_dir: Path):
         "status": run.get("status", "unknown"),
         "raw_json": run["raw_json"],
         "stdout_log": run["stdout_log"],
+        "qtype": ARM_BY_NAME[run["arm"]].qtype,
+        "fp8_forward": ARM_BY_NAME[run["arm"]].fp8_forward,
+        "fp8_backward": ARM_BY_NAME[run["arm"]].fp8_backward,
+        "invalid_reason": invalid_reason,
+        "compile_fallback_detected": compile_fallback,
+        "compile_failure_detected": compile_failure,
+        "cpu_compiler_probe_failed": "Compiler: cl is not found" in log_text,
+        "convrot_dtype_view_lowering_failed": (
+            "self.stride(-1) must be 1 to view Float as Byte" in log_text
+        ),
     }
     try:
         rows = _load_json(path)
     except (OSError, ValueError, TypeError) as error:
-        return {**base, "status": "failed", "parse_error": str(error)}
+        return {
+            **base,
+            "status": "invalid" if invalid_reason else "failed",
+            "parse_error": None if invalid_reason else str(error),
+        }
     done = _event(rows, "done")
     steps = [row for row in rows if row.get("event") == "train_step"]
     if done is None or not steps:
@@ -364,16 +389,10 @@ def normalize_run(run, out_dir: Path):
     cuda_rows = [row.get("cuda", {}) for row in steps]
     dxgi_rows = [row.get("dxgi", {}) for row in steps]
     immutable = finalized.get("immutable_arena") or attached.get("immutable_arena") or {}
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        log_text = ""
+    fp8_gates = _event(rows, "fp8_gates") or {}
     return {
         **base,
-        "status": "complete",
-        "qtype": ARM_BY_NAME[run["arm"]].qtype,
-        "fp8_forward": ARM_BY_NAME[run["arm"]].fp8_forward,
-        "fp8_backward": ARM_BY_NAME[run["arm"]].fp8_backward,
+        "status": "invalid" if invalid_reason else "complete",
         "steps": len(steps),
         "steady_steps": len(steady),
         "steady_step_mean_s": _mean(row.get("seconds") for row in steady),
@@ -408,10 +427,9 @@ def normalize_run(run, out_dir: Path):
         "new_compile_frames_after_warmup": sum(
             int(row.get("new_compile_frames", 0)) for row in steady
         ),
-        "compile_fallback_detected": (
-            "WON'T CONVERT" in log_text or "InductorError" in log_text
-        ),
-        "cpu_compiler_probe_failed": "Compiler: cl is not found" in log_text,
+        "training_fp8_canonical": fp8_gates.get("training_fp8_canonical"),
+        "training_fp8_singletons": fp8_gates.get("training_fp8_singletons"),
+        "compile_cache_key": fp8_gates.get("compile_cache_key"),
         "convrot_dtype_view_lowering_failed": (
             "self.stride(-1) must be 1 to view Float as Byte" in log_text
         ),
@@ -424,6 +442,7 @@ CSV_FIELDS = (
     "repeat",
     "position",
     "status",
+    "invalid_reason",
     "qtype",
     "fp8_forward",
     "fp8_backward",
@@ -447,7 +466,11 @@ CSV_FIELDS = (
     "resident_sidecar_gib",
     "streamed_blocks",
     "new_compile_frames_after_warmup",
+    "training_fp8_canonical",
+    "training_fp8_singletons",
+    "compile_cache_key",
     "compile_fallback_detected",
+    "compile_failure_detected",
     "cpu_compiler_probe_failed",
     "convrot_dtype_view_lowering_failed",
     "raw_json",
@@ -459,7 +482,8 @@ CSV_FIELDS = (
 def aggregate_runs(runs, arms):
     aggregates = {}
     for arm in arms:
-        selected = [run for run in runs if run["arm"] == arm.name and run["status"] == "complete"]
+        arm_runs = [run for run in runs if run["arm"] == arm.name]
+        selected = [run for run in arm_runs if run["status"] == "complete"]
         aggregates[arm.name] = {
             "successful_runs": len(selected),
             "steady_step_median_s": _median(run.get("steady_step_mean_s") for run in selected),
@@ -470,7 +494,12 @@ def aggregate_runs(runs, arms):
             "min_cuda_free_gib": _median(run.get("min_cuda_free_gib") for run in selected),
             "peak_dxgi_usage_gib": _median(run.get("peak_dxgi_usage_gib") for run in selected),
             "compile_fallback_runs": sum(
-                bool(run.get("compile_fallback_detected")) for run in selected
+                bool(run.get("compile_fallback_detected")) for run in arm_runs
+            ),
+            "compile_issue_runs": sum(
+                bool(run.get("compile_fallback_detected"))
+                or bool(run.get("compile_failure_detected"))
+                for run in arm_runs
             ),
         }
     baseline = aggregates.get("fp8", {}).get("steady_step_median_s")
@@ -495,14 +524,14 @@ def render_markdown(manifest, runs, aggregates, arms):
         "Aggregate values are medians across independent runs. Step time uses each "
         "run's steady-step mean.",
         "",
-        "| arm | runs | compile fallback | step s | speedup vs fp8 | fwd ms | bwd ms | peak alloc GiB | peak reserved GiB | min CUDA free GiB | DXGI usage GiB |",
+        "| arm | runs | compile issue | step s | speedup vs fp8 | fwd ms | bwd ms | peak alloc GiB | peak reserved GiB | min CUDA free GiB | DXGI usage GiB |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for arm in arms:
         row = aggregates[arm.name]
         lines.append(
             f"| {arm.name} | {row['successful_runs']} | "
-            f"{row['compile_fallback_runs']} | "
+            f"{row['compile_issue_runs']} | "
             f"{_fmt(row['steady_step_median_s'])} | {_fmt(row['speedup_vs_fp8'])}x | "
             f"{_fmt(row['forward_median_ms'], 1)} | {_fmt(row['backward_median_ms'], 1)} | "
             f"{_fmt(row['peak_torch_allocated_gib'])} | {_fmt(row['peak_torch_reserved_gib'])} | "
@@ -510,9 +539,13 @@ def render_markdown(manifest, runs, aggregates, arms):
         )
     failures = [run for run in runs if run["status"] != "complete"]
     if failures:
-        lines.extend(("", "## Incomplete runs", ""))
+        lines.extend(("", "## Invalid or incomplete runs", ""))
         for run in failures:
-            detail = run.get("parse_error") or run.get("status")
+            detail = (
+                run.get("parse_error")
+                or run.get("invalid_reason")
+                or run.get("status")
+            )
             lines.append(f"- `{run['run_id']}`: {detail}")
     return "\n".join(lines) + "\n"
 

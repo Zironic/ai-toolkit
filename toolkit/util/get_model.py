@@ -29,7 +29,6 @@ LEGACY_MODEL_ARCHES = {
     'lumina2',
     'vega',
     'ssd',
-    'anima',
 }
 
 

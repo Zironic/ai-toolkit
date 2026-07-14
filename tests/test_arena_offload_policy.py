@@ -186,6 +186,23 @@ def test_worst_shape_allocator_slack_reconstructs_current_layout():
     assert runtime._worst_shape_allocator_slack_bytes(1000) == 150
 
 
+def test_aggressive_capacity_counts_exact_smallest_blocks_under_both_budgets():
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._policy = SimpleNamespace(slack_pad_bytes=5)
+    runtime._promotion_candidates = lambda: tuple(
+        {"block_key": f"blocks.{index}", "block_bytes": size}
+        for index, size in enumerate((10, 20, 30, 40, 50))
+    )
+    runtime._worst_shape_allocator_slack_bytes = lambda _cap: 106
+    runtime._worst_shape_candidate_margin_bytes = (
+        lambda candidate: 120 - candidate["block_bytes"]
+    )
+
+    # Four blocks consume 100 bytes and leave the 5-byte allocator pad. The
+    # fifth would exceed both the allocator and physical budgets.
+    assert runtime._aggressive_promotion_capacity(1000) == 4
+
+
 def test_training_cap_binding_uses_configured_phase_margin(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -332,6 +349,111 @@ def test_controller_cold_starts_one_whole_block_below():
     assert decision.reason == "approach_from_below"
 
 
+def test_controller_promotes_each_step_with_four_block_headroom():
+    controller = ArenaResidencyController(slack_pad_bytes=10)
+    controller.bootstrapped = True
+    clean = {
+        "allocator": {
+            "alloc_retries_delta": 0,
+            "free_count_delta": 0,
+        },
+        "resident_bytes": 200,
+        "compile_invalid": False,
+        "transfer": None,
+    }
+
+    first = controller.step(
+        clean,
+        candidate={"block_key": "blocks.3", "block_bytes": 20},
+        demote_candidate=None,
+        cliff_cap_bytes=1000,
+        current_cap_bytes=1000,
+        worst_shape_free_bytes=100,
+        worst_shape_allocator_slack_bytes=200,
+        aggressive_promotion_capacity=4,
+    )
+    assert first.action == "promote"
+    assert first.reason == "abundant_four_block_headroom"
+
+    second = controller.step(
+        {**clean, "resident_bytes": 220},
+        candidate={"block_key": "blocks.4", "block_bytes": 20},
+        demote_candidate=None,
+        cliff_cap_bytes=1000,
+        current_cap_bytes=1000,
+        worst_shape_free_bytes=80,
+        worst_shape_allocator_slack_bytes=180,
+        aggressive_promotion_capacity=4,
+    )
+    assert second.action == "promote"
+    assert second.block_key == "blocks.4"
+    assert controller.pending_promotion["block_key"] == "blocks.4"
+
+
+def test_controller_four_block_fast_lane_keeps_safety_vetoes():
+    controller = ArenaResidencyController(slack_pad_bytes=10)
+    controller.bootstrapped = True
+    dirty = {
+        "allocator": {
+            "alloc_retries_delta": 1,
+            "free_count_delta": 0,
+        },
+        "resident_bytes": 200,
+        "compile_invalid": False,
+        "transfer": None,
+    }
+    decision = controller.step(
+        dirty,
+        candidate={"block_key": "blocks.3", "block_bytes": 20},
+        demote_candidate={"block_key": "blocks.1", "block_bytes": 20},
+        cliff_cap_bytes=1000,
+        current_cap_bytes=1000,
+        worst_shape_free_bytes=100,
+        worst_shape_allocator_slack_bytes=200,
+        aggressive_promotion_capacity=4,
+    )
+    assert decision.action != "promote"
+    assert controller.diagnostics()["last_aggressive_gate"] is False
+
+
+def test_controller_does_not_bypass_bootstrap_verification():
+    controller = ArenaResidencyController(slack_pad_bytes=10)
+    controller.bootstrapped = True
+    controller.begin_bootstrap_promotion(
+        ("blocks.0", "blocks.1", "blocks.2", "blocks.3"),
+        80,
+        200,
+        1000,
+    )
+    clean = {
+        "allocator": {
+            "alloc_retries_delta": 0,
+            "free_count_delta": 0,
+        },
+        "resident_bytes": 280,
+        "compile_invalid": False,
+        "transfer": None,
+    }
+    decision = controller.step(
+        clean,
+        candidate={"block_key": "blocks.4", "block_bytes": 20},
+        demote_candidate=None,
+        cliff_cap_bytes=1000,
+        current_cap_bytes=1000,
+        worst_shape_free_bytes=100,
+        worst_shape_allocator_slack_bytes=200,
+        aggressive_promotion_capacity=4,
+    )
+    assert decision.action == "hold"
+    assert controller.pending_promotion["block_keys"] == (
+        "blocks.0",
+        "blocks.1",
+        "blocks.2",
+        "blocks.3",
+    )
+    assert controller.diagnostics()["last_aggressive_gate"] is False
+
+
 def test_controller_raises_cap_by_fixed_fsm_increment():
     controller = ArenaResidencyController(slack_pad_bytes=10)
     controller.bootstrapped = True
@@ -355,12 +477,16 @@ def test_controller_raises_cap_by_fixed_fsm_increment():
     assert decision.target_cap_bytes == 710
 
 
-def test_arena_sampling_binds_fp8_only_to_singletons(monkeypatch):
+def test_arena_sampling_binds_fp8_to_canonical_and_singletons(monkeypatch):
     model = SimpleNamespace()
+    canonical = SimpleNamespace()
     runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
     runtime._closed = False
     runtime._model = model
+    runtime._device = "cuda"
+    runtime._canonical_modules = (canonical,)
     runtime._config = SimpleNamespace(fp8_sampling=True)
+    runtime._sampling_fp8_canonical = 0
     runtime._sampling_fp8_singletons = 0
     runtime._smart_plan = {"singleton_runtime_ids": {11, 22}}
     runtime._training_plan = object()
@@ -370,12 +496,17 @@ def test_arena_sampling_binds_fp8_only_to_singletons(monkeypatch):
     )
     runtime._bind_training_cap = lambda: None
     calls = []
+
+    def fake_enable(
+        module, include_ids=None, live_ids=None, training=False, device=None
+    ):
+        ids = set(include_ids)
+        calls.append(("enable", module, ids, set(live_ids), training, device))
+        return [(None, None, None, None, value) for value in ids]
+
     monkeypatch.setattr(
         "toolkit.memory_management.arena_offload.runtime.enable_fp8",
-        lambda module, include_ids=None, training=False: (
-            calls.append(("enable", module, set(include_ids), training))
-            or ["restore"]
-        ),
+        fake_enable,
     )
     monkeypatch.setattr(
         "toolkit.memory_management.arena_offload.runtime.disable_fp8",
@@ -383,12 +514,15 @@ def test_arena_sampling_binds_fp8_only_to_singletons(monkeypatch):
     )
 
     with runtime.sampling_session():
-        assert runtime._sampling_fp8_singletons == 1
+        assert runtime._sampling_fp8_canonical == 1
+        assert runtime._sampling_fp8_singletons == 2
 
-    assert calls == [
-        ("enable", model, {11, 22}, False),
-        ("disable", ["restore"]),
-    ]
+    expected_ids = {id(canonical), 11, 22}
+    assert calls[0] == (
+        "enable", model, expected_ids, expected_ids, False, "cuda"
+    )
+    assert calls[1][0] == "disable"
+    assert {restore[4] for restore in calls[1][1]} == expected_ids
 
 
 def test_arena_close_releases_all_owned_resources_after_executor_error():
@@ -466,7 +600,8 @@ def test_bootstrap_uses_min_physical_free_and_one_gib_margin():
     runtime._bootstrap_min_free_bytes = 2 * gib + 450 * 1024 ** 2
     runtime._bootstrap_budget_bytes = 0
     runtime._bootstrap_block_keys = ()
-    runtime._last_step_num = 2
+    runtime._last_step_num = 50_000
+    runtime._successful_training_steps = 1
     runtime._config = SimpleNamespace(
         _policy=SimpleNamespace(wddm_hard_gib=1.0)
     )
@@ -495,7 +630,7 @@ def test_bootstrap_uses_min_physical_free_and_one_gib_margin():
     assert runtime._bootstrap_training_residency(10 * gib) is False
     assert runtime._bootstrap_complete is False
 
-    runtime._last_step_num = 3
+    runtime._successful_training_steps = 2
     assert runtime._bootstrap_training_residency(10 * gib) is True
     assert runtime._bootstrap_budget_bytes == 450 * 1024 ** 2
     assert transitions == [(("blocks.0", "blocks.1"), True)]
@@ -504,6 +639,64 @@ def test_bootstrap_uses_min_physical_free_and_one_gib_margin():
         "blocks.1",
     )
     assert runtime._policy.pending_promotion["resident_bytes_before"] == 100
+
+
+def test_bootstrap_ignores_first_runtime_sample_after_checkpoint_resume():
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._bootstrap_complete = False
+    runtime._bootstrap_min_free_bytes = None
+    runtime._successful_training_steps = 1
+
+    runtime.record_training_physical_free_min(123)
+    assert runtime._bootstrap_min_free_bytes is None
+
+    runtime._successful_training_steps = 2
+    runtime.record_training_physical_free_min(456)
+    assert runtime._bootstrap_min_free_bytes == 456
+
+
+def test_bootstrap_keeps_priority_over_four_block_fast_lane():
+    gib = 1024 ** 3
+    block_bytes = 100 * 1024 ** 2
+    records = {
+        f"blocks.{index}": SimpleNamespace(
+            committed_bytes=block_bytes,
+            leaf_names=("linear",),
+        )
+        for index in range(5)
+    }
+    plan = SimpleNamespace(resident_leaf_keys=frozenset())
+    runtime = ArenaOffloadRuntime.__new__(ArenaOffloadRuntime)
+    runtime._bootstrap_complete = False
+    runtime._bootstrap_min_free_bytes = 3 * gib
+    runtime._bootstrap_budget_bytes = 0
+    runtime._bootstrap_block_keys = ()
+    runtime._successful_training_steps = 2
+    runtime._config = SimpleNamespace(
+        _policy=SimpleNamespace(wddm_hard_gib=1.0)
+    )
+    runtime._arena = SimpleNamespace(
+        block_keys=lambda: tuple(records),
+        block_record=lambda key: records[key],
+    )
+    runtime._residency = SimpleNamespace(
+        plan=plan,
+        resident_bytes=lambda: 0,
+    )
+    runtime._training_plan = plan
+    runtime._smart_plan = {"singleton_resident_bytes": 0}
+    runtime._policy = ArenaResidencyController()
+    transitions = []
+    runtime.transition_training_blocks = lambda keys, resident: (
+        transitions.append((tuple(keys), resident))
+        or {"changed": True, "block_keys": tuple(keys), "plan": object()}
+    )
+
+    assert runtime._bootstrap_training_residency(10 * gib) is True
+    assert transitions == [
+        (("blocks.0", "blocks.1", "blocks.2", "blocks.3", "blocks.4"), True)
+    ]
+    assert runtime._bootstrap_complete is True
 
 
 def test_arena_allocation_failure_drains_and_rolls_back(monkeypatch):

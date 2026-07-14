@@ -45,11 +45,16 @@ The extraction must not contain `ArchitectureAdapter`,
 `SingleStreamMMDiTAdapter`, `forward_streamed`, production `run_blocks()`,
 handwritten Krea leaf paths, or runtime-owned checkpoint trunks.
 
-## Patch stack
+## Work stages
+
+> Packaging (decided 2026-07-14, see the strategy doc): everything below ships
+> as **one unified PR**. Stages 1, 3a, and 3b become ordered commit groups
+> inside it, not separate PRs; Stage 2 stays in-fork preparation. Splitting is
+> a fallback only if the maintainer asks.
 
 ### Stage 1 - Host-memory safety
 
-Submit the backend-independent Windows/WDDM safety layer first:
+The backend-independent Windows/WDDM safety layer, first commit group:
 
 - NVML physical-free sensing;
 - DXGI non-local pinned-memory budget sensing;
@@ -143,10 +148,12 @@ specifically calls for it.
 
 ## Review packaging
 
-Before producing patches:
+Before producing the PR:
 
-1. diff each stage against upstream `main` rather than against the dirty fork;
+1. diff against upstream `main` rather than against the dirty fork;
 2. list every modified existing upstream file and justify it;
-3. keep new arena files separate from Krea2 integration changes;
+3. keep the commit groups clean: safety foundation, arena/dispatcher core,
+   Krea2 integration, and acceptance evidence as separable commits so the
+   maintainer can review (or, on request, split) along those seams;
 4. include maintainer-runnable commands and expected evidence fields;
 5. record exclusions and the deferred second-model proof in the PR body.

@@ -283,7 +283,7 @@ class ImmutableTransformerRuntime:
         blocks,
         block_keys,
         entries_by_block,
-        depth: int = 2,
+        depth: int = 3,
         compile_blocks: bool = True,
         compile_dynamic: bool | None = True,
         compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = (),

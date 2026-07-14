@@ -292,9 +292,13 @@ class SDTrainer(BaseSDTrainProcess):
 
 
     def _prepare_file_item_text_cache_signature(self, dataset, file_item):
-        # This is the value AiToolkitDataset would normally pass from sd:
-        # text_embedding_space_version=self.sd.model_config.arch
-        file_item.text_embedding_space_version = str(self.model_config.arch)
+        from toolkit.util.get_model import get_model_class
+
+        model_class = get_model_class(self.model_config)
+        embedding_space = getattr(model_class, "text_embedding_space_version", None)
+        if not isinstance(embedding_space, str):
+            embedding_space = str(self.model_config.arch)
+        file_item.text_embedding_space_version = embedding_space
 
         # Match the default used by FileItemDTO/TextEmbeddingFileItemDTOMixin.
         if not hasattr(file_item, "text_embedding_version"):

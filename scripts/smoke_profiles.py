@@ -15,7 +15,7 @@ lands -- see tasks/open/GENERIC_BLOCK_DISPATCHER_PLAN.md.)
 
 Fixed mapping, no plugin registry:
 
-    PROFILES = {"krea2": ..., "zimage": ..., "ideogram4": ...}
+    PROFILES = {"krea2": ..., "zimage": ..., "ideogram4": ..., "anima": ...}
 """
 
 from __future__ import annotations
@@ -451,8 +451,76 @@ class Ideogram4SmokeProfile(SmokeProfile):
         return False
 
 
+class AnimaSmokeProfile(SmokeProfile):
+    name = "anima"
+    expected_block_container = "transformer_blocks"
+
+    def build_model_config(self, args) -> ModelConfig:
+        return ModelConfig(
+            name_or_path=(
+                args.model_path
+                or "circlestone-labs/Anima-Base-v1.0-Diffusers"
+            ),
+            arch="anima",
+            model_kwargs={"max_sequence_length": args.max_text_length},
+            **self._shared_offload_config_kwargs(args),
+        )
+
+    def construct_model(self, args, config):
+        from extensions_built_in.diffusion_models.anima import AnimaModel
+
+        model = AnimaModel(
+            device=args.device,
+            model_config=config,
+            dtype=args.dtype,
+            noise_scheduler=AnimaModel.get_train_scheduler(),
+        )
+        model.skip_te = True
+        return model
+
+    def load_transformer(self, model, args):
+        from diffusers import CosmosTransformer3DModel
+
+        transformer = CosmosTransformer3DModel.from_pretrained(
+            model.model_config.name_or_path,
+            subfolder="transformer",
+            torch_dtype=model.torch_dtype,
+            local_files_only=not args.allow_download,
+        )
+        transformer.all_patch_size = [model.patch_size]
+        model.model = transformer
+        return transformer
+
+    def load_conditioning(self, paths, batch_size):
+        caches = load_condition_caches(paths)
+        for cache in caches:
+            if not isinstance(cache, AdvancedPromptEmbeds):
+                raise SystemExit(
+                    "anima requires AdvancedPromptEmbeds conditioning caches"
+                )
+        if len(caches) == 1:
+            return caches[0].expand_to_batch(batch_size)
+        if len(caches) != batch_size:
+            raise SystemExit(
+                f"got {len(caches)} anima caches for batch size {batch_size}; "
+                "pass one cache or exactly batch-size caches"
+            )
+        return AdvancedPromptEmbeds.concat_prompt_embeds(caches)
+
+    def make_latents(self, resolution, batch_size, generator, model) -> torch.Tensor:
+        width, height = resolution
+        channels = int(getattr(model.model.config, "in_channels", 16))
+        return torch.randn(
+            batch_size, channels, height // 8, width // 8, generator=generator
+        )
+
+    def default_fullmodule_target(self, transformer) -> str:
+        return "transformer_blocks.0.attn1.to_q"
+
+
 PROFILES = {
     "krea2": Krea2SmokeProfile(),
     "zimage": ZImageSmokeProfile(),
     "ideogram4": Ideogram4SmokeProfile(),
+    "anima": AnimaSmokeProfile(),
 }

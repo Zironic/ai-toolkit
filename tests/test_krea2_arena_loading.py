@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -8,6 +9,7 @@ from extensions_built_in.diffusion_models.krea2.krea2 import (
     _smoke_direct_arena_load_requested,
     _stream_and_quantize_checkpoint,
     _stream_checkpoint,
+    _train_compile_cache_key,
     _try_load_quantized_transformer_cache,
 )
 from toolkit.memory_management.arena_offload import prepare_canonical_storage
@@ -49,6 +51,25 @@ class _QuantBaseModel:
 
     def print_and_status_update(self, _message):
         pass
+
+
+def test_train_compile_cache_key_partitions_fp8_execution_gates():
+    config = SimpleNamespace(
+        name_or_path="checkpoint.safetensors",
+        qtype="float8",
+        compile_dynamic=True,
+        compile_dynamic_hints=(),
+        layer_offloading_fp8_forward=False,
+        layer_offloading_fp8_grad_input=False,
+    )
+    model = SimpleNamespace(model_config=config)
+    baseline = _train_compile_cache_key(model)
+    config.layer_offloading_fp8_forward = True
+    forward = _train_compile_cache_key(model)
+    config.layer_offloading_fp8_grad_input = True
+    forward_backward = _train_compile_cache_key(model)
+
+    assert len({baseline, forward, forward_backward}) == 3
 
 
 def test_krea_memory_integration_stays_on_public_arena_surface():

@@ -70,7 +70,7 @@ class _ArenaPolicyOptions:
     wddm_margin_gib: float | None = None
     wddm_hard_gib: float | None = None
     checkpoint_keep_last: int = 0
-    prefetch_depth: int = 2
+    prefetch_depth: int = 3
 
     sampling_working_reserve_gib: float | None = None
     sampling_wddm_margin_gib: float | None = None
@@ -185,7 +185,7 @@ class ArenaOffloadConfig:
                 checkpoint_keep_last=max(
                     0, int(get("layer_offloading_checkpoint_keep_last", 0) or 0)
                 ),
-                prefetch_depth=int(get("layer_offloading_prefetch_depth", 2) or 2),
+                prefetch_depth=int(get("layer_offloading_prefetch_depth", 3) or 3),
                 sampling_working_reserve_gib=get(
                     "layer_offloading_smart_sampling_working_reserve_gb"
                 ),

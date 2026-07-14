@@ -18,6 +18,7 @@ import contextlib
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -37,6 +38,59 @@ LOAD_MODES = (SMOKE_DIRECT_LOAD_MODE, PRODUCTION_LOAD_MODE, PAGING_LOAD_MODE)
 
 class GpuBusy(RuntimeError):
     """Another of our GPU scripts holds the lock."""
+
+
+class CudaPhysicalFreeMonitor:
+    """Sample NVML-backed physical free VRAM across one smoke step."""
+
+    def __init__(self, device, interval_s=0.02):
+        self.device = device
+        self.interval_s = float(interval_s)
+        self._stop = threading.Event()
+        self._thread = None
+        self.min_free_bytes = None
+        self.total_bytes = None
+        self.samples = 0
+
+    def start(self):
+        if not torch.cuda.is_available():
+            return self
+        try:
+            from toolkit.memory_management import vram_budget
+
+            free_b, total_b = vram_budget.device_mem_info(self.device)
+        except Exception:
+            return self
+        self.min_free_bytes = int(free_b)
+        self.total_bytes = int(total_b)
+        self.samples = 1
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        from toolkit.memory_management import vram_budget
+
+        while not self._stop.wait(self.interval_s):
+            try:
+                free_b, total_b = vram_budget.device_mem_info(self.device)
+            except Exception:
+                continue
+            self.min_free_bytes = min(self.min_free_bytes, int(free_b))
+            self.total_bytes = int(total_b)
+            self.samples += 1
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.25)
+        if self.min_free_bytes is None or self.total_bytes is None:
+            return None
+        return {
+            "min_free_bytes": int(self.min_free_bytes),
+            "total_bytes": int(self.total_bytes),
+            "samples": int(self.samples),
+        }
 
 
 def lock_path() -> Path:

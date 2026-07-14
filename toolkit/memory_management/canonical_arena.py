@@ -184,7 +184,21 @@ class CanonicalArena:
             return
         original_to = model.to
 
-        def _guarded_to(*_args, **_kwargs):
+        def _guarded_to(*args, **kwargs):
+            runtime = getattr(model, "_arena_offload_runtime", None)
+            placement = getattr(runtime, "_permanent_placement", None)
+            if placement is not None:
+                device, dtype, _non_blocking, _memory_format = (
+                    torch._C._nn._parse_to(*args, **kwargs)
+                )
+                placed_device, placed_dtype = placement
+                same_device = (
+                    device is not None
+                    and torch.device(device) == torch.device(placed_device)
+                )
+                same_dtype = dtype is None or dtype == placed_dtype
+                if same_device and same_dtype:
+                    return model
             raise CanonicalArenaError(
                 "canonical_arena_whole_model_to: whole-model .to()/.cuda()/"
                 ".cpu() is forbidden once canonicalized leaves exist -- it "

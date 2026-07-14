@@ -10,6 +10,9 @@ _ALLOC = ("num_alloc_retries", "num_device_alloc", "num_device_free")
 _COMPILE = ("frames", "graphs", "graph_breaks")
 
 DEFAULT_SLACK_PAD_BYTES = 256 * 1024**2
+AGGRESSIVE_PROMOTION_MIN_CAPACITY = 4
+
+
 def transfer_benefits_from_residency(transfer) -> bool:
     """Return whether a valid window proves that weights are still streaming."""
     if not transfer or transfer.get("h2d_duty_overflow"):
@@ -47,6 +50,8 @@ class ArenaResidencyController:
         self.last_promote_gate = None
         self.last_cap_covers_promo = None
         self.last_worst_shape_allocator_slack_bytes = None
+        self.last_aggressive_capacity = 0
+        self.last_aggressive_gate = False
         self.pending_promotion = None
         self.last_safe_residency_bytes = None
         self.last_rejected_residency_bytes = None
@@ -54,7 +59,7 @@ class ArenaResidencyController:
 
     def step(self, signal, *, candidate, demote_candidate, cliff_cap_bytes,
              worst_shape_free_bytes, worst_shape_allocator_slack_bytes=None,
-             current_cap_bytes=None):
+             current_cap_bytes=None, aggressive_promotion_capacity=0):
         if not self.bootstrapped:
             self.bootstrapped = True
             if demote_candidate is not None:
@@ -77,7 +82,6 @@ class ArenaResidencyController:
         )
         throughput_ok = transfer_benefits_from_residency(signal.get("transfer"))
         worst_ok = candidate is not None and int(worst_shape_free_bytes) >= 0
-        resulting_resident = int(signal.get("resident_bytes", 0) or 0) + block_bytes
         promote_ok = (
             candidate is not None
             and throughput_ok
@@ -96,11 +100,28 @@ class ArenaResidencyController:
             and allocator_slack > block_bytes + self.slack_pad_bytes
         )
         binding = retries > 0 or int(worst_shape_free_bytes) < 0
+        aggressive_capacity = max(0, int(aggressive_promotion_capacity or 0))
+        bootstrap_pending = bool(
+            self.pending_promotion is not None
+            and self.pending_promotion.get("block_keys")
+        )
+        aggressive_ok = (
+            candidate is not None
+            and aggressive_capacity >= AGGRESSIVE_PROMOTION_MIN_CAPACITY
+            and not bootstrap_pending
+            and not bool(signal.get("compile_invalid"))
+            and retries == 0
+            and device_frees == 0
+            and worst_ok
+            and allocator_slack > block_bytes + self.slack_pad_bytes
+        )
         self.last_worst_shape_margin_bytes = int(worst_shape_free_bytes)
         self.last_worst_shape_allocator_slack_bytes = allocator_slack
         self.last_throughput_gate = bool(throughput_ok)
         self.last_promote_gate = bool(promote_ok)
         self.last_cap_covers_promo = bool(cap_covers)
+        self.last_aggressive_capacity = aggressive_capacity
+        self.last_aggressive_gate = bool(aggressive_ok)
         cap_raise_bytes = (
             block_bytes
             if promote_ok and block_bytes > 0
@@ -115,6 +136,20 @@ class ArenaResidencyController:
             and (retries > 0 or device_frees > 0)
         ):
             return self.reject_pending_promotion("promotion_allocator_gc")
+
+        # Abundant measured headroom does not need the multi-window transfer
+        # proof. Spend only one block per step, leaving at least three blocks of
+        # measured capacity in reserve, and make the new block the rollback
+        # candidate for the next boundary.
+        if aggressive_ok:
+            self._begin_promotion(
+                candidate,
+                resident_bytes_before=int(signal.get("resident_bytes", 0) or 0),
+                active_cap_bytes=active_cap,
+            )
+            return self._decision(
+                "promote", candidate, reason="abundant_four_block_headroom"
+            )
 
         previous_state = self.state.name
         self.state, action = vram_budget.residency_fsm_step(
@@ -136,14 +171,11 @@ class ArenaResidencyController:
             self.pending_promotion = None
             self.last_promoted_key = None
         if action == vram_budget.ACT_PROMOTE and candidate is not None:
-            self.last_promoted_key = candidate["block_key"]
-            self.pending_promotion = {
-                "block_key": candidate["block_key"],
-                "block_bytes": block_bytes,
-                "resident_bytes_before": int(signal.get("resident_bytes", 0) or 0),
-                "resident_bytes_after": resulting_resident,
-                "previous_cap_target_bytes": active_cap,
-            }
+            self._begin_promotion(
+                candidate,
+                resident_bytes_before=int(signal.get("resident_bytes", 0) or 0),
+                active_cap_bytes=active_cap,
+            )
             return self._decision(
                 action, candidate, reason="safe_transfer_benefit"
             )
@@ -233,6 +265,22 @@ class ArenaResidencyController:
         self.last_block_key = self.last_promoted_key
         self.last_block_bytes = int(block_bytes)
 
+    def _begin_promotion(
+        self, candidate, *, resident_bytes_before, active_cap_bytes
+    ):
+        block_bytes = int(candidate["block_bytes"])
+        self.last_promoted_key = candidate["block_key"]
+        self.pending_promotion = {
+            "block_key": candidate["block_key"],
+            "block_bytes": block_bytes,
+            "resident_bytes_before": int(resident_bytes_before),
+            "resident_bytes_after": int(resident_bytes_before) + block_bytes,
+            "previous_cap_target_bytes": int(active_cap_bytes),
+        }
+        self.state = vram_budget.ResidencyFsmState(
+            vram_budget.FSM_PROMOTION_VERIFY, 0
+        )
+
     def allocation_failure(self):
         return self.reject_pending_promotion("promotion_allocation_failure")
 
@@ -278,6 +326,8 @@ class ArenaResidencyController:
             "last_worst_shape_allocator_slack_bytes": (
                 self.last_worst_shape_allocator_slack_bytes
             ),
+            "last_aggressive_capacity": self.last_aggressive_capacity,
+            "last_aggressive_gate": self.last_aggressive_gate,
             "pending_promotion": self.pending_promotion,
             "last_safe_residency_bytes": self.last_safe_residency_bytes,
             "last_rejected_residency_bytes": (

@@ -2570,8 +2570,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 arch = 'flux'
             if self.model_config.is_lumina2:
                 arch = 'lumina2'
-            if self.model_config.is_anima:
-                arch = 'flux'  # anima uses FlowMatchEulerDiscreteScheduler
             sampler = get_sampler(
                 self.train_config.noise_scheduler,
                 {
@@ -2789,7 +2787,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     is_auraflow=self.model_config.is_auraflow,
                     is_flux=self.model_config.is_flux,
                     is_lumina2=self.model_config.is_lumina2,
-                    is_anima=self.model_config.is_anima,
                     is_ssd=self.model_config.is_ssd,
                     is_vega=self.model_config.is_vega,
                     dropout=self.network_config.dropout,

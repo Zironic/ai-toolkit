@@ -137,6 +137,10 @@ class ArenaOffloadHelpersTest(unittest.TestCase):
         class Model(torch.nn.Module):
             def __init__(self):
                 super().__init__()
+                self.root_token = torch.nn.Parameter(
+                    torch.ones(4), requires_grad=False
+                )
+                self.register_buffer("root_buffer", torch.ones(4))
                 self.canonical = torch.nn.Linear(4, 4)
                 self.permanent = torch.nn.Linear(4, 4)
 
@@ -150,6 +154,8 @@ class ArenaOffloadHelpersTest(unittest.TestCase):
 
         self.assertEqual(model.canonical.weight.dtype, torch.float32)
         self.assertEqual(model.permanent.weight.dtype, torch.float64)
+        self.assertEqual(model.root_token.dtype, torch.float64)
+        self.assertEqual(model.root_buffer.dtype, torch.float64)
 
 
 class ArenaOffloadConfigTest(unittest.TestCase):
@@ -195,7 +201,7 @@ class ArenaOffloadConfigTest(unittest.TestCase):
         config = ArenaOffloadConfig.from_model_config(object())
         self.assertFalse(config.enabled)
         self.assertFalse(config.compile_blocks)
-        self.assertEqual(config._policy.prefetch_depth, 2)
+        self.assertEqual(config._policy.prefetch_depth, 3)
 
     def test_compatibility_aliases_map_to_internal_policy(self):
         class Aliases:

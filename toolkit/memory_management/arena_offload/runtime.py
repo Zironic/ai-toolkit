@@ -22,6 +22,7 @@ from ..canonical_arena import CanonicalArena
 from ..residency import ResidencyPlan, ResidencyState
 from ..vram_budget import apply_simulated_card
 from .policy import (
+    AGGRESSIVE_PROMOTION_MIN_CAPACITY,
     ArenaResidencyController,
     TrainingSignalWindow,
 )
@@ -36,7 +37,7 @@ RUNTIME_ATTR = "_arena_offload_runtime"
 
 GIB = 1024**3
 BOOTSTRAP_MARGIN_BYTES = GIB
-BOOTSTRAP_MIN_STEP = 3
+BOOTSTRAP_MIN_STEP = 2
 
 
 class ArenaOffloadRuntime:
@@ -73,6 +74,7 @@ class ArenaOffloadRuntime:
         # reads these at the step boundary.
         self._last_shape_key: tuple | None = None
         self._last_step_num: int | None = None
+        self._successful_training_steps = 0
         self._signals = TrainingSignalWindow()
         self._last_policy_error: str | None = None
         self._last_failure_event: dict | None = None
@@ -83,7 +85,9 @@ class ArenaOffloadRuntime:
         self._bootstrap_budget_bytes = 0
         self._bootstrap_block_keys: tuple[str, ...] = ()
         self._training_fp8_restores = []
+        self._training_fp8_canonical = 0
         self._training_fp8_singletons = 0
+        self._sampling_fp8_canonical = 0
         self._sampling_fp8_singletons = 0
         self._permanent_placement = None
 
@@ -258,8 +262,8 @@ class ArenaOffloadRuntime:
         def contains_canonical(module):
             return any(child in canonical for child in module.modules())
 
-        def has_wrapped_parameter(module):
-            for parameter in module.parameters(recurse=True):
+        def has_wrapped_parameter(module, *, recurse=True):
+            for parameter in module.parameters(recurse=recurse):
                 try:
                     names, _context = parameter.__tensor_flatten__()
                 except Exception:
@@ -267,6 +271,22 @@ class ArenaOffloadRuntime:
                 if names:
                     return True
             return False
+
+        def move_local_state(module):
+            local_dtype = (
+                None
+                if dtype is None or has_wrapped_parameter(module, recurse=False)
+                else dtype
+            )
+
+            def convert(tensor):
+                if local_dtype is not None and (
+                    tensor.is_floating_point() or tensor.is_complex()
+                ):
+                    return tensor.to(device=device, dtype=local_dtype)
+                return tensor.to(device=device)
+
+            module._apply(convert, recurse=False)
 
         def move(module):
             if module in canonical:
@@ -277,6 +297,10 @@ class ArenaOffloadRuntime:
                 else:
                     module.to(device=device, dtype=dtype)
                 return
+            # A mixed parent can own direct permanent state (for example
+            # architecture pad tokens) in addition to canonical descendants.
+            # Move that local state before recursing into child subtrees.
+            move_local_state(module)
             for child in module.children():
                 move(child)
 
@@ -334,18 +358,29 @@ class ArenaOffloadRuntime:
         try:
             self._bind_training_cap()
             del network
-            self._executor.finalize_execution()
             if self._config.fp8_forward:
+                canonical_ids = self._canonical_runtime_ids()
+                singleton_ids = self._singleton_runtime_ids()
                 self._training_fp8_restores = enable_fp8(
                     self._model,
-                    include_ids=self._singleton_runtime_ids(),
+                    include_ids=canonical_ids | singleton_ids,
+                    live_ids=canonical_ids | singleton_ids,
                     training=True,
+                    device=self._device,
                 )
-                self._training_fp8_singletons = len(self._training_fp8_restores)
+                installed_ids = {
+                    restore[4] for restore in self._training_fp8_restores
+                }
+                self._training_fp8_canonical = len(installed_ids & canonical_ids)
+                self._training_fp8_singletons = len(installed_ids & singleton_ids)
                 self._resources.record_fp8_restore(
                     "FP8 training restore",
                     lambda restores=self._training_fp8_restores: disable_fp8(restores),
                 )
+            # Save block forwards only after the live-state FP8 transforms are
+            # installed, so compiled dispatcher kernels trace the selected
+            # execution policy rather than Quanto's materializing fallback.
+            self._executor.finalize_execution()
             self._executor.activate(self._executor.TRAIN, self._training_plan)
             return self
         except BaseException as error:
@@ -533,18 +568,29 @@ class ArenaOffloadRuntime:
     def _singleton_runtime_ids(self):
         return set((self._smart_plan or {}).get("singleton_runtime_ids", ()))
 
+    def _canonical_runtime_ids(self):
+        return {id(module) for module in self._canonical_modules}
+
     @contextlib.contextmanager
     def sampling_session(self):
         """Wrap a sampling run and restore TRAIN once at the end."""
         self._require_open()
         sampling_restores = []
         if self._config.fp8_sampling:
+            canonical_ids = self._canonical_runtime_ids()
+            singleton_ids = self._singleton_runtime_ids()
             sampling_restores = enable_fp8(
                 self._model,
-                include_ids=self._singleton_runtime_ids(),
+                include_ids=canonical_ids | singleton_ids,
+                live_ids=canonical_ids | singleton_ids,
                 training=False,
+                device=self._device,
             )
-            self._sampling_fp8_singletons = len(sampling_restores)
+            # Counts are eligibility diagnostics; training keeps its own
+            # persistent transforms underneath this temporary sampling layer.
+            installed_ids = {restore[4] for restore in sampling_restores}
+            self._sampling_fp8_canonical = len(installed_ids & canonical_ids)
+            self._sampling_fp8_singletons = len(installed_ids & singleton_ids)
         try:
             yield self
         finally:
@@ -599,7 +645,11 @@ class ArenaOffloadRuntime:
     # ------------------------------------------------------------------
     def record_training_physical_free_min(self, free_bytes) -> None:
         """Publish one successful step's physical high-water for bootstrap."""
-        if self._bootstrap_complete or free_bytes is None:
+        if (
+            self._bootstrap_complete
+            or free_bytes is None
+            or self._successful_training_steps < BOOTSTRAP_MIN_STEP
+        ):
             return
         value = max(0, int(free_bytes))
         self._bootstrap_min_free_bytes = (
@@ -612,7 +662,7 @@ class ArenaOffloadRuntime:
         if (
             self._bootstrap_complete
             or self._bootstrap_min_free_bytes is None
-            or int(self._last_step_num or 0) < BOOTSTRAP_MIN_STEP
+            or int(self._successful_training_steps) < BOOTSTRAP_MIN_STEP
         ):
             return False
         hard_gib = self._config._policy.wddm_hard_gib
@@ -674,7 +724,7 @@ class ArenaOffloadRuntime:
             )
         )
 
-    def _promotion_candidate(self):
+    def _promotion_candidates(self):
         plan = getattr(self._residency, "plan", None) or self._training_plan
         protected = self._protected_training_blocks()
         candidates = []
@@ -688,10 +738,33 @@ class ArenaOffloadRuntime:
             candidates.append(
                 (int(record.committed_bytes), order, str(block_key))
             )
-        if not candidates:
-            return None
-        block_bytes, _order, block_key = min(candidates)
-        return {"block_key": block_key, "block_bytes": block_bytes}
+        return tuple(
+            {"block_key": block_key, "block_bytes": block_bytes}
+            for block_bytes, _order, block_key in sorted(candidates)
+        )
+
+    def _promotion_candidate(self):
+        candidates = self._promotion_candidates()
+        return candidates[0] if candidates else None
+
+    def _aggressive_promotion_capacity(self, current_cap_bytes):
+        """Blocks that fit under both worst-shape safety budgets."""
+        candidates = self._promotion_candidates()
+        allocator_slack = self._worst_shape_allocator_slack_bytes(
+            current_cap_bytes
+        )
+        pad = int(self._policy.slack_pad_bytes)
+        used = 0
+        capacity = 0
+        for candidate in candidates:
+            used += int(candidate["block_bytes"])
+            cumulative = {"block_bytes": used}
+            if self._worst_shape_candidate_margin_bytes(cumulative) < 0:
+                break
+            if allocator_slack <= used + pad:
+                break
+            capacity += 1
+        return capacity
 
     def _demotion_candidate(self):
         plan = getattr(self._residency, "plan", None) or self._training_plan
@@ -795,6 +868,7 @@ class ArenaOffloadRuntime:
         )
         if self._bootstrap_training_residency(current_cap):
             return
+        aggressive_capacity = self._aggressive_promotion_capacity(current_cap)
         decision = self._policy.step(
             self._signals.last_signal,
             candidate=candidate,
@@ -807,6 +881,7 @@ class ArenaOffloadRuntime:
             worst_shape_allocator_slack_bytes=(
                 self._worst_shape_allocator_slack_bytes(current_cap)
             ),
+            aggressive_promotion_capacity=aggressive_capacity,
         )
         if decision.action == "promote":
             self.transition_training_block(decision.block_key, resident=True)
@@ -910,8 +985,14 @@ class ArenaOffloadRuntime:
             "fp8_forward": bool(self._config.fp8_forward),
             "fp8_backward": bool(self._config.fp8_backward),
             "fp8_sampling": bool(self._config.fp8_sampling),
+            "training_fp8_canonical": getattr(
+                self, "_training_fp8_canonical", 0
+            ),
             "training_fp8_singletons": getattr(
                 self, "_training_fp8_singletons", 0
+            ),
+            "sampling_fp8_canonical": getattr(
+                self, "_sampling_fp8_canonical", 0
             ),
             "sampling_fp8_singletons": getattr(
                 self, "_sampling_fp8_singletons", 0
@@ -943,6 +1024,7 @@ class ArenaOffloadRuntime:
             ),
             "last_shape_key": self._last_shape_key,
             "last_step_num": self._last_step_num,
+            "successful_training_steps": self._successful_training_steps,
             "policy": {
                 **self._signals.diagnostics(),
                 "controller": self._policy.diagnostics(),
@@ -1075,6 +1157,7 @@ class ArenaOffloadRuntime:
             transfer_counters=transfer_stats,
             step_wall_ms=step_wall_ms,
         )
+        self._successful_training_steps += 1
 
     def _training_ring_bytes(self) -> int:
         from ..transfer_plan import build_transfer_plan

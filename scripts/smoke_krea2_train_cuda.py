@@ -43,6 +43,7 @@ from extensions_built_in.diffusion_models.krea2.krea2 import (  # noqa: E402
     SimpleModulation,
 )
 from scripts.smoke_runtime import (  # noqa: E402
+    CudaPhysicalFreeMonitor,
     add_contention_args,
     add_load_mode_arg,
     add_lock_args,
@@ -958,11 +959,19 @@ def main():
         print("[smoke] H2D timing: BLOCKING (old behaviour, A/B control)")
 
     MemoryManager.set_fp8_grad_input_enabled(bool(args.fp8_grad_input))
+    fp8_diagnostics = memory_runtime.diagnostics()
     rows.append(
         {
             "event": "fp8_gates",
             "fp8_forward": bool(args.fp8_training_forward),
             "fp8_grad_input": bool(args.fp8_grad_input),
+            "training_fp8_canonical": int(
+                fp8_diagnostics.get("training_fp8_canonical", 0)
+            ),
+            "training_fp8_singletons": int(
+                fp8_diagnostics.get("training_fp8_singletons", 0)
+            ),
+            "compile_cache_key": compile_cache_key,
         }
     )
     _print_json(rows[-1])
@@ -1084,6 +1093,7 @@ def main():
             )
             for phase in ("forward", "loss", "backward", "grad_stats", "optimizer")
         }
+        physical_free_monitor = CudaPhysicalFreeMonitor(device).start()
         try:
             with execution_context, network, compile_stance:
                 with torch.profiler.record_function("smoke.forward"):
@@ -1099,6 +1109,7 @@ def main():
                     loss.backward()
                     phase_events["backward"][1].record()
         except torch.cuda.OutOfMemoryError:
+            physical_free_monitor.stop()
             # Same policy as BaseSDTrainProcess: an allocator-cap violation
             # widens the cap and skips the batch; strict mode re-raises.
             optimizer.zero_grad(set_to_none=True)
@@ -1132,6 +1143,11 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             phase_events["optimizer"][1].record()
         torch.cuda.synchronize(device)
+        physical_free_sample = physical_free_monitor.stop()
+        if memory_runtime is not None and physical_free_sample is not None:
+            memory_runtime.record_training_physical_free_min(
+                physical_free_sample["min_free_bytes"]
+            )
         elapsed = time.perf_counter() - t0
         grad_norm = grad_norm_tensor.item()
         phase_ms = {
@@ -1158,6 +1174,7 @@ def main():
             "grad_tensors": f"{grads_present}/{len(trainable)}",
             "new_compile_frames": frames_after - frames_before,
             "phase": phase_ms,
+            "physical_free_sample": physical_free_sample,
             "cuda": _cuda_snapshot(f"step_{step}", device),
             "dxgi": _dxgi_snapshot(f"step_{step}"),
         }

@@ -1,5 +1,6 @@
 import io
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -138,6 +139,23 @@ class WholeModelToGuardTests(unittest.TestCase):
         CanonicalArena.guard_whole_model_to(model)
         self.assertIs(model.to, original)
         CanonicalArena.unguard_whole_model_to(model)
+
+    def test_guarded_to_allows_only_idempotent_runtime_placement(self):
+        model = nn.Sequential(_linear())
+        model._arena_offload_runtime = SimpleNamespace(
+            _permanent_placement=(torch.device("cpu"), torch.float32)
+        )
+        CanonicalArena.guard_whole_model_to(model)
+        try:
+            self.assertIs(model.to(torch.device("cpu")), model)
+            self.assertIs(
+                model.to(device=torch.device("cpu"), dtype=torch.float32), model
+            )
+            with self.assertRaises(CanonicalArenaError):
+                model.to(device=torch.device("cpu"), dtype=torch.float64)
+        finally:
+            CanonicalArena.unguard_whole_model_to(model)
+            del model._arena_offload_runtime
 
     def test_unguard_restores_normal_to(self):
         model = nn.Sequential(_linear())

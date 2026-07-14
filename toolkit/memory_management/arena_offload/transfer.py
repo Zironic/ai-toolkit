@@ -54,7 +54,7 @@ _STATE_LOCK = threading.Lock()
 _TICKETS: dict[int, _Ticket] = {}
 _LIVE: collections.deque[int] = collections.deque()
 _NEXT_ID = 0
-_DEPTH = 2
+_DEPTH = 3
 _TRANSFER_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
 # Per-device ring of reusable device buffers, plus the indices currently
 # available. A slot returns to _FREE_SLOTS when fetch_free SUBMITS (not when the
@@ -131,7 +131,7 @@ def raise_dynamo_recompile_limit(min_limit: int = 128) -> None:
             setattr(config, attribute, min_limit)
 
 
-def configure_fetch_runtime(*, depth: int = 2, owner_token=None) -> None:
+def configure_fetch_runtime(*, depth: int = 3, owner_token=None) -> None:
     global _DEPTH, _NEXT_ID, _RUNTIME_OWNER_TOKEN
     if owner_token is not None:
         validate_process_owner(owner_token)
