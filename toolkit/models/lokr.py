@@ -356,6 +356,29 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
 
         orig_dtype = x.dtype
         materialize = getattr(inner, "materialized_weight", None)
+
+        # Keep the quantizer's native forward when no arena materialization is
+        # available. This avoids reconstructing a full base weight and preserves
+        # the ConvRot kernel path; the explicit boundary is required by Dynamo.
+        if (
+            materialize is None
+            and getattr(self.org_module[0], "is_ostris_quantized", False)
+        ):
+            base_forward = self.org_forward if inner is None else inner
+            base_out = torch._dynamo.disable(base_forward)(x)
+            multiplier = torch.mean(self.network_ref().torch_multiplier)
+            if self.op is F.linear:
+                delta_out = self._structured_delta(x)
+            else:
+                lokr_weight = self.get_weight().to(dtype=orig_dtype)
+                delta_out = self.op(
+                    x.to(dtype=lokr_weight.dtype),
+                    lokr_weight.view(self.shape),
+                    None,
+                    **self.extra_args,
+                )
+            return (base_out + delta_out * multiplier).to(orig_dtype)
+
         orig_weight = (
             self.get_orig_weight(x.device)
             if materialize is None
