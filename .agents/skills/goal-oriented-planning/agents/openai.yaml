@@ -1,0 +1,4 @@
+interface:
+  display_name: "Goal-Oriented Planning"
+  short_description: "Create lean, outcome-driven implementation plans"
+  default_prompt: "Use $goal-oriented-planning to create the shortest credible implementation plan for this request."

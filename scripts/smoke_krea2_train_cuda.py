@@ -4,9 +4,11 @@ Loads the full quantized Krea2 transformer, attaches the compile-neutral
 immutable runtime, applies a fresh LoRA network the way BaseSDTrainProcess
 does, then runs a handful of fake training steps (random latents + cached TE
 embeddings, flow-matching velocity loss, backward, AdamW step) and quits. The
-default direct-arena load is a fast harness shortcut; ``--load-mode normal``
-exercises the production load-then-attach lifecycle. No dataset, no dataloader,
-no trainer process.
+default `smoke-direct-to-arena` load is the intended harness path.
+`production-model-load` mirrors the production generic model-load session and
+is only for testing that loading code. The deliberately long alternative
+preserves legacy load-then-copy behavior for explicit paging tests. No dataset,
+no dataloader, no trainer process.
 
 The two-phase lifecycle is mirrored faithfully: the runtime is prepared during
 the attach (before LoRA) and finalized after the network is applied.
@@ -47,6 +49,7 @@ from scripts.smoke_runtime import (  # noqa: E402
     assert_smoke_load_mode,
     configure_smoke_load_mode,
     fail_if_vram_contended,
+    smoke_model_load_session,
 )
 from toolkit.basic import flush  # noqa: E402
 from toolkit.config_modules import ModelConfig, NetworkConfig  # noqa: E402
@@ -805,58 +808,65 @@ def main():
     )
     _print_json(rows[-1])
 
-    print("[smoke] loading full Krea2 transformer")
-    t0 = time.perf_counter()
-    transformer = model._load_transformer()
-    assert_smoke_load_mode(model, args.load_mode)
-    rows.append(
-        {
-            "event": "loaded_transformer",
-            "load_mode": args.load_mode,
-            "seconds": time.perf_counter() - t0,
-        }
-    )
-    _print_json(rows[-1])
-    flush(garbage_collect=False)
-
-    if config.quantize and not getattr(model, "_transformer_quantized_during_load", False):
-        print("[smoke] quantizing transformer")
+    with smoke_model_load_session(model, args.load_mode):
+        print("[smoke] loading full Krea2 transformer")
         t0 = time.perf_counter()
-        quantize_model(model, transformer)
-        flush()
+        transformer = model._load_transformer()
+        assert_smoke_load_mode(model, args.load_mode)
         rows.append(
-            {"event": "quantized_transformer", "seconds": time.perf_counter() - t0}
+            {
+                "event": "loaded_transformer",
+                "load_mode": args.load_mode,
+                "seconds": time.perf_counter() - t0,
+            }
         )
         _print_json(rows[-1])
+        flush(garbage_collect=False)
 
-    print("[smoke] attaching smart training memory manager")
-    t0 = time.perf_counter()
-    # Build residency/plan and prepare the unfinalized runtime from either the
-    # smoke's direct canonical build or the normally loaded frozen base. The
-    # permanent programs are finalized AFTER LoRA apply, below.
-    ignore_modules = [
-        module
-        for module in transformer.modules()
-        if isinstance(module, (SimpleModulation, DoubleSharedModulation))
-    ]
-    transformer.enable_gradient_checkpointing(
-        keep_last=config.layer_offloading_checkpoint_keep_last
-    )
-    model._attach_immutable_training_memory(transformer, ignore_modules)
-    if getattr(transformer, "_memory_manager", None) is not None:
-        MemoryManager._attach_prefetch_pool(transformer, device)
-    model.model = transformer
-    rows.append(
-        {
-            "event": "attached_training_memory",
-            "seconds": time.perf_counter() - t0,
-            "arena": _arena_summary(transformer),
-            "immutable_arena": _immutable_arena_summary(transformer),
-            "cuda": _cuda_snapshot("attached_training_memory", device),
-            "dxgi": _dxgi_snapshot("attached_training_memory"),
-        }
-    )
-    _print_json(rows[-1])
+        if config.quantize and not getattr(
+            model, "_transformer_quantized_during_load", False
+        ):
+            print("[smoke] quantizing transformer")
+            t0 = time.perf_counter()
+            quantize_model(model, transformer)
+            flush()
+            rows.append(
+                {
+                    "event": "quantized_transformer",
+                    "seconds": time.perf_counter() - t0,
+                }
+            )
+            _print_json(rows[-1])
+
+        print("[smoke] attaching smart training memory manager")
+        t0 = time.perf_counter()
+        # Keep the production load session alive through this claim boundary.
+        # The smoke-direct mode already owns a smoke-prepared build; the
+        # production-load mode may own a generic build published while
+        # assigning cached checkpoint state.
+        ignore_modules = [
+            module
+            for module in transformer.modules()
+            if isinstance(module, (SimpleModulation, DoubleSharedModulation))
+        ]
+        transformer.enable_gradient_checkpointing(
+            keep_last=config.layer_offloading_checkpoint_keep_last
+        )
+        model._attach_immutable_training_memory(transformer, ignore_modules)
+        if getattr(transformer, "_memory_manager", None) is not None:
+            MemoryManager._attach_prefetch_pool(transformer, device)
+        model.model = transformer
+        rows.append(
+            {
+                "event": "attached_training_memory",
+                "seconds": time.perf_counter() - t0,
+                "arena": _arena_summary(transformer),
+                "immutable_arena": _immutable_arena_summary(transformer),
+                "cuda": _cuda_snapshot("attached_training_memory", device),
+                "dxgi": _dxgi_snapshot("attached_training_memory"),
+            }
+        )
+        _print_json(rows[-1])
 
     print(
         f"[smoke] applying {args.adapter_variant} network "

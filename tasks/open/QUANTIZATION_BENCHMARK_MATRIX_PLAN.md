@@ -24,15 +24,19 @@ seed, resolution, batch size, adapter setup, compile mode, and number of warmup
 and measured steps. The controller rotates arm order and alternates its
 direction across repeats to reduce fixed startup, thermal, and run-order bias.
 
-The controller is dry-run-only unless `--execute` is passed. It acquires the
-shared smoke GPU lock once per child run and records the matrix run ID in the
-lock detail. The child is launched with `--no-gpu-lock` to avoid nested lock
-acquisition.
+The controller is dry-run-only unless `--execute` is passed. Each child smoke
+acquires the shared GPU lock through `scripts/smoke_runtime.py`. The child owns
+the lock so it remains valid even if the controller or calling terminal exits.
+`--wait-for-gpu` is forwarded to the child when requested.
 
-The default loading mode is `normal`, because the benchmark should include the
-ordinary load-then-attach lifecycle. `direct-arena` remains available for
-iteration when startup time is not part of the question. Startup and steady
-training timings are reported separately.
+The default loading mode is `smoke-direct-to-arena`. It is the intended mode
+for routine smokes and quantization benchmarking because startup lifecycle is
+not the subject of the matrix. `production-model-load` mirrors the production
+generic model-load session and is reserved for tests of production checkpoint
+loading, RAM, and startup behavior. Legacy load-then-copy behavior can cause
+extreme paging and is available only through the explicit load mode
+`YesIWantToCauseTBOfPagingOnPurposeBecauseImExplicitlyBenchmarkingDiskLoad`.
+Startup and steady training timings are reported separately.
 
 Use at least three repeats for a decision. Compare medians across independent
 runs. Treat post-warmup Dynamo frames as invalid steady-state evidence rather

@@ -3180,12 +3180,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 user_set_cache_limit = cache_size_limit is not None
                 if user_set_cache_limit:
                     torch._dynamo.config.cache_size_limit = cache_size_limit
-                torch._dynamo.config.suppress_errors = bool(is_quantized)
-                if is_quantized:
-                    print_acc(
-                        "Quantized model detected: suppressing unsupported "
-                        "torch.compile trace failures and falling back to eager where needed."
-                    )
+                # Compile failures must remain visible for every weight format.
+                # In particular, quantized graphs used to suppress an actual
+                # CPU subgraph failure and silently run that block eagerly.
+                torch._dynamo.config.suppress_errors = False
                 # torch 2.9 inductor bug: the new memory-coalescing tiling analysis
                 # crashes on some dynamic-shape index expressions (sympy PowByNatural
                 # "assert p >= 0", seen with Qwen Image). The analysis doesn't apply

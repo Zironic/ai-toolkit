@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -50,10 +51,12 @@ def test_cuda_smoke_disables_windows_inductor_cpu_isa_probe(monkeypatch):
 
     monkeypatch.setattr(smoke_runtime.sys, "platform", "win32")
     monkeypatch.setattr(config.cpp, "vec_isa_ok", None)
+    monkeypatch.setattr(smoke_runtime.torch._dynamo.config, "suppress_errors", True)
 
     smoke_runtime.configure_cuda_smoke_inductor()
 
     assert config.cpp.vec_isa_ok is False
+    assert smoke_runtime.torch._dynamo.config.suppress_errors is False
 
 
 def test_cuda_smoke_leaves_inductor_isa_policy_unchanged_off_windows(monkeypatch):
@@ -61,25 +64,69 @@ def test_cuda_smoke_leaves_inductor_isa_policy_unchanged_off_windows(monkeypatch
 
     monkeypatch.setattr(smoke_runtime.sys, "platform", "linux")
     monkeypatch.setattr(config.cpp, "vec_isa_ok", None)
+    monkeypatch.setattr(smoke_runtime.torch._dynamo.config, "suppress_errors", True)
 
     smoke_runtime.configure_cuda_smoke_inductor()
 
     assert config.cpp.vec_isa_ok is None
+    assert smoke_runtime.torch._dynamo.config.suppress_errors is False
 
 
 def test_smoke_load_mode_is_explicit_and_self_checking():
     model = SimpleNamespace(_prepared_canonical_build=None)
-    smoke_runtime.configure_smoke_load_mode(model, "normal")
+    smoke_runtime.configure_smoke_load_mode(
+        model, smoke_runtime.PRODUCTION_LOAD_MODE
+    )
     assert model._smoke_direct_arena_load is False
-    smoke_runtime.assert_smoke_load_mode(model, "normal")
+    smoke_runtime.assert_smoke_load_mode(model, smoke_runtime.PRODUCTION_LOAD_MODE)
 
-    smoke_runtime.configure_smoke_load_mode(model, "direct-arena")
+    paging_mode = smoke_runtime.PAGING_LOAD_MODE
+    smoke_runtime.configure_smoke_load_mode(model, paging_mode)
+    assert model._smoke_direct_arena_load is False
+    smoke_runtime.assert_smoke_load_mode(model, paging_mode)
+
+    smoke_runtime.configure_smoke_load_mode(
+        model, smoke_runtime.SMOKE_DIRECT_LOAD_MODE
+    )
     model._prepared_canonical_build = object()
     assert model._smoke_direct_arena_load is True
-    smoke_runtime.assert_smoke_load_mode(model, "direct-arena")
+    smoke_runtime.assert_smoke_load_mode(model, smoke_runtime.SMOKE_DIRECT_LOAD_MODE)
 
     with pytest.raises(RuntimeError, match="requested smoke load mode"):
-        smoke_runtime.assert_smoke_load_mode(model, "normal")
+        smoke_runtime.assert_smoke_load_mode(model, paging_mode)
 
     with pytest.raises(ValueError, match="unknown_smoke_load_mode"):
         smoke_runtime.configure_smoke_load_mode(model, "surprise")
+
+
+def test_production_smoke_mode_uses_production_model_load_session(monkeypatch):
+    events = []
+    session = object()
+
+    @contextmanager
+    def fake_session(model):
+        events.append(("enter", model))
+        yield session
+        events.append(("exit", model))
+
+    monkeypatch.setattr(
+        "toolkit.memory_management.arena_offload.model_load_arena_session",
+        fake_session,
+    )
+    model = SimpleNamespace()
+
+    with smoke_runtime.smoke_model_load_session(
+        model, smoke_runtime.PRODUCTION_LOAD_MODE
+    ) as active:
+        assert active is session
+        events.append(("body", model))
+
+    assert events == [("enter", model), ("body", model), ("exit", model)]
+    with smoke_runtime.smoke_model_load_session(
+        model, smoke_runtime.SMOKE_DIRECT_LOAD_MODE
+    ) as active:
+        assert active is None
+    with smoke_runtime.smoke_model_load_session(
+        model, smoke_runtime.PAGING_LOAD_MODE
+    ) as active:
+        assert active is None

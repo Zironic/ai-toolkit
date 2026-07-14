@@ -27,7 +27,12 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOCK_PATH = REPO_ROOT / ".gpu.lock"
 POLL_SECONDS = 5.0
-LOAD_MODES = ("direct-arena", "normal")
+PAGING_LOAD_MODE = (
+    "YesIWantToCauseTBOfPagingOnPurposeBecauseImExplicitlyBenchmarkingDiskLoad"
+)
+SMOKE_DIRECT_LOAD_MODE = "smoke-direct-to-arena"
+PRODUCTION_LOAD_MODE = "production-model-load"
+LOAD_MODES = (SMOKE_DIRECT_LOAD_MODE, PRODUCTION_LOAD_MODE, PAGING_LOAD_MODE)
 
 
 class GpuBusy(RuntimeError):
@@ -198,6 +203,7 @@ def configure_cuda_smoke_inductor() -> None:
     Windows even when the graph itself is CUDA-only. Marking that ISA probe as
     unavailable avoids the dry compile without enabling a CPU fallback.
     """
+    torch._dynamo.config.suppress_errors = False
     if sys.platform == "win32":
         from torch._inductor import config
 
@@ -237,7 +243,7 @@ def add_lock_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_load_mode_arg(
-    parser: argparse.ArgumentParser, *, default: str = "direct-arena"
+    parser: argparse.ArgumentParser, *, default: str = SMOKE_DIRECT_LOAD_MODE
 ) -> None:
     """Add the explicit full-model smoke loading lifecycle selector."""
     parser.add_argument(
@@ -245,9 +251,13 @@ def add_load_mode_arg(
         choices=LOAD_MODES,
         default=default,
         help=(
-            "direct-arena populates canonical storage during checkpoint load "
-            "for fast smoke iteration; normal exercises ordinary model load "
-            "followed by arena construction (default: %(default)s)"
+            "smoke-direct-to-arena is the intended smoke/benchmark mode and "
+            "populates canonical storage during checkpoint load; "
+            "production-model-load mirrors the production generic load "
+            "session and is for testing production loading code; the "
+            "deliberately long alternative opts into legacy load-then-copy "
+            "behavior, which can cause heavy paging "
+            "(default: %(default)s)"
         ),
     )
 
@@ -256,15 +266,26 @@ def configure_smoke_load_mode(model, load_mode: str) -> None:
     """Apply a smoke-only loading mode without changing production config."""
     if load_mode not in LOAD_MODES:
         raise ValueError(f"unknown_smoke_load_mode:{load_mode}")
-    model._smoke_direct_arena_load = load_mode == "direct-arena"
+    model._smoke_direct_arena_load = load_mode == SMOKE_DIRECT_LOAD_MODE
+
+
+def smoke_model_load_session(model, load_mode: str):
+    """Return the production context only when that lifecycle is requested."""
+    if load_mode not in LOAD_MODES:
+        raise ValueError(f"unknown_smoke_load_mode:{load_mode}")
+    if load_mode != PRODUCTION_LOAD_MODE:
+        return contextlib.nullcontext()
+    from toolkit.memory_management.arena_offload import model_load_arena_session
+
+    return model_load_arena_session(model)
 
 
 def assert_smoke_load_mode(model, load_mode: str) -> None:
     """Fail when a direct-capable model did not exercise the requested mode."""
     direct = getattr(model, "_prepared_canonical_build", None) is not None
-    expected = load_mode == "direct-arena"
+    expected = load_mode == SMOKE_DIRECT_LOAD_MODE
     if direct != expected:
-        actual = "direct-arena" if direct else "normal"
+        actual = SMOKE_DIRECT_LOAD_MODE if direct else "non-direct"
         raise RuntimeError(
             f"requested smoke load mode {load_mode!r}, got {actual!r}"
         )

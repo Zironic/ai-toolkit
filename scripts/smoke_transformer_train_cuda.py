@@ -23,12 +23,14 @@ Examples:
 
     venv\\Scripts\\python.exe scripts\\smoke_transformer_train_cuda.py ^
       --profile zimage --model-path "<z-image-path>" ^
+      --load-mode "YesIWantToCauseTBOfPagingOnPurposeBecauseImExplicitlyBenchmarkingDiskLoad" ^
       --cond-cache "<cond.safetensors>" --qtype qfloat8 ^
       --adapter-variant lora --phase-sequence train,train,sample,train ^
       --resolution 256x256
 
     venv\\Scripts\\python.exe scripts\\smoke_transformer_train_cuda.py ^
       --profile ideogram4 --model-path "<ideogram4-path>" ^
+      --load-mode "YesIWantToCauseTBOfPagingOnPurposeBecauseImExplicitlyBenchmarkingDiskLoad" ^
       --cond-cache "<short.safetensors>" --cond-cache "<long.safetensors>" ^
       --batch-size 2 --qtype convrot4 --adapter-variant lora ^
       --resolution 256x256
@@ -56,11 +58,15 @@ from scripts.smoke_profiles import (  # noqa: E402
     audit_quantized_representation,
 )
 from scripts.smoke_runtime import (  # noqa: E402
+    LOAD_MODES,
+    PAGING_LOAD_MODE,
+    SMOKE_DIRECT_LOAD_MODE,
     add_contention_args,
     add_lock_args,
     assert_smoke_load_mode,
     configure_smoke_load_mode,
     fail_if_vram_contended,
+    smoke_model_load_session,
 )
 
 GIB = 1024**3
@@ -322,11 +328,13 @@ def _parse_args():
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument(
         "--load-mode",
-        choices=("direct-arena", "normal"),
+        choices=LOAD_MODES,
         default=None,
         help=(
-            "Krea2 checkpoint lifecycle; defaults to direct-arena for Krea2 "
-            "and normal for other profiles"
+            "checkpoint lifecycle; Krea2 defaults to "
+            "smoke-direct-to-arena. Use production-model-load only to test "
+            "production loading code. Other profiles require the explicit "
+            "paging-risk opt-in value"
         ),
     )
     parser.add_argument("--allow-download", action="store_true")
@@ -381,9 +389,19 @@ def _parse_args():
     add_lock_args(parser)
     args = parser.parse_args()
     if args.load_mode is None:
-        args.load_mode = "direct-arena" if args.profile == "krea2" else "normal"
-    if args.profile != "krea2" and args.load_mode != "normal":
-        parser.error("--load-mode direct-arena is currently supported only by Krea2")
+        if args.profile == "krea2":
+            args.load_mode = SMOKE_DIRECT_LOAD_MODE
+        else:
+            parser.error(
+                "this profile requires explicit --load-mode "
+                f"{PAGING_LOAD_MODE!r} because ordinary loading can cause "
+                "terabytes of paging"
+            )
+    if args.profile != "krea2" and args.load_mode != PAGING_LOAD_MODE:
+        parser.error(
+            "safe load modes are currently supported only by Krea2 for this "
+            "multi-architecture harness"
+        )
     args.compile_dynamic_resolved = (
         None if args.compile_dynamic == "none" else args.compile_dynamic == "true"
     )
@@ -534,86 +552,90 @@ def main():
     )
     _print_json(rows[-1])
 
-    print(f"[smoke] loading {profile.name} transformer")
-    t0 = time.perf_counter()
-    transformer = profile.load_transformer(model, args)
-    if profile.name == "krea2":
-        assert_smoke_load_mode(model, args.load_mode)
-    rows.append(
-        {
-            "event": "loaded_transformer",
-            "load_mode": args.load_mode,
-            "seconds": time.perf_counter() - t0,
-        }
-    )
-    _print_json(rows[-1])
-    if args.assistant_lora is not None and args.qtype == "qfloat8":
-        # Z-Image documented behaviour: merged assistant converts the qtype.
-        if model.model_config.qtype != "float8":
-            failures.append(
-                "assistant-lora run did not perform the documented "
-                f"qfloat8 -> float8 conversion (qtype={model.model_config.qtype!r})"
-            )
-
-    from toolkit.basic import flush
-    from toolkit.util.quantize import quantize_model
-
-    flush(garbage_collect=False)
-    if config.quantize and not getattr(
-        model, "_transformer_quantized_during_load", False
-    ):
-        print("[smoke] quantizing transformer")
+    with smoke_model_load_session(model, args.load_mode):
+        print(f"[smoke] loading {profile.name} transformer")
         t0 = time.perf_counter()
-        quantize_model(model, transformer)
-        flush()
+        transformer = profile.load_transformer(model, args)
+        if profile.name == "krea2":
+            assert_smoke_load_mode(model, args.load_mode)
         rows.append(
-            {"event": "quantized_transformer", "seconds": time.perf_counter() - t0}
+            {
+                "event": "loaded_transformer",
+                "load_mode": args.load_mode,
+                "seconds": time.perf_counter() - t0,
+            }
         )
         _print_json(rows[-1])
+        if args.assistant_lora is not None and args.qtype == "qfloat8":
+            # Z-Image documented behaviour: merged assistant converts the qtype.
+            if model.model_config.qtype != "float8":
+                failures.append(
+                    "assistant-lora run did not perform the documented "
+                    f"qfloat8 -> float8 conversion (qtype={model.model_config.qtype!r})"
+                )
 
-    representation = audit_quantized_representation(transformer)
-    effective_qtype = model.model_config.qtype
-    rep_failures = assert_representation(representation, effective_qtype)
-    failures.extend(rep_failures)
-    rows.append({"event": "representation", **representation})
-    _print_json(rows[-1])
+        from toolkit.basic import flush
+        from toolkit.util.quantize import quantize_model
 
-    model_ckpt = profile.enable_model_checkpointing(
-        transformer, keep_last=args.checkpoint_keep_last
-    )
+        flush(garbage_collect=False)
+        if config.quantize and not getattr(
+            model, "_transformer_quantized_during_load", False
+        ):
+            print("[smoke] quantizing transformer")
+            t0 = time.perf_counter()
+            quantize_model(model, transformer)
+            flush()
+            rows.append(
+                {
+                    "event": "quantized_transformer",
+                    "seconds": time.perf_counter() - t0,
+                }
+            )
+            _print_json(rows[-1])
 
-    print("[smoke] attaching arena runtime")
-    t0 = time.perf_counter()
-    _attach_arena_runtime(model, transformer, profile, device)
-    model.model = transformer
+        representation = audit_quantized_representation(transformer)
+        effective_qtype = model.model_config.qtype
+        rep_failures = assert_representation(representation, effective_qtype)
+        failures.extend(rep_failures)
+        rows.append({"event": "representation", **representation})
+        _print_json(rows[-1])
 
-    from toolkit.memory_management.runtime import (
-        close_memory_runtime,
-        get_memory_runtime,
-    )
-
-    memory_runtime = get_memory_runtime(transformer)
-    if memory_runtime is None:
-        raise SystemExit(
-            "arena runtime absent after attach -- refusing to fall back to "
-            "the legacy manager"
+        model_ckpt = profile.enable_model_checkpointing(
+            transformer, keep_last=args.checkpoint_keep_last
         )
-    if getattr(transformer, "_memory_manager", None) is not None and not hasattr(
-        model, "_attach_immutable_training_memory"
-    ):
-        failures.append(
-            "legacy per-Linear memory manager attached alongside the arena "
-            "runtime -- silent fallback"
+
+        print("[smoke] attaching arena runtime")
+        t0 = time.perf_counter()
+        _attach_arena_runtime(model, transformer, profile, device)
+        model.model = transformer
+
+        from toolkit.memory_management.runtime import (
+            close_memory_runtime,
+            get_memory_runtime,
         )
-    rows.append(
-        {
-            "event": "attached_arena_runtime",
-            "seconds": time.perf_counter() - t0,
-            "cuda": _cuda_snapshot("attached", device),
-            "dxgi": _dxgi_snapshot("attached"),
-        }
-    )
-    _print_json(rows[-1])
+
+        memory_runtime = get_memory_runtime(transformer)
+        if memory_runtime is None:
+            raise SystemExit(
+                "arena runtime absent after attach -- refusing to fall back to "
+                "the legacy manager"
+            )
+        if getattr(transformer, "_memory_manager", None) is not None and not hasattr(
+            model, "_attach_immutable_training_memory"
+        ):
+            failures.append(
+                "legacy per-Linear memory manager attached alongside the arena "
+                "runtime -- silent fallback"
+            )
+        rows.append(
+            {
+                "event": "attached_arena_runtime",
+                "seconds": time.perf_counter() - t0,
+                "cuda": _cuda_snapshot("attached", device),
+                "dxgi": _dxgi_snapshot("attached"),
+            }
+        )
+        _print_json(rows[-1])
 
     print(f"[smoke] applying {args.adapter_variant} adapter (rank={args.lora_rank})")
     network = _apply_adapter(model, transformer, device, args, profile)

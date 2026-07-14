@@ -3,8 +3,10 @@
 This replaces the retired in-graph sampling smoke with the current immutable
 runtime lifecycle: load/quantize, prepare arena, install adapter, finalize,
 enter a sampling session, and generate one image from cached text embeddings.
-The default direct-arena load is a fast harness shortcut; ``--load-mode
-normal`` exercises the production load-then-attach lifecycle.
+The default `smoke-direct-to-arena` load is the intended harness path.
+`production-model-load` mirrors the production generic model-load session and
+is only for testing that loading code. The deliberately long alternative
+preserves legacy load-then-copy behavior for explicit paging tests.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from scripts.smoke_runtime import (  # noqa: E402
     assert_smoke_load_mode,
     configure_smoke_load_mode,
     fail_if_vram_contended,
+    smoke_model_load_session,
 )
 
 
@@ -173,23 +176,24 @@ def main():
     model = Krea2Model(device=args.device, model_config=config, dtype=args.dtype)
     model.skip_te = True
     configure_smoke_load_mode(model, args.load_mode)
-    transformer = model._load_transformer()
-    assert_smoke_load_mode(model, args.load_mode)
-    if config.quantize and not getattr(
-        model, "_transformer_quantized_during_load", False
-    ):
-        print("[smoke] quantizing transformer")
-        quantize_model(model, transformer)
-        flush()
+    with smoke_model_load_session(model, args.load_mode):
+        transformer = model._load_transformer()
+        assert_smoke_load_mode(model, args.load_mode)
+        if config.quantize and not getattr(
+            model, "_transformer_quantized_during_load", False
+        ):
+            print("[smoke] quantizing transformer")
+            quantize_model(model, transformer)
+            flush()
 
-    print("[smoke] preparing immutable arena offload")
-    ignore_modules = [
-        module
-        for module in transformer.modules()
-        if isinstance(module, (SimpleModulation, DoubleSharedModulation))
-    ]
-    model._attach_immutable_training_memory(transformer, ignore_modules)
-    model.model = transformer
+        print("[smoke] preparing immutable arena offload")
+        ignore_modules = [
+            module
+            for module in transformer.modules()
+            if isinstance(module, (SimpleModulation, DoubleSharedModulation))
+        ]
+        model._attach_immutable_training_memory(transformer, ignore_modules)
+        model.model = transformer
 
     print(f"[smoke] applying {args.adapter_variant} adapter")
     network = train_smoke._apply_lora(
