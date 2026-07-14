@@ -117,11 +117,7 @@ class ArenaRuntimeResources:
             if self.residency is not None:
                 attempt("resident sidecars", self.residency.clear)
 
-            # The public runtime marker remains installed after committed close:
-            # discovery must explain that this transformer was consumed.
             for owner, name, value in reversed(self.published_attributes):
-                if self.canonical_committed and owner is self.model and self.runtime is value:
-                    continue
                 if getattr(owner, name, None) is value:
                     attempt(
                         f"published attribute {name}",

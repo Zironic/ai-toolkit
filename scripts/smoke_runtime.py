@@ -27,6 +27,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOCK_PATH = REPO_ROOT / ".gpu.lock"
 POLL_SECONDS = 5.0
+LOAD_MODES = ("direct-arena", "normal")
 
 
 class GpuBusy(RuntimeError):
@@ -189,11 +190,33 @@ def acquire_gpu_lock(name: str, *, detail: str = "", wait: bool | None = None) -
     atexit.register(holder.__exit__, None, None, None)
 
 
+def configure_cuda_smoke_inductor() -> None:
+    """Skip Inductor's irrelevant Windows CPU ISA compiler probe.
+
+    CUDA smoke graphs compile through Triton. PyTorch may still validate CPU
+    vector ISA support while preparing Inductor, which invokes ``cl.exe`` on
+    Windows even when the graph itself is CUDA-only. Marking that ISA probe as
+    unavailable avoids the dry compile without enabling a CPU fallback.
+    """
+    if sys.platform == "win32":
+        from torch._inductor import config
+
+        config.cpp.vec_isa_ok = False
+
+
 def run_locked(name: str, entry, *, detail: str = "") -> int:
     """Run a script's main() under the lock; exit 2 (not a traceback) if busy."""
+    configure_cuda_smoke_inductor()
     try:
-        with gpu_lock(name, detail=detail):
+        if "--no-gpu-lock" in sys.argv:
             result = entry()
+        else:
+            with gpu_lock(
+                name,
+                detail=detail,
+                wait="--wait-for-gpu" in sys.argv,
+            ):
+                result = entry()
     except GpuBusy as busy:
         print(f"[gpu-lock] {busy}", file=sys.stderr)
         return 2
@@ -211,6 +234,40 @@ def add_lock_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="skip the GPU lock entirely (will contend for VRAM).",
     )
+
+
+def add_load_mode_arg(
+    parser: argparse.ArgumentParser, *, default: str = "direct-arena"
+) -> None:
+    """Add the explicit full-model smoke loading lifecycle selector."""
+    parser.add_argument(
+        "--load-mode",
+        choices=LOAD_MODES,
+        default=default,
+        help=(
+            "direct-arena populates canonical storage during checkpoint load "
+            "for fast smoke iteration; normal exercises ordinary model load "
+            "followed by arena construction (default: %(default)s)"
+        ),
+    )
+
+
+def configure_smoke_load_mode(model, load_mode: str) -> None:
+    """Apply a smoke-only loading mode without changing production config."""
+    if load_mode not in LOAD_MODES:
+        raise ValueError(f"unknown_smoke_load_mode:{load_mode}")
+    model._smoke_direct_arena_load = load_mode == "direct-arena"
+
+
+def assert_smoke_load_mode(model, load_mode: str) -> None:
+    """Fail when a direct-capable model did not exercise the requested mode."""
+    direct = getattr(model, "_prepared_canonical_build", None) is not None
+    expected = load_mode == "direct-arena"
+    if direct != expected:
+        actual = "direct-arena" if direct else "normal"
+        raise RuntimeError(
+            f"requested smoke load mode {load_mode!r}, got {actual!r}"
+        )
 
 
 VRAM_CONTENTION_LIMIT = 0.30

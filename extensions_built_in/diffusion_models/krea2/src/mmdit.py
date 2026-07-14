@@ -27,9 +27,6 @@ from einops import rearrange
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
-from toolkit.memory_management.ingraph_stream import (
-    streamed_linear,
-)
 from toolkit.memory_management.runtime import get_memory_runtime
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -198,70 +195,6 @@ def _mask(mask: Tensor) -> Tensor | None:
     return mask[:, None, None, :]
 
 
-def _streamed_arg_linear(
-    x: Tensor,
-    arg,
-    operation,
-    adapter=None,
-    *,
-    training: bool,
-) -> Tensor:
-    adapter_forward = getattr(adapter, "functional_forward", None)
-    forward = operation.forward_train if training else operation.forward_sample
-    if adapter is None:
-        return forward(x, arg)
-    if adapter_forward is None:
-        lora_a, lora_b, lora_scale = adapter
-        base = forward(x, arg)
-        lora_out = (x.to(lora_a.dtype) @ lora_a.t() @ lora_b.t()) * lora_scale
-        return base + lora_out.to(base.dtype)
-
-    from toolkit.functional_adapter import FunctionalLinear
-    weight, bias, scale = operation.functional_components(arg)
-    def call_fn(value, explicit_weight, explicit_bias, explicit_scale):
-        return operation.forward_explicit(
-            value,
-            explicit_weight,
-            explicit_bias,
-            explicit_scale,
-            training=training,
-        )
-
-    def materialize_fn(explicit_weight, explicit_scale, dtype):
-        tensors = operation.explicit_tensors(explicit_weight, None, explicit_scale)
-        return operation.materialize(
-            tensors,
-            dtype=torch.bfloat16 if dtype is None else dtype,
-        )
-
-    base = FunctionalLinear(
-        weight=weight,
-        bias=bias,
-        scale=scale,
-        call_fn=call_fn,
-        materialize_fn=materialize_fn,
-    )
-    return adapter_forward(base, x)
-
-
-def _streamed_arg_linear_sample(
-    x: Tensor,
-    arg,
-    operation,
-    lora=None,
-) -> Tensor:
-    return _streamed_arg_linear(x, arg, operation, lora, training=False)
-
-
-def _streamed_arg_linear_train(
-    x: Tensor,
-    arg,
-    operation,
-    lora=None,
-) -> Tensor:
-    return _streamed_arg_linear(x, arg, operation, lora, training=True)
-
-
 def temb(
     t: Tensor,
     dim: int,
@@ -384,42 +317,8 @@ class SwiGLU(torch.nn.Module):
         self.up = torch.nn.Linear(features, mlpdim, bias=bias)
         self.down = torch.nn.Linear(mlpdim, features, bias=bias)
 
-    def forward(self, x: Tensor, leaves: dict | None = None) -> Tensor:
-        if leaves is None:
-            return self.down(F.silu(self.gate(x)) * self.up(x))
-        gate = streamed_linear(x, leaves["gate"])
-        up = streamed_linear(x, leaves["up"])
-        return streamed_linear(F.silu(gate) * up, leaves["down"])
-
-    def forward_streamed(
-        self,
-        x: Tensor,
-        gate_arg,
-        up_arg,
-        down_arg,
-        linear_operations,
-        *,
-        training: bool = False,
-        loras=None,
-    ) -> Tensor:
-        loras = (None, None, None) if loras is None else loras
-        if training:
-            gate = _streamed_arg_linear_train(x, gate_arg, linear_operations[0], loras[0])
-            up = _streamed_arg_linear_train(x, up_arg, linear_operations[1], loras[1])
-            return _streamed_arg_linear_train(
-                F.silu(gate) * up,
-                down_arg,
-                linear_operations[2],
-                loras[2],
-            )
-        gate = _streamed_arg_linear_sample(x, gate_arg, linear_operations[0], loras[0])
-        up = _streamed_arg_linear_sample(x, up_arg, linear_operations[1], loras[1])
-        return _streamed_arg_linear_sample(
-            F.silu(gate) * up,
-            down_arg,
-            linear_operations[2],
-            loras[2],
-        )
+    def forward(self, x: Tensor) -> Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class Attention(torch.nn.Module):
@@ -442,18 +341,11 @@ class Attention(torch.nn.Module):
         qkv: Tensor,
         freqs: Tensor | None = None,
         mask: Tensor | None = None,
-        leaves: dict | None = None,
         ref_span: tuple[int, int] | None = None,
         kv_capture: list | None = None,
         kv_cache: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
-        if leaves is None:
-            q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
-        else:
-            q = streamed_linear(qkv, leaves["wq"])
-            k = streamed_linear(qkv, leaves["wk"])
-            v = streamed_linear(qkv, leaves["wv"])
-            gate = streamed_linear(qkv, leaves["gate"])
+        q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
 
         q, k, v = (
             _split_heads(q, self.heads),
@@ -475,53 +367,7 @@ class Attention(torch.nn.Module):
             k = torch.cat((k, kv_cache[0]), dim=2)
             v = torch.cat((v, kv_cache[1]), dim=2)
         out = attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate)
-        if leaves is None:
-            out = self.wo(out)
-        else:
-            out = streamed_linear(out, leaves["wo"])
-
-        return out
-
-    def forward_streamed(
-        self,
-        qkv: Tensor,
-        freqs: Tensor | None,
-        mask: Tensor | None,
-        wq_arg,
-        wk_arg,
-        wv_arg,
-        gate_arg,
-        wo_arg,
-        linear_operations,
-        *,
-        training: bool = False,
-        loras=None,
-    ) -> Tensor:
-        loras = (None, None, None, None, None) if loras is None else loras
-        if training:
-            q = _streamed_arg_linear_train(qkv, wq_arg, linear_operations[0], loras[0])
-            k = _streamed_arg_linear_train(qkv, wk_arg, linear_operations[1], loras[1])
-            v = _streamed_arg_linear_train(qkv, wv_arg, linear_operations[2], loras[2])
-            gate = _streamed_arg_linear_train(qkv, gate_arg, linear_operations[3], loras[3])
-        else:
-            q = _streamed_arg_linear_sample(qkv, wq_arg, linear_operations[0], loras[0])
-            k = _streamed_arg_linear_sample(qkv, wk_arg, linear_operations[1], loras[1])
-            v = _streamed_arg_linear_sample(qkv, wv_arg, linear_operations[2], loras[2])
-            gate = _streamed_arg_linear_sample(qkv, gate_arg, linear_operations[3], loras[3])
-
-        q, k, v = (
-            _split_heads(q, self.heads),
-            _split_heads(k, self.kvheads),
-            _split_heads(v, self.kvheads),
-        )
-
-        q, k, v = self.qknorm(q, k, v)
-        if freqs is not None:
-            q, k = ropeapply(q, k, freqs)
-        out = attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate)
-        if training:
-            return _streamed_arg_linear_train(out, wo_arg, linear_operations[4], loras[4])
-        return _streamed_arg_linear_sample(out, wo_arg, linear_operations[4], loras[4])
+        return self.wo(out)
 
 
 class LastLayer(torch.nn.Module):
@@ -627,7 +473,6 @@ class SingleStreamBlock(nn.Module):
         vec: Tensor,
         freqs: Tensor,
         mask: Tensor | None = None,
-        leaves: dict | None = None,
         ref_span: tuple[int, int] | None = None,
         kv_capture: list | None = None,
         kv_cache: tuple[Tensor, Tensor] | None = None,
@@ -663,57 +508,14 @@ class SingleStreamBlock(nn.Module):
             return x
 
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        attn_leaves = None if leaves is None else leaves["attn"]
-        mlp_leaves = None if leaves is None else leaves["mlp"]
         x = x + pregate * self.attn(
             (1 + prescale) * self.prenorm(x) + preshift,
             freqs,
             mask,
-            leaves=attn_leaves,
             **attn_kwargs,
         )
         x = x + postgate * self.mlp(
             (1 + postscale) * self.postnorm(x) + postshift,
-            leaves=mlp_leaves,
-        )
-
-        return x
-
-    def forward_streamed(
-        self,
-        x: Tensor,
-        vec: Tensor,
-        freqs: Tensor,
-        mask: Tensor | None,
-        leaf_args,
-        linear_operations,
-        *,
-        training: bool = False,
-        loras=None,
-    ) -> Tensor:
-        prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        loras = (None,) * 8 if loras is None else loras
-        x = x + pregate * self.attn.forward_streamed(
-            (1 + prescale) * self.prenorm(x) + preshift,
-            freqs,
-            mask,
-            leaf_args[0],
-            leaf_args[1],
-            leaf_args[2],
-            leaf_args[3],
-            leaf_args[4],
-            linear_operations[:5],
-            training=training,
-            loras=loras[:5],
-        )
-        x = x + postgate * self.mlp.forward_streamed(
-            (1 + postscale) * self.postnorm(x) + postshift,
-            leaf_args[5],
-            leaf_args[6],
-            leaf_args[7],
-            linear_operations[5:],
-            training=training,
-            loras=loras[5:],
         )
 
         return x
@@ -795,9 +597,10 @@ class SingleStreamDiT(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def enable_gradient_checkpointing(self, keep_last: int = 0):
+    def enable_gradient_checkpointing(self, keep_last: int | None = None):
         self.gradient_checkpointing = True
-        self._checkpoint_keep_last = max(0, int(keep_last))
+        if keep_last is not None:
+            self._checkpoint_keep_last = max(0, int(keep_last))
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
@@ -949,18 +752,9 @@ class SingleStreamDiT(nn.Module):
         ref_kv_capture: list | None = None,
         blockcaches: list | None = None,
     ) -> Tensor:
-        runtime = get_memory_runtime(self)
-        block_args = (tvec, freqs, mask)
-        if runtime is not None and runtime.can_run_blocks(
-            block_args,
-            ref_kv_capture=ref_kv_capture,
-            blockcaches=blockcaches,
-        ):
-            # run_blocks() picks the train/sample program from the active phase.
-            return runtime.run_blocks(combined, block_args)
-
-        # Pure eager block math: fallback, reference-image/reference-K/V calls,
-        # and pre-runtime diagnostic calls.
+        # The ordinary model loop remains the sole owner of execution order and
+        # checkpointing. Arena offload, when active, intercepts each selected
+        # block at its existing call boundary.
         checkpoint_cutoff = len(self.blocks) - self._checkpoint_keep_last
         if blockcaches is None:
             blockcaches = [None] * len(self.blocks)

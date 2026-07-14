@@ -524,9 +524,15 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                         # - full_if_contains: any matching layer, INCLUDING linear/conv, overriding the
                         #   normal lora for it
                         all_layers = self.network_config is not None and getattr(self.network_config, 'all_layers', False)
+                        # Inspect the registration table directly. Some quantized
+                        # linears expose ``weight`` as a dequantizing property, so
+                        # getattr() here can materialize a full dense model during
+                        # adapter discovery even though this check only needs to
+                        # identify trainable full-weight leaves.
+                        registered_weight = child_module._parameters.get('weight')
                         is_leaf_with_weight = (
                             len(list(child_module.children())) == 0
-                            and isinstance(getattr(child_module, 'weight', None), torch.nn.Parameter)
+                            and isinstance(registered_weight, torch.nn.Parameter)
                         )
                         matches_full_if_contains = len(self.full_if_contains) > 0 and (
                             any([word in clean_name for word in self.full_if_contains])

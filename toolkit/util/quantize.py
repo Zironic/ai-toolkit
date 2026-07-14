@@ -245,13 +245,63 @@ def quantize(
             # raise e
 
 
+def quantize_module_at_path(
+    model: torch.nn.Module,
+    name: str,
+    *,
+    weights,
+) -> torch.nn.Module:
+    """Quantize one already-materialized module and publish its replacement.
+
+    Recursive Quanto quantization cannot replace the root module: its relative
+    name is empty, so the generated QLinear is assigned to an unusable empty
+    attribute while the original Linear's weight is cleared. Bounded loaders
+    know the real parent path and use this helper for root quantization units.
+    """
+    module = model.get_submodule(name)
+    resolved = get_qtype(weights)
+    if isinstance(resolved, aotype):
+        quantize(module, weights=resolved)
+    elif isinstance(resolved, ostristype):
+        if isinstance(module, torch.nn.Linear):
+            # Shape-ineligible Ostris roots remain dense, matching recursive
+            # quantize() behavior for children (for example Krea's 12-wide
+            # text-fusion projector).
+            convert_linear_to_ostris(module, resolved.quantizer)
+        else:
+            quantize(module, weights=resolved)
+    else:
+        _quantize_submodule(
+            model,
+            name,
+            module,
+            weights=resolved,
+        )
+    return model.get_submodule(name)
+
+
 def assign_quantized_state_dict(
     model: torch.nn.Module,
     state_dict: dict,
     weights,
 ) -> None:
-    """Assign a cached quantized state without copying its model-sized leaves."""
+    """Assign cached quantized state, using a generic active arena session."""
     prepare_quantized_state_dict_model(model, state_dict, weights)
+    from toolkit.memory_management.arena_offload.load_session import (
+        try_prepare_canonical_from_state_dict,
+    )
+
+    if try_prepare_canonical_from_state_dict(model, state_dict) is not None:
+        try:
+            assign_quantized_state_dict_subset(model, state_dict, weights)
+            return
+        except BaseException:
+            from toolkit.memory_management.arena_offload.load_session import (
+                discard_pending_canonical_build,
+            )
+
+            discard_pending_canonical_build(model)
+            raise
     missing, unexpected = model.load_state_dict(state_dict, strict=True, assign=True)
     if missing or unexpected:
         raise RuntimeError(f"missing={missing[:5]} unexpected={unexpected[:5]}")

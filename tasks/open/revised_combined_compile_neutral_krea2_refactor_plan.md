@@ -1,5 +1,12 @@
 # Revised Combined Refactor Plan
 
+> **Partially superseded (2026-07-14):** the architecture-adapter *execution*
+> design in this document is superseded by
+> `GENERIC_BLOCK_DISPATCHER_PLAN.md` (ticket `b7dead1`). The adapter path
+> stays only as a comparison oracle until that plan's Phases 5-6 pass, then
+> is deleted in its Phase 7. Canonical-arena, residency, and lifecycle
+> content here remains valid.
+
 ## Generic Compile-Neutral Runtime and Full Krea2 Migration
 
 ### Repository

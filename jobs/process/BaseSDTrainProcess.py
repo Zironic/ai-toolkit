@@ -85,85 +85,6 @@ from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
 
 
-def _find_vcvars64_bat() -> Optional[str]:
-    candidates = []
-    vswhere = os.path.join(
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        "Microsoft Visual Studio",
-        "Installer",
-        "vswhere.exe",
-    )
-    if os.path.isfile(vswhere):
-        try:
-            install_path = subprocess.check_output(
-                [
-                    vswhere,
-                    "-latest",
-                    "-products",
-                    "*",
-                    "-requires",
-                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                    "-property",
-                    "installationPath",
-                ],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-            if install_path:
-                candidates.append(
-                    os.path.join(install_path, "VC", "Auxiliary", "Build", "vcvars64.bat")
-                )
-        except Exception:
-            pass
-
-    roots = [
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Microsoft Visual Studio"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Microsoft Visual Studio"),
-    ]
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        for year in ("2022", "2019", "2017"):
-            year_root = os.path.join(root, year)
-            if not os.path.isdir(year_root):
-                continue
-            for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
-                candidates.append(
-                    os.path.join(year_root, edition, "VC", "Auxiliary", "Build", "vcvars64.bat")
-                )
-
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-def _ensure_windows_msvc_env() -> bool:
-    if not sys.platform.startswith("win") or shutil.which("cl") is not None:
-        return True
-
-    vcvars = _find_vcvars64_bat()
-    if vcvars is None:
-        return False
-
-    try:
-        env_output = subprocess.check_output(
-            f'cmd /s /c ""{vcvars}" >nul && set"',
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
-    except Exception as e:
-        print_acc(f"WARNING: failed to activate MSVC environment from {vcvars}: {e}")
-        return False
-
-    for line in env_output.splitlines():
-        key, sep, value = line.partition("=")
-        if sep:
-            os.environ[key] = value
-
-    return shutil.which("cl") is not None
-
-
 def _torch_compile_backend_unavailable_reason() -> Optional[str]:
     try:
         from torch.utils._triton import has_triton
@@ -172,11 +93,13 @@ def _torch_compile_backend_unavailable_reason() -> Optional[str]:
     except Exception as e:
         return f"PyTorch Inductor Triton check failed: {e}"
 
-    if not _ensure_windows_msvc_env():
-        return (
-            "Triton is installed, but MSVC cl.exe could not be activated. "
-            "Install Visual Studio Build Tools with the C++ toolchain."
-        )
+    if sys.platform == "win32":
+        # CUDA graphs compile through Triton. Avoid Inductor's incidental CPU
+        # vector-ISA dry compile, which otherwise probes for cl.exe even when
+        # no CPU kernel is present in the graph.
+        from torch._inductor import config
+
+        config.cpp.vec_isa_ok = False
 
     return None
 
@@ -2500,7 +2423,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.sd.skip_te = False
 
         self.hook_after_sd_init_before_load()
-        self.sd.load_model()
+        from toolkit.memory_management.arena_offload import model_load_arena_session
+        with model_load_arena_session(self.sd):
+            self.sd.load_model()
 
         if not hasattr(self, 'cache_text_encoder_outputs_to_disk'):
             raise NotImplementedError(
@@ -2681,9 +2606,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # never load the text encoder in the trainer; embeds come from disk
             self.sd.skip_te = True
 
+        # Shape-aware cold-start hint for arena-offload attach (see
+        # Krea2Model._estimate_training_working_reserve_bytes); harmless for
+        # model classes that don't read it.
+        self.sd.dataset_configs = self.dataset_configs
+        # Arena-capable models must know checkpoint ownership before their
+        # destructive canonical-storage preparation in load_model().
+        self.sd.train_config = self.train_config
+
         self.hook_after_sd_init_before_load()
         # run base sd process run
-        self.sd.load_model()
+        from toolkit.memory_management.arena_offload import model_load_arena_session
+        with model_load_arena_session(self.sd):
+            self.sd.load_model()
 
         if self._use_cached_te:
             if not self.load_cached_text_encoder_outputs_from_disk():
@@ -3164,7 +3099,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if compile_unavailable_reason is not None:
             print_acc("WARNING: compile is disabled.")
             print_acc(compile_unavailable_reason)
-            print_acc("Install a working 'triton' package and compiler toolchain to use torch.compile.")
+            print_acc("Install a working 'triton' package to use torch.compile.")
             self.model_config.compile = False
             self.model_config.train_compile_blocks = False
 
@@ -3284,25 +3219,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 cache_info = ""
 
-                # Whole-model compile wraps every offload-hooked Linear in one
-                # large graph, producing graph-break storms or a multi-minute freeze.
-                # Block compile keeps each block as its own compilation unit so the
-                # pure-math interior benefits while the offload hooks stay at the boundary.
-                if is_unet_offloaded and not block_compile:
-                    print_acc(
-                        "Layer offloading detected: whole-model compile is incompatible "
-                        "(offload hooks inside the compiled graph cause graph-break storms). "
-                        "Switching to block_compile=True automatically."
-                    )
-                    block_compile = True
-
                 # ====================================================
                 # BLOCK COMPILE
                 # ====================================================
-                if immutable_compile_owner:
+                if immutable_compile_owner and block_compile:
                     print_acc(
-                        "Immutable arena owns functional per-block compilation; "
-                        "skipping generic module block_compile/whole-model compile."
+                        "Arena dispatcher owns stateless per-block compilation; "
+                        "skipping the trainer's generic module block_compile."
                     )
                 elif block_compile:
                     BLOCK_LIST_ATTRS = self.sd.get_transformer_block_names()
@@ -3404,6 +3327,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # WHOLE MODEL COMPILE
                 # ====================================================
                 else:
+                    if immutable_compile_owner:
+                        print_acc(
+                            "WARNING: whole-model compile around the arena dispatcher "
+                            "is allowed but has unvalidated performance; dispatcher "
+                            "boundaries remain outside compiled arena policy code."
+                        )
                     print_acc("Compiling model with torch.compile (whole-model compile).")
                     print_acc("The first forward pass will hang for a while. This is normal.")
 

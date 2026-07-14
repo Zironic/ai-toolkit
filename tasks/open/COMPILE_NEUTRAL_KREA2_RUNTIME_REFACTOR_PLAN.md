@@ -1,5 +1,13 @@
 # Compile-Neutral Generic Transformer Runtime and Krea2 Extraction
 
+> **Partially superseded (2026-07-14):** the architecture-adapter *execution*
+> design in this document (adapter protocol, runtime-owned block loop/trunks,
+> runtime-owned checkpointing, `run_blocks()` delegation) is superseded by
+> `GENERIC_BLOCK_DISPATCHER_PLAN.md` (ticket `b7dead1`). The adapter path
+> stays only as a comparison oracle until that plan's Phases 5-6 pass, then
+> is deleted in its Phase 7. Canonical-arena, residency, and lifecycle
+> content here remains valid.
+
 Source: `combined_compile_neutral_krea2_refactor_plan.md`, supplied by the user on 2026-07-11.
 
 ## Outcome

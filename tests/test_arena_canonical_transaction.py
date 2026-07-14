@@ -86,6 +86,72 @@ class CanonicalTransactionTests(unittest.TestCase):
             CanonicalArena.unguard_whole_model_to(model)
             arena.release()
 
+    def test_state_dict_population_consumes_each_source_before_next_block(self):
+        layers = [frozen_linear(), frozen_linear()]
+        model = torch.nn.Module()
+        model.blocks = torch.nn.ModuleList()
+        for layer in layers:
+            block = torch.nn.Module()
+            block.linear = layer
+            model.blocks.append(block)
+        state = {
+            f"blocks.{index}.linear.weight": torch.full_like(layer.weight, index + 1)
+            for index, layer in enumerate(layers)
+        }
+        state.update({
+            f"blocks.{index}.linear.bias": torch.full_like(layer.bias, index + 3)
+            for index, layer in enumerate(layers)
+        })
+        expected = {key: value.clone() for key, value in state.items()}
+        first_refs = (
+            weakref.ref(state["blocks.0.linear.weight"]),
+            weakref.ref(state["blocks.0.linear.bias"]),
+        )
+        residual = torch.tensor([9.0])
+        state["head.weight"] = residual
+
+        def blocks():
+            yield "blocks.0", [("linear", layers[0])]
+            gc.collect()
+            self.assertNotIn("blocks.0.linear.weight", state)
+            self.assertNotIn("blocks.0.linear.bias", state)
+            self.assertTrue(all(ref() is None for ref in first_refs))
+            self.assertIn("blocks.1.linear.weight", state)
+            yield "blocks.1", [("linear", layers[1])]
+
+        arena = CanonicalArena()
+        build = arena.prepare({}, model=model)
+        consumed = build.populate_from_state_dict_consuming(
+            state,
+            blocks=blocks(),
+        )
+
+        self.assertEqual(
+            set(consumed),
+            {
+                "blocks.0.linear.weight",
+                "blocks.0.linear.bias",
+                "blocks.1.linear.weight",
+                "blocks.1.linear.bias",
+            },
+        )
+        self.assertEqual(set(state), {"head.weight"})
+        self.assertIs(state["head.weight"], residual)
+
+        build.commit()
+        try:
+            for index, layer in enumerate(layers):
+                torch.testing.assert_close(
+                    layer.weight,
+                    expected[f"blocks.{index}.linear.weight"],
+                )
+                torch.testing.assert_close(
+                    layer.bias,
+                    expected[f"blocks.{index}.linear.bias"],
+                )
+        finally:
+            arena.release()
+
     def test_direct_population_failure_rolls_back_without_marker_or_pin_leak(self):
         model = torch.nn.Sequential(frozen_linear())
         layer = model[0]

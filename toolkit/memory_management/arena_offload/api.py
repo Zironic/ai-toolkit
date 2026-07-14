@@ -8,7 +8,7 @@ here. The rule the rest of the codebase must follow:
     )
 
 and nothing else. In particular, no `CanonicalArena`, `ResidencyState`,
-`ResidencyPlan`, or `prepare_immutable_runtime` imports outside this package.
+`ResidencyPlan` or dispatcher-controller imports outside this package.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from ..runtime import (
     unwrap_memory_model,
 )
 from .runtime import ArenaOffloadRuntime
-from ..adapters.protocol import validate_architecture_adapter
 
+GIB = 1024**3
 _FP8_QTYPES = ("qfloat8", "float8")
 _COMPATIBILITY_ALIASES = {
     "layer_offloading_smart_working_reserve_gb": (
@@ -101,7 +101,9 @@ class ArenaOffloadConfig:
     )
 
     @classmethod
-    def from_model_config(cls, model_config) -> ArenaOffloadConfig:
+    def from_model_config(
+        cls, model_config, *, training_working_reserve_hint_bytes: int | None = None
+    ) -> ArenaOffloadConfig:
         def get(name: str, default: Any = None) -> Any:
             if hasattr(model_config, name):
                 return getattr(model_config, name)
@@ -109,6 +111,20 @@ class ArenaOffloadConfig:
                 if hasattr(model_config, alias):
                     return getattr(model_config, alias)
             return default
+
+        raw_working_reserve_gib = get("layer_offloading_smart_working_reserve_gb")
+        working_reserve_gib = raw_working_reserve_gib
+        if training_working_reserve_hint_bytes:
+            try:
+                is_auto = raw_working_reserve_gib is None or float(raw_working_reserve_gib) < 0
+            except (TypeError, ValueError):
+                is_auto = str(raw_working_reserve_gib).strip().lower() == "auto"
+            if is_auto:
+                # A caller-supplied, resolution-aware hint (see
+                # vram_budget.estimate_training_working_reserve_bytes) beats the
+                # planner's flat DEFAULT_AUTO_WORKING_RESERVE_GIB fallback, but
+                # never overrides an explicit user value.
+                working_reserve_gib = float(training_working_reserve_hint_bytes) / float(GIB)
 
         fp8_weights = bool(get("quantize", False)) and get("qtype") in _FP8_QTYPES
         requested_forward = bool(get("layer_offloading_fp8_forward", False))
@@ -163,7 +179,7 @@ class ArenaOffloadConfig:
                 float(get("layer_offloading_simulated_vram_gb") or 0.0) or None
             ),
             _policy=_ArenaPolicyOptions(
-                working_reserve_gib=get("layer_offloading_smart_working_reserve_gb"),
+                working_reserve_gib=working_reserve_gib,
                 wddm_margin_gib=get("layer_offloading_smart_wddm_margin_gb"),
                 wddm_hard_gib=get("layer_offloading_smart_wddm_hard_gb"),
                 checkpoint_keep_last=max(
@@ -185,24 +201,33 @@ class ArenaOffloadConfig:
 
 
 def prepare_canonical_storage(
-    transformer, adapter, *, device=None, defer_blocks: bool = False
+    transformer,
+    *,
+    block_names: Sequence[str] | None = None,
+    device=None,
+    defer_blocks: bool = False,
 ):
     """Prepare final arena destinations without publishing model Parameters."""
     from ..canonical_arena import CanonicalArena
+    from .discovery import discover_blocks
     from .resources import ArenaRuntimeResources
 
-    validate_architecture_adapter(adapter)
-    adapter.validate_transformer(transformer)
+    selection = discover_blocks(
+        transformer, container_paths=tuple(block_names or ())
+    )
     resources = None
     if device is not None:
         resources = ArenaRuntimeResources(transformer, device)
         resources.acquire_process_owner()
     try:
-        blocks = adapter.execution_blocks(transformer)
-        entries = {} if defer_blocks else {
-            adapter.block_key(transformer, index): list(adapter.leaf_entries(block))
-            for index, block in enumerate(blocks)
-        }
+        entries = (
+            {}
+            if defer_blocks
+            else {
+                key: list(selection.entries_by_block[key])
+                for key in selection.block_keys
+            }
+        )
         arena = CanonicalArena()
         build = arena.prepare(entries, model=transformer)
         if resources is not None:
@@ -213,12 +238,50 @@ def prepare_canonical_storage(
             resources.release()
         raise
 
+
+def prepare_canonical_storage_from_state_dict(
+    transformer,
+    state_dict,
+    *,
+    block_names: Sequence[str] | None = None,
+    device=None,
+):
+    """Build canonical storage incrementally from a mutable state mapping.
+
+    Serialized source keys and physical tensor leaves are inferred from the
+    transformer's module paths, each module's own state-dict surface, and its
+    quantization storage declaration. The complete mapping is validated before
+    allocation or destructive consumption begins.
+    """
+    from .discovery import discover_blocks
+
+    selection = discover_blocks(
+        transformer, container_paths=tuple(block_names or ())
+    )
+    entries_by_block = selection.entries_by_block
+
+    from .construction import infer_state_dict_schema, validate_state_dict_schema
+
+    schema = infer_state_dict_schema(transformer, entries_by_block)
+    validate_state_dict_schema(state_dict, schema)
+    build = prepare_canonical_storage(
+        transformer,
+        block_names=block_names,
+        device=device,
+        defer_blocks=True,
+    )
+    build.populate_from_state_dict_consuming(
+        state_dict, blocks=entries_by_block.items()
+    )
+    return build
+
+
 def prepare_arena_offload(
     transformer,
     *,
     device,
-    adapter,
     config: ArenaOffloadConfig,
+    block_names: Sequence[str] | None = None,
     ignore_modules: Sequence[Any] | None = None,
     canonical_build=None,
 ) -> ArenaOffloadRuntime:
@@ -234,12 +297,48 @@ def prepare_arena_offload(
     """
     if not config.enabled:
         raise ValueError("arena_offload_not_enabled")
-    validate_architecture_adapter(adapter)
-    adapter.validate_transformer(transformer)
+    from .load_session import claim_pending_canonical_build
+
+    pending_build = claim_pending_canonical_build(transformer)
+    if canonical_build is None:
+        canonical_build = pending_build
+    elif pending_build is not None:
+        pending_build.rollback()
+        canonical_build.rollback()
+        raise ValueError("arena_multiple_pending_canonical_builds")
+    try:
+        from .discovery import discover_blocks
+
+        if not bool(getattr(transformer, "gradient_checkpointing", False)):
+            raise ValueError(
+                "arena training requires model gradient checkpointing before "
+                "canonical storage is committed"
+            )
+        configured_keep_last = int(config._policy.checkpoint_keep_last)
+        model_keep_last = getattr(transformer, "_checkpoint_keep_last", None)
+        if model_keep_last is None:
+            if configured_keep_last:
+                raise ValueError(
+                    "arena checkpoint keep-last requires a model-owned "
+                    "keep-last declaration"
+                )
+        elif int(model_keep_last) != configured_keep_last:
+            raise ValueError(
+                "arena checkpoint keep-last does not match the model-owned "
+                f"value: config={configured_keep_last} model={int(model_keep_last)}"
+            )
+        selection = discover_blocks(
+            transformer,
+            container_paths=tuple(block_names or ()),
+        )
+    except BaseException:
+        if canonical_build is not None:
+            canonical_build.rollback()
+        raise
     return ArenaOffloadRuntime._prepare(
         transformer,
         device=device,
-        adapter=adapter,
+        selection=selection,
         config=config,
         ignore_modules=ignore_modules,
         canonical_build=canonical_build,

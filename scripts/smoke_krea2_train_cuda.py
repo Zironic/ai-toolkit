@@ -1,10 +1,12 @@
 """Manual CUDA smoke for Krea2 LoRA *training* steps with smart offload.
 
 Loads the full quantized Krea2 transformer, attaches the compile-neutral
-immutable runtime exactly the way load_model() does, applies a fresh LoRA
-network the way BaseSDTrainProcess does, then runs a handful of fake training
-steps (random latents + cached TE embeddings, flow-matching velocity loss,
-backward, AdamW step) and quits. No dataset, no dataloader, no trainer process.
+immutable runtime, applies a fresh LoRA network the way BaseSDTrainProcess
+does, then runs a handful of fake training steps (random latents + cached TE
+embeddings, flow-matching velocity loss, backward, AdamW step) and quits. The
+default direct-arena load is a fast harness shortcut; ``--load-mode normal``
+exercises the production load-then-attach lifecycle. No dataset, no dataloader,
+no trainer process.
 
 The two-phase lifecycle is mirrored faithfully: the runtime is prepared during
 the attach (before LoRA) and finalized after the network is applied.
@@ -19,10 +21,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import json
 import os
 import sys
 import time
+import types
 from pathlib import Path
 
 import torch
@@ -36,6 +40,14 @@ from extensions_built_in.diffusion_models.krea2.krea2 import (  # noqa: E402
     Krea2Model,
     SimpleModulation,
 )
+from scripts.smoke_runtime import (  # noqa: E402
+    add_contention_args,
+    add_load_mode_arg,
+    add_lock_args,
+    assert_smoke_load_mode,
+    configure_smoke_load_mode,
+    fail_if_vram_contended,
+)
 from toolkit.basic import flush  # noqa: E402
 from toolkit.config_modules import ModelConfig, NetworkConfig  # noqa: E402
 from toolkit.lora_special import LoRASpecialNetwork  # noqa: E402
@@ -43,7 +55,6 @@ from toolkit.memory_management import MemoryManager, bounce_pool, dxgi_meminfo, 
 from toolkit.memory_management.runtime import close_memory_runtime, get_memory_runtime  # noqa: E402
 from toolkit.prompt_utils import PromptEmbeds  # noqa: E402
 from toolkit.util.quantize import quantize_model  # noqa: E402
-from scripts.smoke_runtime import add_contention_args, fail_if_vram_contended  # noqa: E402
 
 GIB = 1024 ** 3
 DEFAULT_COND_CACHE = (
@@ -99,8 +110,6 @@ def _immutable_arena_summary(transformer):
     fingerprint, transfer-plan range/copy counts, and the pin-ledger 'weights'
     tier. Reports ``{"present": False}`` when the transformer never built one,
     so it can sit alongside ``_arena_summary`` (only one is present per run)."""
-    from toolkit.memory_management.runtime import get_memory_runtime
-
     memory_runtime = get_memory_runtime(transformer)
     if memory_runtime is None:
         return {"present": False}
@@ -108,6 +117,7 @@ def _immutable_arena_summary(transformer):
     stats = arena.stats()
     residency = memory_runtime._residency
     runtime = memory_runtime._executor
+    diagnostics = memory_runtime.diagnostics()
     summary = {
         "present": True,
         "id": id(arena),
@@ -116,6 +126,11 @@ def _immutable_arena_summary(transformer):
         "ledger_weights_gib": _gib(
             pin_manager.pinned_bytes_by_kind().get("weights", 0)
         ),
+        "working_reserve_gib": _gib(diagnostics["working_reserve_bytes"]),
+        "training_cap_target_gib": _gib(
+            diagnostics.get("training_cap_target_bytes")
+        ),
+        "prefetch_depth": diagnostics["prefetch_depth"],
     }
     if residency is not None:
         summary["resident_sidecar_gib"] = _gib(residency.resident_bytes())
@@ -222,6 +237,37 @@ def _parse_dynamic_hints(specs):
             (int(dim_s), int(lo_s) if lo_s else None, int(hi_s) if hi_s else None)
         )
     return tuple(hints)
+
+
+def _adapter_shape_histogram(network):
+    """Compact adapter-construction metadata: shape/branch distribution.
+
+    Lets a LoRA-vs-LoKr comparison confirm both arms targeted the same
+    layers, and weights any per-shape timing against how often that shape
+    actually occurs in the real Krea2 network.
+    """
+    from toolkit.models.lokr import LokrModule
+
+    modules = list(getattr(network, "unet_loras", None) or [])
+    shape_counts: dict[str, int] = {}
+    lokr_branch_counts = {"use_w1": 0, "use_w2": 0, "factorized_w1": 0, "factorized_w2": 0}
+    for module in modules:
+        org = module.org_module[0]
+        in_f = getattr(org, "in_features", None)
+        out_f = getattr(org, "out_features", None)
+        key = f"{in_f}x{out_f}"
+        shape_counts[key] = shape_counts.get(key, 0) + 1
+        if isinstance(module, LokrModule):
+            lokr_branch_counts["use_w1" if module.use_w1 else "factorized_w1"] += 1
+            lokr_branch_counts["use_w2" if module.use_w2 else "factorized_w2"] += 1
+    return {
+        "event": "adapter_shape_histogram",
+        "module_count": len(modules),
+        "shape_counts": dict(sorted(shape_counts.items(), key=lambda kv: -kv[1])),
+        "lokr_branch_counts": (
+            lokr_branch_counts if any(isinstance(m, LokrModule) for m in modules) else None
+        ),
+    }
 
 
 def _parse_resolutions(spec, default_width, default_height):
@@ -487,6 +533,7 @@ def _parse_args():
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--qtype", default="float8")
     parser.add_argument("--cache-dir", default=None)
+    add_load_mode_arg(parser)
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--max-text-length", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
@@ -615,6 +662,25 @@ def _parse_args():
         "distrust its absolute numbers if the inflation is large.",
     )
     parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=2,
+        help="steps excluded from every steady-state aggregate (phase medians, "
+        "per-bucket averages, whole-step average, trace/A-B selection). Step 0 "
+        "is always the trunk compile; a second warmup step is needed at "
+        "resolutions/shapes that still fault fresh allocator segments on their "
+        "first occurrence. A measured (post-warmup) step recording new Dynamo "
+        "compile frames fails the run -- that step was not actually steady.",
+    )
+    parser.add_argument(
+        "--top-ops",
+        type=int,
+        default=50,
+        help="with --trace, also print/record the top-N operators by "
+        "self CUDA time from the profiled steps (aggregated by input shape) "
+        "and export them beside the Chrome trace. Pass 0 to disable.",
+    )
+    parser.add_argument(
         "--trace-out",
         default=".codex/krea2_train_trace.json",
         help="chrome-trace output path for --trace (open in chrome://tracing "
@@ -660,11 +726,20 @@ def _parse_args():
         ),
     )
     add_contention_args(parser)
+    add_lock_args(parser)
     return parser.parse_args()
 
 
 def main():
     args = _parse_args()
+    if args.steps <= 0:
+        raise SystemExit("--steps must be positive")
+    if args.warmup_steps < 0 or args.warmup_steps >= args.steps:
+        raise SystemExit(
+            "--warmup-steps must be non-negative and smaller than --steps"
+        )
+    if args.top_ops < 0:
+        raise SystemExit("--top-ops must be non-negative")
     if args.compile_stance != "default":
         from toolkit.compile_cache import compiler_stance_supported
 
@@ -707,14 +782,23 @@ def main():
     embeds.text_embeds = [embeds.text_embeds[0]] * args.batch_size
 
     config = _build_model_config(args)
+    resolution_buckets = _parse_resolutions(args.resolutions, args.width, args.height)
     rows = []
 
     print("[smoke] constructing Krea2Model without text encoder")
     model = Krea2Model(device=args.device, model_config=config, dtype=args.dtype)
     model.skip_te = True
+    configure_smoke_load_mode(model, args.load_mode)
+    # Shape-aware cold-start hint for arena-offload attach (see
+    # Krea2Model._estimate_training_working_reserve_bytes): mirrors what
+    # BaseSDTrainProcess sets from real DatasetConfig objects.
+    model.dataset_configs = [
+        types.SimpleNamespace(resolution=max(w, h)) for w, h in resolution_buckets
+    ]
     rows.append(
         {
             "event": "start",
+            "load_mode": args.load_mode,
             "cuda": _cuda_snapshot("start", device),
             "dxgi": _dxgi_snapshot("start"),
         }
@@ -724,8 +808,13 @@ def main():
     print("[smoke] loading full Krea2 transformer")
     t0 = time.perf_counter()
     transformer = model._load_transformer()
+    assert_smoke_load_mode(model, args.load_mode)
     rows.append(
-        {"event": "loaded_transformer", "seconds": time.perf_counter() - t0}
+        {
+            "event": "loaded_transformer",
+            "load_mode": args.load_mode,
+            "seconds": time.perf_counter() - t0,
+        }
     )
     _print_json(rows[-1])
     flush(garbage_collect=False)
@@ -742,14 +831,17 @@ def main():
 
     print("[smoke] attaching smart training memory manager")
     t0 = time.perf_counter()
-    # Mirror Krea2Model.load_model(): canonicalize the frozen base into the
-    # arena, build residency/plan, and prepare the (unfinalized) runtime. The
+    # Build residency/plan and prepare the unfinalized runtime from either the
+    # smoke's direct canonical build or the normally loaded frozen base. The
     # permanent programs are finalized AFTER LoRA apply, below.
     ignore_modules = [
         module
         for module in transformer.modules()
         if isinstance(module, (SimpleModulation, DoubleSharedModulation))
     ]
+    transformer.enable_gradient_checkpointing(
+        keep_last=config.layer_offloading_checkpoint_keep_last
+    )
     model._attach_immutable_training_memory(transformer, ignore_modules)
     if getattr(transformer, "_memory_manager", None) is not None:
         MemoryManager._attach_prefetch_pool(transformer, device)
@@ -796,6 +888,8 @@ def main():
         }
     )
     _print_json(rows[-1])
+    rows.append(_adapter_shape_histogram(network))
+    _print_json(rows[-1])
 
     compile_cache_key = None
     if args.compile_cache_dir:
@@ -810,8 +904,6 @@ def main():
     # the TRAIN plan AFTER LoRA apply, so they capture the adapter leaves.
     print("[smoke] finalizing immutable runtime")
     t0 = time.perf_counter()
-    from toolkit.memory_management.runtime import get_memory_runtime
-
     memory_runtime = get_memory_runtime(transformer)
     if memory_runtime is None:
         raise SystemExit(
@@ -905,7 +997,6 @@ def main():
             )
             _dump_horizon(dump_dir, 0, named, optimizer, None, eval_outs)
 
-    resolution_buckets = _parse_resolutions(args.resolutions, args.width, args.height)
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
     print(
@@ -920,9 +1011,9 @@ def main():
     profiler = None
     trace_from = None
     if args.trace > 0:
-        trace_from = max(1, args.steps - args.trace)
+        trace_from = max(args.warmup_steps, args.steps - args.trace)
         if trace_from >= args.steps:
-            raise SystemExit("--trace needs at least one steady step after step 0")
+            raise SystemExit("--trace needs at least one steady step after warmup")
     for step in range(args.steps):
         if args.ab_h2d_parity:
             from toolkit.memory_management import ingraph_stream
@@ -934,6 +1025,10 @@ def main():
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
+                record_shapes=True,
+                with_flops=True,
+                profile_memory=False,
+                with_stack=False,
             )
             profiler.start()
             print(f"[smoke] tracing steps {trace_from}..{args.steps - 1}")
@@ -972,11 +1067,27 @@ def main():
             if args.compile_stance != "default"
             else contextlib.nullcontext()
         )
+        phase_events = {
+            phase: (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for phase in ("forward", "loss", "backward", "grad_stats", "optimizer")
+        }
         try:
             with execution_context, network, compile_stance:
-                pred = model.get_noise_prediction(noisy, timestep, embeds)
-                loss = torch.nn.functional.mse_loss(pred.float(), target)
-                loss.backward()
+                with torch.profiler.record_function("smoke.forward"):
+                    phase_events["forward"][0].record()
+                    pred = model.get_noise_prediction(noisy, timestep, embeds)
+                    phase_events["forward"][1].record()
+                with torch.profiler.record_function("smoke.loss"):
+                    phase_events["loss"][0].record()
+                    loss = torch.nn.functional.mse_loss(pred.float(), target)
+                    phase_events["loss"][1].record()
+                with torch.profiler.record_function("smoke.backward"):
+                    phase_events["backward"][0].record()
+                    loss.backward()
+                    phase_events["backward"][1].record()
         except torch.cuda.OutOfMemoryError:
             # Same policy as BaseSDTrainProcess: an allocator-cap violation
             # widens the cap and skips the batch; strict mode re-raises.
@@ -988,13 +1099,16 @@ def main():
             MemoryManager.recover_cuda_pipeline_after_oom()
             print(f"[smoke] step {step}: OOM at the cap, skipped (cap widened)")
             continue
-        grad_norm = torch.sqrt(
-            sum(
-                p.grad.detach().float().pow(2).sum()
-                for p in trainable
-                if p.grad is not None
+        with torch.profiler.record_function("smoke.grad_stats"):
+            phase_events["grad_stats"][0].record()
+            grad_norm_tensor = torch.sqrt(
+                sum(
+                    p.grad.detach().float().pow(2).sum()
+                    for p in trainable
+                    if p.grad is not None
+                )
             )
-        ).item()
+            phase_events["grad_stats"][1].record()
         grads_present = sum(1 for p in trainable if p.grad is not None)
         completed = step + 1
         horizon_grads = None
@@ -1002,10 +1116,19 @@ def main():
             # Grads captured pre-step: the raw fp32 LoRA gradients the fp8
             # grad-input hops contaminated, before Adam integrates them.
             horizon_grads = _clone_grads_cpu(named)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        with torch.profiler.record_function("smoke.optimizer"):
+            phase_events["optimizer"][0].record()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            phase_events["optimizer"][1].record()
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - t0
+        grad_norm = grad_norm_tensor.item()
+        phase_ms = {
+            f"{phase}_cuda_ms": start.elapsed_time(end)
+            for phase, (start, end) in phase_events.items()
+        }
+        phase_ms["step_wall_ms"] = elapsed * 1000.0
         if dump_dir is not None and completed in horizons:
             eval_outs = _run_fixed_eval(
                 model, transformer, network, embeds, *eval_batch, device
@@ -1024,6 +1147,7 @@ def main():
             "grad_norm": grad_norm,
             "grad_tensors": f"{grads_present}/{len(trainable)}",
             "new_compile_frames": frames_after - frames_before,
+            "phase": phase_ms,
             "cuda": _cuda_snapshot(f"step_{step}", device),
             "dxgi": _dxgi_snapshot(f"step_{step}"),
         }
@@ -1031,7 +1155,9 @@ def main():
         print(
             f"[smoke] step {step} [{row['bucket']}]: {elapsed:.2f}s "
             f"loss={row['loss']:.4f} grad_norm={grad_norm:.4e} "
-            f"grads={row['grad_tensors']} new_frames={row['new_compile_frames']}"
+            f"grads={row['grad_tensors']} new_frames={row['new_compile_frames']} "
+            f"fwd={phase_ms['forward_cuda_ms']:.1f}ms bwd={phase_ms['backward_cuda_ms']:.1f}ms "
+            f"opt={phase_ms['optimizer_cuda_ms']:.1f}ms"
         )
         if step == 0 and compile_cache_key is not None:
             from toolkit.compile_cache import save_compile_cache
@@ -1042,12 +1168,63 @@ def main():
             raise SystemExit("no LoRA gradients produced -- training path is broken")
 
     trace_path = None
+    top_ops = None
+    top_ops_path = None
     if profiler is not None:
         profiler.stop()
         trace_path = Path(args.trace_out)
         trace_path.parent.mkdir(parents=True, exist_ok=True)
         profiler.export_chrome_trace(str(trace_path))
         print(f"[smoke] wrote chrome trace {trace_path}")
+        if args.top_ops > 0:
+            averages = profiler.key_averages(group_by_input_shape=True)
+
+            def _cuda_time_total(event, *, self_only):
+                # torch 2.12 renamed the CUDA-specific profiler fields to
+                # device-generic names. Keep the exported schema stable across
+                # both APIs; CPU time remains in separate profiler fields.
+                prefix = "self_" if self_only else ""
+                cuda_name = f"{prefix}cuda_time_total"
+                if hasattr(event, cuda_name):
+                    return getattr(event, cuda_name)
+                return getattr(event, f"{prefix}device_time_total")
+
+            ranked = sorted(
+                averages,
+                key=lambda e: _cuda_time_total(e, self_only=True),
+                reverse=True,
+            )[: args.top_ops]
+            top_ops = [
+                {
+                    "name": e.key,
+                    "input_shapes": str(e.input_shapes),
+                    "count": e.count,
+                    "cuda_time_total_ms": _cuda_time_total(e, self_only=False)
+                    / 1000.0,
+                    "self_cuda_time_total_ms": _cuda_time_total(e, self_only=True)
+                    / 1000.0,
+                }
+                for e in ranked
+            ]
+            top_ops_path = trace_path.with_suffix(".top_ops.json")
+            top_ops_path.write_text(
+                json.dumps(top_ops, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            print(f"[smoke] wrote top CUDA operators {top_ops_path}")
+            print(f"[smoke] top {len(top_ops)} ops by self CUDA time:")
+            for op in top_ops:
+                print(
+                    f"  {op['self_cuda_time_total_ms']:8.3f} ms self  "
+                    f"{op['cuda_time_total_ms']:8.3f} ms total  x{op['count']:<5d} "
+                    f"{op['name']} {op['input_shapes']}"
+                )
+            del averages, ranked
+        # Kineto owns native CUDA state. Destroy it before arena/runtime
+        # teardown instead of leaving its destructor to interpreter shutdown;
+        # on Windows that ordering can access-violate after all artifacts were
+        # successfully written.
+        profiler = None
+        gc.collect()
 
     if dump_dir is not None:
         loss_series = [
@@ -1060,15 +1237,51 @@ def main():
         print(f"[smoke] wrote {dump_dir / 'loss_series.json'}")
 
     rows.extend(step_rows)
-    steady = [r["seconds"] for r in step_rows[1:]] or [step_rows[0]["seconds"]]
+    measured_rows = step_rows[args.warmup_steps:] or step_rows[-1:]
+    non_warmup_new_frames = [
+        r for r in measured_rows if r["new_compile_frames"] > 0
+    ]
+    if non_warmup_new_frames:
+        raise SystemExit(
+            "measured (post-warmup) step(s) recorded new Dynamo compile frames "
+            f"-- not steady, raise --warmup-steps (currently {args.warmup_steps}): "
+            + ", ".join(
+                f"step {r['step']} (+{r['new_compile_frames']} frames)"
+                for r in non_warmup_new_frames
+            )
+        )
+
+    def _median(values):
+        s = sorted(values)
+        n = len(s)
+        mid = n // 2
+        return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+    steady = [r["seconds"] for r in measured_rows]
+    phase_medians_ms = {
+        phase_key: _median([r["phase"][phase_key] for r in measured_rows])
+        for phase_key in (
+            "forward_cuda_ms",
+            "loss_cuda_ms",
+            "backward_cuda_ms",
+            "grad_stats_cuda_ms",
+            "optimizer_cuda_ms",
+            "step_wall_ms",
+        )
+    }
+    phase_avg_ms = {
+        phase_key: sum(r["phase"][phase_key] for r in measured_rows)
+        / len(measured_rows)
+        for phase_key in phase_medians_ms
+    }
     ab_summary = None
     if args.ab_h2d_parity:
         # Steady steps only; step 0 carries the compile and would land wholly in
         # one arm and bias it.
         blocking_arm = [
-            r["seconds"] for r in step_rows[1:] if r["step"] % 2 == 0
+            r["seconds"] for r in measured_rows if r["step"] % 2 == 0
         ]
-        lazy_arm = [r["seconds"] for r in step_rows[1:] if r["step"] % 2 == 1]
+        lazy_arm = [r["seconds"] for r in measured_rows if r["step"] % 2 == 1]
         ab_summary = {
             "blocking_steps": len(blocking_arm),
             "blocking_mean_s": (
@@ -1088,7 +1301,7 @@ def main():
         # Quantify the observer effect: the same steady state, with and without
         # the profiler attached. A small gap means the timeline's numbers can be
         # trusted; a large one means read it for structure only.
-        untraced = [r["seconds"] for r in step_rows[1:trace_from]]
+        untraced = [r["seconds"] for r in step_rows[args.warmup_steps:trace_from]]
         traced = [r["seconds"] for r in step_rows[trace_from:]]
         trace_summary = {
             "path": str(trace_path),
@@ -1104,11 +1317,12 @@ def main():
                 (trace_summary["traced_step_avg_s"] - base) / base * 100.0
             )
     per_bucket_steady_s = {}
-    for r in step_rows[1:]:
+    for r in measured_rows:
         per_bucket_steady_s.setdefault(r["bucket"], []).append(r["seconds"])
     summary = {
         "event": "done",
         "steps": args.steps,
+        "warmup_steps": args.warmup_steps,
         "resolution_buckets": [f"{w}x{h}" for w, h in resolution_buckets],
         "compile_dynamic": args.compile_dynamic,
         "compile_mark_dynamic": args.compile_mark_dynamic,
@@ -1121,6 +1335,10 @@ def main():
         "per_bucket_steady_avg_s": {
             bucket: sum(secs) / len(secs) for bucket, secs in per_bucket_steady_s.items()
         },
+        "phase_medians_ms": phase_medians_ms,
+        "phase_avg_ms": phase_avg_ms,
+        "top_ops": top_ops,
+        "top_ops_path": str(top_ops_path) if top_ops_path is not None else None,
         "ab_h2d_parity": ab_summary,
         "trace": trace_summary,
         "first_step_s": step_rows[0]["seconds"],

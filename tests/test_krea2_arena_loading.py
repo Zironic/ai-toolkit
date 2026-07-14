@@ -5,7 +5,7 @@ import torch
 from safetensors.torch import save_file
 
 from extensions_built_in.diffusion_models.krea2.krea2 import (
-    _arena_destination_key,
+    _smoke_direct_arena_load_requested,
     _stream_and_quantize_checkpoint,
     _stream_checkpoint,
     _try_load_quantized_transformer_cache,
@@ -29,51 +29,6 @@ class _Transformer(torch.nn.Module):
         self.head = torch.nn.Linear(4, 4)
 
 
-class _TinyAdapter:
-    architecture_key = "test_quant_blocks"
-
-    def validate_transformer(self, transformer):
-        if not getattr(transformer, "blocks", None):
-            raise TypeError("expected blocks")
-
-    def execution_blocks(self, transformer):
-        return tuple(transformer.blocks)
-
-    def block_key(self, transformer, index):
-        return f"blocks.{index}"
-
-    def leaf_entries(self, block):
-        return (("linear", block.linear),)
-
-    def collect_execution_adapters(self, _transformer, _network):
-        return {}
-
-    def build_adapter_args(self, _index, _adapters, multiplier=None):
-        del multiplier
-        return None
-
-    def can_run_current_call(self, _block_args, **_kwargs):
-        return True
-
-    def bind_block_operations(self, storage_views, device):
-        del storage_views, device
-        return (None,)
-
-    def forward_block(
-        self,
-        _block,
-        hidden,
-        _block_args,
-        _leaf_args,
-        _linear_operations,
-        _adapter_args,
-        *,
-        training,
-    ):
-        del training
-        return hidden
-
-
 class _QuantBlock(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -83,7 +38,7 @@ class _QuantBlock(torch.nn.Module):
 class _QuantTransformer(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.blocks = torch.nn.ModuleList([_QuantBlock()])
+        self.blocks = torch.nn.ModuleList([_QuantBlock(), _QuantBlock()])
 
 
 class _QuantBaseModel:
@@ -110,23 +65,22 @@ def test_krea_memory_integration_stays_on_public_arena_surface():
         "CanonicalArena",
         "ResidencyState",
         "ResidencyPlan",
-        "prepare_immutable_runtime",
+        "ImmutableTransformerRuntime",
         "_mm_",
     ):
         assert private_name not in source
 
 
-def test_arena_destination_key_maps_float_and_quantized_cache_leaves():
-    assert _arena_destination_key("blocks.3.attn.wq.weight") == (
-        "blocks.3", "attn.wq", "weight"
-    )
-    assert _arena_destination_key("blocks.3.attn.wq.weight._data") == (
-        "blocks.3", "attn.wq", "qdata"
-    )
-    assert _arena_destination_key("blocks.3.attn.wq.weight._scale") == (
-        "blocks.3", "attn.wq", "scale"
-    )
-    assert _arena_destination_key("head.weight") is None
+def test_direct_arena_loading_requires_explicit_smoke_instance_switch():
+    base_model = mock.Mock(spec=[])
+    assert not _smoke_direct_arena_load_requested(base_model, True)
+
+    base_model._smoke_direct_arena_load = False
+    assert not _smoke_direct_arena_load_requested(base_model, True)
+
+    base_model._smoke_direct_arena_load = True
+    assert _smoke_direct_arena_load_requested(base_model, True)
+    assert not _smoke_direct_arena_load_requested(base_model, False)
 
 
 def test_legacy_sampling_context_runs_installed_guard():
@@ -190,8 +144,9 @@ def test_quantized_ranged_loader_releases_each_source_before_commit(tmp_path):
     checkpoint = tmp_path / "tiny_quant.safetensors"
     save_file(transformer.state_dict(), str(checkpoint))
     transformer.requires_grad_(False)
-    adapter = _TinyAdapter()
-    build = prepare_canonical_storage(transformer, adapter, defer_blocks=True)
+    build = prepare_canonical_storage(
+        transformer, block_names=("blocks",), defer_blocks=True
+    )
 
     _stream_and_quantize_checkpoint(
         _QuantBaseModel(),
@@ -199,7 +154,6 @@ def test_quantized_ranged_loader_releases_each_source_before_commit(tmp_path):
         str(checkpoint),
         torch.float32,
         canonical_build=build,
-        adapter=adapter,
     )
 
     linear = transformer.blocks[0].linear
@@ -275,7 +229,7 @@ def test_quantized_cache_populates_final_arena_without_model_sized_assignment(tm
             transformer,
             cache,
             metadata,
-            canonical_adapter=_TinyAdapter(),
+            canonical_block_names=("blocks",),
             canonical_device="cpu",
         )
 
@@ -313,7 +267,7 @@ def test_quantized_cache_rejects_incomplete_canonical_payload(tmp_path):
         transformer,
         cache,
         metadata,
-        canonical_adapter=_TinyAdapter(),
+        canonical_block_names=("blocks",),
         canonical_device="cpu",
     )
 

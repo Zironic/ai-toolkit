@@ -54,13 +54,14 @@ from toolkit.util.quantize import (
     get_qtype,
     prepare_quantized_state_dict_model,
     quantize,
+    quantize_module_at_path,
     quantize_model,
-    tensor_subclass_leaves,
 )
 from toolkit.memory_management import MemoryManager
 from toolkit.memory_management import vram_budget
 from toolkit.memory_management.arena_offload import (
     prepare_canonical_storage,
+    prepare_canonical_storage_from_state_dict,
 )
 from toolkit.memory_management.runtime import get_memory_runtime
 from toolkit.compile_cache import load_compile_cache, save_compile_cache
@@ -307,23 +308,16 @@ def _load_checkpoint_tensor(handle, data_start, header, key, expected_shape, dty
     return tensor
 
 
-def _arena_destination_key(state_key: str):
-    """Map a Krea checkpoint leaf to the generic arena destination key."""
-    parts = state_key.split(".")
-    if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit():
-        return None
-    tail = parts[-1]
-    if tail in ("_data", "_scale") and len(parts) >= 5 and parts[-2] == "weight":
-        role = "qdata" if tail == "_data" else "scale"
-        linear_parts = parts[2:-2]
-    elif tail in ("weight", "bias"):
-        role = tail
-        linear_parts = parts[2:-1]
-    else:
-        return None
-    if not linear_parts:
-        return None
-    return (f"blocks.{parts[1]}", ".".join(linear_parts), role)
+def _smoke_direct_arena_load_requested(base_model, arena_requested: bool) -> bool:
+    """Return whether a manual smoke explicitly requested direct population.
+
+    This is deliberately an instance-only harness switch, not ModelConfig.
+    Production/UI loads therefore follow the ordinary load-then-attach path.
+    """
+    return bool(
+        arena_requested
+        and getattr(base_model, "_smoke_direct_arena_load", False)
+    )
 
 
 def _stream_checkpoint(transformer, checkpoint_path: str, dtype, *, canonical_build=None) -> None:
@@ -337,9 +331,10 @@ def _stream_checkpoint(transformer, checkpoint_path: str, dtype, *, canonical_bu
                 tensor = _load_checkpoint_tensor(
                     handle, data_start, header, key, target_state[key].shape, dtype
                 )
-                destination_key = _arena_destination_key(key)
-                if destination_key is not None and destination_key in destinations:
-                    destinations[destination_key].copy_(tensor)
+                if canonical_build is not None and canonical_build.copy_state_entry(
+                    key, tensor
+                ):
+                    pass
                 else:
                     _assign_tensor_by_name(transformer, key, tensor)
                 del tensor
@@ -366,7 +361,6 @@ def _stream_and_quantize_checkpoint(
     dtype,
     *,
     canonical_build=None,
-    adapter=None,
 ) -> None:
     """Materialize, quantize, and release one bounded submodule at a time."""
     header, data_start = _read_safetensors_header(checkpoint_path)
@@ -392,16 +386,25 @@ def _stream_and_quantize_checkpoint(
                 del tensor
             unit = _module_by_name(transformer, unit_name)
             unit.to(base_model.device_torch, dtype=dtype)
-            quantize(unit, weights=quantization_type)
+            if isinstance(unit, torch.nn.Linear):
+                unit = quantize_module_at_path(
+                    transformer,
+                    unit_name,
+                    weights=quantization_type,
+                )
+            else:
+                quantize(unit, weights=quantization_type)
             freeze(unit)
             unit.requires_grad_(False)
             unit.to("cpu")
             if canonical_build is not None and unit_name.startswith("blocks."):
-                block_index = int(unit_name.split(".")[1])
-                block_key = adapter.block_key(transformer, block_index)
-                canonical_build.add_block(block_key, adapter.leaf_entries(unit))
-                canonical_build.populate_block_from_model(block_key)
-                canonical_build.release_block_sources_to_meta(block_key)
+                from toolkit.memory_management.arena_offload.discovery import (
+                    managed_entries,
+                )
+
+                canonical_build.add_block(unit_name, managed_entries(unit))
+                canonical_build.populate_block_from_model(unit_name)
+                canonical_build.release_block_sources_to_meta(unit_name)
     if canonical_build is not None:
         canonical_build.finish_population()
     base_model.print_and_status_update("  - finished streaming and quantizing transformer units")
@@ -439,6 +442,8 @@ def _compile_cache_key(base_model) -> str:
     cached graph -- that's exactly the "safe miss" property the mega-cache
     already relies on.
     """
+    from toolkit.memory_management.arena_offload import DISPATCHER_GENERATION
+
     checkpoint_path = getattr(base_model, "_resolved_checkpoint_path", None)
     if checkpoint_path is None:
         checkpoint_path = base_model.model_config.name_or_path
@@ -446,6 +451,7 @@ def _compile_cache_key(base_model) -> str:
         "checkpoint_path": os.path.abspath(checkpoint_path) if os.path.exists(checkpoint_path) else checkpoint_path,
         "qtype": str(base_model.model_config.qtype),
         "torch_version": torch.__version__,
+        "dispatcher_generation": DISPATCHER_GENERATION,
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
 
@@ -470,7 +476,7 @@ def _train_compile_cache_key(base_model) -> str:
     compile_tag = hashlib.sha256(
         json.dumps(compile_identity, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:16]
-    return f"{_compile_cache_key(base_model)}_immutable_train_{compile_tag}"
+    return f"{_compile_cache_key(base_model)}_dispatcher_train_{compile_tag}"
 
 
 def _quantized_transformer_cache_info(base_model, checkpoint_path: str, dtype, config: SingleMMDiTConfig):
@@ -505,10 +511,11 @@ def _try_load_quantized_transformer_cache(
     metadata: dict,
     *,
     canonical_build=None,
-    canonical_adapter=None,
+    canonical_block_names=None,
     canonical_device=None,
 ) -> tuple[bool, object | None]:
     created_build = False
+    canonical_populated = False
     if cache_path is None or not cache_path.exists():
         return False, canonical_build
     try:
@@ -518,19 +525,21 @@ def _try_load_quantized_transformer_cache(
             base_model.print_and_status_update("  - cached quantized transformer metadata mismatch; ignoring")
             return False, canonical_build
         state_dict = payload["state_dict"]
-        if canonical_build is None and canonical_adapter is not None:
+        if canonical_build is None and canonical_device is not None:
             prepare_quantized_state_dict_model(
                 transformer,
                 state_dict,
                 base_model.model_config.qtype,
             )
             transformer.requires_grad_(False)
-            canonical_build = prepare_canonical_storage(
+            canonical_build = prepare_canonical_storage_from_state_dict(
                 transformer,
-                canonical_adapter,
+                state_dict,
+                block_names=canonical_block_names,
                 device=canonical_device,
             )
             created_build = True
+            canonical_populated = True
         if canonical_build is None:
             assign_quantized_state_dict(
                 transformer,
@@ -538,52 +547,15 @@ def _try_load_quantized_transformer_cache(
                 base_model.model_config.qtype,
             )
         else:
-            destinations = canonical_build.destinations
-            canonical_values = {}
-            canonical_keys = set()
-            for key, value in state_dict.items():
-                destination_key = _arena_destination_key(key)
-                if (
-                    destination_key not in destinations
-                    and destination_key is not None
-                    and destination_key[2] == "weight"
-                ):
-                    qdata_key = (*destination_key[:2], "qdata")
-                    if qdata_key in destinations:
-                        destination_key = qdata_key
-                if destination_key not in destinations:
-                    continue
-                leaves = tensor_subclass_leaves(value)
-                if (
-                    destination_key[2] == "qdata"
-                    and len(leaves) == 2
-                    and (*destination_key[:2], "scale") in destinations
-                ):
-                    canonical_values[destination_key] = leaves[0]
-                    canonical_values[(*destination_key[:2], "scale")] = leaves[1]
-                else:
-                    canonical_values[destination_key] = value
-                canonical_keys.add(key)
-            required = set(destinations)
-            provided = set(canonical_values)
-            if provided != required:
-                raise RuntimeError(
-                    "cached arena payload mismatch: "
-                    f"missing={sorted(required - provided)[:5]} "
-                    f"unexpected={sorted(provided - required)[:5]}"
+            if not canonical_populated:
+                canonical_build.populate_from_state_dict_consuming(
+                    state_dict,
                 )
             assign_quantized_state_dict_subset(
                 transformer,
                 state_dict,
                 base_model.model_config.qtype,
-                excluded_keys=canonical_keys,
             )
-
-            def populate(final_destinations):
-                for destination_key, value in canonical_values.items():
-                    final_destinations[destination_key].copy_(value)
-
-            canonical_build.populate(populate)
             transformer.requires_grad_(False)
         from toolkit.dequantize import patch_dequantization_on_save
         patch_dequantization_on_save(transformer)
@@ -803,8 +775,11 @@ class Krea2Model(BaseModel):
             self.model_config.layer_offloading
             and self.model_config.layer_offloading_smart
         )
+        direct_arena_load = _smoke_direct_arena_load_requested(
+            self, arena_requested
+        )
         direct_ranged_population = bool(
-            arena_requested
+            direct_arena_load
             and not self.model_config.quantize
             and self.model_config.assistant_lora_path is None
         )
@@ -815,19 +790,20 @@ class Krea2Model(BaseModel):
 
         canonical_build = None
         try:
-            cache_adapter = None
-            if arena_requested:
-                from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
-
-                cache_adapter = SingleStreamMMDiTAdapter()
             cache_loaded, canonical_build = (
                 _try_load_quantized_transformer_cache(
                     self,
                     transformer,
                     cache_path,
                     cache_metadata,
-                    canonical_adapter=cache_adapter,
-                    canonical_device=self.device_torch,
+                    canonical_block_names=(
+                        self.get_transformer_block_names()
+                        if direct_arena_load
+                        else None
+                    ),
+                    canonical_device=(
+                        self.device_torch if direct_arena_load else None
+                    ),
                 )
                 if stream_quantized
                 else (False, None)
@@ -844,14 +820,10 @@ class Krea2Model(BaseModel):
                     canonical_build = None
                 self.print_and_status_update("  - loading transformer through ranged disk reads")
                 if stream_quantized:
-                    adapter = None
-                    if arena_requested:
-                        from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
-
-                        adapter = SingleStreamMMDiTAdapter()
+                    if direct_arena_load:
                         canonical_build = prepare_canonical_storage(
                             transformer,
-                            adapter,
+                            block_names=self.get_transformer_block_names(),
                             device=self.device_torch,
                             defer_blocks=True,
                         )
@@ -861,7 +833,6 @@ class Krea2Model(BaseModel):
                         checkpoint_path,
                         dtype,
                         canonical_build=canonical_build,
-                        adapter=adapter,
                     )
                     if canonical_build is None:
                         _save_quantized_transformer_cache(
@@ -875,12 +846,10 @@ class Krea2Model(BaseModel):
                     self._transformer_quantized_during_load = True
                 else:
                     if direct_ranged_population:
-                        from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
-
                         transformer.requires_grad_(False)
                         canonical_build = prepare_canonical_storage(
                             transformer,
-                            SingleStreamMMDiTAdapter(),
+                            block_names=self.get_transformer_block_names(),
                             device=self.device_torch,
                         )
                     _stream_checkpoint(
@@ -1060,7 +1029,6 @@ class Krea2Model(BaseModel):
         arena. LoRA/optimizer construction and runtime finalization happen later
         in the trainer, after all frozen base Parameter identities are final.
         """
-        from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
         from toolkit.memory_management.arena_offload import (
             ArenaOffloadConfig,
             prepare_arena_offload,
@@ -1071,13 +1039,44 @@ class Krea2Model(BaseModel):
             return prepare_arena_offload(
                 transformer,
                 device=self.device_torch,
-                adapter=SingleStreamMMDiTAdapter(),
-                config=ArenaOffloadConfig.from_model_config(self.model_config),
+                block_names=self.get_transformer_block_names(),
+                config=ArenaOffloadConfig.from_model_config(
+                    self.model_config,
+                    training_working_reserve_hint_bytes=(
+                        self._estimate_training_working_reserve_bytes()
+                    ),
+                ),
                 ignore_modules=ignore_modules,
                 canonical_build=canonical_build,
             )
         finally:
             self._prepared_canonical_build = None
+
+    def _estimate_training_working_reserve_bytes(self):
+        """Shape-aware cold-start hint for the attach-time residency plan.
+
+        Mirrors ``estimate_sampling_working_reserve_bytes`` above: sized from
+        the LARGEST configured dataset bucket so the attach-time plan reserves
+        enough activation headroom up front instead of discovering the need
+        via a cold-start WDDM-cap-violation storm (see
+        ``vram_budget.estimate_training_working_reserve_bytes``). Returns None
+        when no dataset resolution is known (``dataset_configs`` is set by the
+        trainer before ``load_model()``; other callers of this model class,
+        e.g. sampling-only smokes, leave it unset) -- the arena config then
+        keeps the planner's flat cold-start default, unchanged behaviour.
+        """
+        dataset_configs = getattr(self, "dataset_configs", None) or []
+        resolutions = [
+            max(1, int(getattr(cfg, "resolution", 0) or 0)) for cfg in dataset_configs
+        ]
+        resolutions = [res for res in resolutions if res > 0]
+        if not resolutions:
+            return None
+        token_div = self.vae_scale_factor * self.patch_size
+        image_tokens = max(res // token_div for res in resolutions) ** 2
+        return vram_budget.estimate_training_working_reserve_bytes(
+            image_tokens, self.max_text_length
+        )
 
     def cleanup_memory_runtime_preparation(self):
         build = getattr(self, "_prepared_canonical_build", None)
@@ -1120,12 +1119,23 @@ class Krea2Model(BaseModel):
                     if isinstance(module, (SimpleModulation, DoubleSharedModulation))
                 ]
                 if self.model_config.layer_offloading_smart:
-                    # The compile-neutral immutable runtime is the SOLE smart
-                    # memory/compile backend for Krea2. It streams the repeated
-                    # blocks through the canonical arena and keeps every
-                    # singleton module resident. It also checkpoints each block
-                    # in its own train trunk, so the model's gradient
-                    # checkpointing stays off here.
+                    train_config = getattr(self, "train_config", None)
+                    if train_config is not None and not bool(
+                        getattr(train_config, "gradient_checkpointing", False)
+                    ):
+                        raise ValueError(
+                            "Krea2 arena training requires "
+                            "train.gradient_checkpointing=true"
+                        )
+                    transformer.enable_gradient_checkpointing(
+                        keep_last=getattr(
+                            self.model_config,
+                            "layer_offloading_checkpoint_keep_last",
+                            0,
+                        )
+                    )
+                    # The generic dispatcher is the sole smart memory/compile
+                    # backend. Krea's ordinary block loop owns checkpointing.
                     arena_runtime = self._attach_immutable_training_memory(
                         transformer, ignore_modules
                     )

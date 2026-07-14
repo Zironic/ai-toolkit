@@ -19,7 +19,6 @@ from typing import Any
 
 from .. import allocator_cap
 from ..canonical_arena import CanonicalArena
-from ..immutable_runtime import prepare_immutable_runtime
 from ..residency import ResidencyPlan, ResidencyState
 from ..vram_budget import apply_simulated_card
 from .policy import (
@@ -48,7 +47,6 @@ class ArenaOffloadRuntime:
         model,
         *,
         device,
-        adapter,
         config,
         arena,
         residency,
@@ -60,7 +58,6 @@ class ArenaOffloadRuntime:
     ) -> None:
         self._model = model
         self._device = device
-        self._adapter = adapter
         self._config = config
         self._arena = arena
         self._residency = residency
@@ -100,7 +97,7 @@ class ArenaOffloadRuntime:
         transformer,
         *,
         device,
-        adapter,
+        selection,
         config,
         ignore_modules: Sequence[Any] | None = None,
         canonical_build=None,
@@ -126,10 +123,11 @@ class ArenaOffloadRuntime:
             )
             set_fp8_grad_input_enabled(config.fp8_backward)
 
-            blocks = adapter.execution_blocks(transformer)
+            blocks = selection.blocks
+            block_keys = selection.block_keys
             entries_by_block = {
-                adapter.block_key(transformer, index): list(adapter.leaf_entries(block))
-                for index, block in enumerate(blocks)
+                key: list(selection.entries_by_block[key])
+                for key in block_keys
             }
             if canonical_build is None:
                 arena = CanonicalArena()
@@ -149,24 +147,8 @@ class ArenaOffloadRuntime:
                     for key, entries in entries_by_block.items()
                 }
                 if prepared_entries != expected_entries:
-                    raise RuntimeError("arena_canonical_build_adapter_mismatch")
+                    raise RuntimeError("arena_canonical_build_selection_mismatch")
                 arena = canonical_build.arena
-
-            block_operations = []
-            for index, _block in enumerate(blocks):
-                block_key = adapter.block_key(transformer, index)
-                operations = tuple(
-                    adapter.bind_block_operations(
-                        canonical_build.storage_views(block_key),
-                        device,
-                    )
-                )
-                if len(operations) != len(entries_by_block[block_key]):
-                    raise ValueError(
-                        f"arena_leaf_operation_count_mismatch:{block_key}"
-                    )
-                block_operations.append(operations)
-            block_operations = tuple(block_operations)
 
             canonical_build.commit()
             resources.mark_canonical_committed()
@@ -176,7 +158,12 @@ class ArenaOffloadRuntime:
             resources.canonical_modules = canonical_modules
 
             smart_plan = build_training_plan(
-                transformer, arena, canonical_modules, device, config
+                transformer,
+                arena,
+                canonical_modules,
+                device,
+                config,
+                block_keys=block_keys,
             )
             residency = ResidencyState(arena, device)
             resources.adopt_residency(residency)
@@ -186,11 +173,7 @@ class ArenaOffloadRuntime:
             residency.reconcile(training_plan)
 
             policy = config._policy
-            executor = prepare_immutable_runtime(
-                transformer,
-                residency,
-                architecture_adapter=adapter,
-                block_operations=block_operations,
+            executor_kwargs = dict(
                 depth=policy.prefetch_depth,
                 compile_blocks=config.compile_blocks,
                 compile_dynamic=config._compile_dynamic,
@@ -200,12 +183,19 @@ class ArenaOffloadRuntime:
                 ),
                 owner_token=resources.owner_token,
             )
+            from .dispatcher import prepare_block_dispatcher_runtime
+
+            executor = prepare_block_dispatcher_runtime(
+                transformer,
+                residency,
+                selection=selection,
+                **executor_kwargs,
+            )
             resources.adopt_executor(executor)
 
             runtime = cls(
                 transformer,
                 device=device,
-                adapter=adapter,
                 config=config,
                 arena=arena,
                 residency=residency,
@@ -335,24 +325,16 @@ class ArenaOffloadRuntime:
     def finalize(self, network=None):
         """Build the permanent train/sample programs, then activate TRAIN.
 
-        Must run AFTER the training network is applied: the programs capture the
-        installed adapter leaves. The architecture adapter obtains those entries
-        from the supplied network; finalization never rediscovers them through
-        patched module-forward ownership. ``network=None`` explicitly means
-        frozen-base execution with no functional training adapter. Canonical
-        arena leaves cannot be used for full-parameter training.
+        Must run AFTER the training network is applied so the dispatcher saves
+        the final installed block forwards. ``network`` is retained as a public
+        lifecycle argument, but adapter execution remains owned by those saved
+        model forwards rather than by arena-specific mappings.
         """
         self._require_open()
         try:
             self._bind_training_cap()
-            adapters = self._adapter.collect_execution_adapters(
-                self._model,
-                network,
-            )
-            self._executor.finalize_execution(
-                adapters_by_block=adapters,
-                adapter_multiplier=None,
-            )
+            del network
+            self._executor.finalize_execution()
             if self._config.fp8_forward:
                 self._training_fp8_restores = enable_fp8(
                     self._model,
@@ -390,14 +372,6 @@ class ArenaOffloadRuntime:
             if self._disposed:
                 raise RuntimeError("arena_offload_transformer_disposed")
             raise RuntimeError("arena_offload_runtime_closed")
-
-    def can_run_blocks(self, block_args, **kwargs) -> bool:
-        self._require_open()
-        return self._executor.can_run_current_call(block_args, **kwargs)
-
-    def run_blocks(self, hidden, block_args):
-        self._require_open()
-        return self._executor.run(hidden, block_args)
 
     # ------------------------------------------------------------------
     # execution contexts
@@ -905,6 +879,9 @@ class ArenaOffloadRuntime:
         singleton_resident = int(
             (self._smart_plan or {}).get("singleton_resident_bytes", 0)
         )
+        accounting = self._execution_accounting(active_plan)
+        selection = getattr(self._executor, "selection", None)
+        state_audit = getattr(selection, "accounting", None)
         return {
             "backend": "arena",
             "blocks": self.block_count,
@@ -914,6 +891,19 @@ class ArenaOffloadRuntime:
             "canonical_resident_bytes": canonical_resident,
             "total_weight_resident_bytes": singleton_resident + canonical_resident,
             "plan_fingerprint": getattr(active_plan, "fingerprint", None),
+            "checkpoint_owner": "model",
+            "accounting": accounting,
+            "state_audit": (
+                None
+                if state_audit is None
+                else {
+                    "managed_entries": int(state_audit.managed_entries),
+                    "managed_bytes": int(state_audit.managed_bytes),
+                    "trainable_entries": int(state_audit.trainable_entries),
+                    "resident_entries": int(state_audit.resident_entries),
+                    "resident_bytes": int(state_audit.resident_bytes),
+                }
+            ),
             "prefetch_depth": int(getattr(self._executor, "depth", 0)),
             "compile_blocks": bool(self._config.compile_blocks),
             "compile_dynamic": bool(self._config._compile_dynamic),
@@ -943,6 +933,14 @@ class ArenaOffloadRuntime:
             "working_reserve_bytes": int(
                 (self._smart_plan or {}).get("working_reserve_bytes", 0)
             ),
+            "all_resident_fit": bool(
+                (self._smart_plan or {}).get("all_resident_fit", False)
+            ),
+            "all_resident_working_reserve_bytes": int(
+                (self._smart_plan or {}).get(
+                    "all_resident_working_reserve_bytes", 0
+                )
+            ),
             "last_shape_key": self._last_shape_key,
             "last_step_num": self._last_step_num,
             "policy": {
@@ -951,6 +949,92 @@ class ArenaOffloadRuntime:
             },
             "policy_error": self._last_policy_error,
             "last_failure_event": self._last_failure_event,
+        }
+
+    def _execution_accounting(self, plan) -> dict:
+        """Reconcile canonical payload, residency, and one execution's H2D plan."""
+        from ..transfer_plan import build_transfer_plan
+
+        resident_keys = frozenset(getattr(plan, "resident_leaf_keys", ()))
+        canonical_committed = 0
+        canonical_payload = 0
+        streamed_payload = 0
+        planned_forward_bytes = 0
+        planned_copies = 0
+        resident_leaves = 0
+        streamed_leaves = 0
+        resident_blocks = 0
+        streamed_blocks = 0
+        partial_blocks = 0
+
+        for block_key in self._arena.block_keys():
+            record = self._arena.block_record(block_key)
+            canonical_committed += int(record.committed_bytes)
+            all_leaves = tuple(record.leaf_names)
+            canonical_payload += sum(
+                int(tensor.nbytes)
+                for leaf in all_leaves
+                for tensor in record.leaf_spec(leaf).tensors
+            )
+            streamed = tuple(
+                leaf
+                for leaf in all_leaves
+                if (block_key, leaf) not in resident_keys
+            )
+            resident_count = len(all_leaves) - len(streamed)
+            resident_leaves += resident_count
+            streamed_leaves += len(streamed)
+            if not streamed:
+                resident_blocks += 1
+            elif resident_count == 0:
+                streamed_blocks += 1
+            else:
+                partial_blocks += 1
+            if streamed:
+                transfer = build_transfer_plan(record, streamed)
+                streamed_payload += sum(
+                    int(tensor.nbytes)
+                    for leaf in streamed
+                    for tensor in record.leaf_spec(leaf).tensors
+                )
+                planned_forward_bytes += int(transfer.compact_nbytes)
+                planned_copies += int(transfer.num_ranges)
+
+        canonical_resident_payload = int(self._residency.resident_bytes())
+        protected = self._protected_training_blocks()
+        protected_resident = all(
+            all(
+                (block_key, leaf) in resident_keys
+                for leaf in self._arena.block_record(block_key).leaf_names
+            )
+            for block_key in protected
+        )
+        training_multiplier = 2
+        return {
+            "phase": getattr(plan, "phase", None),
+            "canonical_committed_bytes": canonical_committed,
+            "canonical_payload_bytes": canonical_payload,
+            "canonical_padding_bytes": canonical_committed - canonical_payload,
+            "canonical_resident_payload_bytes": canonical_resident_payload,
+            "streamed_payload_bytes": streamed_payload,
+            "payload_reconciled": (
+                canonical_payload
+                == canonical_resident_payload + streamed_payload
+            ),
+            "resident_blocks": resident_blocks,
+            "streamed_blocks": streamed_blocks,
+            "partially_resident_blocks": partial_blocks,
+            "resident_leaves": resident_leaves,
+            "streamed_leaves": streamed_leaves,
+            "mixed_residency": resident_leaves > 0 and streamed_leaves > 0,
+            "planned_forward_h2d_bytes": planned_forward_bytes,
+            "planned_forward_h2d_copies": planned_copies,
+            "planned_training_h2d_bytes": (
+                planned_forward_bytes * training_multiplier
+            ),
+            "planned_training_h2d_copies": planned_copies * training_multiplier,
+            "protected_training_blocks": tuple(sorted(protected)),
+            "protected_training_blocks_resident": protected_resident,
         }
 
     def _observe_training_step(self, *, shape_key, step_num, step_wall_ms) -> None:

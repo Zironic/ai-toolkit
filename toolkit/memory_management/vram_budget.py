@@ -685,6 +685,50 @@ def estimate_sampling_working_reserve_bytes(
     return int(estimate * float(safety)) + int(headroom_bytes)
 
 
+def estimate_training_working_reserve_bytes(
+    image_tokens: int,
+    text_tokens: int = 512,
+    *,
+    base_bytes: int = int(5.2 * GIB),
+    per_token_bytes: int = 610 * 1024,
+    safety: float = 1.15,
+    headroom_bytes: int = GIB,
+) -> int:
+    """Cold-start estimate of the training working set (pure, CPU-testable).
+
+    Training's cold-start reserve was a flat constant (planner.py's
+    ``DEFAULT_AUTO_WORKING_RESERVE_GIB = 5.0``) with no resolution awareness at
+    all, unlike sampling's shape-aware ``estimate_sampling_working_reserve_bytes``
+    above. At low resolution that flat reserve is generous; at high resolution
+    it is not enough, so the attach-time residency plan keeps too many blocks
+    resident, leaves activations too little headroom, and the run discovers the
+    shortfall only via a cold-start WDDM-cap-violation storm -- each violation
+    widens the allocator cap by a fixed ``WDDM_CAP_RELIEF_BYTES`` (0.5 GiB), so
+    a large resolution jump can cost several wasted/skipped steps before the
+    cap finally catches up (observed: Krea2 LoKr at 1024x1024 skipped 5/5 fake
+    steps under the flat default, never reaching a real step).
+
+    Linear-in-tokens model calibrated on Krea2 LoKr RTX 4070 smoke runs
+    (2026-07-14, ``--block-stream-only`` so zero blocks are resident and
+    ``torch_max_allocated`` is purely the forward+backward+optimizer
+    footprint, uncontaminated by the residency split this estimate feeds):
+
+        512x512   -> 1024 tokens, torch_max_allocated ~= 5.76 GiB
+        1024x1024 -> 4096 tokens, torch_max_allocated ~= 7.50 GiB
+        => per_token ~= 595 KiB, base ~= 5.17 GiB (rounded to 610 KiB / 5.2 GiB)
+
+    Only two points, one adapter variant, one card -- weaker calibration than
+    the sampling estimator above. ``text_tokens`` is folded in at the same
+    per-token rate by symmetry with the sampling model; it was held constant
+    across both calibration runs, not independently measured. ``safety`` and
+    the flat ``headroom_bytes`` deliberately overestimate: streaming one extra
+    block is cheap, under-reserving costs the cap-violation storm above.
+    """
+    tokens = max(0, int(image_tokens)) + max(0, int(text_tokens))
+    estimate = int(base_bytes) + int(tokens * per_token_bytes)
+    return int(estimate * float(safety)) + int(headroom_bytes)
+
+
 def sampling_overshoot_margin_bytes(
     overshoot_gib: float = 0.86,
     safety_gib: float = 0.375,

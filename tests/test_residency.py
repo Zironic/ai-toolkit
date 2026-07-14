@@ -5,10 +5,7 @@ import torch
 
 from toolkit.memory_management import pin_manager
 from toolkit.memory_management.canonical_arena import CanonicalArena
-from toolkit.memory_management.immutable_runtime import (
-    ImmutableTransformerRuntime,
-    _mark_dynamic_dim,
-)
+from toolkit.memory_management.immutable_runtime import ImmutableTransformerRuntime
 from toolkit.memory_management.residency import (
     ResidencyError,
     ResidencyPlan,
@@ -16,18 +13,6 @@ from toolkit.memory_management.residency import (
 )
 
 
-
-
-def test_dynamic_hint_is_weak_so_alignment_guards_can_specialize(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        torch._dynamo,
-        "maybe_mark_dynamic",
-        lambda tensor, dim: calls.append((tensor, dim)),
-    )
-    tensor = torch.zeros(1, 768, 4)
-    _mark_dynamic_dim(tensor, 1)
-    assert calls == [(tensor, 1)]
 
 
 def _linear(seed=0, *, device="cpu", dtype=torch.float32):
@@ -60,32 +45,6 @@ def test_phase_plan_and_existing_planner_seam(arena_layers):
     assert plan.fingerprint != ResidencyPlan.build("sample", plan.resident_leaf_keys).fingerprint
 
 
-class _LinearBlockAdapter:
-    architecture_key = "test_linear_block"
-
-    def execution_blocks(self, transformer):
-        return tuple(transformer.blocks)
-
-    def block_key(self, transformer, index):
-        return f"blocks.{index}"
-
-    def leaf_entries(self, block):
-        return tuple(block.entries)
-
-    def build_adapter_args(self, index, adapters_by_block, multiplier=None):
-        return None
-
-    def can_run_current_call(self, block_args, **kwargs):
-        return True
-
-    def bind_block_operations(self, storage_views, device):
-        del device
-        return (None,) * len(storage_views)
-
-    def forward_block(self, *args, **kwargs):
-        raise AssertionError("not used by residency policy test")
-
-
 def test_runtime_training_transitions_are_whole_block(arena_layers):
     arena, layers = arena_layers
     block = SimpleNamespace(entries=tuple(layers.items()))
@@ -95,11 +54,11 @@ def test_runtime_training_transitions_are_whole_block(arena_layers):
     runtime = ImmutableTransformerRuntime(
         model,
         state,
-        architecture_adapter=_LinearBlockAdapter(),
-        block_operations=((None,) * len(layers),),
+        blocks=model.blocks,
+        block_keys=("blocks.0",),
+        entries_by_block={"blocks.0": tuple(layers.items())},
         compile_blocks=False,
     )
-    runtime.finalize_execution()
 
     growth = runtime.increase_training_residency(
         arena.block_record("blocks.0").committed_bytes,
@@ -123,11 +82,11 @@ def test_exact_training_block_transaction_uses_stable_key(arena_layers):
     runtime = ImmutableTransformerRuntime(
         model,
         state,
-        architecture_adapter=_LinearBlockAdapter(),
-        block_operations=((None,) * len(layers),),
+        blocks=model.blocks,
+        block_keys=("blocks.0",),
+        entries_by_block={"blocks.0": tuple(layers.items())},
         compile_blocks=False,
     )
-    runtime.finalize_execution()
 
     promoted = runtime.transition_training_block("blocks.0", resident=True)
     expected = frozenset(("blocks.0", name) for name in layers)

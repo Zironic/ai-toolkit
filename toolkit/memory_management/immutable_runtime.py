@@ -12,16 +12,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
-from torch.utils.checkpoint import checkpoint
 
 from toolkit.memory_management import vram_budget
-from toolkit.memory_management.arena_offload.transfer import (
-    checkpoint_recompute_context,
-    compiled_checkpoint_context,
-    configure_fetch_runtime,
-    free_on_backward,
-    in_recompute,
-)
 from toolkit.memory_management.residency import (
     ResidencyDelta,
     ResidencyPlan,
@@ -161,35 +153,6 @@ def build_program_fingerprint(
     return hashlib.sha1(source.encode("utf-8")).hexdigest()[:16]
 
 
-def build_train_trunk(block_fns):
-    block_fns = tuple(block_fns)
-
-    def immutable_train_trunk(hidden, block_args):
-        context_fn = compiled_checkpoint_context if torch.compiler.is_compiling() else checkpoint_recompute_context
-        for block_fn in block_fns:
-            hidden = checkpoint(
-                block_fn,
-                hidden,
-                block_args,
-                use_reentrant=False,
-                context_fn=context_fn,
-            )
-        return hidden
-
-    return immutable_train_trunk
-
-
-def build_sample_trunk(block_fns):
-    block_fns = tuple(block_fns)
-
-    def immutable_sample_trunk(hidden, block_args):
-        for block_fn in block_fns:
-            hidden = block_fn(hidden, block_args)
-        return hidden
-
-    return immutable_sample_trunk
-
-
 class ImmutableRuntimeSourceTable:
     """Atomically published per-block source snapshots."""
 
@@ -268,11 +231,6 @@ class ImmutableRuntimeSourceTable:
         self._plan = None
 
 
-def _mark_dynamic_dim(tensor, dim: int) -> None:
-    """Request a dynamic dim without enforcing an invalid dense interval."""
-    torch._dynamo.maybe_mark_dynamic(tensor, int(dim))
-
-
 def _leaf_layout(record) -> tuple:
     layout = []
     for leaf_name in record.leaf_names:
@@ -291,18 +249,14 @@ def _leaf_layout(record) -> tuple:
 
 
 def build_block_abi(
-    model,
     residency: ResidencyState,
-    adapter,
-    index: int,
+    block_key: str,
+    expected: tuple[str, ...],
 ) -> ImmutableBlockABI:
-    block_key = adapter.block_key(model, index)
     record = residency.arena.block_record(block_key)
     if record is None:
         raise ImmutableRuntimeError(f"missing_canonical_block:{block_key}")
 
-    block = adapter.execution_blocks(model)[index]
-    expected = tuple(name for name, _module in adapter.leaf_entries(block))
     if record.leaf_names != expected:
         raise ImmutableRuntimeError(
             f"canonical_leaf_order_mismatch:{block_key}:expected={expected}:actual={record.leaf_names}"
@@ -316,7 +270,7 @@ def build_block_abi(
 
 
 class ImmutableTransformerRuntime:
-    """Permanent eager programs over mutable canonical-block source state."""
+    """Source publication and residency policy for the block dispatcher."""
 
     TRAIN = "train"
     SAMPLE = "sample"
@@ -326,8 +280,9 @@ class ImmutableTransformerRuntime:
         model,
         residency: ResidencyState,
         *,
-        architecture_adapter,
-        block_operations,
+        blocks,
+        block_keys,
+        entries_by_block,
         depth: int = 2,
         compile_blocks: bool = True,
         compile_dynamic: bool | None = True,
@@ -341,10 +296,8 @@ class ImmutableTransformerRuntime:
         self._foreign_vram_checked = False
         self.model = model
         self.residency = residency
-        self.architecture_adapter = architecture_adapter
-        self._blocks = self.architecture_adapter.execution_blocks(model)
-        self.adapters_by_block = {}
-        self.adapter_multiplier = None
+        self._blocks = tuple(blocks)
+        block_keys = tuple(str(key) for key in block_keys)
         self.depth = max(1, int(depth))
         self.compile_blocks = bool(compile_blocks)
         self.compile_dynamic = (
@@ -361,24 +314,16 @@ class ImmutableTransformerRuntime:
 
         self._block_abis = tuple(
             build_block_abi(
-                model,
                 residency,
-                self.architecture_adapter,
-                index,
+                block_key,
+                tuple(name for name, _module in entries_by_block[block_key]),
             )
-            for index in range(len(self._blocks))
+            for block_key in block_keys
         )
-        self._block_operations = tuple(tuple(items) for items in block_operations)
-        if len(self._block_operations) != len(self._block_abis):
-            raise ImmutableRuntimeError("immutable_block_operation_count_mismatch")
-        for abi, operations in zip(self._block_abis, self._block_operations):
-            if len(operations) != len(abi.leaf_names):
-                raise ImmutableRuntimeError(
-                    f"immutable_leaf_operation_count_mismatch:{abi.block_key}"
-                )
+        if len(self._blocks) != len(self._block_abis):
+            raise ImmutableRuntimeError("dispatcher_block_count_mismatch")
         self._sources = ImmutableRuntimeSourceTable(residency, self._block_abis)
         self._block_kernels: dict[tuple[str, int], object] = {}
-        self._block_fns: dict[str, tuple] = {}
         self._programs: dict[str, ImmutableProgram] = {}
         self._finalized = False
         self._finalization_signature = None
@@ -408,52 +353,6 @@ class ImmutableTransformerRuntime:
     def source(self, block_index: int) -> ImmutableBlockSourceSnapshot:
         """Current published source snapshot for one block."""
         return self._sources.source(block_index)
-
-    @staticmethod
-    def _execution_signature(adapters_by_block, adapter_multiplier):
-        entries = []
-        for index, adapters in sorted((adapters_by_block or {}).items()):
-            for name, entry in sorted(adapters.items()):
-                entries.append((int(index), str(name), id(entry)))
-        return tuple(entries), id(adapter_multiplier)
-
-    def finalize_execution(
-        self,
-        *,
-        adapters_by_block=None,
-        adapter_multiplier=None,
-    ):
-        signature = self._execution_signature(
-            adapters_by_block,
-            adapter_multiplier,
-        )
-        if self._finalized:
-            if signature != self._finalization_signature:
-                raise ImmutableRuntimeError(
-                    "incompatible_immutable_runtime_finalization"
-                )
-            return self
-
-        self.adapters_by_block = dict(adapters_by_block or {})
-        self.adapter_multiplier = adapter_multiplier
-        configure_fetch_runtime(depth=self.depth, owner_token=self.owner_token)
-        self._block_fns = {
-            self.TRAIN: tuple(
-                self._make_stable_block_fn(index, self.TRAIN)
-                for index in range(len(self._blocks))
-            ),
-            self.SAMPLE: tuple(
-                self._make_stable_block_fn(index, self.SAMPLE)
-                for index in range(len(self._blocks))
-            ),
-        }
-        self._programs = {
-            self.TRAIN: self._build_program(self.TRAIN),
-            self.SAMPLE: self._build_program(self.SAMPLE),
-        }
-        self._finalization_signature = signature
-        self._finalized = True
-        return self
 
     def _require_finalized(self) -> None:
         if not self._finalized:
@@ -499,12 +398,6 @@ class ImmutableTransformerRuntime:
                 self.finish_sampling_image(shape_key=shape_key)
             else:
                 self._sampling_baseline = None
-    def can_run_current_call(self, block_args, **kwargs) -> bool:
-        return self._finalized and self.architecture_adapter.can_run_current_call(
-            block_args,
-            **kwargs,
-        )
-
     def _assert_arena_stable(self, where: str) -> None:
         current = self.residency.arena.immutable_signature()
         if current != self._arena_signature:
@@ -512,43 +405,6 @@ class ImmutableTransformerRuntime:
                 f"arena_mutated_at_boundary:{where}: canonical host flats "
                 "or registrations changed across a phase boundary"
             )
-
-    def _get_block_kernel(self, index: int, mode: str):
-        key = (str(mode), int(index))
-        existing = self._block_kernels.get(key)
-        if existing is not None:
-            return existing
-
-        block = self._blocks[index]
-        linear_operations = self._block_operations[index]
-        training = mode == self.TRAIN
-
-        def block_kernel(
-            x,
-            block_args,
-            leaf_args,
-            adapter_args,
-        ):
-            return self.architecture_adapter.forward_block(
-                block,
-                x,
-                block_args,
-                leaf_args,
-                linear_operations,
-                adapter_args,
-                training=training,
-            )
-
-        kernel = block_kernel
-        if self.compile_blocks:
-            kernel = torch.compile(
-                kernel,
-                mode="default",
-                fullgraph=False,
-                dynamic=self.compile_dynamic,
-            )
-        self._block_kernels[key] = kernel
-        return kernel
 
     def set_compile_dynamic_hints(self, hints) -> None:
         """Install mark_dynamic hints derived after the runtime was prepared.
@@ -579,106 +435,6 @@ class ImmutableTransformerRuntime:
             f"[immutable] dim {dim} size {size} is outside the declared dynamic "
             f"range [{lo}, {hi}]; compiling a dedicated shape for it. "
             "Widen compile_dynamic_hints to avoid the extra compile."
-        )
-
-    def _current_adapter_args(self, index: int):
-        return self.architecture_adapter.build_adapter_args(
-            index,
-            self.adapters_by_block,
-            self.adapter_multiplier,
-        )
-
-    def _make_stable_block_fn(self, index: int, mode: str):
-        abi = self._block_abis[index]
-        kernel = self._get_block_kernel(index, mode)
-        training = mode == self.TRAIN
-
-        def block_fn(x, block_args):
-            source = self._sources.source(index)
-            transfer = source.transfer
-            token = None
-            compact_flat = None
-
-            if transfer is not None:
-                host = self.residency.arena.block_record(source.block_key).host_flat
-                nbytes = int(transfer.compact_nbytes)
-                guard = x.reshape(-1)[:1].clone() if training else x
-                token = torch.ops.mm.fetch_start_multi_after(
-                    host,
-                    source.ranges,
-                    nbytes,
-                    guard,
-                )
-                compact_flat = torch.ops.mm.fetch_wait(token, nbytes)
-                if training and torch.is_grad_enabled():
-                    x = free_on_backward(x, token)
-
-            leaf_args = source.assemble_leaf_args(
-                self.residency,
-                compact_flat,
-            )
-            if self.compile_blocks and self.compile_dynamic_hints:
-                # Must be set on this exact tensor instance every call (a
-                # fresh x each step) before it crosses the torch.compile
-                # boundary in `kernel`, so a resolution-bucket run requests a
-                # dynamic sequence dimension instead of specializing eagerly.
-                for dim, lo, hi in self.compile_dynamic_hints:
-                    size = int(x.shape[dim])
-                    if (lo is not None and size < lo) or (
-                        hi is not None and size > hi
-                    ):
-                        # A shape the bounds did not anticipate. Marking it
-                        # anyway is a hard ConstraintViolation; skipping the
-                        # hint just costs this shape its own specialization.
-                        self._warn_hint_out_of_range(dim, size, lo, hi)
-                        continue
-                    # Krea sequence lengths are aligned, so the kernel may infer
-                    # divisibility guards (for example size % 8 == 0). A hard
-                    # min/max mark claims every integer in the interval is
-                    # valid and raises ConstraintViolationError. Weak marking
-                    # requests dynamism without forbidding specialization when
-                    # an inferred alignment constraint requires it.
-                    _mark_dynamic_dim(x, dim)
-            out = kernel(
-                x,
-                block_args,
-                leaf_args,
-                self._current_adapter_args(index),
-            )
-
-            if token is not None:
-                if training:
-                    if not in_recompute():
-                        torch.ops.mm.fetch_free_after(token, out)
-                else:
-                    torch.ops.mm.fetch_free_after(token, out)
-            return out
-
-        return block_fn
-
-    def _build_program(self, mode: str) -> ImmutableProgram:
-        adapter_shape = tuple(
-            (index, tuple(sorted(entries)))
-            for index, entries in sorted(self.adapters_by_block.items())
-        )
-        fingerprint = build_program_fingerprint(
-            mode,
-            self._block_abis,
-            architecture_key=self.architecture_adapter.architecture_key,
-            depth=self.depth,
-            checkpoint_mode="full" if mode == self.TRAIN else "none",
-            adapter_shape=adapter_shape,
-            has_multiplier=self.adapter_multiplier is not None,
-        )
-        trunk = (
-            build_train_trunk(self._block_fns[mode])
-            if mode == self.TRAIN
-            else build_sample_trunk(self._block_fns[mode])
-        )
-        return ImmutableProgram(
-            mode=mode,
-            fingerprint=fingerprint,
-            trunk=trunk,
         )
 
     def set_residency_plan(self, plan: ResidencyPlan) -> ResidencyDelta:
@@ -1116,60 +872,9 @@ class ImmutableTransformerRuntime:
         )
         return observed
 
-    def run(self, hidden, block_args):
-        self._require_finalized()
-        if self._active_token is None:
-            raise ImmutableRuntimeError("immutable_execution_not_active")
-        if self._sources.plan is None:
-            raise ImmutableRuntimeError(
-                "no_residency_source_table: publish a plan before execution"
-            )
-        mode = self._active_mode
-        # The active phase -- not grad mode -- selects the program. A training
-        # step legitimately contains no-grad forwards (diff-output preservation
-        # runs a prior prediction with the network detached), and those stay on
-        # the TRAIN program: same residency plan, same fetch policy, and the
-        # train block fn is already no-grad safe. The reverse is still a bug:
-        # a grad-enabled call inside a sampling phase would build a graph the
-        # forward-only program never planned working memory for.
-        if mode == self.SAMPLE and torch.is_grad_enabled():
-            raise ImmutableRuntimeError(
-                f"immutable_execution_mode_mismatch:"
-                f"active={self.SAMPLE}:call={self.TRAIN}"
-            )
-        return self._programs[mode].trunk(hidden, block_args)
-
     def close(self) -> None:
         if self._sources.active_executions:
             raise ImmutableRuntimeError("cannot_close_during_execution")
         self._sources.clear()
         self._programs.clear()
-        self._block_fns.clear()
         self._block_kernels.clear()
-
-def prepare_immutable_runtime(
-    transformer,
-    residency: ResidencyState,
-    *,
-    architecture_adapter,
-    block_operations,
-    depth: int = 2,
-    compile_blocks: bool = True,
-    compile_dynamic: bool | None = True,
-    compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = (),
-    protected_training_leaf_keys=(),
-    owner_token=None,
-) -> ImmutableTransformerRuntime:
-    runtime = ImmutableTransformerRuntime(
-        transformer,
-        residency,
-        architecture_adapter=architecture_adapter,
-        block_operations=block_operations,
-        depth=depth,
-        compile_blocks=compile_blocks,
-        compile_dynamic=compile_dynamic,
-        compile_dynamic_hints=compile_dynamic_hints,
-        protected_training_leaf_keys=protected_training_leaf_keys,
-        owner_token=owner_token,
-    )
-    return runtime

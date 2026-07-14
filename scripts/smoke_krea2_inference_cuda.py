@@ -3,6 +3,8 @@
 This replaces the retired in-graph sampling smoke with the current immutable
 runtime lifecycle: load/quantize, prepare arena, install adapter, finalize,
 enter a sampling session, and generate one image from cached text embeddings.
+The default direct-arena load is a fast harness shortcut; ``--load-mode
+normal`` exercises the production load-then-attach lifecycle.
 """
 
 from __future__ import annotations
@@ -31,7 +33,14 @@ from toolkit.basic import flush  # noqa: E402
 from toolkit.config_modules import GenerateImageConfig, ModelConfig  # noqa: E402
 from toolkit.memory_management.arena_offload import get_arena_runtime  # noqa: E402
 from toolkit.util.quantize import quantize_model  # noqa: E402
-from scripts.smoke_runtime import add_contention_args, fail_if_vram_contended  # noqa: E402
+from scripts.smoke_runtime import (  # noqa: E402
+    add_contention_args,
+    add_load_mode_arg,
+    add_lock_args,
+    assert_smoke_load_mode,
+    configure_smoke_load_mode,
+    fail_if_vram_contended,
+)
 
 
 def _sibling_uncond_path(cond_path: Path):
@@ -57,6 +66,7 @@ def _parse_args():
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--qtype", default="float8")
     parser.add_argument("--cache-dir", default=None)
+    add_load_mode_arg(parser)
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--max-text-length", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
@@ -81,6 +91,7 @@ def _parse_args():
     parser.add_argument("--output", default=".codex/krea2_inference_smoke.png")
     parser.add_argument("--output-json", default=None)
     add_contention_args(parser)
+    add_lock_args(parser)
     return parser.parse_args()
 
 
@@ -161,7 +172,9 @@ def main():
     config = _model_config(args)
     model = Krea2Model(device=args.device, model_config=config, dtype=args.dtype)
     model.skip_te = True
+    configure_smoke_load_mode(model, args.load_mode)
     transformer = model._load_transformer()
+    assert_smoke_load_mode(model, args.load_mode)
     if config.quantize and not getattr(
         model, "_transformer_quantized_during_load", False
     ):
@@ -227,6 +240,7 @@ def main():
     result = {
         "adapter_variant": args.adapter_variant,
         "full_if_contains": train_smoke.adapter_options(args)["full_if_contains"],
+        "load_mode": args.load_mode,
         "seconds": seconds,
         "output": str(output),
         "runtime": runtime.diagnostics(),

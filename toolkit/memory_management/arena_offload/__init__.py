@@ -25,10 +25,14 @@ from .api import (
     is_memory_managed,
     memory_runtime_owns_compile,
     prepare_canonical_storage,
+    prepare_canonical_storage_from_state_dict,
     prepare_arena_offload,
 )
 from .runtime import ArenaOffloadRuntime
+from .dispatcher import DISPATCHER_GENERATION
+from .discovery import BlockDiscoveryError, discover_blocks
 from .errors import ArenaCleanupError, ArenaSetupFatalError
+from .load_session import model_load_arena_session
 from ..runtime import close_memory_runtime, get_memory_runtime
 
 __all__ = [
@@ -36,13 +40,18 @@ __all__ = [
     "ArenaCleanupError",
     "ArenaOffloadRuntime",
     "ArenaSetupFatalError",
+    "BlockDiscoveryError",
+    "DISPATCHER_GENERATION",
     "close_arena_offload",
     "close_memory_runtime",
     "get_arena_runtime",
     "get_memory_runtime",
+    "discover_blocks",
     "is_arena_offloaded",
     "is_memory_managed",
     "memory_runtime_owns_compile",
+    "model_load_arena_session",
     "prepare_canonical_storage",
+    "prepare_canonical_storage_from_state_dict",
     "prepare_arena_offload",
 ]

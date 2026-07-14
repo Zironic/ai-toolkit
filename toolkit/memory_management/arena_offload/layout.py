@@ -11,7 +11,7 @@ from typing import Iterable
 
 import torch
 
-from toolkit.quantization.storage import linear_storage_binding
+from toolkit.quantization.storage import linear_storage_binding, module_storage_binding
 from toolkit.memory_management import pin_manager
 
 LEAF_ALIGN = 256
@@ -35,6 +35,7 @@ class LinearSpec:
     weight_template: torch.Tensor
     weight_requires_grad: bool
     bias_requires_grad: bool
+    substitutions: tuple = ()
 
     def tensor(self, name: str) -> LeafSpec | None:
         return next((item for item in self.tensors if item.role == name), None)
@@ -240,6 +241,7 @@ def pack_block_host(
                         if bias is not None
                         else False
                     ),
+                    substitutions=binding.substitutions,
                 )
             )
     except Exception:
@@ -314,6 +316,7 @@ def pack_block_host_from_flat(block_key: str, linears, flat: torch.Tensor) -> "B
                     if bias is not None
                     else False
                 ),
+                substitutions=binding.substitutions,
             )
         )
 
@@ -663,7 +666,8 @@ class LinearLayout:
     weight_requires_grad: bool
     bias_requires_grad: bool
     execution_key: tuple
-    weight_template: torch.Tensor
+    weight_template: torch.Tensor | None
+    substitutions: tuple = ()
 
     def leaf(self, role: str) -> LeafDescriptor | None:
         return next((leaf for leaf in self.leaf_descriptors if leaf.role == role), None)
@@ -714,9 +718,9 @@ def inspect_block(block_key: str, entries) -> BlockLayout:
     cursor = 0
     linears = []
     for name, module in entries:
-        weight = module.weight
-        bias = getattr(module, "bias", None)
-        binding = linear_storage_binding(weight, bias)
+        weight = module._parameters.get("weight")
+        bias = module._parameters.get("bias")
+        binding = module_storage_binding(module)
         leaves = [item.tensor for item in binding.tensors]
         roles = [item.name for item in binding.tensors]
         descriptors = []
@@ -729,10 +733,11 @@ def inspect_block(block_key: str, entries) -> BlockLayout:
             name=name,
             leaf_descriptors=tuple(descriptors),
             weight_leaf_count=binding.weight_leaf_count,
-            weight_requires_grad=bool(weight.requires_grad),
+            weight_requires_grad=bool(weight.requires_grad) if weight is not None else False,
             bias_requires_grad=bool(bias.requires_grad) if bias is not None else False,
             execution_key=binding.execution_key,
             weight_template=binding.weight_template,
+            substitutions=binding.substitutions,
         ))
     return BlockLayout(block_key, tuple(linears), cursor)
 
@@ -751,3 +756,14 @@ def linear_views(flat: torch.Tensor, layout: LinearLayout):
     )
     bias = views[layout.weight_leaf_count] if len(views) > layout.weight_leaf_count else None
     return weight, bias
+
+
+def substitution_views(flat: torch.Tensor, layout: LinearLayout) -> dict[str, torch.Tensor]:
+    """Reconstruct every declared module-state target from one flat."""
+    views = tuple(typed_view(flat, leaf) for leaf in layout.leaf_descriptors)
+    return {
+        substitution.name: substitution.reconstruct(
+            tuple(views[index] for index in substitution.tensor_indices)
+        )
+        for substitution in layout.substitutions
+    }

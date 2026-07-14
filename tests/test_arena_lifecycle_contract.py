@@ -12,12 +12,12 @@ from toolkit.memory_management.arena_offload import (
     prepare_canonical_storage,
     prepare_arena_offload,
 )
-from toolkit.memory_management.adapters import SingleStreamMMDiTAdapter
 from toolkit.memory_management.arena_offload.errors import (
     ArenaCleanupError,
     is_fatal_arena_setup,
     recover_allows_next_job,
 )
+from toolkit.memory_management.arena_offload.discovery import BlockDiscoveryError
 from toolkit.memory_management.arena_offload.ownership import (
     acquire_process_owner,
     active_process_owner,
@@ -25,117 +25,35 @@ from toolkit.memory_management.arena_offload.ownership import (
 )
 from toolkit.memory_management.arena_offload.resources import ArenaRuntimeResources
 from toolkit.memory_management.arena_offload.runtime import ArenaOffloadRuntime
-from toolkit.quantization.fp8_linear import bind_storage_operation
 
-
-class _Adapter:
-    architecture_key = "test_linear"
-
-    def validate_transformer(self, model):
-        if not isinstance(model, torch.nn.Linear):
-            raise TypeError("expected linear")
-
-    def execution_blocks(self, model):
-        return (model,)
-
-    def block_key(self, _model, index):
-        return f"blocks.{index}"
-
-    def leaf_entries(self, block):
-        return (("linear", block),)
-
-    def collect_execution_adapters(self, _model, _network):
-        return {}
-
-    def build_adapter_args(self, _index, _adapters, multiplier=None):
-        del multiplier
-        return None
-
-    def can_run_current_call(self, _block_args, **_kwargs):
-        return True
-
-    def bind_block_operations(self, storage_views, device):
-        del storage_views, device
-        return (None,)
-
-    def forward_block(
-        self,
-        _block,
-        hidden,
-        _block_args,
-        _leaf_args,
-        _linear_operations,
-        _adapter_args,
-        *,
-        training,
-    ):
-        del training
-        return hidden
-
-
-class _UnsupportedTensor(torch.Tensor):
-    @staticmethod
-    def __new__(cls, payload):
-        return torch.Tensor._make_wrapper_subclass(
-            cls,
-            payload.shape,
-            strides=payload.stride(),
-            storage_offset=payload.storage_offset(),
-            dtype=payload.dtype,
-            layout=payload.layout,
-            device=payload.device,
-            requires_grad=False,
-        )
-
-    def __init__(self, payload):
-        self.payload = payload
-
-    def __tensor_flatten__(self):
-        return ["payload"], None
-
-    @staticmethod
-    def __tensor_unflatten__(inner_tensors, _context, _size, _stride):
-        return _UnsupportedTensor(inner_tensors["payload"])
-
-    @classmethod
-    def __torch_dispatch__(cls, func, _types, args=(), kwargs=None):
-        if func in (torch.ops.aten.detach.default, torch.ops.aten.alias.default):
-            return cls(args[0].payload)
-        raise NotImplementedError(func)
-
-
-class _UnsupportedLeaf(torch.nn.Module):
+class _Block(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self._parameters["weight"] = _UnsupportedTensor(torch.randn(4, 4))
-        self._parameters["bias"] = None
+        self.linear = torch.nn.Linear(4, 4)
+
+    def forward(self, value):
+        return self.linear(value)
 
 
-class _UnsupportedStorageAdapter(_Adapter):
-    def validate_transformer(self, model):
-        if not hasattr(model, "leaf"):
-            raise TypeError("expected leaf")
+class _Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList((_Block(), _Block()))
+        self.gradient_checkpointing = True
+        self._checkpoint_keep_last = 0
 
-    def execution_blocks(self, model):
-        return (model.leaf,)
+    @property
+    def weight(self):
+        return self.blocks[0].linear.weight
 
-    def leaf_entries(self, block):
-        return (("linear", block),)
-
-    def bind_block_operations(self, storage_views, device):
-        return tuple(
-            bind_storage_operation(
-                view.tensors,
-                execution_key=view.spec.execution_key,
-                weight_leaf_count=view.spec.weight_leaf_count,
-                device=device,
-            )
-            for view in storage_views
-        )
+    def forward(self, value):
+        for block in self.blocks:
+            value = block(value)
+        return value
 
 
 def _frozen_linear():
-    model = torch.nn.Linear(4, 4)
+    model = _Model()
     model.requires_grad_(False)
     return model
 
@@ -160,37 +78,16 @@ def test_process_owner_is_exclusive_sequential_and_stale_safe():
 def test_precommit_failure_preserves_original_classification_and_model():
     model = _frozen_linear()
     original = model.weight
-    adapter = _Adapter()
-    adapter.execution_blocks = mock.Mock(side_effect=ValueError("bad architecture"))
 
-    with pytest.raises(ValueError, match="bad architecture"):
+    with pytest.raises(BlockDiscoveryError, match="block_container_not_found"):
         prepare_arena_offload(
             model,
             device="cpu",
-            adapter=adapter,
+            block_names=("missing",),
             config=ArenaOffloadConfig(enabled=True),
         )
 
     assert model.weight is original
-    assert active_process_owner() is None
-    assert not hasattr(model, "_arena_offload_runtime")
-    assert not hasattr(model, "_arena_offload_disposed")
-
-
-def test_unsupported_storage_operation_fails_before_canonical_commit():
-    model = torch.nn.Module()
-    model.leaf = _UnsupportedLeaf()
-    original = model.leaf.weight
-
-    with pytest.raises(ValueError, match="unsupported_linear_storage_operation"):
-        prepare_arena_offload(
-            model,
-            device="cpu",
-            adapter=_UnsupportedStorageAdapter(),
-            config=ArenaOffloadConfig(enabled=True),
-        )
-
-    assert model.leaf.weight is original
     assert active_process_owner() is None
     assert not hasattr(model, "_arena_offload_runtime")
     assert not hasattr(model, "_arena_offload_disposed")
@@ -203,14 +100,14 @@ def test_disabled_config_and_unsupported_architecture_fail_before_mutation():
         prepare_arena_offload(
             model,
             device="cpu",
-            adapter=_Adapter(),
             config=ArenaOffloadConfig(enabled=False),
         )
-    with pytest.raises(TypeError, match="transformer.blocks"):
+    unsupported = torch.nn.Linear(4, 4)
+    unsupported.gradient_checkpointing = True
+    with pytest.raises(BlockDiscoveryError, match="no_repeated_block_container"):
         prepare_arena_offload(
-            model,
+            unsupported,
             device="cpu",
-            adapter=SingleStreamMMDiTAdapter(),
             config=ArenaOffloadConfig(enabled=True),
         )
     assert model.weight is original
@@ -221,7 +118,7 @@ def test_disabled_config_and_unsupported_architecture_fail_before_mutation():
 
 def test_direct_loader_rollback_releases_preparation_owner():
     model = _frozen_linear()
-    build = prepare_canonical_storage(model, _Adapter(), device="cpu")
+    build = prepare_canonical_storage(model, block_names=("blocks",), device="cpu")
     assert active_process_owner() is not None
     build.rollback()
     assert active_process_owner() is None
@@ -239,7 +136,7 @@ def test_postcommit_failure_is_fatal_disposes_and_releases_owner():
             prepare_arena_offload(
                 model,
                 device="cpu",
-                adapter=_Adapter(),
+                block_names=("blocks",),
                 config=ArenaOffloadConfig(enabled=True),
             )
 
@@ -261,7 +158,7 @@ def test_postcommit_failure_is_fatal_disposes_and_releases_owner():
     "target",
     (
         "toolkit.memory_management.arena_offload.runtime.ResidencyState",
-        "toolkit.memory_management.arena_offload.runtime.prepare_immutable_runtime",
+        "toolkit.memory_management.arena_offload.dispatcher.prepare_block_dispatcher_runtime",
     ),
 )
 def test_postcommit_fault_boundaries_are_fatal_and_never_fall_back(target):
@@ -283,7 +180,7 @@ def test_postcommit_fault_boundaries_are_fatal_and_never_fall_back(target):
             prepare_arena_offload(
                 model,
                 device="cpu",
-                adapter=_Adapter(),
+                block_names=("blocks",),
                 config=ArenaOffloadConfig(enabled=True),
             )
     assert caught.value.__cause__ is failure
@@ -368,7 +265,6 @@ def test_phase7_import_and_private_state_boundaries():
     ):
         source = (root / relative).read_text(encoding="utf-8")
         tree = ast.parse(source)
-        assert "memory_management.arena_offload" not in source
         assert not any(
             isinstance(node, ast.Attribute) and node.attr.startswith("_mm_")
             for node in ast.walk(tree)

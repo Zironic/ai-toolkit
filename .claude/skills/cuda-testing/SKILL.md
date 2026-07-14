@@ -14,6 +14,12 @@ description: How to validate CUDA/FP8/memory-manager behavior on the real GPU in
 - **Full training runs (`python run.py ...`) need the user's explicit
   go-ahead**: minutes to hours, real datasets/checkpoints, and a unit test is
   not a substitute. A pre-bash hook asks for confirmation on these.
+- **Use the repo-root `.gpu.lock` as the canonical check for another active
+  smoke or GPU bench.** It records the holder name, PID, start time, and
+  command line. Do not infer smoke ownership from `nvidia-smi`, VRAM usage, or
+  a process-list scan. The shared `scripts/smoke_runtime.py` lock validates and
+  reclaims stale records; wait for the holder or use `--wait-for-gpu` rather
+  than bypassing a live lock unless intentional contention is the test.
 - Env vars are legitimate ONLY as test harness controls and one-off debug
   scripts. Anything that must affect a real training job goes through the job
   config (and UI schema when applicable) -- env vars do not exist in runs
@@ -70,6 +76,19 @@ through the current arena lifecycle. Both scripts accept
 `--adapter-variant {lora,lokr,dora,full}`. Every current `scripts/smoke_*.py`
 fails when startup VRAM usage exceeds 30%; use `--ignore-contention` only when
 intentional contention is part of the test.
+
+`scripts/smoke_transformer_train_cuda.py`: multi-architecture full-model
+runner (profiles `krea2`/`zimage`/`ideogram4` in `scripts/smoke_profiles.py`)
+for the generic-block-dispatcher acceptance gates. zimage/ideogram4 and
+`--qtype qfloat8` fail fast until their blockers land -- see
+`tasks/open/GENERIC_BLOCK_DISPATCHER_PLAN.md` (Pre-built smoke tooling).
+
+`scripts/smoke_quantized_linear_cuda.py`: quantized-Linear contract smoke on
+a synthetic model; runnable today for qfloat8/convrot4/orbit4 (LoRA +
+compile + checkpoint + streamed-state bitwise parity). Gotcha it encodes:
+ConvRot/Orbit forwards branch on `x.requires_grad`, so no-grad outputs must
+be compared against a no-grad eager reference, never the training-branch
+output.
 
 ## Fail-fast conventions for new code
 
