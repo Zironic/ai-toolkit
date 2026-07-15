@@ -192,6 +192,9 @@ def main():
             for module in transformer.modules()
             if isinstance(module, (SimpleModulation, DoubleSharedModulation))
         ]
+        transformer.enable_gradient_checkpointing(
+            keep_last=config.layer_offloading_checkpoint_keep_last
+        )
         model._attach_immutable_training_memory(transformer, ignore_modules)
         model.model = transformer
 

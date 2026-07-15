@@ -6,6 +6,7 @@ import torch
 from safetensors.torch import save_file
 
 from extensions_built_in.diffusion_models.krea2.krea2 import (
+    _sampling_compile_stance,
     _smoke_direct_arena_load_requested,
     _stream_and_quantize_checkpoint,
     _stream_checkpoint,
@@ -70,6 +71,23 @@ def test_train_compile_cache_key_partitions_fp8_execution_gates():
     forward_backward = _train_compile_cache_key(model)
 
     assert len({baseline, forward, forward_backward}) == 3
+
+
+def test_arena_sampling_keeps_default_compile_stance():
+    with mock.patch("torch.compiler.set_stance") as set_stance:
+        with _sampling_compile_stance(True, object()):
+            pass
+    set_stance.assert_not_called()
+
+
+def test_legacy_sampling_keeps_deferred_compile_stance():
+    stance = mock.MagicMock()
+    stance.__enter__.return_value = None
+    stance.__exit__.return_value = False
+    with mock.patch("torch.compiler.set_stance", return_value=stance) as set_stance:
+        with _sampling_compile_stance(True, None):
+            pass
+    set_stance.assert_called_once_with("eager_then_compile")
 
 
 def test_krea_memory_integration_stays_on_public_arena_surface():

@@ -122,6 +122,13 @@ QWEN_IMAGE_VAE_PATH = "Qwen/Qwen-Image"
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 
+def _sampling_compile_stance(compile_sample: bool, arena_runtime):
+    """Use deferred whole-pipeline compile only for the legacy sampler."""
+    if compile_sample and arena_runtime is None:
+        return torch.compiler.set_stance("eager_then_compile")
+    return contextlib.nullcontext()
+
+
 def _truthy_env(name: str) -> bool:
     value = os.getenv(name)
     return value is not None and value.lower() not in ("", "0", "false", "no")
@@ -1304,19 +1311,18 @@ class Krea2Model(BaseModel):
         # block kernels itself. Its residency plan was activated at the sampling
         # boundary by the trainer.
 
-        # Sampling compiles are static-shape (dynamic=False); running the
-        # call under eager_then_compile defers each compile to the second
-        # call with a given shape instead of wasting one on the very first
-        # -- so "did a new compile happen" must be re-checked on every
-        # call, not just the first one this process.
+        # Legacy sampling compiles are static-shape (dynamic=False); running
+        # that path under eager_then_compile defers each compile to the second
+        # call with a given shape. The immutable arena owns block compilation
+        # itself and must stay on the default stance: eager_then_compile's
+        # example-input cloning cannot reconstruct Quanto QBytesTensor state.
         frames_before = None
         if compile_cache_dir and self.model_config.compile_sample:
             frames_before = torch._dynamo.utils.counters["frames"].get("total", 0)
 
-        compile_stance = (
-            torch.compiler.set_stance("eager_then_compile")
-            if self.model_config.compile_sample
-            else contextlib.nullcontext()
+        compile_stance = _sampling_compile_stance(
+            self.model_config.compile_sample,
+            arena_runtime,
         )
         immutable_context = (
             arena_runtime.sampling_image(
