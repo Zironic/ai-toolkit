@@ -1,6 +1,7 @@
 import io
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -109,6 +110,34 @@ class CanonicalizeTests(unittest.TestCase):
         self.assertEqual(arena.committed_pinned_bytes(), 0)
         self.assertEqual(arena.block_keys(), ())
 
+    def test_pageable_build_can_register_and_unregister_same_storage(self):
+        layer = _linear(in_f=64, out_f=64, bias=True)
+        expected = layer.weight.detach().clone()
+        arena = CanonicalArena()
+        build = arena.prepare(
+            {"blocks.0": [("lin", layer)]},
+            pin_on_finish=False,
+        )
+        try:
+            build.populate_from_model()
+            stats = build.commit()
+            record = arena.block_record("blocks.0")
+            pointer = record.host_flat.data_ptr()
+            self.assertEqual(stats.pinned_bytes, 0)
+            self.assertFalse(record.pack.pinned)
+            self.assertEqual(arena.committed_pinned_bytes(), 0)
+
+            if torch.cuda.is_available():
+                self.assertTrue(arena.pin_block("blocks.0", required=True))
+                self.assertTrue(record.pack.pinned)
+                self.assertEqual(record.host_flat.data_ptr(), pointer)
+                self.assertTrue(arena.unpin_block("blocks.0"))
+                self.assertFalse(record.pack.pinned)
+                self.assertEqual(record.host_flat.data_ptr(), pointer)
+            torch.testing.assert_close(layer.weight, expected)
+        finally:
+            arena.release()
+
     def test_unknown_block_lookup_returns_none(self):
         arena = CanonicalArena()
         try:
@@ -126,8 +155,13 @@ class WholeModelToGuardTests(unittest.TestCase):
         try:
             arena.canonicalize({"blocks.0": [("lin", model[0])]})
             CanonicalArena.guard_whole_model_to(model)
-            with self.assertRaises(CanonicalArenaError):
-                model.to(torch.device("cpu"))
+            for move in (
+                lambda: model.to(torch.device("cpu")),
+                model.cpu,
+                model.cuda,
+            ):
+                with self.assertRaises(CanonicalArenaError):
+                    move()
         finally:
             CanonicalArena.unguard_whole_model_to(model)
             arena.release()
@@ -140,27 +174,41 @@ class WholeModelToGuardTests(unittest.TestCase):
         self.assertIs(model.to, original)
         CanonicalArena.unguard_whole_model_to(model)
 
-    def test_guarded_to_allows_only_idempotent_runtime_placement(self):
+    def test_guarded_movement_routes_all_entry_points_to_runtime(self):
         model = nn.Sequential(_linear())
-        model._arena_offload_runtime = SimpleNamespace(
-            _permanent_placement=(torch.device("cpu"), torch.float32)
+        runtime = SimpleNamespace(
+            device=torch.device("cuda:0"),
+            handle_whole_model_move=mock.Mock(return_value=model),
         )
+        model._arena_offload_runtime = runtime
         CanonicalArena.guard_whole_model_to(model)
         try:
             self.assertIs(model.to(torch.device("cpu")), model)
-            self.assertIs(
-                model.to(device=torch.device("cpu"), dtype=torch.float32), model
+            self.assertIs(model.cpu(), model)
+            self.assertIs(model.cuda(), model)
+            self.assertEqual(runtime.handle_whole_model_move.call_count, 3)
+            self.assertEqual(
+                runtime.handle_whole_model_move.call_args_list[0].args,
+                (torch.device("cpu"),),
             )
-            with self.assertRaises(CanonicalArenaError):
-                model.to(device=torch.device("cpu"), dtype=torch.float64)
+            self.assertEqual(
+                runtime.handle_whole_model_move.call_args_list[1].args,
+                ("cpu",),
+            )
+            self.assertEqual(
+                runtime.handle_whole_model_move.call_args_list[2].args,
+                (torch.device("cuda:0"),),
+            )
         finally:
             CanonicalArena.unguard_whole_model_to(model)
             del model._arena_offload_runtime
 
     def test_unguard_restores_normal_to(self):
         model = nn.Sequential(_linear())
+        originals = (model.to, model.cuda, model.cpu)
         CanonicalArena.guard_whole_model_to(model)
         CanonicalArena.unguard_whole_model_to(model)
+        self.assertEqual((model.to, model.cuda, model.cpu), originals)
         # Ordinary .to() must work again (no canonicalized leaves here).
         model.to(torch.device("cpu"))
 
@@ -171,7 +219,3 @@ class WholeModelToGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-import pytest
-
-pytestmark = pytest.mark.process_isolated

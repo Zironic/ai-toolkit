@@ -45,6 +45,7 @@ from toolkit import aux_embed_cache
 from PIL import Image
 from torchvision.transforms import functional as TF
 from toolkit.basic import flush
+from toolkit.memory_management.runtime import get_memory_runtime
 
 
 adapter_transforms = transforms.Compose([
@@ -541,6 +542,7 @@ class SDTrainer(BaseSDTrainProcess):
 
             arena_runtime = get_memory_runtime(self.sd.unet)
             if arena_runtime is not None:
+                arena_runtime.park_residency_for_external_phase()
                 arena_runtime.place_permanent_modules("cpu")
             else:
                 self.sd.unet.to('cpu')
@@ -566,7 +568,6 @@ class SDTrainer(BaseSDTrainProcess):
                     self.device_torch,
                     dtype=self.sd.torch_dtype
                 ).detach()
-
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
         # move vae to device if we did not cache latents

@@ -139,7 +139,3 @@ class BuildTransferPlanTests(unittest.TestCase):
             plan.leaf_specs["a"]["weight"] = None
 if __name__ == "__main__":
     unittest.main()
-
-import pytest
-
-pytestmark = pytest.mark.process_isolated

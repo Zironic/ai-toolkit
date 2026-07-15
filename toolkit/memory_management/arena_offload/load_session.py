@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
+import torch
+
 
 PENDING_CANONICAL_BUILD_ATTR = "_arena_pending_canonical_build"
 _CURRENT_SESSION = ContextVar("arena_direct_load_session", default=None)
@@ -40,7 +42,9 @@ class _DirectLoadSession:
         self.pending.clear()
 
 
-def _arena_load_enabled(base_model) -> bool:
+def _arena_load_enabled(base_model, enabled) -> bool:
+    if enabled is not None:
+        return bool(enabled)
     config = getattr(base_model, "model_config", None)
     return bool(
         config is not None
@@ -50,15 +54,24 @@ def _arena_load_enabled(base_model) -> bool:
     )
 
 
+def _managed_source_keys(build) -> set[str]:
+    return {
+        source_key
+        for block_schema in build.state_schema.values()
+        for source_key in block_schema
+    }
+
+
 @contextmanager
-def model_load_arena_session(base_model):
+def model_load_arena_session(base_model, *, enabled=None):
     """Offer generic direct arena ingestion during ``base_model.load_model``.
 
     Unsupported or non-inferable state schemas leave the state mapping intact
-    and use the ordinary assignment path. Once a mapping has been consumed,
-    the model must claim it through ``prepare_arena_offload`` before returning.
+    and use the ordinary assignment path. A consumed mapping remains owned by
+    the model until the shared trainer claims it through
+    ``prepare_arena_offload`` or releases the unfinished preparation.
     """
-    if not _arena_load_enabled(base_model):
+    if not _arena_load_enabled(base_model, enabled):
         yield None
         return
     if _CURRENT_SESSION.get() is not None:
@@ -72,15 +85,47 @@ def model_load_arena_session(base_model):
         block_names=block_names,
     )
     token = _CURRENT_SESSION.set(session)
+    original_load_state_dict = torch.nn.Module.load_state_dict
+
+    def load_state_dict(module, state_dict, strict=True, assign=False):
+        build = try_prepare_canonical_from_state_dict(module, state_dict)
+        if build is None:
+            return original_load_state_dict(
+                module, state_dict, strict=strict, assign=assign
+            )
+        expected_missing = _managed_source_keys(build)
+        try:
+            incompatible = original_load_state_dict(
+                module, state_dict, strict=False, assign=assign
+            )
+            missing = set(incompatible.missing_keys)
+            unexpected = set(incompatible.unexpected_keys)
+            if missing != expected_missing or unexpected:
+                raise RuntimeError(
+                    "arena_direct_load_residual_mismatch:"
+                    f"missing={sorted(missing - expected_missing)[:5]}:"
+                    f"unconsumed={sorted(expected_missing - missing)[:5]}:"
+                    f"unexpected={sorted(unexpected)[:5]}"
+                )
+            return type(incompatible)([], [])
+        except BaseException:
+            discard_pending_canonical_build(module)
+            raise
+
+    torch.nn.Module.load_state_dict = load_state_dict
     try:
         yield session
         if session.pending:
-            session.rollback_pending()
-            raise RuntimeError("arena_direct_load_build_not_claimed")
+            setattr(
+                base_model,
+                "_arena_pending_load_models",
+                tuple(model for model, _build in session.pending.values()),
+            )
     except BaseException:
         session.rollback_pending()
         raise
     finally:
+        torch.nn.Module.load_state_dict = original_load_state_dict
         _CURRENT_SESSION.reset(token)
 
 
@@ -90,8 +135,13 @@ def try_prepare_canonical_from_state_dict(model, state_dict):
     if session is None:
         return None
     from .api import prepare_canonical_storage_from_state_dict
-    from .construction import CanonicalStateInferenceError
+    from .construction import (
+        CanonicalBuildError,
+        CanonicalStateConsumedError,
+        CanonicalStateInferenceError,
+    )
     from .discovery import BlockDiscoveryError
+    from ..canonical_arena import CanonicalArenaError
 
     try:
         build = prepare_canonical_storage_from_state_dict(
@@ -100,7 +150,14 @@ def try_prepare_canonical_from_state_dict(model, state_dict):
             block_names=session.block_names,
             device=session.device,
         )
-    except (BlockDiscoveryError, CanonicalStateInferenceError) as error:
+    except CanonicalStateConsumedError:
+        raise
+    except (
+        BlockDiscoveryError,
+        CanonicalArenaError,
+        CanonicalBuildError,
+        CanonicalStateInferenceError,
+    ) as error:
         session.unsupported_reason = str(error)
         return None
     try:

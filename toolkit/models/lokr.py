@@ -244,7 +244,7 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             (self.lokr_w2 if self.use_w2
              else make_weight_cp(self.lokr_t2, self.lokr_w2_a, self.lokr_w2_b) if self.cp
              else self.lokr_w2_a@self.lokr_w2_b),
-            self.scale
+            self._runtime_scale
         )
         if orig_weight is not None:
             weight = weight.reshape(orig_weight.shape)

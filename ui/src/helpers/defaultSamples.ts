@@ -3,6 +3,7 @@ import { SampleConfig } from "@/types";
 export const defaultSampleConfig: SampleConfig = {
   sampler: 'flowmatch',
   sample_every: 250,
+  sample_start_step: 0,
   width: 1024,
   height: 1024,
   samples: [
@@ -53,6 +54,7 @@ export const defaultSampleConfig: SampleConfig = {
 export const defaultAudioSampleConfig: SampleConfig = {
   sampler: 'flowmatch',
   sample_every: 250,
+  sample_start_step: 0,
   width: 1024,
   height: 1024,
   samples: [
@@ -407,6 +409,7 @@ It's Converging!
 export const defaultIdeogramSamplesConfig: SampleConfig = {
   sampler: 'flowmatch',
   sample_every: 250,
+  sample_start_step: 0,
   width: 1024,
   height: 1024,
   samples: [

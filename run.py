@@ -39,6 +39,8 @@ def _configure_windows_torch_allocator() -> None:
 
 _configure_windows_torch_allocator()
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
+# The hf-xet backend can stall indefinitely mid-download; default to plain HTTP.
+os.environ["HF_HUB_DISABLE_XET"] = os.getenv("HF_HUB_DISABLE_XET", "1")
 # Be generous with the HF download read timeout (default 10s) so large/flaky model pulls
 # (e.g. Qwen3-VL) don't die on a transient ReadTimeout. Overridable via .env.
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")

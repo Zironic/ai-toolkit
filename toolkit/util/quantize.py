@@ -1,16 +1,16 @@
 from fnmatch import fnmatch
 from typing import List, Optional, Union, TYPE_CHECKING
 import torch
-from torchao.quantization import Float8Tensor
 
 from optimum.quanto.quantize import _quantize_submodule
 from optimum.quanto.tensor import Optimizer, qtype, qtypes
-from torchao.quantization.quant_api import (
-    quantize_ as torchao_quantize_,
-    _is_linear as torchao_is_linear,
+from toolkit.quantization.torchao_compat import (
     Float8WeightOnlyConfig,
-    IntxWeightOnlyConfig,
-    Int8WeightOnlyConfig
+    Int8WeightOnlyConfig,
+    intx_weight_only_config,
+    torchao_is_float8_tensor,
+    torchao_is_linear,
+    torchao_quantize_,
 )
 from optimum.quanto import freeze
 from optimum.quanto.tensor.qbytes import QBytesTensor
@@ -75,12 +75,12 @@ Q_MODULES = [
 ]
 
 torchao_qtypes = {
-    "uint2": IntxWeightOnlyConfig(torch.int2),
-    "uint3": IntxWeightOnlyConfig(torch.int3),
-    "uint4": IntxWeightOnlyConfig(torch.int4),
-    "uint5": IntxWeightOnlyConfig(torch.int5),
-    "uint6": IntxWeightOnlyConfig(torch.int6),
-    "uint7": IntxWeightOnlyConfig(torch.int7),
+    "uint2": intx_weight_only_config(2),
+    "uint3": intx_weight_only_config(3),
+    "uint4": intx_weight_only_config(4),
+    "uint5": intx_weight_only_config(5),
+    "uint6": intx_weight_only_config(6),
+    "uint7": intx_weight_only_config(7),
     "uint8": Int8WeightOnlyConfig(),
     "int8": Int8WeightOnlyConfig(),
     "float8": Float8WeightOnlyConfig(),
@@ -166,6 +166,7 @@ def quantize(
     optimizer: Optional[Optimizer] = None,
     include: Optional[Union[str, List[str]]] = None,
     exclude: Optional[Union[str, List[str]]] = None,
+    quantize_device: Optional[torch.device] = None,
 ):
     """Quantize the specified model submodules
 
@@ -192,6 +193,10 @@ def quantize(
         exclude (`Optional[Union[str, List[str]]]`):
             Patterns constituting the denylist. If provided, module names must not match
             any patterns from the denylist.
+        quantize_device (`Optional[torch.device]`):
+            If provided, each module is moved to this device to quantize, then moved
+            back to the device its weights were on initially. Lets a CPU-resident
+            model (low vram) quantize layer-by-layer on the GPU.
     """
     if include is not None:
         include = [include] if isinstance(include, str) else include
@@ -205,7 +210,7 @@ def quantize(
         def filter_fn(module: torch.nn.Module, fqn: str) -> bool:
             if not torchao_is_linear(module, fqn):
                 return False
-            if isinstance(module.weight, Float8Tensor):
+            if torchao_is_float8_tensor(module.weight):
                 return False
             if include is not None and not any(fnmatch(fqn, pattern) for pattern in include):
                 return False
@@ -227,7 +232,27 @@ def quantize(
             # check if m is QLinear or QConv2d
             if m.__class__.__name__ in Q_MODULES:
                 continue
-            else:
+            if (
+                isinstance(weights, aotype)
+                and not isinstance(m, torch.nn.Linear)
+                and (
+                    quantize_device is not None
+                    or include is not None
+                    or exclude is not None
+                )
+            ):
+                # torchao only quantizes nn.Linear; when a device round-trip or
+                # include/exclude filtering is in play, skip containers so each
+                # linear is handled individually (a container-level torchao call
+                # would quantize excluded children too)
+                continue
+            orig_device = None
+            if quantize_device is not None and next(m.children(), None) is None:
+                param = next(m.parameters(recurse=False), None)
+                if param is not None:
+                    orig_device = param.device
+                    m.to(quantize_device)
+            try:
                 if isinstance(weights, ostristype):
                     if isinstance(m, torch.nn.Linear):
                         convert_linear_to_ostris(m, weights.quantizer)
@@ -240,6 +265,10 @@ def quantize(
                         activations=activations,
                         optimizer=optimizer,
                     )
+            finally:
+                if orig_device is not None:
+                    # quanto replaces the module in its parent, so re-fetch by name
+                    model.get_submodule(name).to(orig_device)
         except Exception as e:
             print(f"Failed to quantize {name}: {e}")
             # raise e

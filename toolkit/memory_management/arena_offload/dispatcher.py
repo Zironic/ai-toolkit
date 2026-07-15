@@ -6,6 +6,9 @@ from dataclasses import dataclass
 
 import torch
 
+from toolkit.compile_utils import configure_cuda_only_inductor
+from torch.utils._pytree import tree_flatten, tree_unflatten
+
 from toolkit.memory_management.immutable_runtime import (
     ImmutableProgram,
     ImmutableRuntimeError,
@@ -19,6 +22,44 @@ from toolkit.memory_management.arena_offload.transfer import (
 
 
 DISPATCHER_GENERATION = "generic-block-dispatcher-v1"
+
+
+def _first_tensor_argument(args, kwargs):
+    """Locate the tensor leaf that best carries block execution lifetime."""
+    leaves, spec = tree_flatten((args, kwargs))
+    tensors = [
+        (index, value)
+        for index, value in enumerate(leaves)
+        if isinstance(value, torch.Tensor)
+    ]
+    for index, value in tensors:
+        if value.requires_grad:
+            return value, (spec, index)
+    if tensors:
+        index, value = tensors[0]
+        return value, (spec, index)
+    raise ImmutableRuntimeError("unsupported_block_arguments:no_tensor_argument")
+
+
+def _replace_tensor_argument(args, kwargs, location, value):
+    expected_spec, index = location
+    leaves, spec = tree_flatten((args, kwargs))
+    if spec != expected_spec:
+        raise ImmutableRuntimeError("block_argument_structure_changed")
+    leaves[index] = value
+    return tree_unflatten(leaves, spec)
+
+
+def _first_output_tensor(output):
+    """Return a lifetime guard without constraining the block output shape."""
+    leaves, _spec = tree_flatten(output)
+    tensors = [value for value in leaves if isinstance(value, torch.Tensor)]
+    for value in tensors:
+        if value.requires_grad:
+            return value
+    if tensors:
+        return tensors[0]
+    raise ImmutableRuntimeError("unsupported_block_output:no_tensor_leaf")
 
 
 def _in_backward_graph_task() -> bool:
@@ -93,6 +134,17 @@ class GenericBlockDispatcherRuntime(ImmutableTransformerRuntime):
         self._dispatchers = ()
         self._saved_forwards = ()
         self._replacements = ()
+        self._sampling_forward_begin = None
+        self._sampling_forward_end = None
+        self._sampling_allocation_failure = None
+
+    def set_sampling_forward_callbacks(
+        self, begin=None, end=None, allocation_failure=None
+    ):
+        """Install eager callbacks around one complete sampled transformer pass."""
+        self._sampling_forward_begin = begin
+        self._sampling_forward_end = end
+        self._sampling_allocation_failure = allocation_failure
 
     def _replacement_plan(self, index, invoker):
         abi = self._block_abis[index]
@@ -165,6 +217,7 @@ class GenericBlockDispatcherRuntime(ImmutableTransformerRuntime):
             )
 
         if self.compile_blocks:
+            configure_cuda_only_inductor()
             kernel = torch.compile(
                 kernel,
                 mode="default",
@@ -242,17 +295,22 @@ class GenericBlockDispatcherRuntime(ImmutableTransformerRuntime):
             raise ImmutableRuntimeError(
                 "immutable_execution_mode_mismatch:active=sample:call=train"
             )
-        if not args or not isinstance(args[0], torch.Tensor):
+        sampling = self._active_mode == self.SAMPLE
+        if sampling and index == 0 and self._sampling_forward_begin is not None:
+            self._sampling_forward_begin()
+        try:
+            first, first_location = _first_tensor_argument(args, kwargs)
+        except ImmutableRuntimeError as error:
             raise ImmutableRuntimeError(
                 f"unsupported_block_arguments:{self._block_abis[index].block_key}"
-            )
+            ) from error
 
         source = self._sources.source(index)
         transfer = source.transfer
         token = None
         compact_flat = None
-        first = args[0]
         training = self._active_mode == self.TRAIN
+        release_on_backward = False
         if transfer is not None:
             if training and any(
                 (source.block_key, leaf) in self.protected_training_leaf_keys
@@ -271,24 +329,56 @@ class GenericBlockDispatcherRuntime(ImmutableTransformerRuntime):
                 guard,
             )
             compact_flat = torch.ops.mm.fetch_wait(token, nbytes)
-            if training and torch.is_grad_enabled():
+            release_on_backward = (
+                training and torch.is_grad_enabled() and first.requires_grad
+            )
+            if release_on_backward:
                 first = free_on_backward(first, token)
-                args = (first, *args[1:])
+                args, kwargs = _replace_tensor_argument(
+                    args, kwargs, first_location, first
+                )
 
         leaf_args = source.assemble_leaf_args(self.residency, compact_flat)
         self._mark_dispatch_dynamic(first)
-        output = self._get_dispatch_kernel(index)(leaf_args, args, kwargs)
+        while True:
+            try:
+                output = self._get_dispatch_kernel(index)(leaf_args, args, kwargs)
+                break
+            except BaseException as error:
+                recover = (
+                    sampling
+                    and self._sampling_allocation_failure is not None
+                    and self._sampling_allocation_failure(error)
+                )
+                if recover:
+                    continue
+                # Non-reentrant checkpoint replay raises its private early-stop
+                # control-flow exception as soon as it has regenerated every
+                # tensor backward requested. That can unwind the block before the
+                # normal post-forward release below. With no gradient-bearing
+                # input, frozen streamed state is not a backward dependency and
+                # there is no free_on_backward node, so release on that unwind.
+                if token is not None and not release_on_backward:
+                    torch.ops.mm.fetch_free(token)
+                raise
         if token is not None:
             # The first checkpoint pass discards its fetched views, so return
-            # that slot after forward. Replay runs inside an autograd graph
-            # task; its token is instead released by free_on_backward after
-            # the compiled block backward has consumed the substituted state.
-            if (
-                not training
-                or not torch.is_grad_enabled()
-                or not _in_backward_graph_task()
-            ):
-                torch.ops.mm.fetch_free_after(token, output)
+            # that slot after forward. A replay with a gradient-bearing input
+            # instead releases through free_on_backward after the compiled
+            # block backward consumes the substituted state. When no input
+            # requires gradients there is no backward node to run that hook,
+            # and the frozen streamed state is not a backward dependency, so
+            # the replay must also release at forward completion.
+            if not release_on_backward or not _in_backward_graph_task():
+                torch.ops.mm.fetch_free_after(
+                    token, _first_output_tensor(output)
+                )
+        if (
+            sampling
+            and index == len(self._blocks) - 1
+            and self._sampling_forward_end is not None
+        ):
+            self._sampling_forward_end()
         return output
 
     def close(self):
@@ -305,6 +395,9 @@ class GenericBlockDispatcherRuntime(ImmutableTransformerRuntime):
         self._saved_forwards = ()
         self._invokers = ()
         self._replacements = ()
+        self._sampling_forward_begin = None
+        self._sampling_forward_end = None
+        self._sampling_allocation_failure = None
         super().close()
 
 

@@ -36,6 +36,19 @@ def test_cap_for_live_is_allowance_inverse():
     assert vb.allocator_allowance_bytes(cap, gib(6.77)) == pytest.approx(gib(0.21), abs=gib(0.01))
 
 
+def test_promotion_cap_growth_preserves_allocator_allowance():
+    current = gib(6.5)
+    promoted = gib(0.5)
+    target = vb.cap_bytes_preserving_allowance_after_promotion(
+        current, promoted, gib(9.5)
+    )
+
+    before = vb.allocator_allowance_bytes(current, gib(5.5))
+    after = vb.allocator_allowance_bytes(target, gib(6.0))
+    assert target > current + promoted
+    assert after >= before
+
+
 def test_cap_for_live_clamped_to_cliff():
     cap = vb.cap_bytes_for_live(gib(11.0), gib(2.0), cliff_cap_bytes=gib(9.85))
     assert cap == gib(9.85)
@@ -76,6 +89,18 @@ def test_cold_settles_to_stable_after_k_clean():
     assert s.name == vb.FSM_COLD and a == vb.ACT_HOLD
     s, a = drive(s, CLEAN, k_clean=2)
     assert s.name == vb.FSM_STABLE
+
+
+def test_cold_pressure_raises_cap_when_it_can_relieve():
+    s = vb.ResidencyFsmState()
+    s, a = drive(s, {"binding": True, "cap_can_relieve": True})
+    assert s.name == vb.FSM_CAP_VERIFY and a == vb.ACT_RAISE_CAP
+
+
+def test_cold_pressure_demotes_when_cap_is_pinned():
+    s = vb.ResidencyFsmState()
+    s, a = drive(s, {"binding": True, "cap_can_relieve": False})
+    assert s.name == vb.FSM_COLD and a == vb.ACT_DEMOTE
 
 
 def _stable():

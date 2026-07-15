@@ -108,11 +108,14 @@ def _adapt_quanto_fp8(value) -> Fp8LinearDeclaration | None:
 
 
 def _adapt_torchao_fp8(value) -> Fp8LinearDeclaration | None:
-    try:
-        from torchao.quantization import Float8Tensor
-    except ImportError:
+    from .torchao_compat import (
+        torchao_arena_fp8_supported,
+        torchao_is_float8_tensor,
+    )
+
+    if not torchao_arena_fp8_supported():
         return None
-    if not isinstance(value, Float8Tensor):
+    if not torchao_is_float8_tensor(value):
         return None
     qdata, scale = value.qdata, value.scale
     block_size = tuple(value.block_size or ())
@@ -149,6 +152,11 @@ def set_fp8_grad_input_enabled(enabled: bool) -> None:
     if bool(enabled) and not _FP8_GRAD_INPUT:
         _FP8_GRAD_VERIFIED = None
     _FP8_GRAD_INPUT = bool(enabled)
+
+
+def fp8_grad_input_enabled() -> bool:
+    """Return the Toolkit-owned process policy for FP8 input gradients."""
+    return bool(_FP8_GRAD_INPUT)
 
 
 def reference_dequantize_to(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

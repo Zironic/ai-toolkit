@@ -182,9 +182,10 @@ export interface ModelConfig {
   low_vram: boolean;
   model_kwargs: { [key: string]: any };
   layer_offloading?: boolean;
+  layer_offloading_smart?: boolean;
+  layer_offloading_smart_cap_calibration?: boolean;
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
-  layer_offloading_smart?: boolean;
   layer_offloading_block_stream_only?: boolean;
   layer_offloading_pinned_weight_gb?: number;
   layer_offloading_smart_working_reserve_gb?: number;
@@ -218,6 +219,7 @@ export interface ModelConfig {
   compile_mode?: 'default' | 'max-autotune' | 'fastest';
   compile_fullgraph?: boolean;
   compile_dynamic?: boolean;
+  compile_coordinate_descent?: boolean;
   cache_size_limit?: number;
 }
 
@@ -242,6 +244,7 @@ export interface SampleItem {
 export interface SampleConfig {
   sampler: string;
   sample_every: number;
+  sample_start_step: number;
   width: number;
   height: number;
   prompts?: string[];
@@ -323,6 +326,7 @@ export interface CaptionProcessConfig {
     max_new_tokens?: number;
     fixed_caption?: string;
     caption_extension?: string;
+    thinking?: boolean;
   }
 }
 

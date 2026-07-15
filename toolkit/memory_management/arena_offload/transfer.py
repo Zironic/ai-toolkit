@@ -404,7 +404,11 @@ def _validated_transfer_ranges(
         raise RuntimeError("mm.fetch_start_multi expected a contiguous host_flat")
     if not pin_manager.is_arena_backed(host_flat):
         raise RuntimeError(
-            "mm.fetch_start_multi expected a registered canonical arena source"
+            "mm.fetch_start_multi expected a canonical arena source"
+        )
+    if torch.cuda.is_available() and not pin_manager.is_host_pinned(host_flat):
+        raise RuntimeError(
+            "mm.fetch_start_multi expected the streamed canonical block to be pinned"
         )
     if ranges.device.type != "cpu" or ranges.dtype != torch.int64:
         raise RuntimeError("mm.fetch_start_multi expected CPU int64 ranges")
@@ -678,7 +682,7 @@ def _register_ordered_effects():
 
 # NOT registered at import time: in torch 2.12 ordered-effect tokens trip an
 # internal token-erasure assertion inside the checkpoint HOP lowering
-# (see tests/test_ingraph_training_ops.py, compiled xfail). Phase 4a S1 keeps
+# (see tests/test_ingraph_training_ops.py, compiled xfail). The current path keeps
 # this as the candidate ordering mechanism for the compiled trunk; call it
 # explicitly once the HOP interaction is resolved (torch upgrade or flat-trunk
 # design without the checkpoint HOP).

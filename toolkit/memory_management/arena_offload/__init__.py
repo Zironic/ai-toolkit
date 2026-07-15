@@ -20,6 +20,7 @@ the legacy manager remains a separate backend.
 from .api import (
     ArenaOffloadConfig,
     close_arena_offload,
+    estimate_training_working_reserve_hint_bytes,
     get_arena_runtime,
     is_arena_offloaded,
     is_memory_managed,
@@ -27,6 +28,7 @@ from .api import (
     prepare_canonical_storage,
     prepare_canonical_storage_from_state_dict,
     prepare_arena_offload,
+    validate_arena_training_mode,
 )
 from .runtime import ArenaOffloadRuntime
 from .dispatcher import DISPATCHER_GENERATION
@@ -47,6 +49,7 @@ __all__ = [
     "get_arena_runtime",
     "get_memory_runtime",
     "discover_blocks",
+    "estimate_training_working_reserve_hint_bytes",
     "is_arena_offloaded",
     "is_memory_managed",
     "memory_runtime_owns_compile",
@@ -54,4 +57,5 @@ __all__ = [
     "prepare_canonical_storage",
     "prepare_canonical_storage_from_state_dict",
     "prepare_arena_offload",
+    "validate_arena_training_mode",
 ]

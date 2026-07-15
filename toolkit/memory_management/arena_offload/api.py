@@ -18,6 +18,12 @@ from dataclasses import dataclass, field
 from typing import Any
 import warnings
 
+from toolkit.quantization.torchao_compat import (
+    TORCHAO_ARENA_FP8_MIN_VERSION,
+    TORCHAO_VERSION,
+    torchao_arena_fp8_supported,
+)
+
 from ..runtime import (
     RUNTIME_ATTR,
     close_memory_runtime,
@@ -34,7 +40,8 @@ _COMPATIBILITY_ALIASES = {
     "layer_offloading_smart_working_reserve_gb": (
         "layer_offloading_smart_headroom_gb",
     ),
-    "layer_offloading_smart_wddm_margin_gb": (
+    "layer_offloading_smart_physical_vram_headroom_gb": (
+        "layer_offloading_smart_wddm_margin_gb",
         "layer_offloading_smart_buffer_gb",
     ),
     "layer_offloading_smart_wddm_hard_gb": (
@@ -43,13 +50,83 @@ _COMPATIBILITY_ALIASES = {
     "layer_offloading_smart_sampling_working_reserve_gb": (
         "layer_offloading_smart_sampling_headroom_gb",
     ),
-    "layer_offloading_smart_sampling_wddm_margin_gb": (
+    "layer_offloading_smart_sampling_physical_vram_headroom_gb": (
+        "layer_offloading_smart_sampling_wddm_margin_gb",
         "layer_offloading_smart_sampling_buffer_gb",
     ),
     "layer_offloading_smart_sampling_wddm_hard_gb": (
         "layer_offloading_smart_sampling_hard_buffer_gb",
     ),
 }
+
+
+def estimate_training_working_reserve_hint_bytes(
+    dataset_configs, *, batch_size: int = 1
+) -> int | None:
+    """Estimate the worst configured image-training working set.
+
+    Dataset ``resolution`` is an area target: a 1024 bucket is approximately
+    1024**2 pixels regardless of aspect ratio. Diffusion transformers normally
+    see one token per 16x16 image pixels after VAE and patch compression.
+    Planning from the largest configured bucket prevents earlier low-resolution
+    steps from licensing residency that the later bucket cannot support.
+    """
+    max_image_tokens = 0
+    for dataset in dataset_configs or ():
+        resolution = getattr(dataset, "resolution", 0)
+        if isinstance(resolution, Sequence) and not isinstance(
+            resolution, (str, bytes)
+        ):
+            candidates = resolution
+        else:
+            candidates = (resolution,)
+        for candidate in candidates:
+            try:
+                side = max(0, int(candidate))
+            except (TypeError, ValueError):
+                continue
+            image_tokens = (side * side + 255) // 256
+            max_image_tokens = max(max_image_tokens, image_tokens)
+    if max_image_tokens <= 0:
+        return None
+
+    from ..vram_budget import estimate_training_working_reserve_bytes
+
+    batch = max(1, int(batch_size or 1))
+    return estimate_training_working_reserve_bytes(
+        max_image_tokens * batch,
+        text_tokens=512 * batch,
+    )
+
+
+def validate_arena_training_mode(
+    *,
+    full_finetune=False,
+    mutates_base_weights=False,
+    train_text_encoder=False,
+    unload_text_encoder=True,
+) -> None:
+    """Reject mutable-base configurations before model loading.
+
+    Canonical arena leaves are immutable frozen base weights. Full-parameter
+    training or merge-in save workflows require a different storage
+    architecture, independent of the model or quantization integration.
+    """
+    if full_finetune:
+        raise ValueError(
+            "arena offload requires frozen base transformer weights and does "
+            "not support full-model fine-tuning"
+        )
+    if mutates_base_weights:
+        raise ValueError(
+            "arena offload requires immutable base transformer weights and "
+            "does not support merge_network_on_save"
+        )
+    if train_text_encoder or not unload_text_encoder:
+        raise ValueError(
+            "arena offload does not support a text encoder during training; "
+            "cache text embeddings and unload the text encoder"
+        )
 
 
 def unwrap(model):
@@ -67,13 +144,14 @@ class _ArenaPolicyOptions:
     """Internal policy inputs retained while fork job aliases are migrated."""
 
     working_reserve_gib: float | None = None
-    wddm_margin_gib: float | None = None
+    physical_vram_headroom_gib: float | None = None
     wddm_hard_gib: float | None = None
+    cap_calibration: bool = False
     checkpoint_keep_last: int = 0
     prefetch_depth: int = 3
 
     sampling_working_reserve_gib: float | None = None
-    sampling_wddm_margin_gib: float | None = None
+    sampling_physical_vram_headroom_gib: float | None = None
     sampling_wddm_hard_gib: float | None = 1.0
 
 
@@ -90,6 +168,7 @@ class ArenaOffloadConfig:
     fp8_backward: bool = False
     fp8_sampling: bool = False
     compile_blocks: bool = False
+    strict_vram_cap: bool = False
     _compile_dynamic: bool | None = True
     _compile_dynamic_hints: tuple[tuple[int, int | None, int | None], ...] = ()
     # Validation knob: pretend the card is this many GiB, so small-card
@@ -131,6 +210,11 @@ class ArenaOffloadConfig:
         requested_backward = bool(get("layer_offloading_fp8_grad_input", False))
         requested_sampling = bool(get("layer_offloading_fp8_sampling", False))
         ignored = []
+        torchao_fp8_unavailable = bool(
+            fp8_weights
+            and get("qtype") == "float8"
+            and not torchao_arena_fp8_supported()
+        )
         if not fp8_weights:
             ignored.extend(
                 name
@@ -143,6 +227,13 @@ class ArenaOffloadConfig:
             )
         elif requested_backward and not requested_forward:
             ignored.append("fp8_backward_without_fp8_forward")
+        if torchao_fp8_unavailable and any(
+            (requested_forward, requested_backward, requested_sampling)
+        ):
+            ignored.append(
+                "torchao_fp8_requires_"
+                f"{TORCHAO_ARENA_FP8_MIN_VERSION}_installed_{TORCHAO_VERSION}"
+            )
         if ignored:
             warnings.warn(
                 "arena offload ignored irrelevant FP8 options: "
@@ -156,16 +247,22 @@ class ArenaOffloadConfig:
                 get("layer_offloading", False)
                 and get("layer_offloading_smart", False)
             ),
-            fp8_forward=fp8_weights and requested_forward,
+            fp8_forward=(
+                fp8_weights and not torchao_fp8_unavailable and requested_forward
+            ),
             fp8_backward=fp8_weights
+            and not torchao_fp8_unavailable
             and requested_forward
             and requested_backward,
             fp8_sampling=fp8_weights
+            and not torchao_fp8_unavailable
             and requested_sampling,
-            compile_blocks=bool(
-                get("compile", False)
-                or get("compile_sample", False)
-                or get("train_compile_blocks", False)
+            # Arena execution has one shared block dispatcher for training
+            # and sampling, so Toolkit's supported model compile setting owns
+            # both phases.
+            compile_blocks=bool(get("compile", False)),
+            strict_vram_cap=bool(
+                get("layer_offloading_strict_vram_cap", False)
             ),
             _compile_dynamic=(
                 None
@@ -180,8 +277,13 @@ class ArenaOffloadConfig:
             ),
             _policy=_ArenaPolicyOptions(
                 working_reserve_gib=working_reserve_gib,
-                wddm_margin_gib=get("layer_offloading_smart_wddm_margin_gb"),
+                physical_vram_headroom_gib=get(
+                    "layer_offloading_smart_physical_vram_headroom_gb"
+                ),
                 wddm_hard_gib=get("layer_offloading_smart_wddm_hard_gb"),
+                cap_calibration=bool(
+                    get("layer_offloading_smart_cap_calibration", False)
+                ),
                 checkpoint_keep_last=max(
                     0, int(get("layer_offloading_checkpoint_keep_last", 0) or 0)
                 ),
@@ -189,8 +291,8 @@ class ArenaOffloadConfig:
                 sampling_working_reserve_gib=get(
                     "layer_offloading_smart_sampling_working_reserve_gb"
                 ),
-                sampling_wddm_margin_gib=get(
-                    "layer_offloading_smart_sampling_wddm_margin_gb"
+                sampling_physical_vram_headroom_gib=get(
+                    "layer_offloading_smart_sampling_physical_vram_headroom_gb"
                 ),
                 sampling_wddm_hard_gib=get(
                     "layer_offloading_smart_sampling_wddm_hard_gb", 1.0
@@ -229,7 +331,11 @@ def prepare_canonical_storage(
             }
         )
         arena = CanonicalArena()
-        build = arena.prepare(entries, model=transformer)
+        build = arena.prepare(
+            entries,
+            model=transformer,
+            pin_on_finish=False,
+        )
         if resources is not None:
             resources.adopt_canonical_build(build)
         return build

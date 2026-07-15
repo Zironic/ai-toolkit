@@ -55,6 +55,14 @@ def close_memory_runtime(model) -> None:
 
 def close_memory_runtime_preparation(model_owner) -> None:
     """Release a loader-scoped preparation that never published a runtime."""
+    pending_models = getattr(model_owner, "_arena_pending_load_models", ())
+    if hasattr(model_owner, "_arena_pending_load_models"):
+        delattr(model_owner, "_arena_pending_load_models")
+    if pending_models:
+        from .arena_offload.load_session import discard_pending_canonical_build
+
+        for model in pending_models:
+            discard_pending_canonical_build(model)
     operation = getattr(model_owner, "cleanup_memory_runtime_preparation", None)
     if operation is not None:
         operation()

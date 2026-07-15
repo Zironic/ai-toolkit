@@ -389,34 +389,40 @@ export default function SimpleJob({
                 />
                 {jobConfig.config.process[0].model.layer_offloading && (
                   <div className="pt-2">
-                    {modelArch?.name === 'krea2' && (
-                      <>
-                        <Checkbox
-                          label="Arena Transformer Offloading"
-                          checked={jobConfig.config.process[0].model.layer_offloading_smart || false}
-                          onChange={value =>
-                            setJobConfig(value, 'config.process[0].model.layer_offloading_smart')
-                          }
-                          docKey="model.layer_offloading_smart"
-                        />
-                        {jobConfig.config.process[0].model.layer_offloading_smart &&
-                          jobConfig.config.process[0].model.quantize &&
-                          ['qfloat8', 'float8'].includes(jobConfig.config.process[0].model.qtype || '') && (
-                            <Checkbox
-                              label="Native FP8 Sampling"
-                              checked={jobConfig.config.process[0].model.layer_offloading_fp8_sampling || false}
-                              onChange={value =>
-                                setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_sampling')
-                              }
-                              docKey="model.layer_offloading_fp8_sampling"
-                            />
-                          )}
-                      </>
+                    <Checkbox
+                      label="Automatic Arena Offloading"
+                      checked={jobConfig.config.process[0].model.layer_offloading_smart || false}
+                      onChange={value => setJobConfig(value, 'config.process[0].model.layer_offloading_smart')}
+                      docKey="model.layer_offloading_smart"
+                    />
+                    {jobConfig.config.process[0].model.layer_offloading_smart && (
+                      <Checkbox
+                        label="Calibrate PyTorch VRAM"
+                        checked={
+                          jobConfig.config.process[0].model.layer_offloading_smart_cap_calibration || false
+                        }
+                        onChange={value =>
+                          setJobConfig(
+                            value,
+                            'config.process[0].model.layer_offloading_smart_cap_calibration',
+                          )
+                        }
+                        docKey="model.layer_offloading_smart_cap_calibration"
+                      />
                     )}
-                    {!(
-                      modelArch?.name === 'krea2' &&
-                      jobConfig.config.process[0].model.layer_offloading_smart
-                    ) && (
+                    {jobConfig.config.process[0].model.layer_offloading_smart &&
+                      jobConfig.config.process[0].model.quantize &&
+                      ['qfloat8', 'float8'].includes(jobConfig.config.process[0].model.qtype || '') && (
+                        <Checkbox
+                          label="Native FP8 Sampling"
+                          checked={jobConfig.config.process[0].model.layer_offloading_fp8_sampling || false}
+                          onChange={value =>
+                            setJobConfig(value, 'config.process[0].model.layer_offloading_fp8_sampling')
+                          }
+                          docKey="model.layer_offloading_fp8_sampling"
+                        />
+                      )}
+                    {!jobConfig.config.process[0].model.layer_offloading_smart && (
                       <SliderInput
                         label="Transformer Offload %"
                         value={Math.round(
@@ -1404,6 +1410,15 @@ export default function SimpleJob({
                   onChange={value => setJobConfig(value, 'config.process[0].sample.sample_every')}
                   placeholder="eg. 250"
                   min={1}
+                  required
+                />
+                <NumberInput
+                  label="Sample Start Step"
+                  value={jobConfig.config.process[0].sample.sample_start_step ?? 0}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.sample_start_step')}
+                  placeholder="eg. 0"
+                  className="pt-2"
+                  min={0}
                   required
                 />
                 <SelectInput

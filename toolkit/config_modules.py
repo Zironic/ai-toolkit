@@ -797,12 +797,19 @@ class ModelConfig:
             "layer_offloading_smart_wddm_margin_gb",
             kwargs.get("layer_offloading_smart_buffer_gb", -1.0),
         )
+        self.layer_offloading_smart_physical_vram_headroom_gb = kwargs.get(
+            "layer_offloading_smart_physical_vram_headroom_gb",
+            self.layer_offloading_smart_wddm_margin_gb,
+        )
         self.layer_offloading_wddm_spill_reserve_pct = kwargs.get(
             "layer_offloading_wddm_spill_reserve_pct", 0.10
         )
         self.layer_offloading_smart_wddm_hard_gb = kwargs.get(
             "layer_offloading_smart_wddm_hard_gb",
             kwargs.get("layer_offloading_smart_hard_buffer_gb", 1.0),
+        )
+        self.layer_offloading_smart_cap_calibration = kwargs.get(
+            "layer_offloading_smart_cap_calibration", False
         )
         # Sampling layout changes are independent from training offload and
         # must be explicitly requested. Native FP8 sampling is a second,
@@ -823,6 +830,10 @@ class ModelConfig:
         self.layer_offloading_smart_sampling_wddm_margin_gb = kwargs.get(
             "layer_offloading_smart_sampling_wddm_margin_gb",
             kwargs.get("layer_offloading_smart_sampling_buffer_gb", -1.0),
+        )
+        self.layer_offloading_smart_sampling_physical_vram_headroom_gb = kwargs.get(
+            "layer_offloading_smart_sampling_physical_vram_headroom_gb",
+            self.layer_offloading_smart_sampling_wddm_margin_gb,
         )
         self.layer_offloading_smart_sampling_wddm_hard_gb = kwargs.get(
             "layer_offloading_smart_sampling_wddm_hard_gb",
@@ -897,6 +908,10 @@ class ModelConfig:
         self.layer_offloading_wddm_cap_strict = kwargs.get(
             "layer_offloading_wddm_cap_strict", False
         )
+        self.layer_offloading_strict_vram_cap = kwargs.get(
+            "layer_offloading_strict_vram_cap",
+            self.layer_offloading_wddm_cap_strict,
+        )
         # Validation knob: run as if the card had this many GiB of VRAM. The
         # difference against the real card is hidden from BOTH total and free
         # (and enforced by the allocator cap), so residency planning, streaming
@@ -941,6 +956,9 @@ class ModelConfig:
         self.compile_mode = kwargs.get("compile_mode", "default")
         self.compile_fullgraph = kwargs.get("compile_fullgraph", False)
         self.compile_dynamic = kwargs.get("compile_dynamic", True)
+        self.compile_coordinate_descent = kwargs.get(
+            "compile_coordinate_descent", None
+        )
         # Explicit torch._dynamo.mark_dynamic hints applied to the immutable
         # runtime's per-block hidden-state tensor before each block_fn call,
         # e.g. ((1, 256, 4096),) marks dim 1 (sequence length) dynamic over

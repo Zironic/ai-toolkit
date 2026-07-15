@@ -68,20 +68,20 @@ class BaseJob:
     def cleanup(self, on_cleaned=None):
         """Release every process owned by this job, even after a partial failure."""
         errors = []
-        for process in reversed(getattr(self, "process", ())):
+        processes = list(getattr(self, "process", ()))
+        for process in reversed(processes):
             try:
                 process.cleanup()
             except Exception as error:
                 errors.append(f"{type(process).__name__}: {error}")
-            finally:
-                process.job = None
         if errors:
-            self.process.clear()
             raise RuntimeError("job cleanup failed: " + "; ".join(errors))
+        for process in processes:
+            process.job = None
         if on_cleaned is not None:
             # Detached UI workers use this boundary to exit after owned
             # resources are closed but before CPython recursively finalizes the
             # trainer object graph. A normal callback returns and cleanup keeps
             # the existing reference-release behavior.
             on_cleaned()
-        self.process.clear()
+        self.process = []

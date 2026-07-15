@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest import mock
 
-from toolkit.memory_management import bounce_pool, dxgi_meminfo, pin_manager
+from toolkit.memory_management import dxgi_meminfo, pin_manager
 
 GIB = 1024 ** 3
 
@@ -53,7 +53,7 @@ class DxgiHeadroomTests(unittest.TestCase):
         with mock.patch.object(
             dxgi_meminfo, "query_non_local_video_memory_info", return_value=None
         ):
-            with mock.patch.object(bounce_pool, "_psutil", _FakePsutil(32 * GIB)):
+            with mock.patch.object(pin_manager, "_psutil", _FakePsutil(32 * GIB)):
                 with mock.patch.dict(
                     os.environ,
                     {
@@ -63,8 +63,8 @@ class DxgiHeadroomTests(unittest.TestCase):
                     },
                     clear=False,
                 ):
-                    bounce_pool.register_pinned_bytes(3 * GIB)
-                    self.assertEqual(bounce_pool.pinned_bytes_headroom(0), 5 * GIB)
+                    pin_manager.register_pinned_bytes(3 * GIB)
+                    self.assertEqual(pin_manager.pinned_bytes_headroom(0), 5 * GIB)
 
     def test_dxgi_headroom_does_not_subtract_pinned_ledger(self):
         reading = dxgi_meminfo.DxgiMemoryInfo(
@@ -86,10 +86,10 @@ class DxgiHeadroomTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                bounce_pool.register_pinned_bytes(4 * GIB)
+                pin_manager.register_pinned_bytes(4 * GIB)
                 # pct pinned to 0 -> reserve is exactly the 1 GiB floor, so the
                 # focus is the double-subtract invariant (ledger not subtracted).
-                self.assertEqual(bounce_pool.pinned_bytes_headroom(0), 5 * GIB)
+                self.assertEqual(pin_manager.pinned_bytes_headroom(0), 5 * GIB)
 
     def test_control_disable_keeps_legacy_proxy_for_control(self):
         reading = dxgi_meminfo.DxgiMemoryInfo(
@@ -101,7 +101,7 @@ class DxgiHeadroomTests(unittest.TestCase):
         with mock.patch.object(
             dxgi_meminfo, "query_non_local_video_memory_info", return_value=reading
         ):
-            with mock.patch.object(bounce_pool, "_psutil", _FakePsutil(32 * GIB)):
+            with mock.patch.object(pin_manager, "_psutil", _FakePsutil(32 * GIB)):
                 with mock.patch.dict(
                     os.environ,
                     {
@@ -110,14 +110,14 @@ class DxgiHeadroomTests(unittest.TestCase):
                     },
                     clear=False,
                 ):
-                    self.assertEqual(bounce_pool.pinned_bytes_headroom(0), 8 * GIB)
+                    self.assertEqual(pin_manager.pinned_bytes_headroom(0), 8 * GIB)
 
 
 class SpillReserveMarginTests(unittest.TestCase):
     def setUp(self):
         def _clear():
-            bounce_pool._SPILL_RESERVE_FLOOR_GIB_OVERRIDE = None
-            bounce_pool._SPILL_RESERVE_PCT_OVERRIDE = None
+            pin_manager._SPILL_RESERVE_FLOOR_GIB_OVERRIDE = None
+            pin_manager._SPILL_RESERVE_PCT_OVERRIDE = None
         _clear()
         self.addCleanup(_clear)
 
@@ -130,7 +130,7 @@ class SpillReserveMarginTests(unittest.TestCase):
         ):
             # 0.20 * 16 GiB = 3.2 GiB > 2 GiB floor.
             self.assertEqual(
-                bounce_pool.dxgi_spill_reserve_bytes(16 * GIB),
+                pin_manager.dxgi_spill_reserve_bytes(16 * GIB),
                 int(0.20 * 16 * GIB),
             )
 
@@ -142,7 +142,7 @@ class SpillReserveMarginTests(unittest.TestCase):
             clear=False,
         ):
             # 0.20 * 8 GiB = 1.6 GiB < 2 GiB floor.
-            self.assertEqual(bounce_pool.dxgi_spill_reserve_bytes(8 * GIB), 2 * GIB)
+            self.assertEqual(pin_manager.dxgi_spill_reserve_bytes(8 * GIB), 2 * GIB)
 
     def test_margin_falls_back_to_floor_without_budget(self):
         with mock.patch.dict(
@@ -151,8 +151,8 @@ class SpillReserveMarginTests(unittest.TestCase):
              "AI_TOOLKIT_WDDM_SPILL_RESERVE_PCT": "0.20"},
             clear=False,
         ):
-            self.assertEqual(bounce_pool.dxgi_spill_reserve_bytes(None), 2 * GIB)
-            self.assertEqual(bounce_pool.dxgi_spill_reserve_bytes(0), 2 * GIB)
+            self.assertEqual(pin_manager.dxgi_spill_reserve_bytes(None), 2 * GIB)
+            self.assertEqual(pin_manager.dxgi_spill_reserve_bytes(0), 2 * GIB)
 
     def test_config_override_supersedes_env(self):
         with mock.patch.dict(
@@ -161,9 +161,9 @@ class SpillReserveMarginTests(unittest.TestCase):
              "AI_TOOLKIT_WDDM_SPILL_RESERVE_PCT": "0.20"},
             clear=False,
         ):
-            bounce_pool.set_spill_reserve_policy(floor_gib=3.0, pct=0.10)
+            pin_manager.set_spill_reserve_policy(floor_gib=3.0, pct=0.10)
             # config floor 3 GiB dominates 0.10 * 16 = 1.6 GiB.
-            self.assertEqual(bounce_pool.dxgi_spill_reserve_bytes(16 * GIB), 3 * GIB)
+            self.assertEqual(pin_manager.dxgi_spill_reserve_bytes(16 * GIB), 3 * GIB)
 
 
 class SafeForControlTests(unittest.TestCase):
