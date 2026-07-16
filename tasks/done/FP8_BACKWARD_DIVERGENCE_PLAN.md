@@ -3,6 +3,9 @@
 Ticket: git-bug `fce0b45`. Status/progress live on the ticket; this doc is
 the durable design.
 
+> **Concluded 2026-07-16:** Phase 1 answered the headline training-divergence
+> question. The optional expansion phases are not required for that decision.
+
 ## Question
 
 How bad is FP8 grad-input for *training*, measured as compounded trajectory

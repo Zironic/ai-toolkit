@@ -1,9 +1,12 @@
 # Canonical Host Arena + Sidecar Residency Refactor
 
+> **Completed/superseded 2026-07-16:** The immutable arena foundation shipped
+> and was generalized into the production block dispatcher.
+>
 > Durable architecture plan. Mutable status lives in git-bug ticket `628b0cb`.
 > Related: `534ea49` (current pinned arena, the measured reference), `3ca8a7b`
 > (in-graph streaming), `ca8f496` (model-agnostic extraction), and
-> `tasks/open/INGRAPH_STREAM_PLAN.md`.
+> `tasks/done/INGRAPH_STREAM_PLAN.md`.
 >
 > Rewritten 2026-07-10 after the pin-assumption measurement campaign
 > (`scripts/bench_pin_assumptions.py`). The previous revision assumed pin

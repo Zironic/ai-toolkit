@@ -2,7 +2,7 @@
 
 Consumes dump dirs written by scripts/smoke_krea2_train_cuda.py --dump-dir
 (meta.json + horizon_NNNN.pt + loss_series.json) and emits, per horizon and
-per test arm, the plan's metric table (tasks/open/FP8_BACKWARD_DIVERGENCE_PLAN.md):
+per test arm, the plan's metric table (tasks/done/FP8_BACKWARD_DIVERGENCE_PLAN.md):
 
 - effective-update metrics on dW = (alpha/r) * up @ down per LoRA module
   (rel Frobenius, cosine, max abs diff, norm ratio), aggregate + per-block,

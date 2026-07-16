@@ -12,8 +12,7 @@ What makes PRXPixel unusual (and what each override below is doing about it):
     (``in_channels=3``, ``patch_size=16``). We use a ``FakeVAE`` (identity,
     scaling_factor=1) so BaseModel's encode_images/decode_latents become no-ops
     and the "latents" everywhere in the toolkit are just the image in [-1, 1].
-    Same trick as ``../chroma/chroma_radiance_model.py`` and
-    ``extensions/z_image_pixel``.
+    Same trick as ``../chroma/chroma_radiance_model.py``.
 
   - **x-prediction.** The model predicts the CLEAN image x0, not the
     flow-matching velocity. ai-toolkit's MSE compares ``get_noise_prediction``

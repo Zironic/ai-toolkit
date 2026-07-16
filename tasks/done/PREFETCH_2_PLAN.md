@@ -1,6 +1,10 @@
 # Prefetch 2.0 Implementation Plan
 
-> **git-bug:** `ee6fa64` (open) — tune thresholds from real trace captures.
+> **Completed/superseded 2026-07-16:** The core shipped. Threshold and
+> per-shape follow-ups are retired because smart training now routes through
+> the arena path rather than BouncePool prefetch.
+>
+> **git-bug:** `ee6fa64` — historical threshold-tuning follow-up.
 > Core landed under `4bfb44c` (closed) — durable execution trace implemented.
 > Status lives in the tickets; this file is the plan.
 

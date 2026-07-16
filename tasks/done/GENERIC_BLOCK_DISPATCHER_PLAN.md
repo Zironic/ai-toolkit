@@ -1,5 +1,8 @@
 # Generic Block Dispatcher Arena Refactor Plan
 
+> **Completed 2026-07-16:** The generic saved-forward dispatcher is the
+> production arena path; the implementation and GPU acceptance gates passed.
+
 > **git-bug:** `b7dead1` for the overall effort and `b1a13d2` for the Phase 0
 > execution-seam decision.
 >
@@ -9,8 +12,8 @@
 >
 > **Supersedes:** the architecture-adapter execution design in:
 >
-> * `tasks/open/COMPILE_NEUTRAL_KREA2_RUNTIME_REFACTOR_PLAN.md`
-> * `tasks/open/revised_combined_compile_neutral_krea2_refactor_plan.md`
+> * `tasks/done/COMPILE_NEUTRAL_KREA2_RUNTIME_REFACTOR_PLAN.md`
+> * `tasks/done/revised_combined_compile_neutral_krea2_refactor_plan.md`
 > * ticket `6dd9ba6`
 >
 > Existing canonical-arena, residency, transactional commit, fail-closed
@@ -19,7 +22,7 @@
 >
 > This plan extends the physical storage declarations in
 > `toolkit/quantization/storage.py` (the `LayerStorageBinding` work from
-> `tasks/open/OSTRIS_ARENA_QUANTIZATION_PLAN.md`, ticket `c9ee48d`). It does
+> `tasks/done/OSTRIS_ARENA_QUANTIZATION_PLAN.md`, ticket `c9ee48d`). It does
 > not create a parallel storage abstraction. Phase 7 updates
 > `docs/decisions/UPSTREAM_PR_PLAN.md` and ticket `553ffec`.
 
@@ -1157,7 +1160,7 @@ After Krea2 and the second architecture pass:
 Update:
 
 * `docs/decisions/UPSTREAM_PR_PLAN.md`;
-* `tasks/open/UPSTREAM_ARENA_EXTRACTION_PLAN.md`;
+* `tasks/done/UPSTREAM_ARENA_EXTRACTION_PLAN.md`;
 * ticket `553ffec`;
 * tickets `b7dead1` and `6dd9ba6`;
 * maintainer-runnable validation instructions.

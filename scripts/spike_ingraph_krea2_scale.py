@@ -1,4 +1,4 @@
-"""Phase 0b scale spike for tasks/open/INGRAPH_STREAM_PLAN.md (git-bug 3ca8a7b).
+"""Phase 0b scale spike for tasks/done/INGRAPH_STREAM_PLAN.md (git-bug 3ca8a7b).
 
 Runs the toy-spike machinery (tests/test_ingraph_spike.py) against the REAL
 Krea2 fp8 transformer (28 blocks x 8 quantized Linears, ~12 GB qdata):

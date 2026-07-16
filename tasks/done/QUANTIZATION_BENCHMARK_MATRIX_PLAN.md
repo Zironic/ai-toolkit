@@ -3,6 +3,12 @@
 Mutable implementation and run status belongs in git-bug ticket `393f8bf`.
 This document fixes the comparison protocol and artifact contract.
 
+> **Concluded 2026-07-16:** Retained artifacts cover FP8, both native FP8
+> training modes, ConvRot8, ConvRotInt4, and a ConvRot4 fallback run. The real
+> FP4 tensor-core path requires Blackwell (`sm_100+`) and cannot be benchmarked
+> on this RTX 4070. The three-repeat campaign is intentionally retired rather
+> than presenting fallback timing as FP4 hardware performance.
+
 ## Outcome
 
 Produce repeatable, directly comparable Krea2 LoRA training measurements for:

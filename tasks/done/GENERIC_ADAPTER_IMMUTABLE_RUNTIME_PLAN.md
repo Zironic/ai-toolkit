@@ -1,5 +1,9 @@
 # LoKr and DoRA Support in the Immutable Runtime
 
+> **Superseded 2026-07-16:** The functional adapter served as an oracle; the
+> execution adapter was deleted after the generic block dispatcher passed its
+> acceptance gates.
+
 ## Decision
 
 Deliver this work in two independently useful tiers.

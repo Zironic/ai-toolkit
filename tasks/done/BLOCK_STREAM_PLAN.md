@@ -1,7 +1,10 @@
 # True Block Streaming Plan
 
-> **git-bug:** `a696018` (open) — decide whether the block GPU ring should stay
-> gated. Status lives in the ticket; this file is the plan.
+> **Result recorded 2026-07-16:** One-H2D-per-block reduced submit count but
+> regressed wall time. The GPU ring remains gated off, and the generic arena
+> dispatcher supersedes this Krea-specific target path.
+>
+> **git-bug:** `a696018` - block GPU ring decision and recorded result.
 
 ## Goal
 

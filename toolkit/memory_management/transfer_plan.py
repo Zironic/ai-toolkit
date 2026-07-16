@@ -1,5 +1,5 @@
 """Static multi-range transfer plans (Slice 2,
-tasks/open/IMMUTABLE_TRANSFER_ARENA_PLAN.md).
+tasks/done/IMMUTABLE_TRANSFER_ARENA_PLAN.md).
 
 A ``BlockTransferPlan`` says which byte ranges of a canonical block's host
 flat (``canonical_arena.BlockRecord``) need to move to the device for one

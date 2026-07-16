@@ -1,5 +1,9 @@
 # torch.compile for Streamed (Offloaded) Blocks — Plan
 
+> **Superseded 2026-07-16:** This design was first replaced by in-graph
+> streaming and then retired with that backend in favor of the arena
+> dispatcher.
+>
 > Durable plan. Mutable status (what's done / blocked) belongs in a git-bug
 > ticket, not here. Related plans: `BLOCK_STREAM_PLAN.md` (block-granular
 > staging this builds on), `UPSTREAM_PR_D_FP8_TRAINING_PLAN.md`.

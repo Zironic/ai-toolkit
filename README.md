@@ -1,5 +1,14 @@
 # Ostris AI Toolkit
 
+> **This is [Zironic/ai-toolkit](https://github.com/Zironic/ai-toolkit), a fork of
+> [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit).** The fork's work lives
+> on the **`faster-dop`** branch: memory-management / offload streaming so large
+> diffusion models (Krea 2, Z-Image, Anima, ...) train on 12 GB consumer GPUs,
+> Windows/WDDM-aware memory safety, native FP8 execution, crash-resistant
+> checkpointing, and more — see [CHANGES_FROM_UPSTREAM.md](CHANGES_FROM_UPSTREAM.md)
+> for the full tour. The installation commands below clone this fork on
+> `faster-dop`; use the upstream repo for upstream documentation and support.
+
 AI Toolkit is an easy to use all in one training suite for diffusion models. I try to support all the latest models on consumer grade hardware. Image and video models. It can be run as a GUI or CLI. It is designed to be easy to use but still have every feature imaginable. Free and open source.
 
 
@@ -30,6 +39,7 @@ AI Toolkit is an easy to use all in one training suite for diffusion models. I t
 - [HiDream-ai/HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image) (HiDream O1)
 - [Photoroom/prxpixel-t2i](https://huggingface.co/Photoroom/prxpixel-t2i) (PRXPixel)
 - [circlestone-labs/Anima-Base-v1.0-Diffusers](https://huggingface.co/circlestone-labs/Anima-Base-v1.0-Diffusers) (Anima)
+- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2)
 
 ### Instruction / Edit
 - [black-forest-labs/FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) (FLUX.1-Kontext-dev)
@@ -49,7 +59,6 @@ AI Toolkit is an easy to use all in one training suite for diffusion models. I t
 - [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) (Wan 2.2 TI2V 5B)
 - [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) (LTX-2)
 - [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) (LTX-2.3)
-- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2)
 
 ### Audio
 - [ACE-Step/Ace-Step1.5](https://huggingface.co/ACE-Step/Ace-Step1.5) (Ace Step 1.5)
@@ -70,7 +79,7 @@ Requirements:
 
 Linux:
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
+git clone -b faster-dop https://github.com/Zironic/ai-toolkit.git
 cd ai-toolkit
 python3 -m venv venv
 source venv/bin/activate
@@ -87,7 +96,7 @@ Windows:
 If you are having issues with Windows. I recommend using the easy install script at [https://github.com/Tavris1/AI-Toolkit-Easy-Install](https://github.com/Tavris1/AI-Toolkit-Easy-Install)
 
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
+git clone -b faster-dop https://github.com/Zironic/ai-toolkit.git
 cd ai-toolkit
 python -m venv venv
 .\venv\Scripts\activate
@@ -103,7 +112,7 @@ locates at `./run_mac.zsh` that will install the dependencies locally and run th
 do the following:
 
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
+git clone -b faster-dop https://github.com/Zironic/ai-toolkit.git
 cd ai-toolkit
 chmod +x run_mac.zsh
 ./run_mac.zsh
@@ -157,7 +166,7 @@ A folder with the name and the training folder from the config file will be crea
 checkpoints and images in it. You can stop the training at any time using ctrl+c and when you resume, it will pick back up
 from the last checkpoint.
 
-IMPORTANT. If you press crtl+c while it is saving, it will likely corrupt that checkpoint. So wait until it is done saving
+This fork writes checkpoints atomically (each file is written to a temporary path and moved into place, on a background worker), so pressing ctrl+c during a save leaves the previous complete checkpoint intact instead of corrupting it. Letting a save finish before interrupting still avoids losing the newest checkpoint.
 
 ### Need help?
 
@@ -185,7 +194,7 @@ I have also created a short video showing how to get started using AI Toolkit wi
 ### 1. Setup
 #### ai-toolkit:
 ```
-git clone https://github.com/ostris/ai-toolkit.git
+git clone -b faster-dop https://github.com/Zironic/ai-toolkit.git
 cd ai-toolkit
 git submodule update --init --recursive
 python -m venv venv

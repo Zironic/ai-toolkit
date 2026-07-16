@@ -1,6 +1,10 @@
 # Ostris Naive 2 GiB Prefetch Benchmark Plan
 
-> **git-bug:** `267470b` (open) - implementation and benchmark status.
+> **Concluded 2026-07-16:** The upstream arms were infeasible without another
+> memory manager, the local path succeeded, and the campaign intentionally
+> stopped with that limitation recorded.
+>
+> **git-bug:** `267470b` - implementation and benchmark status.
 > This document is the durable design and acceptance criteria; run status and
 > results belong on the ticket.
 

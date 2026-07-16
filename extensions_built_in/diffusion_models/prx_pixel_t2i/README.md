@@ -3,10 +3,13 @@
 ai-toolkit integration for [`Photoroom/prxpixel-t2i`](https://huggingface.co/Photoroom/prxpixel-t2i),
 a ~7B pixel-space diffusion transformer.
 
-It is implemented **from scratch** so ai-toolkit does not depend on the (still
-unmerged) diffusers PR [huggingface/diffusers#13928](https://github.com/huggingface/diffusers/pull/13928):
+It is implemented **from scratch** so ai-toolkit does not depend on diffusers'
+PRX integration ([huggingface/diffusers#13928](https://github.com/huggingface/diffusers/pull/13928),
+merged June 2026): the diffusers revision pinned in `requirements_base.txt`
+(`7c12518a`) predates that merge and has no `PRXPixelPipeline`, so
 the transformer is vendored in [src/transformer_prx.py](src/transformer_prx.py)
 and a minimal preview sampler lives in [src/pipeline.py](src/pipeline.py).
+(If the pin ever moves past the merge, the vendored copies can be reconsidered.)
 
 ## What makes this model unusual
 

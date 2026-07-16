@@ -1,4 +1,4 @@
-"""Phase 0 spike for tasks/open/INGRAPH_STREAM_PLAN.md (git-bug 3ca8a7b).
+"""Phase 0 spike for tasks/done/INGRAPH_STREAM_PLAN.md (git-bug 3ca8a7b).
 
 Proves, on the real GPU, the machinery the in-graph streaming design rests on:
 

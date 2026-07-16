@@ -1,6 +1,6 @@
 """Pin-management assumption benchmarks (evidence for the canonical-arena plan).
 
-Measures the platform facts that tasks/open/IMMUTABLE_TRANSFER_ARENA_PLAN.md
+Measures the platform facts that tasks/done/IMMUTABLE_TRANSFER_ARENA_PLAN.md
 is built on. Re-run after torch/CUDA/driver upgrades; test 1 is the canary for
 torch's is_pinned() semantics, tests 13-15 for Dynamo guard behavior.
 

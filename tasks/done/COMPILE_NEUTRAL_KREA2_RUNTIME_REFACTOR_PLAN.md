@@ -1,6 +1,10 @@
 # Compile-Neutral Generic Transformer Runtime and Krea2 Extraction
 
-> **Partially superseded (2026-07-14):** the architecture-adapter *execution*
+> **Superseded 2026-07-16:** The generic saved-forward block dispatcher is now
+> the production architecture boundary; the comparison adapter was deleted.
+> Canonical arena and lifecycle results were carried into that implementation.
+>
+> **Historical note (2026-07-14):** the architecture-adapter *execution*
 > design in this document (adapter protocol, runtime-owned block loop/trunks,
 > runtime-owned checkpointing, `run_blocks()` delegation) is superseded by
 > `GENERIC_BLOCK_DISPATCHER_PLAN.md` (ticket `b7dead1`). The adapter path

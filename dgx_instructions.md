@@ -1,6 +1,12 @@
 # AI Toolkit by Ostris
 
-## DGX OS installation instructions
+## DGX OS installation instructions (DGX Spark / Grace, ARM64)
+
+These instructions target **ARM64 (aarch64) DGX systems** — DGX Spark and other
+NVIDIA Grace-based machines — which is why the miniconda and Node.js downloads
+below are ARM64 builds. On an x86-64 DGX system, follow the standard Linux
+instructions in the [README](README.md) instead, substituting x86-64 installers
+where needed.
 
 You need to use Python 3.11 to run AI Toolkit on DGX OS. The easiest way to do this without affecting the system installation of Python is to create a virtual environment with **miniconda**, which allows you to specify the version of Python to use in the environment.
 
@@ -58,7 +64,7 @@ Download a Linux ARM64 build of Node.js from: https://nodejs.org (for example: h
 
 Extract it and add the bin directory to your path. I extracted it to **/opt** and added the following to my ~/.bashrc file:
 ```
-export PATH=“/opt/node-v24.11.1-linux-arm64/bin:$PATH”
+export PATH="/opt/node-v24.11.1-linux-arm64/bin:$PATH"
 ```
 
 

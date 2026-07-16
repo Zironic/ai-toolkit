@@ -215,6 +215,8 @@ The comparison passes for both ordinary reference modulation and
 
 ## Repository State Note
 
-`tasks/open/OSTRIS_NAIVE_PREFETCH_BENCHMARK_PLAN.md` appeared untracked after
-the pre-merge checkpoint. It was not from upstream, was not included in either
-commit, and remained local when the branch was pushed.
+The plan formerly at `tasks/open/OSTRIS_NAIVE_PREFETCH_BENCHMARK_PLAN.md`
+appeared untracked after the pre-merge checkpoint. It was not from upstream,
+was not included in either commit, and remained local when the branch was
+pushed. It is now archived at
+`tasks/done/OSTRIS_NAIVE_PREFETCH_BENCHMARK_PLAN.md`.

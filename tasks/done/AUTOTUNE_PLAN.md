@@ -1,9 +1,12 @@
 # Dynamic working-reserve + keep_last autotune — implementation plan
 
-> **git-bug:** `68d3565` (open) — manual WDDM cliff guard: validate proactive
-> demotion across resolutions. This plan spans the broader working-reserve /
-> keep_last autotune; open sub-tickets track individual pieces. Status lives in
-> the tickets; this file is the plan.
+> **Completed/superseded 2026-07-16:** The legacy controller work is
+> implemented; active smart training now uses arena policy and the calibrated
+> memory cap.
+>
+> **git-bug:** `68d3565` - manual WDDM cliff guard validation across
+> resolutions. This plan spans the broader working-reserve / keep_last
+> autotune; status and results live in the ticket.
 
 > **Terminology (renamed).** The single word "headroom" used to mean two
 > different things; the budget is now split into named buckets:
@@ -50,7 +53,7 @@ desktop footprint and lowers our ceiling mid-run.
 So **never target a hardcoded total.** Target driver-level free memory, which
 already accounts for everyone (us + DWM + other processes).
 
-`_cuda_memory` ([manager.py](manager.py)) already reads `mem_get_info`, exposing
+`_cuda_memory` ([manager.py](../../toolkit/memory_management/manager.py)) already reads `mem_get_info`, exposing
 driver-level `device_used_gb` / `device_free_gb` in each perf-log record. The
 spill cliff is exactly when driver-level **free → 0**.
 
@@ -88,7 +91,7 @@ correct.
 ## Stage A — keep_last retarget (speed-based)
 
 Retarget the existing `CheckpointKeepLastAutotuner`
-([checkpoint_autotuner.py](checkpoint_autotuner.py)) from "largest keep_last
+([checkpoint_autotuner.py](../../toolkit/memory_management/checkpoint_autotuner.py)) from "largest keep_last
 that fits in reserved" to **"keep_last that minimizes windowed step time."**
 
 - Per resolution bucket (already structured that way).
@@ -137,7 +140,7 @@ is where the real win is.
 
 ## The one genuinely new mechanic: live re-plan
 
-`smart_training_plan` ([manager.py L574](manager.py)) runs **once at attach** and
+`smart_training_plan` ([manager.py L574](../../toolkit/memory_management/manager.py)) runs **once at attach** and
 never moves the offload boundary again. Stage B needs to **promote/demote
 individual layers mid-run** (move a few weights GPU↔CPU+pinned, flip the
 `_layer_memory_manager` offload flag). `attach` does this en masse; a bounded
@@ -150,7 +153,7 @@ per-layer version is the new, riskiest code.
 
 Precedent for the measure→derive→re-plan loop already exists for **sampling**:
 `_sampling_peak_headroom_bytes` learned and fed as `max(default, learned)` into
-the next plan ([manager.py L1026-1147](manager.py)). Stage B is the training,
+the next plan ([manager.py L1026-1147](../../toolkit/memory_management/manager.py)). Stage B is the training,
 within-run equivalent.
 
 ## Wiring / config

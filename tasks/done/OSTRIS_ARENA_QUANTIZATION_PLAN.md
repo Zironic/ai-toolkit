@@ -1,5 +1,10 @@
 # OstrisLinear Arena Quantization Support Plan
 
+> **Completed 2026-07-16:** Arena storage and execution now support every
+> current `OstrisLinear` generically through registered buffers, bias, and the
+> module's own quantizer. Ticket `c9ee48d` is closed. Hardware-specific fast
+> paths remain the responsibility of each quantizer and device.
+
 > **git-bug:** `c9ee48d` ("Add compressed OstrisLinear support to smart arena
 > offload"). Mutable implementation status, validation results, and handoff
 > notes belong in that ticket.
@@ -635,7 +640,7 @@ separate user-launched acceptance step and must be recorded on the ticket.
 - Build on the immutable arena implementation tracked by `628b0cb`; do not
   recreate legacy in-graph streaming machinery.
 - Build adapter integration on ticket `6dd9ba6` and
-  `tasks/open/GENERIC_ADAPTER_IMMUTABLE_RUNTIME_PLAN.md`. The current worktree
+  `tasks/done/GENERIC_ADAPTER_IMMUTABLE_RUNTIME_PLAN.md`. The current worktree
   contains uncommitted adapter/runtime changes, so implementation must rebase
   its assumptions on the settled protocol before editing overlapping files.
 - Preserve the arena package's separation from the legacy manager.

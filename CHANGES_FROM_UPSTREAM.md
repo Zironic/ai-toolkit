@@ -12,8 +12,9 @@ This is not a file-by-file changelog. It is a practical guide to the fork's
 headline features: what they are for, who might want them, and which ideas are
 useful outside this repository.
 
-For the exhaustive implementation audit, see
-[`CHANGES_FROM_UPSTREAM_UPDATED.md`](CHANGES_FROM_UPSTREAM_UPDATED.md).
+For implementation detail beyond this guide, read the code, the plans under
+`tasks/`, the rationale docs under `docs/decisions/`, and
+`git diff <upstream commit>...<fork commit>` between the two commits above.
 
 ---
 

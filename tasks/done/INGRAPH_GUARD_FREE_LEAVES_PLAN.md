@@ -1,5 +1,8 @@
 # In-Graph Guard-Free Leaves Plan
 
+> **Superseded 2026-07-16:** The legacy in-graph backend was retired by
+> commit `3dd7f389`; no production leaf-guard work remains on that path.
+>
 > Status lives in git-bug ticket `fdc66d8`.
 > Related: `INGRAPH_STREAM_PLAN.md` (weights-as-inputs guard-free rule),
 > `INGRAPH_PHASE4A_TRAINING_PLAN.md` (compiled fully-streamed training),

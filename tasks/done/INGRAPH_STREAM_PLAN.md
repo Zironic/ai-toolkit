@@ -1,5 +1,9 @@
 # In-Graph Weight Streaming — Full Implementation Plan
 
+> **Completed then retired 2026-07-16:** The sampling and training proofs
+> succeeded. The backend was later removed by commit `3dd7f389` after the
+> generic arena dispatcher became the production path.
+>
 > Durable plan. Status lives in a git-bug ticket, not here.
 > Architecture amendment (2026-07-10):
 > `IMMUTABLE_TRANSFER_ARENA_PLAN.md` supersedes component 1's mutable

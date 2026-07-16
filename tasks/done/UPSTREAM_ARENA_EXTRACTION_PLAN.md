@@ -1,10 +1,14 @@
 # Upstream Arena Extraction Plan
 
+> **Published 2026-07-16:** The extracted arena implementation is upstream PR
+> [#948](https://github.com/ostris/ai-toolkit/pull/948). Ticket `553ffec` is
+> closed with the PR URL recorded.
+
 > Strategy: `docs/decisions/UPSTREAM_PR_PLAN.md`
 >
-> Runtime design: `tasks/open/GENERIC_BLOCK_DISPATCHER_PLAN.md`
+> Runtime design: `tasks/done/GENERIC_BLOCK_DISPATCHER_PLAN.md`
 >
-> Status belongs on git-bug ticket `553ffec`; this document contains the
+> Historical status belongs on git-bug ticket `553ffec`; this document contains the
 > extraction design and acceptance boundary.
 
 ## Outcome

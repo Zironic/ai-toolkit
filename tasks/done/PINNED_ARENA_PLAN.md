@@ -1,5 +1,8 @@
 # Pinned Arena Phase 2: budget integration + full train->sample->train cycle
 
+> **Completed then superseded 2026-07-16:** The phase delivered its acceptance
+> boundary and was later generalized into the canonical arena.
+
 Tickets: 534ea49 (boundary pin churn), 763bb75 (register/alloc collision + pack
 leak). Phase 1 (landed 2026-07-08) built the arena mechanics: `pinned_arena.py`,
 attach/detach/unpin guards, sampling-boundary survival, ingraph sampling pack

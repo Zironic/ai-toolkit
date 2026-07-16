@@ -6,7 +6,9 @@
 # never shows up as a trainable arch. To register a real model, import its
 # class there and append it to the AI_TOOLKIT_MODELS list. (Models can also
 # live in their own folder under extensions/, which defines its own
-# AI_TOOLKIT_MODELS list -- see extensions/z_image_pixel for a tiny example.)
+# module-level AI_TOOLKIT_MODELS list -- the scan in
+# toolkit/util/get_model.py:get_all_models() treats extensions/ and
+# extensions_built_in/ identically.)
 from .example_model import ExampleModel
 
 __all__ = ["ExampleModel"]

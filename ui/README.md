@@ -1,36 +1,45 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AI Toolkit UI
 
-## Getting Started
+The web interface for AI Toolkit: start/stop/monitor training jobs, build job
+configs, browse datasets and sample images, and (in this fork) read git-bug
+tickets at `/tickets`. It is a Next.js App Router app (`src/`) plus a
+background worker process.
 
-First, run the development server:
+## Architecture
+
+Both `npm run dev` and `npm run start` launch **two processes** via
+`concurrently`:
+
+- **UI** — the Next.js app. Production (`npm run start`) serves on port
+  **8675**.
+- **Worker** — `cron/worker.ts`. It polls the database for queued jobs and
+  actually launches/stops training runs, invoking the repo's Python through
+  the project venv (`cron/pythonPath.ts`). Jobs keep running if the UI page is
+  closed, but the worker process must be alive for jobs to start and be
+  managed.
+
+State lives in a SQLite database managed by Prisma (`prisma/schema.prisma`;
+the database file `aitk_db.db` sits at the repo root). `npm run update_db`
+runs `prisma generate` + `prisma db push` and is part of `build_and_start`.
+
+## Commands
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm run build_and_start   # install deps, sync DB, build worker + UI, serve on :8675
+npm run dev               # hot-reload dev server + worker
+npm test                  # vitest
+npm run lint              # next lint
+npm run format            # prettier
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Notes
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- The worker shells out to this repository's Python environment, so the UI
+  must run **on the training machine** (repo checkout + venv + GPU). It is
+  not deployable to Vercel or any host detached from the toolkit.
+- To require an auth token, set the `AI_TOOLKIT_AUTH` environment variable
+  before starting (see the root [README](../README.md)).
+- The Tickets page (`/tickets`) reconstructs git-bug tickets by reading
+  `refs/bugs/*` with read-only git (`src/server/gitbug.ts`); it never takes
+  git-bug's store lock, so it is the safe way to browse tickets while the
+  CLI is in use.

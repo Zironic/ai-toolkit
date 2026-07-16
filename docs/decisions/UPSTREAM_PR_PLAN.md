@@ -2,10 +2,10 @@
 
 > **git-bug:** see the ticket "Arena offload: pre-PR refactor and upstream
 > extraction". Status lives in the ticket; this file is the strategy.
-> Execution plan: `../../tasks/open/UPSTREAM_ARENA_EXTRACTION_PLAN.md`.
+> Execution plan: `../../tasks/done/UPSTREAM_ARENA_EXTRACTION_PLAN.md`.
 
 > **Terminology note.** The reserve vocabulary was renamed; see the glossary at
-> the top of `../../tasks/open/AUTOTUNE_PLAN.md`. In short: **working_reserve** =
+> the top of `../../tasks/done/AUTOTUNE_PLAN.md`. In short: **working_reserve** =
 > our transient working set (the old "headroom"), **system_reserve** = measured
 > uncontrolled VRAM, **wddm_margin** = the cushion above the ~500 MB WDDM churn
 > cliff, **usable** = what is left for resident weights + ring.
@@ -133,7 +133,7 @@ Arranged as reviewable commit groups, in dependency order:
 The in-fork pre-PR refactor (old Stage 2) still happens first and is not part
 of the PR diff. Deferred follow-ups (resident + native-FP8 sampling, second
 architecture) are unchanged. Step-by-step execution:
-`tasks/open/UPSTREAM_ARENA_EXTRACTION_PLAN.md`.
+`tasks/done/UPSTREAM_ARENA_EXTRACTION_PLAN.md`.
 
 The arena is an **additional** backend. Upstream's per-linear `MemoryManager`
 stays, recognizably unchanged apart from adopting the host-memory safety layer -
@@ -211,7 +211,7 @@ refactor on an untested prediction, and let its breakage list re-order the work.
   semantic `Fp8LinearSpec` via per-backend construction adapters (TorchAO
   `Float8Tensor`, Quanto `QBytesTensor`), and native qualification dispatches
   on the spec, never backend identity. Implemented and focus-tested; see
-  `../../tasks/open/OSTRIS_ARENA_QUANTIZATION_PLAN.md` and ticket `c9ee48d`.
+  `../../tasks/done/OSTRIS_ARENA_QUANTIZATION_PLAN.md` and ticket `c9ee48d`.
 
 ## One-sentence upstream framing
 

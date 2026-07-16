@@ -1,7 +1,7 @@
 """Phase 0 seam proof for the generic block dispatcher (ticket b1a13d2).
 
 Proves (or kills) the core mechanism of the generic block dispatcher plan
-(tasks/open/GENERIC_BLOCK_DISPATCHER_PLAN.md): a real Krea SingleStreamBlock
+(tasks/done/GENERIC_BLOCK_DISPATCHER_PLAN.md): a real Krea SingleStreamBlock
 whose ordinary forward executes from explicitly substituted state via
 OriginalBlockInvoker + torch.func.functional_call, eager and compiled, with
 backward and model-owned non-reentrant checkpoint recomputation.

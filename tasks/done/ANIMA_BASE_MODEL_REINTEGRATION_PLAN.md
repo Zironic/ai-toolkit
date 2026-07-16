@@ -2,6 +2,9 @@
 
 Ticket: `8e5e883` (`Re-integrate Anima correctly`)
 
+> **Completed 2026-07-16:** The BaseModel reintegration is implemented. Real
+> TE-worker validation remains tracked separately on ticket `98ffdf9`.
+
 ## Goal
 
 Make Anima a first-class `BaseModel` implementation under

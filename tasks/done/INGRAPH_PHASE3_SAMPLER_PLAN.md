@@ -1,5 +1,8 @@
 # In-Graph Phase 3 — Fully Streamed Compiled Sampling (execution plan)
 
+> **Completed then retired 2026-07-16:** The phase proof succeeded; the
+> in-graph backend was later removed by commit `3dd7f389`.
+>
 > Durable plan. Status lives in git-bug `3ca8a7b`, not here.
 > Parent: `INGRAPH_STREAM_PLAN.md` (this document is the execution plan for
 > its Phase 3, re-scoped after the first roadblock). Incorporates the

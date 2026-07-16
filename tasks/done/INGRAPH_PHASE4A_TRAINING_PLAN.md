@@ -1,5 +1,8 @@
 # In-Graph Streaming Phase 4a — full-checkpoint streamed training compile
 
+> **Completed then retired 2026-07-16:** The training proof passed; the
+> in-graph backend was later removed by commit `3dd7f389`.
+>
 > Execution plan for `INGRAPH_STREAM_PLAN.md` Phase 4 Rung 2 (Rung 1 was
 > de-scoped to synthetic scale — see the parent plan; its three risk items
 > are retired by `tests/test_training_compile_synthetic.py`). Status lives

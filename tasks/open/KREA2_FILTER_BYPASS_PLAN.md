@@ -1,5 +1,8 @@
 # Krea2 content-filter bypass — mechanistic study & intervention plan
 
+> **git-bug:** `fe5dcca` (open) - finish the step-gated teacher evaluation and
+> make the distillation decision. Mutable status and evidence belong there.
+
 > **Type:** design / plan doc (durable). Mutable status (what's running, what's
 > blocked) belongs in a git-bug ticket, not here. Edit this file when the
 > *approach* changes, not to log progress.
@@ -381,7 +384,7 @@ offload path). Relevant facts:
   manager) — not the residency pattern. Alternating residency alone does not
   create overlap in eager mode.
 
-See `tasks/open/PREFETCH_2_PLAN.md` and `tasks/open/BLOCK_STREAM_PLAN.md` for the
+See `tasks/done/PREFETCH_2_PLAN.md` and `tasks/done/BLOCK_STREAM_PLAN.md` for the
 streaming machinery this rides on.
 
 ## Resolved issues

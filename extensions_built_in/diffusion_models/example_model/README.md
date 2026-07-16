@@ -31,7 +31,10 @@ example/
    `extensions_built_in/diffusion_models/__init__.py` — import your class
    there and append it to `AI_TOOLKIT_MODELS`.
    (Alternatively, give your model its own folder under `extensions/` with its
-   own `AI_TOOLKIT_MODELS` list — see `extensions/z_image_pixel/`.)
+   own module-level `AI_TOOLKIT_MODELS` list — the scan treats `extensions/`
+   and `extensions_built_in/` identically. No built-in model currently uses
+   that path; `extensions/example/` shows the analogous folder-scan pattern
+   for job extensions via `AI_TOOLKIT_EXTENSIONS`.)
 3. The class attribute `arch` (e.g. `"example"`) is matched against
    `model.arch` in the training config YAML to pick your class.
 4. To expose it in the web UI, add an entry to
