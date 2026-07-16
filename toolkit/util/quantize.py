@@ -452,7 +452,17 @@ def assign_quantized_state_dict_subset(
 def quantize_model(
     base_model: "BaseModel",
     model_to_quantize: torch.nn.Module,
+    *,
+    canonical_build=None,
 ):
+    """Quantize a transformer, optionally populating final arena storage.
+
+    ``canonical_build`` is used by full-model smoke loaders that do not own a
+    checkpoint-specific streaming loader. Each repeated block is quantized,
+    copied into its final canonical destination, and released before the next
+    block is processed. Normal production callers leave it unset and retain
+    the existing quantize-then-attach behavior.
+    """
     from toolkit.dequantize import patch_dequantization_on_save
 
     if not hasattr(base_model, "get_transformer_block_names"):
@@ -467,6 +477,11 @@ def quantize_model(
     exclude_modules = base_model.get_quantization_exclude_modules() or []
 
     if base_model.model_config.accuracy_recovery_adapter is not None:
+        if canonical_build is not None:
+            raise ValueError(
+                "direct arena quantization does not support an accuracy "
+                "recovery adapter"
+            )
         from toolkit.config_modules import NetworkConfig
         from toolkit.lora_special import LoRASpecialNetwork
 
@@ -618,7 +633,7 @@ def quantize_model(
         # move and quantize only certain pieces at a time.
         quantization_type = get_qtype(base_model.model_config.qtype)
         # all_blocks = list(model_to_quantize.transformer_blocks)
-        all_blocks: List[torch.nn.Module] = []
+        all_blocks: List[tuple[str, torch.nn.Module]] = []
         transformer_block_names = base_model.get_transformer_block_names()
         for name in transformer_block_names:
             # name may be a dotted path for models that nest their blocks
@@ -629,19 +644,32 @@ def quantize_model(
                 if block_list is None:
                     break
             if block_list is not None:
-                all_blocks += list(block_list)
+                all_blocks += [
+                    (f"{name}.{index}", block)
+                    for index, block in enumerate(block_list)
+                ]
         base_model.print_and_status_update(
             f" - quantizing {len(all_blocks)} transformer blocks"
         )
-        for block in tqdm(all_blocks):
+        for block_key, block in tqdm(all_blocks):
             block.to(base_model.device_torch, dtype=base_model.torch_dtype, non_blocking=True)
             quantize(block, weights=quantization_type)
             freeze(block)
+            block.requires_grad_(False)
             # NOT non_blocking: an async D2H allocates the cpu destination in pinned
             # memory, which the caching host allocator keeps forever (with power-of-2
             # bucket rounding on top) — that silently retained a model-sized chunk of
             # host ram after the weights moved back to the gpu for training
-            block.to("cpu")
+            if canonical_build is None:
+                block.to("cpu")
+            else:
+                from toolkit.memory_management.arena_offload import (
+                    populate_canonical_block_from_model,
+                )
+
+                populate_canonical_block_from_model(
+                    canonical_build, block_key, block
+                )
 
         # todo, on extras find a universal way to quantize them on device and move them back to their original
         # device without having to move the transformer blocks to the device first
@@ -649,3 +677,7 @@ def quantize_model(
         # model_to_quantize.to(base_model.device_torch, dtype=base_model.torch_dtype)
         quantize(model_to_quantize, weights=quantization_type, exclude=exclude_modules)
         freeze(model_to_quantize)
+        if canonical_build is not None:
+            canonical_build.finish_population()
+
+    return canonical_build

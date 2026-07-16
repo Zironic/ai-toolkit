@@ -108,6 +108,13 @@ def _torch_compile_backend_unavailable_reason() -> Optional[str]:
     return None
 
 
+def _set_dynamo_cache_size_limit(limit: int) -> None:
+    """Apply Toolkit's cache-size knob across old and current Torch names."""
+    for limit_name in ('recompile_limit', 'cache_size_limit'):
+        if hasattr(torch._dynamo.config, limit_name):
+            setattr(torch._dynamo.config, limit_name, int(limit))
+
+
 def _detach_to_cpu(obj):
     """Deep-copy an optimizer state_dict onto CPU, cloning every tensor.
 
@@ -727,14 +734,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     lambda: dop_executor.shutdown(wait=False, cancel_futures=True),
                 )
                 self._dop_cache_executor = None
-
-            db_executor = getattr(self, "thread_pool", None)
-            if db_executor is not None:
-                attempt(
-                    "UI database executor",
-                    lambda: db_executor.shutdown(wait=False, cancel_futures=True),
-                )
-                self.thread_pool = None
 
             sd = getattr(self, "sd", None)
             runtime = getattr(self, "_arena_runtime", None)
@@ -2569,6 +2568,71 @@ class BaseSDTrainProcess(BaseTrainProcess):
             f"{len(shapes)} observed shapes."
         )
 
+    def _validate_arena_fullgraph_static_recompile_budget(self):
+        """Reject a strict static arena job that is guaranteed to exhaust Dynamo."""
+        if not getattr(self.model_config, 'compile', False):
+            return
+
+        runtime = get_memory_runtime(unwrap_model(self.sd.unet))
+        if runtime is None:
+            return
+        config = runtime.config
+        if not (
+            config.compile_blocks
+            and getattr(config, '_compile_fullgraph', False)
+            and getattr(config, '_compile_dynamic', True) is False
+        ):
+            return
+
+        configured_limit = getattr(self.model_config, 'cache_size_limit', None)
+        if configured_limit is None:
+            dynamo_config = torch._dynamo.config
+            configured_limit = getattr(
+                dynamo_config,
+                'recompile_limit',
+                getattr(dynamo_config, 'cache_size_limit', 8),
+            )
+        limit = int(configured_limit)
+
+        layout = self.sd.get_compile_sequence_layout()
+        shapes = None if layout is None else self._observed_input_shapes(layout)
+        if not shapes:
+            print_acc(
+                "[ArenaOffload] WARNING arena_fullgraph_static_shapes_unknown: "
+                "compile_fullgraph=True and compile_dynamic=False, but the "
+                "job's compiled sequence shapes could not be enumerated. "
+                "Use compile_dynamic=True unless cache_size_limit is sized "
+                "for every training and sampling shape."
+            )
+            return
+
+        from toolkit.compile_shape_bounds import estimate_hidden_sequence_variants
+
+        variants = estimate_hidden_sequence_variants(
+            transformer=unwrap_model(self.sd.unet),
+            observed_shapes=shapes,
+            layout=layout,
+        )
+        if variants is None:
+            print_acc(
+                "[ArenaOffload] WARNING arena_fullgraph_static_shapes_unknown: "
+                "the job's compiled sequence sizes could not be derived. "
+                "Use compile_dynamic=True unless cache_size_limit is sized "
+                "for every training and sampling shape."
+            )
+            return
+
+        variant_floor = len(variants)
+        if variant_floor >= limit:
+            raise RuntimeError(
+                "arena_fullgraph_static_recompile_limit: "
+                f"observed_variant_floor={variant_floor} limit={limit}; "
+                "compile_fullgraph=True with compile_dynamic=False can hit "
+                "Dynamo's per-code-object limit during training. Set "
+                "compile_dynamic=True or raise cache_size_limit above the "
+                "observed variant count."
+            )
+
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
@@ -3222,6 +3286,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.model_config.train_compile_blocks = False
 
         self._apply_derived_compile_dynamic_hints()
+        self._validate_arena_fullgraph_static_recompile_budget()
 
         # ============================================================
         # COMPILE
@@ -3296,7 +3361,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 cache_size_limit = getattr(self.model_config, 'cache_size_limit', None)
                 user_set_cache_limit = cache_size_limit is not None
                 if user_set_cache_limit:
-                    torch._dynamo.config.cache_size_limit = cache_size_limit
+                    # PyTorch 2.12 enforces recompile_limit; older releases
+                    # exposed the same per-code cap as cache_size_limit. Keep
+                    # the existing job knob effective on both APIs.
+                    _set_dynamo_cache_size_limit(cache_size_limit)
                 configure_cuda_only_inductor()
                 # Compile failures must remain visible for every weight format.
                 # In particular, quantized graphs used to suppress an actual
@@ -3329,7 +3397,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         "Set compile_mode explicitly to opt into more aggressive modes."
                     )
 
-                if is_quantized and compile_fullgraph:
+                if is_quantized and compile_fullgraph and not runtime_owns_block_compile:
                     print_acc(
                         "Quantized model detected: fullgraph=True is incompatible, "
                         "switching to fullgraph=False."
@@ -3343,8 +3411,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # ====================================================
                 if runtime_owns_block_compile:
                     print_acc(
-                        "Arena offload owns block compilation; "
-                        "skipping trainer compile."
+                        "Arena offload owns "
+                        + ("strict fullgraph " if compile_fullgraph else "")
+                        + "block compilation; skipping trainer compile."
                     )
                 elif block_compile:
                     BLOCK_LIST_ATTRS = self.sd.get_transformer_block_names()
@@ -3446,12 +3515,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # WHOLE MODEL COMPILE
                 # ====================================================
                 else:
-                    if immutable_compile_owner:
-                        print_acc(
-                            "WARNING: whole-model compile around the arena dispatcher "
-                            "is allowed but has unvalidated performance; dispatcher "
-                            "boundaries remain outside compiled arena policy code."
-                        )
                     print_acc("Compiling model with torch.compile (whole-model compile).")
                     print_acc("The first forward pass will hang for a while. This is normal.")
 

@@ -532,6 +532,33 @@ def test_base_model_restores_arena_only_after_text_encoder_offload():
     assert events == [("text", "cpu"), ("arena", "restore")]
 
 
+def test_base_model_device_state_supports_te_only_partial_load():
+    text_encoder = mock.Mock()
+    model = SimpleNamespace(
+        vae=None,
+        unet=None,
+        text_encoder=text_encoder,
+        adapter=None,
+        refiner_unet=None,
+    )
+    state = {
+        "vae": {"training": False, "device": "cpu", "requires_grad": False},
+        "unet": {"training": False, "device": "cpu", "requires_grad": False},
+        "text_encoder": {
+            "training": False,
+            "device": "cuda",
+            "requires_grad": False,
+        },
+    }
+
+    with mock.patch("toolkit.models.base_model.flush"):
+        BaseModel.set_device_state(model, state)
+
+    text_encoder.eval.assert_called_once_with()
+    text_encoder.to.assert_called_once_with("cuda")
+    text_encoder.requires_grad_.assert_called_once_with(False)
+
+
 def test_base_model_text_cache_preset_activates_only_text_encoder():
     model = SimpleNamespace(
         save_device_state=mock.Mock(),
@@ -706,6 +733,11 @@ def test_backend_import_and_shared_private_state_boundaries():
     ).read_text(encoding="utf-8")
     assert "if runtime_owns_block_compile:" in trainer_source
     assert "if runtime_owns_block_compile and block_compile:" not in trainer_source
+    assert (
+        "is_quantized and compile_fullgraph and not runtime_owns_block_compile"
+        in trainer_source
+    )
+    assert "strict fullgraph " in trainer_source
 
 
 def test_legacy_manager_does_not_import_arena_backend():

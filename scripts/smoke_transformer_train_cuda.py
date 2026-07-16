@@ -13,24 +13,20 @@ The default phase sequence `train,train,sample,train` proves training ->
 sampling -> training survival: sample state publication, checkpoint state
 staying usable, compiled training kernels surviving the transition.
 
-KNOWN BLOCKERS (the smoke exists ahead of the work it gates; see the
-multi-architecture smoke plan):
-  * zimage / ideogram4: no generic arena attach exists yet; those models
-    still use the legacy MemoryManager.attach. The runner fails loudly with
-    a pointer to the generic-dispatcher plan.
+Every profile defaults to the smoke-only direct-to-arena load lifecycle.
+Use ``--load-mode production-model-load`` only when the production checkpoint
+loading path itself is the behavior under test.
 
 Examples:
 
     venv\\Scripts\\python.exe scripts\\smoke_transformer_train_cuda.py ^
       --profile zimage --model-path "<z-image-path>" ^
-      --load-mode "YesIWantToCauseTBOfPagingOnPurposeBecauseImExplicitlyBenchmarkingDiskLoad" ^
       --cond-cache "<cond.safetensors>" --qtype qfloat8 ^
       --adapter-variant lora --phase-sequence train,train,sample,train ^
       --resolution 256x256
 
     venv\\Scripts\\python.exe scripts\\smoke_transformer_train_cuda.py ^
       --profile ideogram4 --model-path "<ideogram4-path>" ^
-      --load-mode "YesIWantToCauseTBOfPagingOnPurposeBecauseImExplicitlyBenchmarkingDiskLoad" ^
       --cond-cache "<short.safetensors>" --cond-cache "<long.safetensors>" ^
       --batch-size 2 --qtype convrot4 --adapter-variant lora ^
       --resolution 256x256
@@ -40,8 +36,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
+import platform
 import sys
 import time
 from pathlib import Path
@@ -59,11 +57,9 @@ from scripts.smoke_profiles import (  # noqa: E402
 )
 from scripts.smoke_runtime import (  # noqa: E402
     CudaPhysicalFreeMonitor,
-    LOAD_MODES,
-    PAGING_LOAD_MODE,
-    PRODUCTION_LOAD_MODE,
     SMOKE_DIRECT_LOAD_MODE,
     add_contention_args,
+    add_load_mode_arg,
     add_lock_args,
     assert_smoke_load_mode,
     configure_smoke_load_mode,
@@ -154,6 +150,414 @@ def _print_json(row):
     print(json.dumps(row, indent=2, sort_keys=True, default=str))
 
 
+def _tensor_checksum(tensor) -> str:
+    value = tensor.detach().float().contiguous().cpu()
+    return hashlib.sha256(value.numpy().tobytes()).hexdigest()
+
+
+def _gradient_checksum(module) -> str | None:
+    digest = hashlib.sha256()
+    found = False
+    for name, parameter in sorted(module.named_parameters()):
+        if parameter.grad is None:
+            continue
+        found = True
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(parameter.grad.shape)).encode("ascii"))
+        value = parameter.grad.detach().float().contiguous().cpu()
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest() if found else None
+
+
+def _git_head() -> str | None:
+    head_path = REPO_ROOT / ".git" / "HEAD"
+    try:
+        head = head_path.read_text(encoding="ascii").strip()
+        if not head.startswith("ref: "):
+            return head
+        ref = head[5:]
+        ref_path = REPO_ROOT / ".git" / ref
+        if ref_path.is_file():
+            return ref_path.read_text(encoding="ascii").strip()
+        packed = REPO_ROOT / ".git" / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text(encoding="ascii").splitlines():
+                if line.endswith(f" {ref}"):
+                    return line.split(" ", 1)[0]
+    except OSError:
+        return None
+    return None
+
+
+def _megacache_manifest(args, model, phases, device) -> dict:
+    import torch._functorch.config as functorch_config
+    import torch._inductor.config as inductor_config
+    from toolkit.memory_management.arena_offload import DISPATCHER_GENERATION
+
+    try:
+        import triton
+
+        triton_version = triton.__version__
+    except Exception:
+        triton_version = None
+    manifest = {
+        "schema": "ai_toolkit.full_model_megacache.v1",
+        "toolkit_git_head": _git_head(),
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "triton": triton_version,
+        "cuda_runtime": torch.version.cuda,
+        "gpu_name": torch.cuda.get_device_name(device),
+        "gpu_capability": list(torch.cuda.get_device_capability(device)),
+        "model": {
+            "profile": args.profile,
+            "path": args.model_path,
+            "qtype": model.model_config.qtype,
+            "adapter_variant": args.adapter_variant,
+            "lora_rank": int(args.lora_rank),
+            "lora_alpha": float(args.lora_alpha),
+            "assistant_lora": args.assistant_lora,
+        },
+        "workload": {
+            "resolution": args.resolution,
+            "batch_size": int(args.batch_size),
+            "phase_sequence": list(phases),
+            "seed": int(args.seed),
+            "conditioning": [str(Path(path).resolve()) for path in args.cond_cache],
+        },
+        "compile": {
+            "backend": "inductor",
+            "mode": "default",
+            "fullgraph": bool(args.compile_fullgraph),
+            "dynamic": args.compile_dynamic_resolved,
+            "dispatcher_generation": str(DISPATCHER_GENERATION),
+            "aot_autograd_cache": bool(functorch_config.enable_autograd_cache),
+            "strict_autograd_cache": bool(functorch_config.strict_autograd_cache),
+            "fx_graph_cache": bool(inductor_config.fx_graph_cache),
+            "autotune_local_cache": bool(inductor_config.autotune_local_cache),
+            "coordinate_descent_tuning": bool(
+                inductor_config.coordinate_descent_tuning
+            ),
+            "coordinate_descent_check_all_directions": bool(
+                inductor_config.coordinate_descent_check_all_directions
+            ),
+            "compile_threads": os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"),
+        },
+    }
+    encoded = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    manifest["fingerprint"] = hashlib.sha256(encoded).hexdigest()
+    return manifest
+
+
+def _write_json_atomic(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _manifest_sidecar_path(args) -> Path | None:
+    if args.megacache_manifest:
+        return Path(args.megacache_manifest).resolve()
+    if args.megacache_artifact:
+        artifact = Path(args.megacache_artifact).resolve()
+        return artifact.with_name(f"{artifact.name}.manifest.json")
+    return None
+
+
+def _artifact_inventory_has(counts: dict[str, int], name: str) -> bool:
+    name = name.lower()
+    return any(name in key.lower() and int(value) > 0 for key, value in counts.items())
+
+
+def _artifact_inventory_count(counts: dict[str, int], name: str) -> int:
+    name = name.lower()
+    return sum(
+        int(value) for key, value in counts.items() if name in key.lower()
+    )
+
+
+def _validate_megacache_evidence(
+    expected_arm: str,
+    evidence: dict,
+    expected_variants: int | None,
+) -> list[str]:
+    failures = []
+    if evidence.get("aot_bypass") or evidence.get("fx_bypass"):
+        failures.append(f"{expected_arm}: compiler cache bypass observed: {evidence}")
+    if evidence.get("graph_breaks"):
+        failures.append(f"{expected_arm}: internal graph breaks observed: {evidence}")
+
+    cold = expected_arm in ("cold", "empty-control", "invalidation")
+    if cold:
+        if not evidence.get("aot_miss") or not evidence.get("fx_miss"):
+            failures.append(
+                f"{expected_arm}: cold execution did not miss both AOT and FX caches: "
+                f"{evidence}"
+            )
+        if not evidence.get("backend_codegen_observed"):
+            failures.append(
+                f"{expected_arm}: cold execution performed no observable backend codegen"
+            )
+        variant_key = "aot_miss"
+    else:
+        if not evidence.get("aot_hit") or not evidence.get("fx_hit"):
+            failures.append(
+                f"{expected_arm}: warm execution did not hit both AOT and FX caches: "
+                f"{evidence}"
+            )
+        if evidence.get("aot_miss") or evidence.get("fx_miss"):
+            failures.append(f"{expected_arm}: warm execution also had cache misses: {evidence}")
+        warm_work = (
+            evidence.get("backend_codegen_observed")
+            or evidence.get("inductor_codegen_calls")
+            or evidence.get("triton_compile_calls")
+            or evidence.get("autotune_benchmark_calls")
+            or evidence.get("coordinate_descent_calls")
+        )
+        if warm_work:
+            failures.append(f"{expected_arm}: warm execution performed compiler work: {evidence}")
+        variant_key = "aot_hit"
+
+    if expected_variants is not None:
+        actual = int(evidence.get(variant_key, 0))
+        if actual != expected_variants:
+            failures.append(
+                f"{expected_arm}: expected {expected_variants} {variant_key} "
+                f"variants, observed {actual}"
+            )
+    return failures
+
+
+def _start_megacache_diagnostics(args) -> dict | None:
+    if args.megacache_mode == "off":
+        return None
+
+    import torch._functorch.config as functorch_config
+    import torch._inductor.config as inductor_config
+
+    from scripts.megacache_diagnostics import (
+        cache_dir_stats,
+        install_backend_instrumentation,
+    )
+
+    cache_dir_value = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if not cache_dir_value:
+        raise SystemExit(
+            "MegaCache matrix modes require TORCHINDUCTOR_CACHE_DIR to be set "
+            "before this process imports torch; use run_full_model_megacache_matrix.py"
+        )
+    cache_dir = Path(cache_dir_value).resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    initial_disk = cache_dir_stats(cache_dir)
+    shared = args.megacache_expected_arm == "shared-disk"
+    if shared and not initial_disk["files"]:
+        raise SystemExit("shared-disk arm requires the producer's populated cache dir")
+    if shared and not args.megacache_allow_populated_inductor_cache:
+        raise SystemExit(
+            "shared-disk arm requires --megacache-allow-populated-inductor-cache"
+        )
+    if not shared and initial_disk["files"]:
+        raise SystemExit(
+            f"{args.megacache_expected_arm} arm requires an empty Inductor cache "
+            f"directory, found {initial_disk['files']} files in {cache_dir}"
+        )
+
+    functorch_config.enable_autograd_cache = True
+    functorch_config.strict_autograd_cache = True
+    inductor_config.fx_graph_cache = True
+    inductor_config.autotune_local_cache = True
+    return {
+        "cache_dir": cache_dir,
+        "initial_disk": initial_disk,
+        "backend_calls": install_backend_instrumentation(),
+    }
+
+
+def _activate_megacache(
+    args,
+    model,
+    phases,
+    device,
+    diagnostics: dict | None,
+    failures: list[str],
+) -> dict | None:
+    if diagnostics is None:
+        return None
+
+    from scripts.megacache_diagnostics import cache_dir_stats
+    from toolkit.compile_cache import load_compile_cache_artifact
+
+    torch._dynamo.utils.counters.clear()
+    diagnostics["backend_baseline"] = dict(diagnostics["backend_calls"])
+    manifest = _megacache_manifest(args, model, phases, device)
+    artifact_path = (
+        None
+        if args.megacache_artifact is None
+        else Path(args.megacache_artifact).resolve()
+    )
+    manifest_path = _manifest_sidecar_path(args)
+    producer_manifest = None
+    manifest_matches = None
+    loaded = None
+    load_seconds = 0.0
+
+    if args.megacache_mode == "consume":
+        if manifest_path is None or not manifest_path.is_file():
+            failures.append(f"MegaCache producer manifest is absent: {manifest_path}")
+        else:
+            try:
+                producer_manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                failures.append(f"failed to read MegaCache producer manifest: {error}")
+        if producer_manifest is not None:
+            manifest_matches = (
+                producer_manifest.get("fingerprint") == manifest.get("fingerprint")
+            )
+            if args.megacache_expected_arm == "megacache" and not manifest_matches:
+                failures.append(
+                    "MegaCache consumer manifest does not match the producer; "
+                    "artifact load was rejected"
+                )
+            elif args.megacache_expected_arm == "invalidation" and manifest_matches:
+                failures.append(
+                    "invalidation arm did not change a compile-relevant manifest field"
+                )
+        should_load = manifest_matches or args.megacache_expected_arm == "invalidation"
+        if should_load and artifact_path is not None:
+            started = time.perf_counter()
+            loaded = load_compile_cache_artifact(artifact_path)
+            load_seconds = time.perf_counter() - started
+            if loaded is None:
+                failures.append(f"torch rejected or did not find MegaCache artifact {artifact_path}")
+
+    diagnostics.update(
+        {
+            "manifest": manifest,
+            "producer_manifest": producer_manifest,
+            "manifest_matches": manifest_matches,
+            "artifact": None if artifact_path is None else str(artifact_path),
+            "manifest_path": None if manifest_path is None else str(manifest_path),
+            "loaded": loaded is not None,
+            "loaded_artifacts": (
+                {} if loaded is None else loaded.artifact_counts
+            ),
+            "artifact_bytes_loaded": 0 if loaded is None else loaded.byte_count,
+            "load_seconds": load_seconds,
+            "disk_after_load": cache_dir_stats(diagnostics["cache_dir"]),
+        }
+    )
+    if loaded is not None:
+        if not _artifact_inventory_has(loaded.artifact_counts, "aot"):
+            failures.append(
+                f"loaded MegaCache inventory has no AOT artifact: {loaded.artifact_counts}"
+            )
+        if not _artifact_inventory_has(loaded.artifact_counts, "inductor"):
+            failures.append(
+                "loaded MegaCache inventory has no Inductor artifact: "
+                f"{loaded.artifact_counts}"
+            )
+        expected = args.megacache_expected_variants
+        if expected is not None and _artifact_inventory_count(
+            loaded.artifact_counts, "aot"
+        ) != expected:
+            failures.append(
+                f"loaded MegaCache inventory does not contain {expected} AOT variants: "
+                f"{loaded.artifact_counts}"
+            )
+    return diagnostics
+
+
+def _finish_megacache(args, diagnostics: dict | None, failures: list[str]) -> dict | None:
+    if diagnostics is None:
+        return None
+
+    from scripts.megacache_diagnostics import (
+        cache_dir_stats,
+        cache_evidence,
+        counter_snapshot,
+        numeric_delta,
+    )
+    from toolkit.compile_cache import (
+        save_compile_cache_artifact,
+        windows_triton_bundle_fallback_stats,
+    )
+
+    counters = counter_snapshot(torch)
+    backend_delta = numeric_delta(
+        diagnostics["backend_calls"], diagnostics["backend_baseline"]
+    )
+    evidence = cache_evidence(counters, backend_delta)
+    saved = None
+    save_seconds = 0.0
+    if args.megacache_mode == "produce":
+        started = time.perf_counter()
+        saved = save_compile_cache_artifact(args.megacache_artifact)
+        save_seconds = time.perf_counter() - started
+        if saved is None:
+            failures.append("torch produced no MegaCache artifact")
+        else:
+            manifest_path = _manifest_sidecar_path(args)
+            if manifest_path is None:
+                failures.append("MegaCache producer has no manifest path")
+            else:
+                _write_json_atomic(manifest_path, diagnostics["manifest"])
+            if not _artifact_inventory_has(saved.artifact_counts, "aot"):
+                failures.append(
+                    f"saved MegaCache inventory has no AOT artifact: {saved.artifact_counts}"
+                )
+            if not _artifact_inventory_has(saved.artifact_counts, "inductor"):
+                failures.append(
+                    "saved MegaCache inventory has no Inductor artifact: "
+                    f"{saved.artifact_counts}"
+                )
+            expected = args.megacache_expected_variants
+            if expected is not None and _artifact_inventory_count(
+                saved.artifact_counts, "aot"
+            ) != expected:
+                failures.append(
+                    f"saved MegaCache inventory does not contain {expected} AOT variants: "
+                    f"{saved.artifact_counts}"
+                )
+
+    if args.megacache_expected_arm in ("megacache", "invalidation") and not diagnostics[
+        "loaded"
+    ]:
+        failures.append(
+            f"{args.megacache_expected_arm} consumer did not accept an artifact"
+        )
+    failures.extend(
+        _validate_megacache_evidence(
+            args.megacache_expected_arm,
+            evidence,
+            args.megacache_expected_variants,
+        )
+    )
+    diagnostics.update(
+        {
+            "counters": counters,
+            "backend_calls": backend_delta,
+            "evidence": evidence,
+            "saved_artifacts": {} if saved is None else saved.artifact_counts,
+            "artifact_bytes_saved": 0 if saved is None else saved.byte_count,
+            "save_seconds": save_seconds,
+            "disk_after_execute": cache_dir_stats(diagnostics["cache_dir"]),
+            "windows_triton_bundle_fallback": (
+                windows_triton_bundle_fallback_stats()
+            ),
+        }
+    )
+    diagnostics["cache_dir"] = str(diagnostics["cache_dir"])
+    return diagnostics
+
+
 def _install_nonfinite_trace(transformer):
     """Report the first non-finite major-stage output without tracing leaves."""
     state = {"first": None}
@@ -200,17 +604,18 @@ def _install_nonfinite_trace(transformer):
 # Arena attach (shared; profiles must not own this)
 # ---------------------------------------------------------------------------
 
-def _attach_arena_runtime(model, transformer, profile, device):
-    """Attach the arena runtime the way load_model() would.
-
-    Krea2 already exposes the integration seam. The other architectures wait
-    on the generic block dispatcher (tasks/open/GENERIC_BLOCK_DISPATCHER_PLAN.md,
-    tickets b7dead1 / b1a13d2); until it lands this fails loudly rather than
-    silently falling back to the legacy per-Linear manager.
-    """
+def _attach_arena_runtime(
+    model, transformer, profile, device, *, canonical_build=None
+):
+    """Attach the arena runtime, adopting any smoke-prepared canonical build."""
     ignore_modules = profile.arena_ignore_modules(transformer)
     attach = getattr(model, "_attach_immutable_training_memory", None)
     if attach is not None:
+        if canonical_build is not None:
+            if getattr(model, "_prepared_canonical_build", None) is not None:
+                canonical_build.rollback()
+                raise RuntimeError("smoke_multiple_prepared_canonical_builds")
+            model._prepared_canonical_build = canonical_build
         runtime = attach(transformer, ignore_modules)
         # Mirror the production load_model sequence. Ranged quantized loading
         # leaves non-block modules on CPU; after canonical commit the runtime
@@ -228,6 +633,7 @@ def _attach_arena_runtime(model, transformer, profile, device):
         block_names=model.get_transformer_block_names(),
         config=ArenaOffloadConfig.from_model_config(model.model_config),
         ignore_modules=ignore_modules,
+        canonical_build=canonical_build,
     )
     runtime.place_permanent_modules(device, model.torch_dtype)
 
@@ -310,7 +716,7 @@ def _parse_resolution(spec):
     return int(w_s), int(h_s)
 
 
-def _parse_args():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Shared multi-architecture CUDA training smoke. "
         "Do not hook this up to pytest."
@@ -328,17 +734,7 @@ def _parse_args():
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--qtype", default="qfloat8")
     parser.add_argument("--cache-dir", default=None)
-    parser.add_argument(
-        "--load-mode",
-        choices=LOAD_MODES,
-        default=None,
-        help=(
-            "checkpoint lifecycle; Krea2 defaults to "
-            "smoke-direct-to-arena. Use production-model-load only to test "
-            "production loading code. Other profiles require the explicit "
-            "paging-risk opt-in value"
-        ),
-    )
+    add_load_mode_arg(parser)
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--max-text-length", type=int, default=512)
     parser.add_argument("--resolution", default="256x256")
@@ -375,6 +771,30 @@ def _parse_args():
     parser.add_argument(
         "--compile-dynamic", choices=("true", "false", "none"), default="true"
     )
+    parser.add_argument("--compile-fullgraph", action="store_true")
+    parser.add_argument(
+        "--compile-coordinate-descent",
+        choices=("true", "false", "none"),
+        default="none",
+        help="explicit TorchAO/Inductor coordinate-descent policy",
+    )
+    parser.add_argument(
+        "--megacache-mode",
+        choices=("off", "produce", "control", "consume"),
+        default="off",
+        help="full-model MegaCache matrix role; the matrix runner sets this",
+    )
+    parser.add_argument("--megacache-artifact", default=None)
+    parser.add_argument("--megacache-manifest", default=None)
+    parser.add_argument(
+        "--megacache-expected-arm",
+        choices=("cold", "empty-control", "shared-disk", "megacache", "invalidation"),
+        default=None,
+    )
+    parser.add_argument("--megacache-expected-variants", type=int, default=None)
+    parser.add_argument(
+        "--megacache-allow-populated-inductor-cache", action="store_true"
+    )
     parser.add_argument(
         "--attention-backend",
         choices=("native", "flash"),
@@ -389,34 +809,26 @@ def _parse_args():
     )
     add_contention_args(parser)
     add_lock_args(parser)
-    args = parser.parse_args()
-    if args.load_mode is None:
-        if args.profile == "krea2":
-            args.load_mode = SMOKE_DIRECT_LOAD_MODE
-        elif args.profile == "anima":
-            args.load_mode = PRODUCTION_LOAD_MODE
-        else:
-            parser.error(
-                "this profile requires explicit --load-mode "
-                f"{PAGING_LOAD_MODE!r} because ordinary loading can cause "
-                "terabytes of paging"
-            )
-    if (
-        args.profile not in ("krea2", "anima")
-        and args.load_mode != PAGING_LOAD_MODE
-    ):
-        parser.error(
-            "safe load modes are currently supported only by Krea2 for this "
-            "multi-architecture harness"
-        )
-    if args.profile == "anima" and args.load_mode == SMOKE_DIRECT_LOAD_MODE:
-        parser.error(
-            "the anima profile supports production-model-load or the explicit "
-            "legacy paging mode, not smoke-direct-to-arena"
-        )
+    args = parser.parse_args(argv)
     args.compile_dynamic_resolved = (
         None if args.compile_dynamic == "none" else args.compile_dynamic == "true"
     )
+    args.compile_coordinate_descent_resolved = (
+        None
+        if args.compile_coordinate_descent == "none"
+        else args.compile_coordinate_descent == "true"
+    )
+    if args.megacache_mode != "off":
+        if args.no_compile:
+            parser.error("MegaCache matrix modes require block compilation")
+        if not args.compile_fullgraph:
+            parser.error("MegaCache full-model acceptance requires --compile-fullgraph")
+        if args.megacache_expected_arm is None:
+            parser.error("MegaCache matrix modes require --megacache-expected-arm")
+        if args.megacache_mode in ("produce", "consume") and not args.megacache_artifact:
+            parser.error(f"--megacache-mode {args.megacache_mode} requires an artifact")
+        if args.megacache_expected_variants is not None and args.megacache_expected_variants < 1:
+            parser.error("--megacache-expected-variants must be positive")
     return args
 
 
@@ -425,7 +837,15 @@ def _parse_args():
 # ---------------------------------------------------------------------------
 
 def _train_phase(
-    step_num, model, transformer, network, embeds, latents_cpu, generator, device
+    step_num,
+    model,
+    transformer,
+    network,
+    embeds,
+    latents_cpu,
+    generator,
+    device,
+    include_checksums=False,
 ):
     from toolkit.memory_management.runtime import get_memory_runtime
 
@@ -464,7 +884,7 @@ def _train_phase(
     except BaseException:
         physical_free_monitor.stop()
         raise
-    return {
+    result = {
         "seconds": time.perf_counter() - started,
         "loss": loss.item(),
         "pred_norm": pred.detach().float().norm().item(),
@@ -473,9 +893,21 @@ def _train_phase(
         "runtime_accounting": runtime_accounting,
         "_physical_free_monitor": physical_free_monitor,
     }
+    if include_checksums:
+        result["pred_checksum"] = _tensor_checksum(pred)
+    return result
 
 
-def _sample_phase(model, transformer, network, embeds, latents_cpu, generator, device):
+def _sample_phase(
+    model,
+    transformer,
+    network,
+    embeds,
+    latents_cpu,
+    generator,
+    device,
+    include_checksums=False,
+):
     from toolkit.memory_management.runtime import get_memory_runtime
 
     latents = latents_cpu.to(device, model.torch_dtype)
@@ -498,13 +930,16 @@ def _sample_phase(model, transformer, network, embeds, latents_cpu, generator, d
         with torch.no_grad():
             pred = model.get_noise_prediction(latents, timestep, embeds)
     torch.cuda.synchronize(device)
-    return {
+    result = {
         "seconds": time.perf_counter() - started,
         "pred_norm": pred.detach().float().norm().item(),
         "pred_finite": bool(torch.isfinite(pred.detach().float()).all()),
         "pred_shape": tuple(pred.shape),
         "runtime_accounting": runtime_accounting,
     }
+    if include_checksums:
+        result["pred_checksum"] = _tensor_checksum(pred)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +951,7 @@ def main():
     profile = PROFILES[args.profile]
     failures: list[str] = []
     rows: list[dict] = []
+    megacache = _start_megacache_diagnostics(args)
 
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -549,6 +985,9 @@ def main():
 
     # --- config + exact requested-representation gate --------------------
     config = profile.build_model_config(args)
+    from toolkit.compile_utils import configure_quantized_compile_tuning
+
+    configure_quantized_compile_tuning(config)
     if config.qtype != args.qtype and args.assistant_lora is None:
         raise SystemExit(
             f"requested qtype {args.qtype!r} became {config.qtype!r} in the "
@@ -558,6 +997,7 @@ def main():
     print(f"[smoke] constructing {profile.name} model without text encoder")
     model = profile.construct_model(args, config)
     configure_smoke_load_mode(model, args.load_mode)
+    canonical_build = None
     rows.append(
         {
             "event": "start",
@@ -601,7 +1041,29 @@ def main():
         ):
             print("[smoke] quantizing transformer")
             t0 = time.perf_counter()
-            quantize_model(model, transformer)
+            if args.load_mode == SMOKE_DIRECT_LOAD_MODE:
+                from toolkit.memory_management.arena_offload import (
+                    prepare_canonical_storage,
+                )
+
+                canonical_build = prepare_canonical_storage(
+                    transformer,
+                    block_names=model.get_transformer_block_names(),
+                    device=device,
+                    defer_blocks=True,
+                )
+                try:
+                    quantize_model(
+                        model,
+                        transformer,
+                        canonical_build=canonical_build,
+                    )
+                except BaseException:
+                    canonical_build.rollback()
+                    canonical_build = None
+                    raise
+            else:
+                quantize_model(model, transformer)
             flush()
             rows.append(
                 {
@@ -628,7 +1090,24 @@ def main():
 
         print("[smoke] attaching arena runtime")
         t0 = time.perf_counter()
-        _attach_arena_runtime(model, transformer, profile, device)
+        direct_canonical_prepared = bool(
+            getattr(model, "_prepared_canonical_build", None) is not None
+            or canonical_build is not None
+        )
+        if args.load_mode == SMOKE_DIRECT_LOAD_MODE:
+            assert_smoke_load_mode(
+                model,
+                args.load_mode,
+                canonical_build=canonical_build,
+            )
+        _attach_arena_runtime(
+            model,
+            transformer,
+            profile,
+            device,
+            canonical_build=canonical_build,
+        )
+        canonical_build = None
         model.model = transformer
 
         from toolkit.memory_management.runtime import (
@@ -652,6 +1131,7 @@ def main():
         rows.append(
             {
                 "event": "attached_arena_runtime",
+                "direct_canonical_prepared": direct_canonical_prepared,
                 "seconds": time.perf_counter() - t0,
                 "cuda": _cuda_snapshot("attached", device),
                 "dxgi": _dxgi_snapshot("attached"),
@@ -720,6 +1200,13 @@ def main():
     if not accounting.get("protected_training_blocks_resident"):
         failures.append("model keep-last checkpoint blocks are not fully resident")
 
+    # The dispatcher is finalized but its compiled block kernels are still
+    # lazy. Load the artifact here so restored entries exist before the first
+    # model graph is created or executed.
+    megacache = _activate_megacache(
+        args, model, phases, device, megacache, failures
+    )
+
     # --- conditioning + fixed latents -------------------------------------
     embeds = profile.load_conditioning(args.cond_cache, args.batch_size)
     # Match SDTrainer: cached conditioning is stored on CPU and moved to the
@@ -753,6 +1240,7 @@ def main():
                 latents_cpu,
                 generator,
                 device,
+                include_checksums=megacache is not None,
             )
             grads_present = sum(1 for p in trainable if p.grad is not None)
             grad_norm = torch.sqrt(
@@ -766,6 +1254,9 @@ def main():
                 torch.isfinite(p.grad.float()).all().item()
                 for p in trainable
                 if p.grad is not None
+            )
+            grad_checksum = (
+                _gradient_checksum(network) if megacache is not None else None
             )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -783,6 +1274,8 @@ def main():
                     "physical_free_sample": physical_free_sample,
                 }
             )
+            if grad_checksum is not None:
+                result["grad_checksum"] = grad_checksum
             loss_series.append(result["loss"])
             if grads_present == 0:
                 failures.append(f"phase {index} (train): no adapter gradients")
@@ -812,7 +1305,14 @@ def main():
             step_num += 1
         else:
             result = _sample_phase(
-                model, transformer, network, embeds, latents_cpu, generator, device
+                model,
+                transformer,
+                network,
+                embeds,
+                latents_cpu,
+                generator,
+                device,
+                include_checksums=megacache is not None,
             )
             result["new_compile_frames"] = _new_frames_since(frames_before)
             saw_sample = True
@@ -859,6 +1359,8 @@ def main():
             "train -> sample -> train transition was not proven"
         )
 
+    megacache = _finish_megacache(args, megacache, failures)
+
     # --- teardown ----------------------------------------------------------
     from toolkit.memory_management import pin_manager
 
@@ -886,6 +1388,7 @@ def main():
         "discovery": discovery,
         "phases": phases,
         "loss_series": loss_series,
+        "megacache": megacache,
         "dynamo": _dynamo_counters(),
         "runtime_diagnostics_before_close": diagnostics_before_close,
         "nonfinite_trace": (

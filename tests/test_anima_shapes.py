@@ -176,3 +176,12 @@ def test_anima_keeps_five_dimensional_patch_projection_dense():
     model = AnimaModel.__new__(AnimaModel)
 
     assert model.get_quantization_exclude_modules() == ["patch_embed.proj"]
+
+
+def test_anima_scheduler_uses_checkpoint_static_shift():
+    scheduler = AnimaModel.get_train_scheduler()
+
+    scheduler.set_timesteps(sigmas=[1.0, 0.5], device="cpu")
+
+    assert scheduler.config.use_dynamic_shifting is False
+    torch.testing.assert_close(scheduler.timesteps, torch.tensor([1000.0, 750.0]))

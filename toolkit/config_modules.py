@@ -89,6 +89,7 @@ class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
         self.sample_every: int = kwargs.get('sample_every', 100)
+        self.sample_start_step: int = kwargs.get('sample_start_step', 0)
         self.width: int = kwargs.get('width', 512)
         self.height: int = kwargs.get('height', 512)
         self.neg = kwargs.get('neg', False)
@@ -924,7 +925,7 @@ class ModelConfig:
         # Ticket 534ea49: pin offloaded weights ONCE into persistent per-block
         # flat host buffers instead of cudaHostRegister-ing/unregistering them
         # at every sampling boundary. Off by default -- flip after GPU
-        # validation (see docs/decisions or tasks/open/PIN_MANAGER_PLAN.md).
+        # validation (see docs/decisions or tasks/done/PIN_MANAGER_PLAN.md).
         self.layer_offloading_pinned_arena = kwargs.get(
             "layer_offloading_pinned_arena", False
         )

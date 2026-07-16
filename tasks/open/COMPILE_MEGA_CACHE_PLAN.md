@@ -1,9 +1,16 @@
 # torch.compile Mega-Cache (Inductor/AOTAutograd persistence) — Plan
 
+> **Active scope 2026-07-16:** Sampling support shipped. A controlled CUDA
+> probe now proves ordinary Mega-Cache restoration; the remaining work is to
+> prove the current arena regional-block seam and full-model variants.
+>
+> **git-bug:** `ab208bf` (open) - regional-block and full-model restoration.
+>
 > Durable plan. Mutable status (what's done / blocked) belongs in a git-bug
-> ticket, not here. Related: `COMPILE_STREAMED_OFFLOAD_PLAN.md` (Slice 5's
+> ticket, not here. Related: `tasks/done/COMPILE_STREAMED_OFFLOAD_PLAN.md`
+> (Slice 5's
 > sampler/training transition hardening is exactly where the training half
-> of this hooks in), `INGRAPH_PHASE3_SAMPLER_PLAN.md` (measures cold/warm
+> of this hooks in), `tasks/done/INGRAPH_PHASE3_SAMPLER_PLAN.md` (measures cold/warm
 > compile time; the mega-cache is how "warm" survives a process restart).
 
 ## Goal
@@ -76,12 +83,37 @@ value calculus:
      torch 2.12 REJECTS for training with mutating ops (our guarded
      `_after` fetch ops). The unlock is a mutation-free gated op set
      (`fetch_free_gated(token, gate) -> token` chained functionally) --
-     parked in `INGRAPH_PHASE4A_TRAINING_PLAN.md`.
+     parked in `tasks/done/INGRAPH_PHASE4A_TRAINING_PLAN.md`.
    - Multi-bucket training multiplies the ~150 s per shape bucket; the
      freeze-after-warmup / bucket-count policy in
-     `INGRAPH_STREAM_PLAN.md` Phase 5 must budget with this number.
+     `tasks/done/INGRAPH_STREAM_PLAN.md` Phase 5 must budget with this number.
 
-## Not yet done: training compile (`train_compile_blocks`, `enable_compiled_training`)
+## Current remaining work (2026-07-16)
+
+Phase 1 is complete. `scripts/probe_torch_megacache_cuda.py` demonstrated
+fresh-process artifact restoration into an empty cache with exact forward,
+loss, and gradient checksums and no compiler work in the Mega-Cache consumer.
+
+The shortest remaining path is:
+
+1. Land the arena-only strict block-kernel seam tracked by
+   `ARENA_FULLGRAPH_COMPILE_PLAN.md` and ticket `c4e29f1`.
+2. Run the controlled cache boundary through one real arena-dispatched
+   Z-Image block with `fullgraph=True` and autocast outside the compiled
+   callable.
+3. Require restored AOTAutograd and FXGraph hits, zero graph breaks, zero
+   Triton compilation or coordinate-descent work, exact arena transfer counts,
+   and exact output and gradient checksums.
+4. Only after that gate passes, run the full three-variant model acceptance
+   and record artifact inventories, timings, counters, and checksums.
+
+Legacy `LinearLayerMemoryManager` fullgraph compilation is not part of this
+cache acceptance. The target runtime is the generic arena dispatcher.
+
+## Historical design: retired in-graph training compile
+
+The section below records the former `train_compile_blocks` design. It is not
+the active implementation target after the in-graph backend was removed.
 
 Training is a harder target than sampling for three compounding reasons, the
 first of which is a **hard prerequisite, not yet true today**:
@@ -98,7 +130,8 @@ first of which is a **hard prerequisite, not yet true today**:
    currently calls `enable_compiled_training()` again afterward, so today the
    first residency change after setup silently and permanently drops
    training back to eager for the rest of the job. This matches
-   `COMPILE_STREAMED_OFFLOAD_PLAN.md` Slice 5's own open item ("assert both
+   `tasks/done/COMPILE_STREAMED_OFFLOAD_PLAN.md` Slice 5's own open item
+   ("assert both
    compiled sets rebuild") -- it's flagging exactly this gap as unfinished.
    **The mega-cache work below is meaningless until Slice 5 makes the
    rebuild actually happen** -- there's nothing to cache warm-vs-cold if the
@@ -121,8 +154,9 @@ first of which is a **hard prerequisite, not yet true today**:
    in one blob would not be *incorrect* (guards still discriminate) but it
    pointlessly bloats every save/load with unrelated graphs, and the two
    compile lifecycles have different lifetimes (sampling is session-scoped
-   per `INGRAPH_PHASE3_SAMPLER_PLAN.md`; training graphs "live for days" per
-   `COMPILE_STREAMED_OFFLOAD_PLAN.md`'s Windows/Triton-stability risk) and
+   per `tasks/done/INGRAPH_PHASE3_SAMPLER_PLAN.md`; training graphs "live for
+   days" per `tasks/done/COMPILE_STREAMED_OFFLOAD_PLAN.md`'s
+   Windows/Triton-stability risk) and
    shouldn't share an invalidation unit.
 
 ### Design
@@ -172,7 +206,8 @@ first of which is a **hard prerequisite, not yet true today**:
   same way sampling is, or does the sheer variety of training shapes make
   that check nearly always true (degrading to "save every sampling round" --
   measure blob size and save latency before deciding either way)?
-- Sequencing with `COMPILE_STREAMED_OFFLOAD_PLAN.md` Slice 5's own open
+- Sequencing with `tasks/done/COMPILE_STREAMED_OFFLOAD_PLAN.md` Slice 5's own
+  open
   question ("compile only after controllers settle" / "freeze resizes once
   compile engages"): if that lands first, training compile becomes far more
   stable across a run, which changes how often the mega-cache actually needs

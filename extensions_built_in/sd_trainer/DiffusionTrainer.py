@@ -279,6 +279,13 @@ class DiffusionTrainer(SDTrainer):
             # Clear the task list after completion
             self._async_tasks.clear()
 
+    def _shutdown_thread_pool(self):
+        thread_pool = getattr(self, "thread_pool", None)
+        if thread_pool is None:
+            return
+        self.thread_pool = None
+        thread_pool.shutdown(wait=True)
+
     def on_error(self, e: Exception):
         super(DiffusionTrainer, self).on_error(e)
         if self.is_ui_trainer:
@@ -290,7 +297,7 @@ class DiffusionTrainer(SDTrainer):
             except Exception as db_err:
                 print(f"[AITK] Warning: failed to update DB during error handling: {db_err}")
             finally:
-                self.thread_pool.shutdown(wait=True)
+                self._shutdown_thread_pool()
 
     def handle_timing_print_hook(self, timing_dict):
         if "train_loop" not in timing_dict:
@@ -311,7 +318,7 @@ class DiffusionTrainer(SDTrainer):
             self.update_status("completed", "Training completed")
             # Wait for all async operations to finish before shutting down
             asyncio.run(self.wait_for_all_async())
-            self.thread_pool.shutdown(wait=True)
+            self._shutdown_thread_pool()
 
     def end_step_hook(self):
         super(DiffusionTrainer, self).end_step_hook()

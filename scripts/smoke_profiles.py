@@ -11,7 +11,7 @@ paths, no leaf paths, no block execution, no quantizer operations, no
 runtime checkpoint policy. (`arena_ignore_modules` is the one concession:
 which permanent tokens/projections stay out of the arena is model knowledge
 the runner cannot derive until the generic dispatcher's state classification
-lands -- see tasks/open/GENERIC_BLOCK_DISPATCHER_PLAN.md.)
+lands -- see tasks/done/GENERIC_BLOCK_DISPATCHER_PLAN.md.)
 
 Fixed mapping, no plugin registry:
 
@@ -230,6 +230,8 @@ class SmokeProfile:
             layer_offloading_prefetch_depth=args.prefetch_depth,
             compile=not args.no_compile,
             compile_dynamic=args.compile_dynamic_resolved,
+            compile_fullgraph=args.compile_fullgraph,
+            compile_coordinate_descent=args.compile_coordinate_descent_resolved,
         )
 
 
@@ -322,11 +324,22 @@ class ZImageSmokeProfile(SmokeProfile):
         return model
 
     def load_transformer(self, model, args):
-        transformer, _base = model.load_transformer(
-            model.model_config.name_or_path,
-            model.model_config.extras_name_or_path,
-            model.torch_dtype,
-        )
+        # The universal ZImage loader normally quantizes before returning. In
+        # smoke-direct mode the shared runner owns blockwise quantization so it
+        # can publish each final representation straight into canonical arena
+        # storage and release the source block immediately.
+        direct_arena = bool(getattr(model, "_smoke_direct_arena_load", False))
+        quantize_requested = bool(model.model_config.quantize)
+        if direct_arena:
+            model.model_config.quantize = False
+        try:
+            transformer, _base = model.load_transformer(
+                model.model_config.name_or_path,
+                model.model_config.extras_name_or_path,
+                model.torch_dtype,
+            )
+        finally:
+            model.model_config.quantize = quantize_requested
         if model.model_config.assistant_lora_path is not None:
             # Documented behaviour: the assistant adapter is merged before
             # quantization and converts qfloat8 -> float8. The runner asserts
@@ -334,6 +347,9 @@ class ZImageSmokeProfile(SmokeProfile):
             model.load_training_adapter(transformer)
             if model.model_config.qtype == "qfloat8":
                 model.model_config.qtype = "float8"
+        model._transformer_quantized_during_load = bool(
+            getattr(transformer, "aitk_is_quantized", False)
+        )
         model.model = transformer
         return transformer
 

@@ -1517,6 +1517,7 @@ class BaseModel:
 
     def set_device_state(self, state):
         # vae/unet may be None on a partial (te_only) load; skip them then.
+        arena_runtime = None
         if self.vae is not None:
             if state['vae']['training']:
                 self.vae.train()

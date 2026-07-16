@@ -34,7 +34,7 @@ scheduler_config = {
     "max_shift": 1.15,
     "num_train_timesteps": 1000,
     "shift": 3.0,
-    "use_dynamic_shifting": True,
+    "use_dynamic_shifting": False,
 }
 
 

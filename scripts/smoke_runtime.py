@@ -306,7 +306,8 @@ def add_load_mode_arg(
         default=default,
         help=(
             "smoke-direct-to-arena is the intended smoke/benchmark mode and "
-            "populates canonical storage during checkpoint load; "
+            "populates final canonical storage without a model-sized "
+            "post-load arena copy; "
             "production-model-load mirrors the production generic load "
             "session and is for testing production loading code; the "
             "deliberately long alternative opts into legacy load-then-copy "
@@ -334,9 +335,12 @@ def smoke_model_load_session(model, load_mode: str):
     return model_load_arena_session(model)
 
 
-def assert_smoke_load_mode(model, load_mode: str) -> None:
+def assert_smoke_load_mode(model, load_mode: str, *, canonical_build=None) -> None:
     """Fail when a direct-capable model did not exercise the requested mode."""
-    direct = getattr(model, "_prepared_canonical_build", None) is not None
+    direct = bool(
+        getattr(model, "_prepared_canonical_build", None) is not None
+        or canonical_build is not None
+    )
     expected = load_mode == SMOKE_DIRECT_LOAD_MODE
     if direct != expected:
         actual = SMOKE_DIRECT_LOAD_MODE if direct else "non-direct"

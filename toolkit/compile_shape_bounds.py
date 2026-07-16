@@ -83,6 +83,53 @@ def align_up(value: int, alignment: int) -> int:
     return ((int(value) + alignment - 1) // alignment) * alignment
 
 
+def estimate_hidden_sequence_variants(
+    *,
+    transformer: Any,
+    observed_shapes: Iterable[ObservedInputShape],
+    layout: SequenceLayout,
+) -> frozenset[int] | None:
+    """Exact compiled sequence sizes for the enumerated job shapes.
+
+    This is narrower than ``estimate_hidden_sequence_bounds``: it preserves
+    the observed latent/text pairings so a strict static compile can estimate
+    its unavoidable shape-specialization floor before the first CUDA call.
+    """
+    config = getattr(transformer, "config", None)
+    if config is None:
+        return None
+
+    patch = _as_pair(
+        _config_value(config, "patch_size", "patch", "latent_patch_size")
+    )
+    if patch is None:
+        return None
+    patch_h, patch_w = patch
+    if patch_h < 1 or patch_w < 1:
+        return None
+
+    variants = set()
+    for shape in observed_shapes:
+        if (
+            shape.latent_height % patch_h != 0
+            or shape.latent_width % patch_w != 0
+        ):
+            return None
+        image_tokens = (shape.latent_height // patch_h) * (
+            shape.latent_width // patch_w
+        )
+        text_tokens = int(shape.text_length) if layout.includes_text else 0
+        sequence = align_up(
+            image_tokens + text_tokens + int(layout.extra_tokens),
+            layout.sequence_alignment,
+        )
+        if sequence < 1:
+            return None
+        variants.add(sequence)
+
+    return frozenset(variants) if variants else None
+
+
 def estimate_hidden_sequence_bounds(
     *,
     transformer: Any,

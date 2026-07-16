@@ -257,6 +257,7 @@ class ArenaOffloadRuntime:
                 depth=policy.prefetch_depth,
                 compile_blocks=config.compile_blocks,
                 compile_dynamic=config._compile_dynamic,
+                compile_fullgraph=config._compile_fullgraph,
                 compile_dynamic_hints=config._compile_dynamic_hints,
                 protected_training_leaf_keys=smart_plan.get(
                     "protected_training_leaf_keys", ()
@@ -1787,6 +1788,7 @@ class ArenaOffloadRuntime:
             "prefetch_depth": int(getattr(self._executor, "depth", 0)),
             "compile_blocks": bool(self._config.compile_blocks),
             "compile_dynamic": bool(self._config._compile_dynamic),
+            "compile_fullgraph": bool(self._config._compile_fullgraph),
             "strict_vram_cap": bool(
                 getattr(self._config, "strict_vram_cap", False)
             ),

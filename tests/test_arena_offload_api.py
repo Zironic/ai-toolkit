@@ -84,6 +84,7 @@ class _FakeModelConfig:
     layer_offloading_fp8_grad_input = True
     layer_offloading_fp8_sampling = True
     compile = True
+    compile_fullgraph = True
     compile_sample = True
     train_compile_blocks = False
     layer_offloading_smart_working_reserve_gb = -1.0
@@ -275,6 +276,7 @@ class ArenaOffloadConfigTest(unittest.TestCase):
         self.assertTrue(config.fp8_sampling)
         # compile_blocks is derived, not its own public knob.
         self.assertTrue(config.compile_blocks)
+        self.assertTrue(config._compile_fullgraph)
         self.assertFalse(config.strict_vram_cap)
         self.assertEqual(config._policy.prefetch_depth, 3)
         self.assertEqual(config._policy.checkpoint_keep_last, 2)
@@ -343,6 +345,7 @@ class ArenaOffloadConfigTest(unittest.TestCase):
         config = ArenaOffloadConfig.from_model_config(object())
         self.assertFalse(config.enabled)
         self.assertFalse(config.compile_blocks)
+        self.assertFalse(config._compile_fullgraph)
         self.assertEqual(config._policy.prefetch_depth, 3)
         self.assertFalse(config._policy.cap_calibration)
 
@@ -354,6 +357,16 @@ class ArenaOffloadConfigTest(unittest.TestCase):
 
         config = ArenaOffloadConfig.from_model_config(DeadAliases())
         self.assertFalse(config.compile_blocks)
+        self.assertFalse(config._compile_fullgraph)
+
+    def test_fullgraph_is_disabled_when_compile_is_disabled(self):
+        class FullgraphWithoutCompile:
+            compile = False
+            compile_fullgraph = True
+
+        config = ArenaOffloadConfig.from_model_config(FullgraphWithoutCompile())
+        self.assertFalse(config.compile_blocks)
+        self.assertFalse(config._compile_fullgraph)
 
     def test_compatibility_aliases_map_to_internal_policy(self):
         class Aliases:

@@ -10,6 +10,7 @@ from toolkit.compile_shape_bounds import (
     SequenceLayout,
     align_up,
     estimate_hidden_sequence_bounds,
+    estimate_hidden_sequence_variants,
 )
 
 KREA_LAYOUT = SequenceLayout(
@@ -93,3 +94,27 @@ def test_patch_size_pair_config():
     transformer = SimpleNamespace(config={"patch_size": [1, 2, 2]})
     bounds = _bounds([ObservedInputShape(128, 128, 0)], transformer=transformer)
     assert bounds == SequenceBounds(4096, 4096)
+
+
+def test_exact_variants_deduplicate_equal_sequence_sizes():
+    variants = estimate_hidden_sequence_variants(
+        transformer=_transformer(),
+        observed_shapes=[
+            ObservedInputShape(128, 64, 512),
+            ObservedInputShape(64, 128, 512),
+            ObservedInputShape(64, 64, 8),
+        ],
+        layout=KREA_LAYOUT,
+    )
+    assert variants == frozenset({2560, 1280})
+
+
+def test_exact_variants_refuse_unknown_layout_inputs():
+    assert (
+        estimate_hidden_sequence_variants(
+            transformer=SimpleNamespace(),
+            observed_shapes=[ObservedInputShape(64, 64, 8)],
+            layout=KREA_LAYOUT,
+        )
+        is None
+    )

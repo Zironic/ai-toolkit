@@ -16,6 +16,7 @@ from toolkit.memory_management.arena_offload.discovery import BlockDiscoveryErro
 from toolkit.memory_management.arena_offload.dispatcher import (
     _first_output_tensor,
     _first_tensor_argument,
+    _is_dynamo_compile_failure,
     _replace_tensor_argument,
 )
 from toolkit.memory_management.arena_offload.ownership import active_process_owner
@@ -96,13 +97,16 @@ def _fp8_transformer(device, count=3, width=32):
     return model
 
 
-def _fp8_runtime(model, device, *, forward, backward, compile_blocks):
+def _fp8_runtime(
+    model, device, *, forward, backward, compile_blocks, fullgraph=False
+):
     config = ArenaOffloadConfig(
         enabled=True,
         fp8_forward=forward,
         fp8_backward=backward,
         compile_blocks=compile_blocks,
         _compile_dynamic=False,
+        _compile_fullgraph=fullgraph,
     )
     config = replace(
         config,
@@ -384,6 +388,68 @@ def test_sampling_dispatch_retries_one_failed_compiled_block_in_eager_wrapper():
         close_arena_offload(model)
 
 
+def test_strict_compile_failure_classifier_includes_recompile_limit():
+    error = torch._dynamo.exc.FailOnRecompileLimitHit(
+        "synthetic recompile limit"
+    )
+    assert _is_dynamo_compile_failure(error)
+    assert not _is_dynamo_compile_failure(RuntimeError("ordinary block error"))
+
+
+def test_later_strict_recompile_failure_keeps_block_identity():
+    model = _frozen_transformer()
+    model.enable_gradient_checkpointing()
+    with mock.patch(
+        "toolkit.memory_management.arena_offload.planner.vram_budget.device_mem_info",
+        return_value=(8 * 1024**3, 12 * 1024**3),
+    ), mock.patch(
+        "toolkit.memory_management.arena_offload.planner.vram_budget."
+        "auto_physical_vram_headroom_gib",
+        return_value=1.0,
+    ):
+        runtime = prepare_arena_offload(
+            model,
+            device="cpu",
+            block_names=("blocks",),
+            config=ArenaOffloadConfig(enabled=True, compile_blocks=False),
+        )
+    try:
+        runtime.finalize()
+        executor = runtime._executor
+        executor.compile_fullgraph = True
+        executor._strict_kernels_executed.add(0)
+
+        def failed_recompile(_index):
+            def fail(*_args, **_kwargs):
+                raise torch._dynamo.exc.FailOnRecompileLimitHit(
+                    "synthetic later recompile"
+                )
+
+            return fail
+
+        executor._get_dispatch_kernel = failed_recompile
+        resident = [
+            (block_key, leaf_name)
+            for block_key in runtime._arena.block_keys()
+            for leaf_name in runtime._arena.block_record(block_key).leaf_names
+        ]
+        executor.activate(
+            executor.SAMPLE,
+            ResidencyPlan.build(executor.SAMPLE, resident),
+        )
+        with torch.no_grad(), executor.execution(executor.SAMPLE), pytest.raises(
+            RuntimeError,
+            match="fullgraph_block_compile_failed:blocks.0",
+        ) as raised:
+            model(torch.randn(2, 4))
+        assert isinstance(
+            raised.value.__cause__,
+            torch._dynamo.exc.FailOnRecompileLimitHit,
+        )
+    finally:
+        close_arena_offload(model)
+
+
 def test_saved_installed_forward_checkpoint_backward_and_teardown():
     torch.manual_seed(17)
     model = _frozen_transformer()
@@ -465,6 +531,9 @@ def test_saved_installed_forward_checkpoint_backward_and_teardown():
 def test_cuda_streamed_compiled_train_sample_train():
     from toolkit.memory_management.arena_offload import transfer
 
+    graph_breaks_before = sum(
+        torch._dynamo.utils.counters["graph_break"].values()
+    )
     torch.manual_seed(23)
     device = torch.device("cuda")
     model = _frozen_transformer().to(device)
@@ -473,6 +542,7 @@ def test_cuda_streamed_compiled_train_sample_train():
         enabled=True,
         compile_blocks=True,
         _compile_dynamic=False,
+        _compile_fullgraph=True,
     )
     config = replace(
         config,
@@ -508,6 +578,7 @@ def test_cuda_streamed_compiled_train_sample_train():
         adapters.append(block.adapter_gain)
     runtime.finalize()
     diagnostics = runtime.diagnostics()
+    assert diagnostics["compile_fullgraph"] is True
     accounting = diagnostics["accounting"]
     assert accounting["payload_reconciled"]
     assert accounting["mixed_residency"]
@@ -579,8 +650,95 @@ def test_cuda_streamed_compiled_train_sample_train():
     assert torch.isfinite(second).all()
     assert torch.isfinite(third).all()
     assert torch.isfinite(fourth).all()
+    assert sum(torch._dynamo.utils.counters["graph_break"].values()) == (
+        graph_breaks_before
+    )
     close_arena_offload(model)
     assert active_process_owner() is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_fullgraph_dynamic_variants_keep_recompile_headroom():
+    debug_entries = getattr(
+        torch._dynamo.eval_frame,
+        "_debug_get_cache_entry_list",
+        None,
+    )
+    if debug_entries is None:
+        pytest.skip("this Torch build has no test-only Dynamo cache introspection")
+
+    torch._dynamo.reset()
+    device = torch.device("cuda")
+    model = _frozen_transformer().to(device)
+    model.enable_gradient_checkpointing(keep_last=1)
+    config = ArenaOffloadConfig(
+        enabled=True,
+        compile_blocks=True,
+        _compile_dynamic=True,
+        _compile_fullgraph=True,
+        _compile_dynamic_hints=((1, 2, 8),),
+    )
+    config = replace(
+        config,
+        _policy=replace(
+            config._policy,
+            working_reserve_gib=0.0,
+            physical_vram_headroom_gib=0.0,
+            checkpoint_keep_last=1,
+        ),
+    )
+    with mock.patch(
+        "toolkit.memory_management.arena_offload.planner.vram_budget.device_mem_info",
+        return_value=(8 * 1024**3, 12 * 1024**3),
+    ):
+        runtime = prepare_arena_offload(
+            model,
+            device=device,
+            block_names=("blocks",),
+            config=config,
+        )
+
+    try:
+        runtime.finalize()
+        for step, sequence in enumerate((3, 5, 7), start=1):
+            value = torch.randn(
+                2,
+                sequence,
+                4,
+                device=device,
+                requires_grad=True,
+            )
+            with runtime.training_step(
+                shape_key=(2, sequence, 4),
+                step_num=step,
+            ):
+                model(value).square().mean().backward()
+            assert value.grad is not None
+
+        runtime._executor.activate(
+            runtime._executor.SAMPLE,
+            ResidencyPlan.build(runtime._executor.SAMPLE, ()),
+        )
+        with torch.no_grad(), runtime._executor.execution(
+            runtime._executor.SAMPLE
+        ):
+            sampled = model(torch.randn(2, 6, 4, device=device))
+        assert torch.isfinite(sampled).all()
+
+        compiled = runtime._executor._get_dispatch_kernel(0)
+        original = getattr(compiled, "_torchdynamo_orig_callable", None)
+        assert original is not None
+        entry_count = len(debug_entries(original.__code__))
+        limit = int(torch._dynamo.config.recompile_limit)
+        print(f"arena strict dynamic cache entries: {entry_count}/{limit}")
+        assert 0 < entry_count <= limit // 2, (
+            f"strict dynamic arena used {entry_count}/{limit} per-code "
+            "Dynamo cache entries"
+        )
+    finally:
+        close_arena_offload(model)
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -650,6 +808,9 @@ def test_cuda_fp8_gates_select_distinct_canonical_arena_paths():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_compiled_fp8_canonical_arena_emits_scaled_mm():
+    graph_breaks_before = sum(
+        torch._dynamo.utils.counters["graph_break"].values()
+    )
     device = torch.device("cuda")
     model = _fp8_transformer(device)
     runtime = _fp8_runtime(
@@ -658,6 +819,7 @@ def test_cuda_compiled_fp8_canonical_arena_emits_scaled_mm():
         forward=True,
         backward=True,
         compile_blocks=True,
+        fullgraph=True,
     )
     network = _apply_lora(model, device, torch.bfloat16)
     try:
@@ -677,6 +839,10 @@ def test_cuda_compiled_fp8_canonical_arena_emits_scaled_mm():
         assert sum(event.count for event in scaled_mm) > 0
         assert runtime.diagnostics()["training_fp8_canonical"] == 3
         assert runtime.diagnostics()["training_fp8_singletons"] == 1
+        assert runtime.diagnostics()["compile_fullgraph"] is True
+        assert sum(torch._dynamo.utils.counters["graph_break"].values()) == (
+            graph_breaks_before
+        )
     finally:
         close_arena_offload(model)
         torch.cuda.empty_cache()

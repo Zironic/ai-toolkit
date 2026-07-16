@@ -542,7 +542,7 @@ class ToolkitModuleMixin:
         weight_device = weight.device
         if weight.device != down_weight.device:
             weight = weight.to(down_weight.device)
-        if scale.device != down_weight.device:
+        if torch.is_tensor(scale) and scale.device != down_weight.device:
             scale = scale.to(down_weight.device)
         # merge weight
         if self.full_rank:

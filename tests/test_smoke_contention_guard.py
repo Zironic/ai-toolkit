@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import argparse
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from scripts import smoke_runtime
+
+
+def test_shared_smoke_load_mode_defaults_to_direct_arena():
+    parser = argparse.ArgumentParser()
+    smoke_runtime.add_load_mode_arg(parser)
+
+    assert parser.parse_args([]).load_mode == smoke_runtime.SMOKE_DIRECT_LOAD_MODE
 
 
 def test_contention_guard_rejects_cuda_above_thirty_percent(monkeypatch):
@@ -92,6 +100,14 @@ def test_smoke_load_mode_is_explicit_and_self_checking():
     assert model._smoke_direct_arena_load is True
     smoke_runtime.assert_smoke_load_mode(model, smoke_runtime.SMOKE_DIRECT_LOAD_MODE)
 
+    model._prepared_canonical_build = None
+    smoke_runtime.assert_smoke_load_mode(
+        model,
+        smoke_runtime.SMOKE_DIRECT_LOAD_MODE,
+        canonical_build=object(),
+    )
+
+    model._prepared_canonical_build = object()
     with pytest.raises(RuntimeError, match="requested smoke load mode"):
         smoke_runtime.assert_smoke_load_mode(model, paging_mode)
 

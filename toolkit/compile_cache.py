@@ -7,40 +7,146 @@ loaded blob that doesn't match the current graph/guards is a safe cache miss
 themselves.
 """
 
+from dataclasses import dataclass
 import os
 import re
+import shutil
+import threading
+from pathlib import Path
 
 import torch
 
 
-def _blob_path(cache_dir: str, key: str) -> str:
+_TRITON_BUNDLE_LOCK = threading.RLock()
+_WINDOWS_TRITON_FALLBACK_INSTALLED = False
+_WINDOWS_TRITON_FALLBACK_COPIES = 0
+
+
+def _recover_windows_triton_bundle_replace(error) -> bool:
+    """Recover one PyTorch TritonBundler directory rename on Windows."""
+    global _WINDOWS_TRITON_FALLBACK_COPIES
+
+    if os.name != "nt" or getattr(error, "winerror", None) != 5:
+        return False
+    source_value = getattr(error, "filename", None)
+    destination_value = getattr(error, "filename2", None)
+    if not source_value or not destination_value:
+        return False
+    source = Path(source_value)
+    destination = Path(destination_value)
+    if (
+        not source.is_dir()
+        or not source.name.startswith("tmp.")
+        or source.parent != destination.parent
+    ):
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination, dirs_exist_ok=True)
+    shutil.rmtree(source, ignore_errors=True)
+    _WINDOWS_TRITON_FALLBACK_COPIES += 1
+    return True
+
+
+def _install_windows_triton_bundle_fallback() -> None:
+    """Make restored Triton bundle emission robust to WinError 5 renames."""
+    global _WINDOWS_TRITON_FALLBACK_INSTALLED
+
+    if os.name != "nt" or _WINDOWS_TRITON_FALLBACK_INSTALLED:
+        return
+    from torch._inductor.triton_bundler import TritonBundler
+
+    original = TritonBundler.read_and_emit
+
+    def guarded_read_and_emit(bundle):
+        maximum_recoveries = max(1, len(bundle.kernel_artifacts) + 1)
+        with _TRITON_BUNDLE_LOCK:
+            for _attempt in range(maximum_recoveries):
+                try:
+                    return original(bundle)
+                except PermissionError as error:
+                    if not _recover_windows_triton_bundle_replace(error):
+                        raise
+            raise RuntimeError(
+                "restored Triton bundle exceeded its Windows rename recovery limit"
+            )
+
+    TritonBundler.read_and_emit = staticmethod(guarded_read_and_emit)
+    _WINDOWS_TRITON_FALLBACK_INSTALLED = True
+
+
+def windows_triton_bundle_fallback_stats() -> dict[str, int | bool]:
+    return {
+        "installed": _WINDOWS_TRITON_FALLBACK_INSTALLED,
+        "copy_recoveries": _WINDOWS_TRITON_FALLBACK_COPIES,
+    }
+
+
+@dataclass(frozen=True)
+class CompileCacheArtifact:
+    path: str
+    byte_count: int
+    info: object
+
+    @property
+    def artifact_counts(self) -> dict[str, int]:
+        return compile_cache_artifact_counts(self.info)
+
+
+def compile_cache_artifact_counts(info) -> dict[str, int]:
+    if info is None:
+        return {}
+    return {
+        str(kind): len(keys)
+        for kind, keys in sorted(info.artifacts.items(), key=lambda item: str(item[0]))
+    }
+
+
+def compile_cache_path(cache_dir: str, key: str) -> str:
     safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
     return os.path.join(cache_dir, f"{safe_key}.torchcompile_cache")
 
 
+def load_compile_cache_artifact(path) -> CompileCacheArtifact | None:
+    path = str(Path(path))
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as file:
+        data = file.read()
+    _install_windows_triton_bundle_fallback()
+    info = torch.compiler.load_cache_artifacts(data)
+    if info is None:
+        return None
+    return CompileCacheArtifact(path=path, byte_count=len(data), info=info)
+
+
+def save_compile_cache_artifact(path) -> CompileCacheArtifact | None:
+    result = torch.compiler.save_cache_artifacts()
+    if result is None:
+        return None
+    artifacts, info = result
+    path = str(Path(path))
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "wb") as file:
+        file.write(artifacts)
+    os.replace(tmp_path, path)
+    return CompileCacheArtifact(
+        path=path,
+        byte_count=len(artifacts),
+        info=info,
+    )
+
+
 def load_compile_cache(cache_dir: str, key: str) -> bool:
     """Load a saved mega-cache blob for `key` if present. Returns True if loaded."""
-    path = _blob_path(cache_dir, key)
-    if not os.path.isfile(path):
-        return False
-    with open(path, "rb") as f:
-        data = f.read()
-    return torch.compiler.load_cache_artifacts(data) is not None
+    path = compile_cache_path(cache_dir, key)
+    return load_compile_cache_artifact(path) is not None
 
 
 def save_compile_cache(cache_dir: str, key: str) -> bool:
     """Snapshot the current process's compile caches to disk for `key`."""
-    result = torch.compiler.save_cache_artifacts()
-    if result is None:
-        return False
-    artifacts, _info = result
-    os.makedirs(cache_dir, exist_ok=True)
-    path = _blob_path(cache_dir, key)
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "wb") as f:
-        f.write(artifacts)
-    os.replace(tmp_path, path)
-    return True
+    path = compile_cache_path(cache_dir, key)
+    return save_compile_cache_artifact(path) is not None
 
 
 def compiler_stance_supported(stance: str) -> bool:
