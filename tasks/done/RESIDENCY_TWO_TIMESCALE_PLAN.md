@@ -251,7 +251,7 @@ when, sustained over a window:
 
 No hardcoded floor: `--cap-descent` gives the ceiling per config, the live
 counters gate the last block. Re-run the descent as a **per-config
-recalibration** whenever the layout changes (resolution, pinned-arena on/off,
+recalibration** whenever the layout changes (resolution, residency split,
 model) -- fragmentation, hence the knee, moves with the layout.
 
 ### Signal per regime
@@ -391,7 +391,7 @@ sequences -- the controller convention in this repo (GPU CI does not exist).
   ignore-first-window rule (see the state machine) need tuning against real
   window traces -- start conservative (Kverify >= 2 so the lagged signal is seen)
   and relax if convergence is too slow.
-- **Interaction with pinned-arena.** The descent was run without `--pinned-arena`
-  (fresh pins per sample -> DXGI yoyo, harmless to the dedicated-side
-  measurement). Confirm the floor/knee under a persistent arena before trusting
-  the numbers for arena runs.
+- **Canonical Arena calibration.** The historical descent predates the
+  canonical Arena and does not establish an absolute floor or knee for current
+  layouts. Recalibrate per current configuration and use the live counters as
+  the guardrail.

@@ -6,7 +6,7 @@ pytestmark = [
     pytest.mark.process_isolated,
 ]
 
-from toolkit.memory_management import ingraph_stream
+from toolkit.memory_management.arena_offload import transfer as ingraph_stream
 
 
 def _reset(depth=2):

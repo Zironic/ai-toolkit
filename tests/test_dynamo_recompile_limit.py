@@ -9,7 +9,7 @@ import unittest
 
 import torch
 
-from toolkit.memory_management.ingraph_stream import raise_dynamo_recompile_limit
+from toolkit.memory_management.arena_offload.transfer import raise_dynamo_recompile_limit
 
 
 class RaiseDynamoRecompileLimitTests(unittest.TestCase):

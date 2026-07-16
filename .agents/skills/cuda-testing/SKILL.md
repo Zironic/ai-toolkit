@@ -10,7 +10,8 @@ description: How to validate CUDA/FP8/memory-manager behavior on the real GPU in
 - **Small real-GPU scripts are the normal way to check this code; no need to
   ask first.** Run them through the project venv: a targeted test file like
   `venv/Scripts/python.exe -m pytest tests/test_bounce_pool.py -q` (seconds)
-  or an ad-hoc script like `venv/Scripts/python.exe scripts/bench_bounce_fill_group.py`.
+  or an ad-hoc script like
+  `venv/Scripts/python.exe scripts/bench_pin_assumptions.py --tests 1,5`.
 - **Do not run the full `tests/` suite as a default confidence check.** It
   currently takes ~5 minutes (process-isolated tests; see ticket `f2aceba`).
   A full-suite run is for genuinely cross-cutting changes, an explicit user

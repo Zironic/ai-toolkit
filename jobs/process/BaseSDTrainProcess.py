@@ -32,6 +32,7 @@ from toolkit.memory_management.runtime import (
     is_memory_managed,
     memory_runtime_owns_compile,
 )
+from toolkit.memory_management.arena_offload import arena_fetch_report
 
 from toolkit.basic import value_map
 from toolkit.clip_vision_adapter import ClipVisionAdapter
@@ -213,7 +214,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._save_stager = None
         self._arena_runtime = None
         self._compile_cache_session = None
-        self._cleanup_started = False
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
         # if true, then we do not do an optimizer step. We are accumulating gradients
@@ -346,7 +346,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # to hold network if there is one
         self.network: Union[Network, None] = None
-        self._arena_runtime = None
         self._cleanup_in_progress = False
         self._cleanup_completed = False
         self.adapter: Union[T2IAdapter, IPAdapter, ClipVisionAdapter, ReferenceAdapter, CustomAdapter, ControlNetModel, None] = None
@@ -518,19 +517,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # Sampling layout mutation is opt-in and separate from native FP8
         # sampling. With it disabled, preserve the model's existing behavior.
         transformer = getattr(self.sd, 'unet', None)
-        # Shape-aware cold-start reserve: models that can size their sampling
-        # working set from the pending gen configs (resolution, CFG mode) hint
-        # the residency planner so the first high-res sample streams enough
-        # blocks up front instead of demoting mid-denoise. Optional per model;
-        # a learned measured reserve replaces it after the first sample.
-        estimate_fn = getattr(
-            self.sd, 'estimate_sampling_working_reserve_bytes', None
-        )
-        cold_start_hint = (
-            estimate_fn(gen_img_config_list) if estimate_fn is not None else None
-        )
-        sampling_context = (
-            MemoryManager.inference_resident(
+        arena_runtime = get_memory_runtime(transformer)
+        if (
+            arena_runtime is None
+            and self.model_config.layer_offloading
+            and self.model_config.layer_offloading_smart
+            and self.model_config.layer_offloading_smart_sampling
+        ):
+            # Shape-aware cold-start reserve: models that can size their sampling
+            # working set from the pending gen configs (resolution, CFG mode) hint
+            # the legacy residency planner before the first high-res sample.
+            estimate_fn = getattr(
+                self.sd, 'estimate_sampling_working_reserve_bytes', None
+            )
+            cold_start_hint = (
+                estimate_fn(gen_img_config_list) if estimate_fn is not None else None
+            )
+            sampling_context = MemoryManager.inference_resident(
                 transformer,
                 self.device_torch,
                 fp8_sampling=(
@@ -548,22 +551,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.model_config.layer_offloading_smart_sampling_wddm_hard_gb
                 ),
             )
-            if (
-                self.model_config.layer_offloading
-                and self.model_config.layer_offloading_smart
-                and self.model_config.layer_offloading_smart_sampling
-            )
-            else contextlib.nullcontext()
-        )
+        else:
+            sampling_context = contextlib.nullcontext()
         # The arena runtime owns residency across the train<->sample boundary
         # over ONE arena: the model enters runtime.sampling_image() per image
         # (SAMPLE program: no checkpointing, forward-only streaming), and the
-        # session below restores the TRAIN program once at the end. Because the
-        # runtime owns residency, the legacy inference_resident sampling context
-        # must NOT also re-plan the transformer -- null it out for this backend.
-        arena_runtime = get_memory_runtime(self.sd.unet)
-        if arena_runtime is not None:
-            sampling_context = contextlib.nullcontext()
+        # session below restores the TRAIN program once at the end.
 
         arena_session = (
             arena_runtime.sampling_session(gen_configs=gen_img_config_list)
@@ -1469,7 +1462,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             record['offload_prefetch'] = prefetch_report
             print_acc(prefetch_report)
         try:
-            ingraph_report = MemoryManager.ingraph_fetch_report(
+            ingraph_report = arena_fetch_report(
                 reset=True,
                 step_wall_ms=total * step_count * 1000.0,
             )
@@ -3611,15 +3604,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
-        arena_runtime = get_memory_runtime(self.sd.unet)
+        arena_runtime = self._arena_runtime
         if arena_runtime is not None:
-            self._arena_runtime = arena_runtime
-            # Two-phase lifecycle: the model prepared the arena (unfinalized)
-            # during load_model, BEFORE LoRA. The permanent train/sample programs
-            # must be FINALIZED HERE, after the network is applied, so they
-            # capture the installed adapter leaves. That is exactly why
-            # finalization lives in setup, not load_model.
-            arena_runtime.finalize(self.network)
             info = arena_runtime.diagnostics()
             print_acc(
                 "Arena offload training enabled: "
@@ -3629,9 +3615,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"depth={info['prefetch_depth']}. "
                 "First training step will compile."
             )
-            # Before step 1: if another tenant on the GPU is the reason we are
-            # streaming rather than resident, say so. Otherwise the symptom is
-            # just a mysteriously slow run.
             arena_runtime.report_foreign_vram_once(phase="training")
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:

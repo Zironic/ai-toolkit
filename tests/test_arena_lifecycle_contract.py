@@ -742,7 +742,98 @@ def test_backend_import_and_shared_private_state_boundaries():
 
 def test_legacy_manager_does_not_import_arena_backend():
     root = Path(__file__).parents[1]
-    imports = _imported_modules(
-        root / "toolkit" / "memory_management" / "manager.py"
-    )
+    manager_path = root / "toolkit" / "memory_management" / "manager.py"
+    imports = _imported_modules(manager_path)
     assert not any("arena_offload" in name for name in imports)
+    assert "abandoned_fetches" not in manager_path.read_text(encoding="utf-8")
+
+
+def test_trainer_has_one_finalize_and_legacy_sampling_is_non_arena_only():
+    source = (
+        Path(__file__).parents[1] / "jobs" / "process" / "BaseSDTrainProcess.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    process_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BaseSDTrainProcess"
+    )
+    methods = {
+        node.name: node
+        for node in process_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    finalize_calls = [
+        node
+        for node in ast.walk(methods["run"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "finalize"
+    ]
+    assert len(finalize_calls) == 1
+    network_apply_calls = [
+        node
+        for node in ast.walk(methods["run"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "apply_to"
+    ]
+    assert network_apply_calls
+    assert finalize_calls[0].lineno > max(node.lineno for node in network_apply_calls)
+
+    pre_loop_calls = [
+        node
+        for node in ast.walk(methods["run"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "hook_before_train_loop"
+    ]
+    foreign_vram_calls = [
+        node
+        for node in ast.walk(methods["run"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "report_foreign_vram_once"
+    ]
+    assert len(pre_loop_calls) == 1
+    assert len(foreign_vram_calls) == 1
+    assert foreign_vram_calls[0].lineno > pre_loop_calls[0].lineno
+
+    sample = methods["sample"]
+    inference_calls = [
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "inference_resident"
+    ]
+    assert len(inference_calls) == 1
+    inference_call = inference_calls[0]
+    guards = [
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.If)
+        and inference_call in tuple(ast.walk(node))
+    ]
+    assert any("arena_runtime is None" in ast.unparse(node.test) for node in guards)
+
+    estimate_calls = [
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "estimate_fn"
+    ]
+    assert len(estimate_calls) == 1
+    estimate_call = estimate_calls[0]
+    estimate_guards = [
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.If)
+        and estimate_call in tuple(ast.walk(node))
+    ]
+    assert any(
+        "arena_runtime is None" in ast.unparse(node.test)
+        for node in estimate_guards
+    )

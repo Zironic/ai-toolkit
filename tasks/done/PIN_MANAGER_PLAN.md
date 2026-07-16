@@ -3,10 +3,8 @@
 > **Completed 2026-07-16:** The single pin authority shipped and passed its
 > focused GPU validation under ticket `da1aae5`.
 >
-> Durable plan. Status lives in a git-bug ticket, not here.
-> Related: `INGRAPH_STREAM_PLAN.md` Phase 6 (planner coordination of
-> shared-budget consumers — this plan is the general mechanism Phase 6
-> needs), the DXGI pin-for-speed effort (probe + two-cliff model),
+> Durable plan. Status lives in a git-bug ticket, not here. Related: the DXGI
+> pin-for-speed effort (probe + two-cliff model) and
 > `docs/decisions/UPSTREAM_PR_PLAN.md` (WDDM gating stays local).
 
 ## Problem

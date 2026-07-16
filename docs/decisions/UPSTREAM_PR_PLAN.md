@@ -43,16 +43,17 @@ below still applies in full.
 
 The previous stack was **A** (resident sampling) -> **P** (DXGI probe) -> **C**
 (bounded training streaming core) -> **D** (native FP8 training). It is
-superseded. The four plan docs are archived in `tasks/done/`, along with the
-four `MODEL_AGNOSTIC_SUBPLAN_*` docs whose seams the new plan absorbs.
+superseded; its iteration plans were removed after the current rules moved to
+the Arena contract and focused guidance.
 
-**Why C and D died.** Both were built on `_BouncingLinearFn`, the per-linear
-streaming autograd function. PR D's own plan said it outright: the FP8-native
-training path "is a branch inside `_BouncingLinearFn` - without C's hooks there
-is nowhere for this code to run." Commit `3dd7f38` retired that backend; the
-immutable runtime is now the sole transformer backend on the fork's active path.
-Upstreaming C would mean upstreaming code the fork no longer runs, with D landing
-inside it. **The block-native arena is the payload now.**
+**Why C and D died.** Both coupled native FP8 training to the C/D smart-training
+orchestration around `_BouncingLinearFn`. That orchestration is retired from the
+fork's active transformer-training path, which now uses the immutable Arena.
+The plain per-linear legacy backend itself remains supported for upstream
+compatibility and capabilities Arena does not own, especially text-encoder
+offload. Upstreaming C would still mean upstreaming smart machinery the active
+Arena path does not run, with D landing inside it. **The block-native arena is
+the payload now.**
 
 **Why P was right and is preserved.** PR P (DXGI shared-budget probe + pinned
 memory crash guard) was correct and its upstream-consumer audit still holds.

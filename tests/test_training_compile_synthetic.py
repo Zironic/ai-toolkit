@@ -1,4 +1,4 @@
-"""Rung 1 (Phase 4-pre) de-risk at synthetic scale, per INGRAPH_STREAM_PLAN.
+"""Synthetic training compile de-risk at small scale.
 
 Production training on the reference card is keep_last=0 / fully streamed, so
 resident-block compile is never exercised at Krea2 scale; these tests carry

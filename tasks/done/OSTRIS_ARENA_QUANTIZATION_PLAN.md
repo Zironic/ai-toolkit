@@ -60,11 +60,10 @@ The following are verified against the repository as of 2026-07-14:
 - `LinearSpec` and block packs now carry ordered tensor leaves and an execution
   key, but remain Linear-specific through weight templates, weight leaf counts,
   role accessors, and requires-grad fields.
-- Memory management still imports FP8 binding APIs in legacy manager paths,
-  `ingraph_stream.py`, `arena_offload/fp8.py`, and arena layout construction.
-  `arena_offload/layout.py` also binds an execution operation and stores it on
-  `LinearView`. These are the remaining execution-awareness seams to move into
-  runtime/architecture adapters; they are no longer FP8 implementation code.
+- Memory management still imports FP8 binding APIs in the supported legacy
+  manager and current Arena FP8/runtime paths. These are execution-awareness
+  seams rather than a reason to preserve the retired in-graph compatibility
+  layer.
 - Canonical layout discovery reads `module.weight`. For `OstrisLinear` that is
   a dequantizing property, so current arena construction cannot preserve the
   compressed representation.

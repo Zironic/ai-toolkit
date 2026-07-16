@@ -55,6 +55,11 @@ iteration names are not compatibility requirements.
   while the source mapping remains intact. Once a managed source entry has been
   consumed, a later build failure aborts that model load instead of reusing the
   partial mapping.
+- Dispatcher finalization occurs after the adapter or network is installed, so
+  the immutable execution description captures the model's final forwards and
+  trainable leaves exactly once.
+- Residency/source publication and teardown reject changes while an execution
+  generation is active.
 - Whole-model `.cpu()` and current-arena `.cuda()` or `.to(device)` requests are
   interpreted by the runtime: permanent state follows the requested device and
   training residency is parked or restored. Whole-model dtype conversion,
@@ -73,6 +78,10 @@ The dispatcher's compiled callable is a pure functional block kernel; eager
 residency selection and transfers remain outside it. Therefore Mixed and Full
 residency, including transitions between them across processes, share the same
 guarded MegaCache entries.
+
+Transfer slots are reusable only after the compute stream's final reader has
+been ordered past them. For training this includes checkpoint recomputation and
+backward, not only the original forward call.
 
 Compiled production and ordinary smoke paths load one cumulative model-level
 MegaCache before their first lazy invocation and save newly compiled variants

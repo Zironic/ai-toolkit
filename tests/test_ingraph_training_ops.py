@@ -1,4 +1,4 @@
-"""Phase 4a S1: fetch ops under checkpoint + autograd (INGRAPH_PHASE4A plan).
+"""Fetch operations under checkpoint and autograd.
 
 Proves the training-mode free discipline: `free_on_backward` anchors each
 ticket's free event to the consuming block's backward, while the no-grad
@@ -15,8 +15,8 @@ import unittest
 
 import torch
 
-from toolkit.memory_management import ingraph_stream
-from toolkit.memory_management.ingraph_stream import free_on_backward
+from toolkit.memory_management.arena_offload import transfer as ingraph_stream
+from toolkit.memory_management.arena_offload.transfer import free_on_backward
 
 K = 32  # matrix side; K*K*4 bytes per block pack
 

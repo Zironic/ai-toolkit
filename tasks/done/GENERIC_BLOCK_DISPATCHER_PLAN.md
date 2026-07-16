@@ -10,11 +10,9 @@
 > acceptance criteria. Progress, validation results, blockers, priorities,
 > and handoff notes belong on the associated git-bug tickets.
 >
-> **Supersedes:** the architecture-adapter execution design in:
->
-> * `tasks/done/COMPILE_NEUTRAL_KREA2_RUNTIME_REFACTOR_PLAN.md`
-> * `tasks/done/revised_combined_compile_neutral_krea2_refactor_plan.md`
-> * ticket `6dd9ba6`
+> **Supersedes:** the earlier architecture-adapter execution design tracked by
+> ticket `6dd9ba6`. The current contract is
+> `docs/ARENA_OFFLOAD_CONTRACT.md`.
 >
 > Existing canonical-arena, residency, transactional commit, fail-closed
 > lifecycle, and host-memory rules remain valid unless explicitly changed

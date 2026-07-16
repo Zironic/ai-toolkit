@@ -4,6 +4,9 @@ Ticket: 534ea49 (boundary pin churn). Builds on Phase 2 (budget integration).
 
 > **Completed 2026-07-16:** Training coverage landed and was subsequently
 > generalized into the canonical arena implementation.
+> This is a historical predecessor plan: its commands, flags, file paths, and
+> symbols are archival and are not expected to run. The supported behavior is
+> documented in `docs/ARENA_OFFLOAD_CONTRACT.md`.
 
 Phase 1 built the arena mechanics; Phase 2 made the budget correct; the
 register-mechanism work (below) made sampling actually pin the full streamed

@@ -83,7 +83,7 @@ running and remove a stale `.git/git-bug/lock` if present, then retry.
 # (process-isolated tests; ticket f2aceba) — don't run it by default, only for
 # genuinely cross-cutting changes, an explicit request, or a release gate.
 venv/Scripts/python.exe -m pytest tests/test_bounce_pool.py -q
-venv/Scripts/python.exe scripts/bench_bounce_fill_group.py   # ad-hoc GPU script
+venv/Scripts/python.exe scripts/bench_pin_assumptions.py --tests 1,5  # ad-hoc GPU script
 
 # Full training run — minutes to hours. Only when the user asks.
 python run.py config/your_config.yaml -n "run_name"

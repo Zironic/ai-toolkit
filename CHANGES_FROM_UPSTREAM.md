@@ -296,7 +296,13 @@ additional variants such as:
 
 - Native speedups are hardware- and layout-dependent.
 - Unsupported shapes and formats deliberately fall back.
-- FP8 grad-input is more experimental than ordinary FP8 forward.
+- FP8 grad-input remains workload-sensitive. In the completed 100-step Krea2
+  synthetic campaign on the reference RTX 4070, its dW and fixed-evaluation
+  divergence stayed below identical-seed BF16 rerun nondeterminism and appeared
+  as a fixed offset rather than a compounding trajectory. Native FP8 forward
+  was about 18% faster in that campaign and was also non-compounding. This is
+  evidence from one architecture, card, and random-latent workload, so validate
+  the exact model and training objective before relying on it.
 - Numerical behavior should be validated for the exact model and training goal.
 
 ## What is worth copying

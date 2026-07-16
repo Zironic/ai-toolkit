@@ -78,7 +78,8 @@ model onto the card, where the uncapped run crashed somewhere downstream.
 Before raising OOM, a capped allocator **frees its idle cached segments
 and retries** -- torch `reserved` GCs down toward the cap on demand, so
 the reserved-minus-allocated gap (typically 1-3 GiB) is **reclaimable**
-(evidence: `scripts/bench_allocator_cap_gc.py`).
+(measured by the retired allocator-cap GC probe; the durable result is recorded
+here).
 
 - The GC is **all-or-nothing**: one binding allocation dumps *every* idle
   segment, on both the OOM-retry path and the gc_threshold path.
@@ -118,7 +119,8 @@ if live alone exceeds the target, thrash self-sustains -- every sweep
 dumps ALL idle cache, every would-be reuse becomes a fresh cudaMalloc,
 which sweeps again (measured 10x per-alloc cost even in a mild synthetic).
 Residency growth eats the allowance 1:1: the layout controller's ceiling
-and the cap are coupled. Evidence: `scripts/bench_gc_threshold_allowance.py`.
+and the cap are coupled. This result came from the retired GC-threshold
+allowance probe and is recorded here as the durable policy evidence.
 
 ## Pinned host memory economics
 

@@ -475,3 +475,10 @@ def is_arena_offloaded(model) -> bool:
 
 def close_arena_offload(model) -> None:
     close_memory_runtime(model)
+
+
+def arena_fetch_report(reset: bool = False, *, step_wall_ms=None) -> str | None:
+    """Return Arena transfer statistics, or None when no fetches were active."""
+    from .transfer import fetch_report
+
+    return fetch_report(reset=reset, step_wall_ms=step_wall_ms)

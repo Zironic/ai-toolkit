@@ -19,6 +19,7 @@ the legacy manager remains a separate backend.
 
 from .api import (
     ArenaOffloadConfig,
+    arena_fetch_report,
     close_arena_offload,
     estimate_training_working_reserve_hint_bytes,
     get_arena_runtime,
@@ -40,6 +41,7 @@ from ..runtime import close_memory_runtime, get_memory_runtime
 
 __all__ = [
     "ArenaOffloadConfig",
+    "arena_fetch_report",
     "ArenaCleanupError",
     "ArenaOffloadRuntime",
     "ArenaSetupFatalError",

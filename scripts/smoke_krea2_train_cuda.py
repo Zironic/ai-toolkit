@@ -56,6 +56,7 @@ from toolkit.basic import flush  # noqa: E402
 from toolkit.config_modules import ModelConfig, NetworkConfig  # noqa: E402
 from toolkit.lora_special import LoRASpecialNetwork  # noqa: E402
 from toolkit.memory_management import MemoryManager, bounce_pool, dxgi_meminfo, pin_manager  # noqa: E402
+from toolkit.memory_management.arena_offload import transfer as arena_transfer  # noqa: E402
 from toolkit.memory_management.runtime import close_memory_runtime, get_memory_runtime  # noqa: E402
 from toolkit.prompt_utils import PromptEmbeds  # noqa: E402
 from toolkit.util.quantize import quantize_model  # noqa: E402
@@ -91,29 +92,11 @@ def _cuda_snapshot(label, device):
     return row
 
 
-def _arena_summary(transformer):
-    """Ticket 534ea49 Phase 2 Slice E: arena presence/size instrumentation."""
-    arena = getattr(transformer, "_mm_weight_arena", None)
-    if arena is None:
-        return {"present": False}
-    stats = arena.stats()
-    return {
-        "present": True,
-        "id": id(arena),
-        "blocks": stats.blocks,
-        "pinned_gib": _gib(stats.pinned_bytes),
-        "pageable_blocks": stats.pageable_blocks,
-        "pageable_gib": _gib(stats.pageable_bytes),
-        "ledger_weights_gib": _gib(pin_manager.pinned_bytes_by_kind().get("weights", 0)),
-    }
-
-
 def _immutable_arena_summary(transformer):
     """Slice 6 diagnostics for the canonical immutable-arena backend: arena
     identity, host bytes, GPU sidecar bytes, the active residency-plan
     fingerprint, transfer-plan range/copy counts, and the pin-ledger 'weights'
-    tier. Reports ``{"present": False}`` when the transformer never built one,
-    so it can sit alongside ``_arena_summary`` (only one is present per run)."""
+    tier. Reports ``{"present": False}`` when the transformer never built one."""
     memory_runtime = get_memory_runtime(transformer)
     if memory_runtime is None:
         return {"present": False}
@@ -320,10 +303,8 @@ def _build_model_config(args):
         layer_offloading_smart_wddm_hard_gb=args.wddm_hard_gib,
         layer_offloading_wddm_spill_reserve_pct=args.spill_reserve_pct,
         layer_offloading_checkpoint_keep_last=args.checkpoint_keep_last,
-        layer_offloading_block_stream_only=args.block_stream_only,
         layer_offloading_fp8_forward=args.fp8_training_forward,
         layer_offloading_fp8_grad_input=args.fp8_grad_input,
-        layer_offloading_pinned_arena=args.pinned_arena,
         # The immutable runtime is built during load_model, so its ring depth
         # and compile gate arrive through the config.
         layer_offloading_prefetch_depth=args.prefetch_depth,
@@ -432,97 +413,6 @@ def adapter_options(args):
     }
 
 
-def _named_trainable(network):
-    """LoRA params in native fp32, keyed by their qualified names.
-
-    Divergence dumps (ticket fce0b45) must bypass save_weights entirely: it
-    casts to save_dtype (typically bf16) and would put a rounding floor under
-    every metric.
-    """
-    return [(n, p) for n, p in network.named_parameters() if p.requires_grad]
-
-
-def _clone_cpu(named):
-    return {n: p.detach().float().cpu().clone() for n, p in named}
-
-
-def _clone_grads_cpu(named):
-    return {
-        n: p.grad.detach().float().cpu().clone()
-        for n, p in named
-        if p.grad is not None
-    }
-
-
-def _optim_state_cpu(optimizer):
-    def to_cpu(obj):
-        if isinstance(obj, torch.Tensor):
-            return obj.detach().cpu().clone()
-        if isinstance(obj, dict):
-            return {k: to_cpu(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [to_cpu(v) for v in obj]
-        return obj
-
-    return to_cpu(optimizer.state_dict())
-
-
-def _make_fixed_batch(seed, args, device, torch_dtype):
-    gen = torch.Generator(device="cpu").manual_seed(seed)
-    lat_h, lat_w = args.height // 8, args.width // 8
-    latents = torch.randn(
-        args.batch_size, 16, lat_h, lat_w, generator=gen
-    ).to(device, torch_dtype)
-    noise = torch.randn(
-        args.batch_size, 16, lat_h, lat_w, generator=gen
-    ).to(device, torch_dtype)
-    timestep = (torch.rand(args.batch_size, generator=gen) * 1000.0).to(device)
-    t_frac = (timestep.float() / 1000.0).view(-1, 1, 1, 1).to(device)
-    noisy = ((1.0 - t_frac) * latents.float() + t_frac * noise.float()).to(torch_dtype)
-    return noisy, timestep
-
-
-def _run_fixed_eval(model, transformer, network, embeds, noisy, timestep, device):
-    """One no-grad forward on the fixed eval batch, in BOTH eval-forward modes.
-
-    bf16 eval isolates accumulated weight divergence (forward arm-invariant
-    given the weights); fp8 eval answers the train/inference-consistency
-    question. Forward mode is flipped by toggling the manager's
-    _fp8_training_requested flag and refreshing the per-linear markers -- the
-    exact seam _restore_offload uses -- then restored to the arm's own mode.
-    """
-    mm = getattr(transformer, "_memory_manager", None)
-    if mm is None:
-        raise SystemExit("fixed eval requires the smart memory manager attached")
-    fp8_capable = torch.cuda.get_device_capability(device) >= (8, 9)
-    original = bool(getattr(mm, "_fp8_training_requested", False))
-    outs = {}
-    try:
-        for mode in ("bf16", "fp8"):
-            mm._fp8_training_requested = (mode == "fp8") and fp8_capable
-            MemoryManager._refresh_training_fp8_flags(transformer, mm)
-            with torch.no_grad(), network:
-                pred = model.get_noise_prediction(noisy, timestep, embeds)
-            outs[mode] = pred.detach().float().cpu().clone()
-    finally:
-        mm._fp8_training_requested = original
-        MemoryManager._refresh_training_fp8_flags(transformer, mm)
-    return outs
-
-
-def _dump_horizon(dump_dir, completed_steps, named, optimizer, grads, eval_outs):
-    payload = {
-        "step": completed_steps,
-        "lora": _clone_cpu(named),
-        "grads": grads if grads is not None else {},
-        "optim": _optim_state_cpu(optimizer),
-        "eval": eval_outs,
-    }
-    path = Path(dump_dir) / f"horizon_{completed_steps:04d}.pt"
-    torch.save(payload, path)
-    print(f"[smoke] dumped horizon {completed_steps} -> {path}")
-
-
 def _parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -549,8 +439,7 @@ def _parse_args():
             "comma-separated WxH buckets cycled round-robin across training "
             "steps, e.g. '512x512,768x512,512x768,896x640' -- simulates a "
             "multi-bucket dataset feeding the same run. Unset = single bucket "
-            "from --width/--height (unchanged behaviour). The fixed eval batch "
-            "(--dump-dir) still uses --width/--height regardless."
+            "from --width/--height (unchanged behaviour)."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=1)
@@ -583,43 +472,12 @@ def _parse_args():
     )
     parser.add_argument("--spill-reserve-pct", type=float, default=0.20)
     parser.add_argument("--pinned-weight-gib", type=float, default=-1.0)
-    parser.add_argument(
-        "--pinned-arena", action="store_true",
-        help=(
-            "Ticket 534ea49: pin offloaded weights once into a persistent "
-            "per-block flat arena instead of re-pinning them at every "
-            "sampling boundary."
-        ),
-    )
     parser.add_argument("--checkpoint-keep-last", type=int, default=0)
-    parser.add_argument("--block-stream-only", action="store_true")
     parser.add_argument("--fp8-training-forward", action="store_true")
     parser.add_argument(
         "--fp8-grad-input", action="store_true",
         help="enable the fp8 grad-input backward gate "
-        "(mirrors ModelConfig.layer_offloading_fp8_grad_input); ticket fce0b45",
-    )
-    parser.add_argument(
-        "--dump-dir", default=None,
-        help="divergence-experiment dump dir (ticket fce0b45): writes meta.json, "
-        "horizon_NNNN.pt (LoRA/optim/grads/fixed-eval, native fp32), loss_series.json",
-    )
-    parser.add_argument(
-        "--dump-horizons", default="0,1,5,10,25,50,100",
-        help="comma-separated step counts at which to dump state (0 = pre-training)",
-    )
-    parser.add_argument(
-        "--eval-seed", type=int, default=1234,
-        help="seed for the fixed eval batch (identical across arms, distinct from --seed)",
-    )
-    parser.add_argument(
-        "--init-lora", default=None,
-        help="torch.save'd {name: tensor} dict to load into the LoRA before step 0 "
-        "(warm-branch arms); names must match network.named_parameters()",
-    )
-    parser.add_argument(
-        "--init-optim", default=None,
-        help="torch.save'd optimizer state_dict to load before step 0",
+        "(mirrors ModelConfig.layer_offloading_fp8_grad_input)",
     )
     parser.add_argument(
         "--prefetch-depth", type=int, default=2,
@@ -866,7 +724,6 @@ def main():
             {
                 "event": "attached_training_memory",
                 "seconds": time.perf_counter() - t0,
-                "arena": _arena_summary(transformer),
                 "immutable_arena": _immutable_arena_summary(transformer),
                 "cuda": _cuda_snapshot("attached_training_memory", device),
                 "dxgi": _dxgi_snapshot("attached_training_memory"),
@@ -943,27 +800,8 @@ def main():
     )
     _print_json(rows[-1])
 
-    # --- fp8 backward divergence experiment wiring (ticket fce0b45) ---
-    named = _named_trainable(network)
-    if args.init_lora:
-        init_state = torch.load(args.init_lora, map_location="cpu", weights_only=True)
-        loaded = 0
-        with torch.no_grad():
-            for n, p in named:
-                if n not in init_state:
-                    raise SystemExit(f"--init-lora missing param {n}")
-                p.copy_(init_state[n].to(p.device, p.dtype))
-                loaded += 1
-        print(f"[smoke] loaded {loaded} LoRA tensors from {args.init_lora}")
-    if args.init_optim:
-        optim_state = torch.load(args.init_optim, map_location="cpu", weights_only=True)
-        optimizer.load_state_dict(optim_state)
-        print(f"[smoke] loaded optimizer state from {args.init_optim}")
-
     if args.blocking_h2d_timing:
-        from toolkit.memory_management import ingraph_stream
-
-        ingraph_stream.set_h2d_timing_blocking(True)
+        arena_transfer.set_h2d_timing_blocking(True)
         print("[smoke] H2D timing: BLOCKING (old behaviour, A/B control)")
 
     MemoryManager.set_fp8_grad_input_enabled(bool(args.fp8_grad_input))
@@ -984,46 +822,6 @@ def main():
     )
     _print_json(rows[-1])
 
-    dump_dir = None
-    horizons = set()
-    eval_batch = None
-    if args.dump_dir:
-        dump_dir = Path(args.dump_dir)
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        horizons = {int(h) for h in args.dump_horizons.split(",") if h.strip() != ""}
-        meta = {
-            "arm": {
-                "fp8_forward": bool(args.fp8_training_forward),
-                "fp8_grad_input": bool(args.fp8_grad_input),
-            },
-            "seed": args.seed,
-            "eval_seed": args.eval_seed,
-            "steps": args.steps,
-            "horizons": sorted(horizons),
-            "lora_rank": args.lora_rank,
-            "lora_alpha": args.lora_alpha,
-            "lr": args.lr,
-            "width": args.width,
-            "height": args.height,
-            "resolutions": args.resolutions,
-            "compile_dynamic": args.compile_dynamic,
-            "compile_mark_dynamic": args.compile_mark_dynamic,
-            "batch_size": args.batch_size,
-            "qtype": args.qtype,
-            "init_lora": args.init_lora,
-            "init_optim": args.init_optim,
-            "param_names": [n for n, _ in named],
-        }
-        (dump_dir / "meta.json").write_text(
-            json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
-        )
-        eval_batch = _make_fixed_batch(args.eval_seed, args, device, model.torch_dtype)
-        if 0 in horizons:
-            eval_outs = _run_fixed_eval(
-                model, transformer, network, embeds, *eval_batch, device
-            )
-            _dump_horizon(dump_dir, 0, named, optimizer, None, eval_outs)
-
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
     print(
@@ -1043,9 +841,7 @@ def main():
             raise SystemExit("--trace needs at least one steady step after warmup")
     for step in range(args.steps):
         if args.ab_h2d_parity:
-            from toolkit.memory_management import ingraph_stream
-
-            ingraph_stream.set_h2d_timing_blocking(step % 2 == 0)
+            arena_transfer.set_h2d_timing_blocking(step % 2 == 0)
         if trace_from is not None and step == trace_from:
             profiler = torch.profiler.profile(
                 activities=[
@@ -1139,12 +935,6 @@ def main():
             )
             phase_events["grad_stats"][1].record()
         grads_present = sum(1 for p in trainable if p.grad is not None)
-        completed = step + 1
-        horizon_grads = None
-        if dump_dir is not None and completed in horizons:
-            # Grads captured pre-step: the raw fp32 LoRA gradients the fp8
-            # grad-input hops contaminated, before Adam integrates them.
-            horizon_grads = _clone_grads_cpu(named)
         with torch.profiler.record_function("smoke.optimizer"):
             phase_events["optimizer"][0].record()
             optimizer.step()
@@ -1163,14 +953,6 @@ def main():
             for phase, (start, end) in phase_events.items()
         }
         phase_ms["step_wall_ms"] = elapsed * 1000.0
-        if dump_dir is not None and completed in horizons:
-            eval_outs = _run_fixed_eval(
-                model, transformer, network, embeds, *eval_batch, device
-            )
-            _dump_horizon(
-                dump_dir, completed, named, optimizer, horizon_grads, eval_outs
-            )
-
         frames_after = torch._dynamo.utils.counters["frames"].get("total", 0)
         row = {
             "event": "train_step",
@@ -1258,16 +1040,6 @@ def main():
         # successfully written.
         profiler = None
         gc.collect()
-
-    if dump_dir is not None:
-        loss_series = [
-            {"step": r["step"] + 1, "loss": r["loss"], "grad_norm": r["grad_norm"]}
-            for r in step_rows
-        ]
-        (dump_dir / "loss_series.json").write_text(
-            json.dumps(loss_series, indent=2), encoding="utf-8"
-        )
-        print(f"[smoke] wrote {dump_dir / 'loss_series.json'}")
 
     rows.extend(step_rows)
     measured_rows = step_rows[args.warmup_steps:] or step_rows[-1:]
@@ -1377,30 +1149,13 @@ def main():
         "first_step_s": step_rows[0]["seconds"],
         "steady_step_avg_s": sum(steady) / len(steady),
         "dynamo": _dynamo_counters(),
-        "ingraph_fetch_report": MemoryManager.ingraph_fetch_report(reset=True),
+        "ingraph_fetch_report": arena_transfer.fetch_report(reset=True),
         "offload_profile_report": MemoryManager.offload_profile_report(reset=True),
         "cuda": _cuda_snapshot("done", device),
         "dxgi": _dxgi_snapshot("done"),
     }
     rows.append(summary)
     _print_json(summary)
-
-    if args.pinned_arena:
-        # Ticket 534ea49 Phase 2 Slice E: explicit teardown at the very end
-        # (model unload, not a training/sampling boundary). The "weights"
-        # ledger must return to its pre-arena baseline.
-        ledger_before_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
-        MemoryManager._destroy_pinned_arena(transformer)
-        ledger_after_destroy = pin_manager.pinned_bytes_by_kind().get("weights", 0)
-        teardown_row = {
-            "event": "pinned_arena_destroyed",
-            "ledger_weights_gib_before": _gib(ledger_before_destroy),
-            "ledger_weights_gib_after": _gib(ledger_after_destroy),
-            "arena_present_after": getattr(transformer, "_mm_weight_arena", None)
-            is not None,
-        }
-        rows.append(teardown_row)
-        _print_json(teardown_row)
 
     # True unload (a genuine model unload, not a phase boundary): the runtime
     # closes and every pinned byte returns to the pre-arena baseline.

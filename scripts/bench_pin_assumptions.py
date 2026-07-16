@@ -360,9 +360,10 @@ def test_10():
 
 
 def _fetch_ops_setup():
-    from toolkit.memory_management import ingraph_stream, pin_manager
+    from toolkit.memory_management import pin_manager
+    from toolkit.memory_management.arena_offload import transfer
 
-    ingraph_stream.configure_fetch_runtime(depth=2)
+    transfer.configure_fetch_runtime(depth=2)
     return pin_manager
 
 

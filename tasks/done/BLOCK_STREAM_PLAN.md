@@ -77,7 +77,7 @@ weights bitwise-equal direct transfer, **one H2D per 8-Linear block** (224 -> 28
 submits/step measured), 2-block eviction correct, and end-to-end gradient parity
 within GEMM noise.
 
-Submit-count goal MET: `scripts/bench_block_stream_forward.py` shows
+Submit-count goal MET in the now-retired block-stream benchmark:
 **224 -> 28 H2D submits/step (8x fewer)**. But in that synthetic regime
 (pinned float, cheap submits) wall-time **regressed** (605 -> 836 ms/step):
 cheap submits mean cutting their count doesn't pay, while two costs show up:
