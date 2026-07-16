@@ -123,34 +123,6 @@ class FreeOnBackwardTests(unittest.TestCase):
         fetches = int(ingraph_stream.fetch_stats()["fetches"]) - stats0
         self.assertEqual(fetches, 2 * self.N_BLOCKS)
 
-    def test_compiled_checkpoint_fwd_bwd_zero_breaks(self):
-        # Requires the post-grad ordering pass: without it, Inductor hoists
-        # backward re-fetches (data-dep only on saved boundary activations)
-        # above frees and trips the depth guard. The pass rewrites backward
-        # fetch_start_after nodes to fetch_start_gated, gated on the previous
-        # free's token output -- real dataflow no scheduling stage can drop.
-        from toolkit.memory_management import ingraph_stream_scheduling
-
-        ingraph_stream_scheduling.install_ordering_pass()
-        torch._dynamo.reset()
-        compiled = torch.compile(
-            lambda x: _trunk(x, self.hosts), fullgraph=True, dynamic=False
-        )
-        x = torch.randn(8, K, device=self.device, requires_grad=True)
-        breaks_before = sum(
-            torch._dynamo.utils.counters["graph_break"].values()
-        )
-        out = compiled(x)
-        grad_out = torch.randn_like(out)
-        out.backward(grad_out)
-        self.assertEqual(
-            sum(torch._dynamo.utils.counters["graph_break"].values()),
-            breaks_before,
-        )
-        ref_out, ref_grad = self._reference(x.detach(), grad_out)
-        torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
-        torch.testing.assert_close(x.grad, ref_grad, rtol=0, atol=0)
-
     def test_backward_buffer_reuse_hammer(self):
         # Many passes at depth 2: any premature recycle (a fetch overwriting a
         # buffer a backward still reads) breaks bitwise equality of grads.

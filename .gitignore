@@ -199,3 +199,7 @@ MULTITRIGGER_DOP_REFACTOR_PLAN.md
 
 # GPU lock for smoke/bench scripts (scripts/smoke_runtime.py)
 .gpu.lock
+
+# Local Codex one-shot editors and registered benchmark worktrees
+/.codex_*.py
+/.worktrees/

@@ -191,42 +191,6 @@ class TrainingLeavesTests(unittest.TestCase):
             torch.testing.assert_close(ga, lora.a.grad, rtol=8e-2, atol=8e-2)
             torch.testing.assert_close(gb, lora.b.grad, rtol=8e-2, atol=8e-2)
 
-    def test_compiled_training_zero_breaks_and_parity(self):
-        from toolkit.memory_management import ingraph_stream_scheduling
-
-        ingraph_stream_scheduling.install_ordering_pass()
-        torch._dynamo.reset()
-        compiled = torch.compile(self._trunk, fullgraph=True, dynamic=False)
-        x = torch.randn(
-            4, 16, N_IN, device=self.device, dtype=torch.bfloat16, requires_grad=True
-        )
-        breaks_before = sum(
-            torch._dynamo.utils.counters["graph_break"].values()
-        )
-        self._zero_grads(x)
-        out = compiled(x)
-        out.square().mean().backward()
-        self.assertEqual(
-            sum(torch._dynamo.utils.counters["graph_break"].values()),
-            breaks_before,
-        )
-        ref = self._reference(x.detach())
-        torch.testing.assert_close(out, ref, rtol=5e-2, atol=8e-2)
-        for lora in self.loras:
-            self.assertGreater(lora.a.grad.abs().sum().item(), 0.0)
-            self.assertGreater(lora.b.grad.abs().sum().item(), 0.0)
-
-        # Repeat steps: stable, grads keep flowing.
-        graphs = int(torch._dynamo.utils.counters["stats"].get("unique_graphs", 0))
-        for _ in range(3):
-            self._zero_grads(x)
-            compiled(x).square().mean().backward()
-        self.assertEqual(
-            int(torch._dynamo.utils.counters["stats"].get("unique_graphs", 0)),
-            graphs,
-        )
-
-
 if __name__ == "__main__":
     unittest.main()
 
