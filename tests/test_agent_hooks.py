@@ -496,11 +496,94 @@ class SkillMirrorTests(unittest.TestCase):
         self.assertIn("differs", differences[0])
 
 
+class SilentTextNormalizationTests(unittest.TestCase):
+    def test_normalizer_removes_blank_lines_and_applies_line_style(self) -> None:
+        cases = (
+            (b"alpha\nbeta\n\n", b"\r\n", b"alpha\r\nbeta\r\n"),
+            (b"alpha\r\nbeta\r\n \t\r\n", b"\n", b"alpha\nbeta\n"),
+            (b"alpha\nbeta", b"\r\n", b"alpha\r\nbeta\r\n"),
+            (b"alpha  ", b"\n", b"alpha  \n"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, (before, newline, expected) in enumerate(cases):
+                with self.subTest(index=index):
+                    path = Path(tmp) / f"case-{index}.txt"
+                    path.write_bytes(before)
+
+                    self.assertTrue(HOOKS.normalize_text_file(path, newline))
+                    self.assertEqual(expected, path.read_bytes())
+
+    def test_normalizer_ignores_binary_and_empty_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "binary.bin"
+            empty = Path(tmp) / "empty.txt"
+            binary.write_bytes(b"binary\x00payload\n\n")
+            empty.write_bytes(b"")
+
+            self.assertFalse(HOOKS.normalize_text_file(binary, b"\n"))
+            self.assertFalse(HOOKS.normalize_text_file(empty, b"\n"))
+            self.assertEqual(b"binary\x00payload\n\n", binary.read_bytes())
+            self.assertEqual(b"", empty.read_bytes())
+
+    def test_worktree_style_follows_core_autocrlf(self) -> None:
+        for value, expected in (("true\n", b"\r\n"), ("input\n", b"\n")):
+            with self.subTest(value=value.strip()):
+                completed = subprocess.CompletedProcess(
+                    ["git", "config"],
+                    0,
+                    stdout=value,
+                    stderr="",
+                )
+                with mock.patch.object(
+                    HOOKS,
+                    "run_bounded_subprocess",
+                    return_value=completed,
+                ):
+                    self.assertEqual(
+                        expected,
+                        HOOKS.preferred_worktree_newline(REPO_ROOT),
+                    )
+
+    def test_post_edit_cleanup_adds_no_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "notes.md"
+            path.write_bytes(b"content\n\n")
+            event = {"cwd": str(root), "hook_event_name": "PostToolUse"}
+
+            with (
+                mock.patch.object(HOOKS, "read_event", return_value=event),
+                mock.patch.object(HOOKS, "project_root", return_value=root),
+                mock.patch.object(
+                    HOOKS,
+                    "extract_changed_files",
+                    return_value=[path],
+                ),
+                mock.patch.object(
+                    HOOKS,
+                    "preferred_worktree_newline",
+                    return_value=b"\n",
+                ),
+                mock.patch.object(HOOKS, "add_context") as add_context,
+            ):
+                result = HOOKS.mode_format_after_edit()
+
+            self.assertEqual(0, result)
+            self.assertEqual(b"content\n", path.read_bytes())
+            add_context.assert_not_called()
+
+
 class HookConfigTests(unittest.TestCase):
     def test_codex_registers_pre_edit_and_avoids_post_output_blocking(self) -> None:
         config = json.loads((REPO_ROOT / ".codex" / "hooks.json").read_text())
         pre_groups = config["hooks"]["PreToolUse"]
         post_groups = config["hooks"]["PostToolUse"]
+        format_hooks = [
+            hook
+            for group in post_groups
+            for hook in group["hooks"]
+            if "format-after-edit" in hook.get("command", "")
+        ]
 
         self.assertTrue(
             any("apply_patch" in group.get("matcher", "") for group in pre_groups)
@@ -511,6 +594,10 @@ class HookConfigTests(unittest.TestCase):
                 for group in post_groups
                 for hook in group["hooks"]
             )
+        )
+        self.assertTrue(format_hooks)
+        self.assertTrue(
+            all("statusMessage" not in hook for hook in format_hooks)
         )
         self.assertTrue(
             all(
@@ -525,6 +612,12 @@ class HookConfigTests(unittest.TestCase):
         config = json.loads((REPO_ROOT / ".claude" / "settings.json").read_text())
         pre_groups = config["hooks"]["PreToolUse"]
         post_groups = config["hooks"]["PostToolUse"]
+        format_hooks = [
+            hook
+            for group in post_groups
+            for hook in group["hooks"]
+            if "format-after-edit" in hook.get("command", "")
+        ]
 
         self.assertTrue(
             any(
@@ -532,6 +625,10 @@ class HookConfigTests(unittest.TestCase):
                 for group in pre_groups
                 for hook in group["hooks"]
             )
+        )
+        self.assertTrue(format_hooks)
+        self.assertTrue(
+            all("statusMessage" not in hook for hook in format_hooks)
         )
         self.assertTrue(
             any(

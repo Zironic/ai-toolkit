@@ -70,6 +70,7 @@ INTERNAL_TIMEOUT_SECONDS = float(
     os.environ.get("AGENT_HOOK_INTERNAL_TIMEOUT_SECONDS", "30")
 )
 TIMEOUT_RETURN_CODE = 124
+MAX_SILENT_TEXT_FIX_BYTES = 10 * 1024 * 1024
 
 WRAP_MARKER = "__AGENT_HOOK_WRAPPED__=1"
 SKIP_CAP_MARKER = "AGENT_HOOK_NO_CAP=1"
@@ -1232,14 +1233,73 @@ def skill_tree_differences(root: Path) -> list[str]:
     return differences
 
 
+def preferred_worktree_newline(root: Path) -> bytes:
+    """Match Git's effective working-tree newline policy for this checkout."""
+    proc = run_bounded_subprocess(
+        ["git", "config", "--get", "core.autocrlf"],
+        timeout_seconds=INTERNAL_TIMEOUT_SECONDS,
+        cwd=str(root),
+        text=True,
+        capture_output=True,
+        errors="replace",
+    )
+    if proc.returncode == 0 and (proc.stdout or "").strip().lower() == "true":
+        return b"\r\n"
+    return b"\n"
+
+
+def normalize_text_file(path: Path, newline: bytes) -> bool:
+    """Silently normalize line endings and keep one final newline.
+
+    Operate on UTF-8 text bytes so trailing spaces on content lines are
+    preserved. Binary, empty, oversized, and unreadable files are ignored.
+    """
+    try:
+        if path.stat().st_size > MAX_SILENT_TEXT_FIX_BYTES:
+            return False
+        original = path.read_bytes()
+    except OSError:
+        return False
+
+    if not original or b"\x00" in original:
+        return False
+    try:
+        original.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+
+    canonical = original.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    lines = canonical.split(b"\n")
+    while lines and not lines[-1].strip(b" \t"):
+        lines.pop()
+
+    if not lines:
+        normalized = b""
+    else:
+        normalized = newline.join(lines) + newline
+
+    if normalized == original:
+        return False
+    try:
+        path.write_bytes(normalized)
+    except OSError:
+        return False
+    return True
+
+
 def mode_format_after_edit() -> int:
-    """Report mirrored-skill drift and Ruff findings on changed lines."""
+    """Silently normalize text, then report skill drift and Ruff findings."""
     event = read_event()
     cwd = cwd_from_event(event)
     root = project_root(cwd)
 
     changed_files = sorted(set(extract_changed_files(event, cwd)))
     output: list[str] = []
+    newline = preferred_worktree_newline(root)
+
+    for path in changed_files:
+        if path.exists() and path.is_file():
+            normalize_text_file(path, newline)
 
     if changed_files_touch_skill_trees(root, changed_files):
         differences = skill_tree_differences(root)

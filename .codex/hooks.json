@@ -46,8 +46,7 @@
             "type": "command",
             "command": "python3 \"$(git rev-parse --show-toplevel)/.agent-hooks/agent_hooks.py\" format-after-edit",
             "commandWindows": "$root = (git rev-parse --show-toplevel).Trim(); & \"$root\\venv\\Scripts\\python.exe\" \"$root\\.agent-hooks\\agent_hooks.py\" format-after-edit",
-            "timeout": 120,
-            "statusMessage": "Checking edited files"
+            "timeout": 120
           }
         ]
       }
