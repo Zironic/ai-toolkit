@@ -75,10 +75,10 @@ class BooguImageEditModel(BooguImageModel):
         # Reference images keep their own aspect/size (not resized to the target).
         self.use_raw_control_images = True
 
-    @property
-    def text_embedding_space_version(self):
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
         # Distinct from the base T2I cache: the edit features fold in the ref image.
-        return self.arch + "_v1"
+        return str(model_config.arch) + "_v1"
 
     # ------------------------------------------------------------------
     # Reference-image helpers

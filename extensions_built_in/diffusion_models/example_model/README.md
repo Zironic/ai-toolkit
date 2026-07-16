@@ -63,6 +63,10 @@ train:
    `encode_images()` per dataset image (latent cache) and
    `get_prompt_embeds()` per caption (text-embed cache, saved via
    `AdvancedPromptEmbeds.save`, one file per caption).
+   Models whose `load_model()` supports both partial-load modes can set
+   `supports_te_cache_worker = True`; the generic worker then writes these
+   final conditioning objects and the trainer reloads them without a text
+   encoder.
 3. **Train step** (every step, see `extensions_built_in/sd_trainer/SDTrainer.py`):
    1. clean latents come from the cache or `encode_images()`
    2. noise + timestep are sampled; `add_noise()` (BaseModel) mixes them
@@ -125,9 +129,15 @@ conditioning, preferred for all new models over the older `PromptEmbeds`:
   `embeds.frozen_dtype_keys`.
 - CFG concat (`concat_prompt_embeds`), batch expansion, `.to()`, `.save()` /
   `.load()` for the disk cache are all handled for you.
+- The cache treats every `AdvancedPromptEmbeds` field as opaque model output.
+  Token trimming, masks, and model-specific conditioning rules belong in your
+  model extension, not in the worker.
 
 If you ever change what `get_prompt_embeds` produces, bump the
-`text_embedding_space_version` property so stale on-disk caches invalidate.
+class-level `get_text_embedding_space_version(model_config)` result so stale
+on-disk caches invalidate. It must be resolvable without constructing the
+model. The default is `model_config.arch`; include any config value that changes
+the final conditioning representation.
 
 ## Gradient checkpointing
 
@@ -236,7 +246,8 @@ Worked implementations to copy: `../ideogram4/src/transformer.py`
 | Override | When you need it |
 |---|---|
 | `get_model_to_train()` | LoRA should attach to something other than `self.model` |
-| `text_embedding_space_version` / `latent_space_version` | invalidate users' caches after a breaking change |
+| `get_text_embedding_space_version(model_config)` / `latent_space_version` | invalidate users' caches after a breaking change |
+| `supports_te_cache_worker` | opt in after `load_model()` implements both `te_only` and `skip_te` partial loads |
 | `te_padding_side` | LLM text encoders that need left padding |
 | `is_multistage`, `multistage_boundaries` | multi-expert models split by timestep range (`../wan22/wan22_14b_model.py`) |
 | `load_training_adapter()` pattern | assistant LoRAs (de-distillation adapters), see `../z_image/z_image.py` |

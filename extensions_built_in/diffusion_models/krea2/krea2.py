@@ -595,6 +595,7 @@ def _save_quantized_transformer_cache(base_model, transformer, cache_path: Path,
 
 class Krea2Model(BaseModel):
     arch = "krea2"
+    supports_te_cache_worker = True
 
     def __init__(
         self,
@@ -662,11 +663,23 @@ class Krea2Model(BaseModel):
         # node / hub pipeline kv_cache toggles) to work properly.
         self.kv_cache = bool(self.model_config.model_kwargs.get("kv_cache", False))
 
-    @property
-    def text_embedding_space_version(self):
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
         # v2 invalidates embeddings created by the old silent 512-token truncation.
-        if self.prompt_overflow_policy == "error":
-            return f"krea2-v2-error-{self.max_text_length}"
+        model_kwargs = getattr(model_config, "model_kwargs", {}) or {}
+        overflow_policy = str(
+            model_kwargs.get("prompt_overflow_policy", "unlimited")
+        ).lower()
+        max_text_length = int(model_kwargs.get("max_text_length", 512))
+        if overflow_policy not in ("unlimited", "error"):
+            raise ValueError(
+                "model.model_kwargs.prompt_overflow_policy must be "
+                "'unlimited' or 'error'"
+            )
+        if max_text_length < 1:
+            raise ValueError("model.model_kwargs.max_text_length must be at least 1")
+        if overflow_policy == "error":
+            return f"krea2-v2-error-{max_text_length}"
         return "krea2-v2-unlimited"
 
     @staticmethod

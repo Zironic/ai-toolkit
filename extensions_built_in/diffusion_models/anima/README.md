@@ -33,14 +33,23 @@ activations; the repeated transformer blocks are still quantized normally.
 
 ## Text caches and TE worker
 
-Prompt conditioning is stored as `AdvancedPromptEmbeds`, with one natural-
-length 2D `(L, D)` tensor per prompt. The tensors are padded only at the model
-call. The cache space is `anima_te_v2`, so legacy batched `PromptEmbeds` caches
-are not reused.
+Prompt conditioning is stored as `AdvancedPromptEmbeds`, with one full-length
+2D `(512, D)` conditioner output per prompt. The conditioner output after the
+T5 attention-mask length is learned conditioning, not padding, so it must not
+be trimmed. The cache space is `anima_te_v3`, so truncated or legacy batched
+prompt caches are not reused.
 
 `te_only` loads both Qwen3 and `AnimaTextConditioner` without the transformer or
 VAE. `skip_te` loads fake placeholders for both text components so the trainer
 can consume worker-created disk caches without co-resident text models.
+`AnimaModel` advertises that generic partial-load contract through
+`supports_te_cache_worker`; worker orchestration contains no Anima dispatch.
+
+The pinned Transformers 5.5.3 tokenizer backend performs an unrelated online
+Mistral metadata probe when `Qwen2Tokenizer` receives a Hub ID, even with
+`local_files_only=True`. The Anima loader therefore uses a complete cached
+snapshot path when available, while retaining the Hub-ID path as a fallback
+for a first run whose tokenizer files are not cached yet.
 
 ## LoRA and sampling
 

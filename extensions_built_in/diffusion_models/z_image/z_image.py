@@ -8,6 +8,7 @@ from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConf
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
+from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.prompt_utils import PromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
@@ -56,6 +57,13 @@ SINGLE_FILE_EXTRAS_REPO = "Tongyi-MAI/Z-Image-Turbo"
 
 class ZImageModel(BaseModel):
     arch = "zimage"
+    supports_te_cache_worker = True
+
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
+        # v2 stores the transformer's variable-length list representation as
+        # AdvancedPromptEmbeds instead of relying on core collation to rewrite it.
+        return "zimage_te_v2"
 
     def __init__(
         self,
@@ -427,7 +435,7 @@ class ZImageModel(BaseModel):
 
         return noise_pred
 
-    def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
+    def get_prompt_embeds(self, prompt: str) -> AdvancedPromptEmbeds:
         if self.pipeline.text_encoder.device != self.device_torch:
             self.pipeline.text_encoder.to(self.device_torch)
 
@@ -436,8 +444,11 @@ class ZImageModel(BaseModel):
             do_classifier_free_guidance=False,
             device=self.device_torch,
         )
-        pe = PromptEmbeds([prompt_embeds, None])
-        return pe
+        if isinstance(prompt_embeds, torch.Tensor):
+            prompt_embeds = list(prompt_embeds.unbind(dim=0))
+        else:
+            prompt_embeds = list(prompt_embeds)
+        return AdvancedPromptEmbeds(text_embeds=prompt_embeds)
 
     def get_model_has_grad(self):
         return False

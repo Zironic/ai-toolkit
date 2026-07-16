@@ -67,3 +67,31 @@ def get_model_class(config: ModelConfig):
         f"No model implementation is registered for architecture {config.arch!r}. "
         "Check model.arch and any extension import errors printed above."
     )
+
+
+def resolve_text_embedding_space_version(config: ModelConfig) -> str:
+    """Resolve a model's prompt-cache namespace without instantiating it.
+
+    Both the TE worker and the skip-TE trainer need this value before model
+    weights are loaded. New model extensions should implement the class-level
+    ``get_text_embedding_space_version(model_config)`` hook. A string class
+    attribute remains supported for existing third-party extensions.
+    """
+    model_class = get_model_class(config)
+
+    declared_version = vars(model_class).get("text_embedding_space_version")
+    if isinstance(declared_version, str):
+        version = declared_version
+    else:
+        resolver = getattr(model_class, "get_text_embedding_space_version", None)
+        if callable(resolver):
+            version = resolver(config)
+        else:
+            version = str(config.arch)
+
+    if not isinstance(version, str) or not version:
+        raise ValueError(
+            f"{model_class.__name__}.get_text_embedding_space_version() must "
+            "return a non-empty string"
+        )
+    return version

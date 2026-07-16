@@ -48,8 +48,8 @@ def main():
 
     job = get_job(args.config_file, args.name)
 
-    # Z-Image / Anima trainers run as 'extension' jobs, not 'train' — gate on whether the
-    # process supports TE caching rather than on the job type.
+    # Extension trainers may use job types other than 'train', so gate on the
+    # process capability rather than the job type or model architecture.
     processes = getattr(job, "process", None) or []
     supported = [p for p in processes if hasattr(p, "run_te_cache_worker")]
     if not supported:

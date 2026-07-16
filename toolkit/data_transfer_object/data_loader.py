@@ -415,10 +415,6 @@ class DataLoaderBatchDTO:
                         y = base_prompt_embeds
                     else:
                         y = x.prompt_embeds
-                    if x.text_embedding_space_version == "zimage":
-                        # z image needs to be a list if it is not already
-                        if not isinstance(y.text_embeds, list):
-                            y.text_embeds = [y.text_embeds]
                     prompt_embeds_list.append(y)
                 padding_side = self.file_items[0].te_padding_side
                 

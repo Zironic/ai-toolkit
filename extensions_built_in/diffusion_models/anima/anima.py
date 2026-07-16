@@ -66,6 +66,38 @@ SAVE_RENAME = {
 LOAD_RENAME = {value: key for key, value in SAVE_RENAME.items()}
 
 
+def _load_anima_tokenizers(base_model_path):
+    def load_from(source):
+        return (
+            Qwen2Tokenizer.from_pretrained(source, subfolder="tokenizer"),
+            T5TokenizerFast.from_pretrained(source, subfolder="t5_tokenizer"),
+        )
+
+    if os.path.isdir(base_model_path):
+        return load_from(base_model_path)
+
+    # Transformers 5.5.3 calls Hub model_info() from its generic Mistral-regex
+    # probe even when Qwen tokenizer files are already cached and
+    # local_files_only=True. A local snapshot path bypasses that unrelated
+    # probe. If the snapshot is only partially cached, retain normal first-run
+    # behavior by falling back to the Hub ID so missing tokenizer files can be
+    # downloaded.
+    try:
+        from huggingface_hub import snapshot_download
+
+        cached_snapshot = snapshot_download(base_model_path, local_files_only=True)
+    except Exception:
+        cached_snapshot = None
+
+    if cached_snapshot is not None:
+        try:
+            return load_from(cached_snapshot)
+        except OSError:
+            pass
+
+    return load_from(base_model_path)
+
+
 def _pad_prompt_embeds(
     embeds: List[torch.Tensor],
     device: torch.device,
@@ -105,8 +137,12 @@ class AnimaPipeline:
 class AnimaModel(BaseModel):
     arch = "anima"
     use_old_lokr_format = False
-    text_embedding_space_version = "anima_te_v2"
+    supports_te_cache_worker = True
     text_embed_dim = 1024
+
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
+        return "anima_te_v3"
 
     def __init__(
         self,
@@ -152,6 +188,17 @@ class AnimaModel(BaseModel):
         ):
             base_model_path = model_path
 
+        component_source = base_model_path
+        if not os.path.isdir(base_model_path):
+            try:
+                from huggingface_hub import snapshot_download
+
+                component_source = snapshot_download(
+                    base_model_path, local_files_only=True
+                )
+            except Exception:
+                component_source = base_model_path
+
         self.print_and_status_update("Loading Anima model")
         transformer = None
         if self.te_only:
@@ -159,7 +206,7 @@ class AnimaModel(BaseModel):
         else:
             self.print_and_status_update("Loading Anima transformer")
             transformer = CosmosTransformer3DModel.from_pretrained(
-                base_model_path,
+                component_source,
                 subfolder="transformer",
                 torch_dtype=dtype,
             )
@@ -193,7 +240,7 @@ class AnimaModel(BaseModel):
         else:
             self.print_and_status_update("Loading Anima VAE")
             vae = AutoencoderKLQwenImage.from_pretrained(
-                base_model_path,
+                component_source,
                 subfolder="vae",
                 torch_dtype=self.vae_torch_dtype,
             )
@@ -202,12 +249,7 @@ class AnimaModel(BaseModel):
             vae.eval()
             flush()
 
-        tokenizer = Qwen2Tokenizer.from_pretrained(
-            base_model_path, subfolder="tokenizer"
-        )
-        t5_tokenizer = T5TokenizerFast.from_pretrained(
-            base_model_path, subfolder="t5_tokenizer"
-        )
+        tokenizer, t5_tokenizer = _load_anima_tokenizers(base_model_path)
 
         if self.skip_te:
             from toolkit.unloader import FakeTextEncoder
@@ -220,7 +262,7 @@ class AnimaModel(BaseModel):
         else:
             self.print_and_status_update("Loading Anima text encoder (Qwen3)")
             text_encoder = Qwen3Model.from_pretrained(
-                base_model_path,
+                component_source,
                 subfolder="text_encoder",
                 torch_dtype=dtype,
             )
@@ -231,7 +273,7 @@ class AnimaModel(BaseModel):
 
             self.print_and_status_update("Loading Anima text conditioner")
             text_conditioner = AnimaTextConditioner.from_pretrained(
-                base_model_path,
+                component_source,
                 subfolder="text_conditioner",
                 torch_dtype=dtype,
             )
@@ -318,10 +360,10 @@ class AnimaModel(BaseModel):
             source_attention_mask=qwen_mask,
         ).to(dtype=self.torch_dtype, device=self.te_device_torch)
 
-        per_item = []
-        for index in range(conditioning.shape[0]):
-            length = max(int(t5_mask[index].sum().item()), 1)
-            per_item.append(conditioning[index, :length])
+        # AnimaTextConditioner expands every prompt to the transformer's full
+        # conditioning sequence. Tokens beyond the T5 attention-mask length are
+        # learned conditioner output, not padding, and must be preserved.
+        per_item = [conditioning[index] for index in range(conditioning.shape[0])]
         return AdvancedPromptEmbeds(text_embeds=per_item)
 
     @torch.no_grad()

@@ -132,9 +132,9 @@ class BooguImageModel(BaseModel):
         # Lazily-built, resolution-independent rotary frequency tables.
         self._freqs_cis = None
 
-    @property
-    def text_embedding_space_version(self):
-        return self.arch + "_v1"
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
+        return str(model_config.arch) + "_v1"
 
     @staticmethod
     def get_train_scheduler():

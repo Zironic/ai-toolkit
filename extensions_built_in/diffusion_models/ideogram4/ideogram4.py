@@ -160,6 +160,7 @@ def _load_sharded(base, index_path, is_local, prefix="") -> dict:
 
 class Ideogram4Model(BaseModel):
     arch = "ideogram4"
+    supports_te_cache_worker = True
 
     def __init__(
         self,
@@ -195,10 +196,10 @@ class Ideogram4Model(BaseModel):
         # inactive everywhere else (training, conditional pass).
         self.unconditional_lora: Optional[LoRASpecialNetwork] = None
 
-    @property
-    def text_embedding_space_version(self):
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
         # we changed the embeddings. invalidate cache.
-        return self.arch + "_te_v2"
+        return str(model_config.arch) + "_te_v2"
 
     @staticmethod
     def get_train_scheduler():

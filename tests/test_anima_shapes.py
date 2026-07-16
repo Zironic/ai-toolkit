@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from extensions_built_in.diffusion_models.anima import AnimaModel
+from extensions_built_in.diffusion_models.anima.anima import _load_anima_tokenizers
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 
 
@@ -120,8 +121,8 @@ class _FakeConditioner(torch.nn.Module):
         target_attention_mask,
         source_attention_mask,
     ):
-        batch, length = target_input_ids.shape
-        return torch.ones(batch, length, 6)
+        batch = target_input_ids.shape[0]
+        return torch.ones(batch, 5, 6)
 
 
 def _bare_model():
@@ -134,6 +135,83 @@ def _bare_model():
     model.vae_scale_factor = 8
     model.accelerator = SimpleNamespace(autocast=nullcontext)
     return model
+
+
+def test_anima_tokenizers_use_complete_cached_snapshot(monkeypatch, tmp_path):
+    repo_id = "owner/anima"
+    snapshot = str(tmp_path)
+    qwen_calls = []
+    t5_calls = []
+    qwen_tokenizer = object()
+    t5_tokenizer = object()
+
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda repo, local_files_only: snapshot,
+    )
+    monkeypatch.setattr(
+        "extensions_built_in.diffusion_models.anima.anima.Qwen2Tokenizer.from_pretrained",
+        lambda source, subfolder: qwen_calls.append((source, subfolder))
+        or qwen_tokenizer,
+    )
+    monkeypatch.setattr(
+        "extensions_built_in.diffusion_models.anima.anima.T5TokenizerFast.from_pretrained",
+        lambda source, subfolder: t5_calls.append((source, subfolder))
+        or t5_tokenizer,
+    )
+
+    result = _load_anima_tokenizers(repo_id)
+
+    assert result == (qwen_tokenizer, t5_tokenizer)
+    assert qwen_calls == [(snapshot, "tokenizer")]
+    assert t5_calls == [(snapshot, "t5_tokenizer")]
+
+
+def test_anima_tokenizers_fall_back_when_cached_snapshot_is_partial(
+    monkeypatch, tmp_path
+):
+    repo_id = "owner/anima"
+    snapshot = str(tmp_path)
+    qwen_calls = []
+    t5_calls = []
+    qwen_tokenizer = object()
+    t5_tokenizer = object()
+
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda repo, local_files_only: snapshot,
+    )
+
+    def load_qwen(source, subfolder):
+        qwen_calls.append((source, subfolder))
+        return qwen_tokenizer
+
+    def load_t5(source, subfolder):
+        t5_calls.append((source, subfolder))
+        if source == snapshot:
+            raise OSError("t5 tokenizer is not cached")
+        return t5_tokenizer
+
+    monkeypatch.setattr(
+        "extensions_built_in.diffusion_models.anima.anima.Qwen2Tokenizer.from_pretrained",
+        load_qwen,
+    )
+    monkeypatch.setattr(
+        "extensions_built_in.diffusion_models.anima.anima.T5TokenizerFast.from_pretrained",
+        load_t5,
+    )
+
+    result = _load_anima_tokenizers(repo_id)
+
+    assert result == (qwen_tokenizer, t5_tokenizer)
+    assert qwen_calls == [
+        (snapshot, "tokenizer"),
+        (repo_id, "tokenizer"),
+    ]
+    assert t5_calls == [
+        (snapshot, "t5_tokenizer"),
+        (repo_id, "t5_tokenizer"),
+    ]
 
 
 def test_anima_encode_and_decode_keep_trainer_latents_4d():
@@ -185,8 +263,14 @@ def test_anima_prompt_cache_stores_one_2d_tensor_per_prompt():
     embeds = model.get_prompt_embeds(["long", "short"])
 
     assert isinstance(embeds, AdvancedPromptEmbeds)
-    assert [tuple(item.shape) for item in embeds.text_embeds] == [(3, 6), (1, 6)]
+    assert [tuple(item.shape) for item in embeds.text_embeds] == [(5, 6), (5, 6)]
     assert all(item.ndim == 2 for item in embeds.text_embeds)
+    assert (
+        AnimaModel.get_text_embedding_space_version(
+            SimpleNamespace(arch="anima")
+        )
+        == "anima_te_v3"
+    )
 
 
 def test_anima_keeps_five_dimensional_patch_projection_dense():

@@ -99,6 +99,10 @@ UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも
 class BaseModel:
     # override these in child classes
     arch = None
+    # Set True only when load_model() honors both te_only and skip_te. The
+    # trainer uses this capability instead of maintaining an architecture
+    # allowlist in generic worker orchestration.
+    supports_te_cache_worker = False
 
     def __init__(
             self,
@@ -174,7 +178,7 @@ class BaseModel:
         #   skip_te  -> load the transformer (+VAE) but NOT the text encoder(s); the
         #               text encoder is replaced with a FakeTextEncoder. Used by the
         #               trainer once a worker has cached all embeddings to disk.
-        # Only honored by models that implement them (currently zimage + anima).
+        # Only honored by models that declare supports_te_cache_worker=True.
         self.te_only = False
         self.skip_te = False
 
@@ -271,9 +275,19 @@ class BaseModel:
     def is_lumina2(self):
         return self.arch == 'lumina2'
     
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
+        """Return the cache namespace for final prompt-conditioning tensors.
+
+        This is class-level because the TE worker must validate caches before
+        loading either the text stack or the training model. Model extensions
+        should override it whenever get_prompt_embeds() changes semantics.
+        """
+        return str(model_config.arch)
+
     @property
     def text_embedding_space_version(self):
-        return self.arch
+        return type(self).get_text_embedding_space_version(self.model_config)
 
     @property
     def text_embed_dim(self):

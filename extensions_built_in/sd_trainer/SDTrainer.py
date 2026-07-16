@@ -244,6 +244,9 @@ class SDTrainer(BaseSDTrainProcess):
         """Inputs that determine the aux (blank/trigger/uncond/sample) embeds. Changing
         any of these invalidates the on-disk aux cache. Used identically by the worker
         (writer) and the trainer (reader) so they agree on the cache key."""
+        from toolkit.util.get_model import resolve_text_embedding_space_version
+
+        embedding_space = resolve_text_embedding_space_version(self.model_config)
         sample_prompts: List[str] = []
         sample_negs: List[Optional[str]] = []
         if (
@@ -257,6 +260,7 @@ class SDTrainer(BaseSDTrainProcess):
         return {
             'model': str(self.model_config.name_or_path),
             'arch': str(self.model_config.arch),
+            'text_embedding_space_version': embedding_space,
             'trigger_word': self.trigger_word,
             'unconditional_prompt': self.train_config.unconditional_prompt,
             'diff_output_preservation': bool(self.train_config.diff_output_preservation),
@@ -293,13 +297,11 @@ class SDTrainer(BaseSDTrainProcess):
 
 
     def _prepare_file_item_text_cache_signature(self, dataset, file_item):
-        from toolkit.util.get_model import get_model_class
+        from toolkit.util.get_model import resolve_text_embedding_space_version
 
-        model_class = get_model_class(self.model_config)
-        embedding_space = getattr(model_class, "text_embedding_space_version", None)
-        if not isinstance(embedding_space, str):
-            embedding_space = str(self.model_config.arch)
-        file_item.text_embedding_space_version = embedding_space
+        file_item.text_embedding_space_version = resolve_text_embedding_space_version(
+            self.model_config
+        )
 
         # Match the default used by FileItemDTO/TextEmbeddingFileItemDTOMixin.
         if not hasattr(file_item, "text_embedding_version"):

@@ -2318,8 +2318,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # don't recurse: the worker process sets this so it caches in-process instead
         if os.environ.get('AITK_IS_TE_WORKER', '0') == '1':
             return False
-        # only archs with a te_only / skip_te load path
-        if self.model_config.arch not in ('zimage', 'anima', 'ideogram4', 'krea2'):
+        # The model owns partial-load behavior. Generic orchestration only
+        # checks the capability; it does not know architecture names.
+        ModelClass = get_model_class(self.model_config)
+        if not getattr(ModelClass, 'supports_te_cache_worker', False):
             return False
         if not (hasattr(self, 'cache_text_encoder_outputs_to_disk') and hasattr(self, 'aux_cache_is_ready')):
             return False

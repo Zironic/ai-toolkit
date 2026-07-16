@@ -125,6 +125,7 @@ UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも
 
 
 class StableDiffusion:
+    supports_te_cache_worker = False
 
     def __init__(
             self,
@@ -281,9 +282,13 @@ class StableDiffusion:
         """Expected last dim of text embeddings, or None if no validation needed."""
         return None
 
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
+        return str(model_config.arch)
+
     @property
     def text_embedding_space_version(self):
-        return self.arch
+        return type(self).get_text_embedding_space_version(self.model_config)
     
     @property
     def unet_unwrapped(self):

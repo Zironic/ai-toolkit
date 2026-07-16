@@ -61,6 +61,12 @@ class ExampleModel(BaseModel):
     # newer LoKr weight format is the correct one for any new architecture.
     use_old_lokr_format = False
 
+    @classmethod
+    def get_text_embedding_space_version(cls, model_config: ModelConfig) -> str:
+        # Bump this whenever get_prompt_embeds() changes its final tensor
+        # semantics. The worker resolves it before model weights are loaded.
+        return "example_te_v1"
+
     def __init__(
         self,
         device,                  # "cuda:0" etc.
@@ -349,8 +355,8 @@ class ExampleModel(BaseModel):
              (masks, token ids), list it in ``embeds.frozen_dtype_keys``.
 
         NOTE: if you change how embeddings are computed after release, bump
-        ``text_embedding_space_version`` (a property on BaseModel) to
-        invalidate users' on-disk caches.
+        ``get_text_embedding_space_version()`` to invalidate users' on-disk
+        caches.
         """
         if isinstance(prompt, str):
             prompt = [prompt]
