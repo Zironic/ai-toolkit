@@ -129,9 +129,16 @@ and the cap are coupled. Evidence: `scripts/bench_gc_threshold_allowance.py`.
   "0.6-2 GB/s, pin/unpin is seconds" figure was an artifact of per-tensor
   churn, multi-GiB copies, settle waits, and (plausibly) pagefile faults
   after unpinning under RAM pressure -- the ONE regime where repin is slow.
-  Persistent pinned arenas remain the right default as **pagefile
-  protection**, not because registration is expensive. Always populate a
-  buffer BEFORE registering it (20x cheaper than register-then-populate).
+  Cheap registration enables **residency-aware arena pinning**: the runtime
+  keeps only streamed (non-resident) blocks plus a small demotion reserve
+  (`DEFAULT_DEMOTION_PIN_RESERVE_BLOCKS = 2`, deterministic demotion order)
+  registered, and unpins resident blocks after their promotion copies settle
+  (`residency.pin_requirements_for_plan`,
+  `immutable_runtime.reconcile_pin_policy`), returning DXGI shared budget.
+  The canonical host flats stay allocated and populated while unregistered,
+  so the slow pagefile-repin regime only bites under real RAM contention.
+  Always populate a buffer BEFORE registering it (20x cheaper than
+  register-then-populate).
 - Also measured: Dynamo/compile is completely indifferent to pinnedness and
   to host-flat identity (same-shape swaps, even via fresh closures, cause
   zero recompiles). Pinnedness gates in compile paths are our policy code.
@@ -164,8 +171,10 @@ and the cap are coupled. Evidence: `scripts/bench_gc_threshold_allowance.py`.
   torch's reclaimable idle cache as used and would under-promote. GC health
   per training window is in the perf log (`alloc_retries_delta`,
   `cuda_free_count_delta`); the digest prints an "Allocator GC" summary and
-  per-window `reclaimable_at_peak`. `scripts/smoke_krea2_ingraph_cuda.py
-  --cap-descent` measures a phase's true footprint floor empirically.
+  per-window `reclaimable_at_peak`. Exercise a phase's footprint empirically
+  with the current smoke harnesses (`scripts/smoke_krea2_train_cuda.py`,
+  `scripts/smoke_krea2_inference_cuda.py`,
+  `scripts/smoke_transformer_train_cuda.py`).
 - Every ring/reserve resize destroys prefetch state. Aim for a no-resize
   stable band, not continuous adaptation.
 
@@ -180,9 +189,13 @@ env vars.
 
 ## Pointers (source of truth for current behavior)
 
-- `toolkit/memory_management/manager.py` -- planner + live controllers
+- `toolkit/memory_management/arena_offload/` -- generic arena dispatcher
+  (primary offload runtime); sampling via `immutable_runtime.py`
+- `toolkit/memory_management/manager.py` -- legacy planner + live controllers
 - `toolkit/memory_management/manager_modules.py` -- per-Linear streaming
 - `toolkit/memory_management/bounce_pool.py` -- pinned bounce pool + ledger
 - `toolkit/memory_management/pin_manager.py` -- pin authority
+- `toolkit/memory_management/vram_budget.py` -- NVML-backed free/budget sensors
+- `toolkit/memory_management/allocator_cap.py` -- WDDM hard allocator cap
 - `tests/` -- CPU/sim coverage for the controllers (GPU CI does not exist)
 - Mutable status: git-bug tickets (see docs/TICKETS.md)

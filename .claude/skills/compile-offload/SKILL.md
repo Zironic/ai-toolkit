@@ -6,10 +6,12 @@ description: Principles for torch.compile interacting with weight streaming/offl
 # torch.compile + offload streaming
 
 This is the fastest-moving area of the repo. The principles below have held
-across several rewrites; for current mechanism ALWAYS check
-`tasks/open/INGRAPH_STREAM_PLAN.md`, git-bug ticket `3ca8a7b`, and the code
-(`toolkit/memory_management/manager_modules.py`, the Krea2 integration)
-before relying on details.
+across several rewrites; for current mechanism ALWAYS check the code
+(`toolkit/memory_management/arena_offload/`, `immutable_runtime.py`,
+`manager_modules.py`), the open plans in `tasks/open/`
+(`ARENA_FULLGRAPH_COMPILE_PLAN.md`, `COMPILE_MEGA_CACHE_PLAN.md`), and their
+git-bug tickets before relying on details. The in-graph streaming and
+immutable-transfer-arena plans are shipped history under `tasks/done/`.
 
 ## Principles that keep proving true
 
@@ -38,6 +40,11 @@ before relying on details.
   narrower `torch._inductor.config.max_autotune_gemm`, are on the table; the
   latter is the one worth trying (it lets Inductor template the GEMM so the
   quant/dequant pointwise kernels can fold into its epilogue). Untested.
+- **Dynamo is indifferent to pinnedness and host-flat identity** (measured:
+  swapping a same-shaped host flat, even via a fresh closure per boundary,
+  causes zero recompiles). Pinnedness gates in compile paths are our policy
+  code, not a compiler requirement. Diagnose recompile causes with
+  `TORCH_LOGS=recompiles,guards`; never design around a guessed guard.
 - **Bound the dynamic sequence dim; measure recompiles with `new_frames`.**
   Bounds are auto-derived (`toolkit/compile_shape_bounds.py`) from dataset
   buckets + sample resolutions + the model's `SequenceLayout`. Sampling shares
@@ -56,19 +63,21 @@ before relying on details.
   is expected: compile cache + prefetch warmup. Only flag it if it repeats
   every iteration.
 
-## Known state (verify before trusting -- this section rots fastest)
+## Current state (verify before trusting -- this section rots fastest)
 
-As of 2026-07-10: in-graph weight streaming Phases 0-3 done (all-28
-fully-streamed smoke passed). The pin-assumption measurement campaign
-(`scripts/bench_pin_assumptions.py`) killed two beliefs: registration of
-RAM-resident pages is ms-scale (~150 GiB/s, NOT 0.6-2 GB/s), and
-**Dynamo is indifferent to pinnedness and host-flat identity** -- swapping
-a same-shaped host flat, even via a fresh closure per boundary, causes zero
-recompiles, so the production sampling-boundary recompiles have an
-undiagnosed guard cause (task I2 in the plan; diagnose with
-`TORCH_LOGS=recompiles,guards` before designing around it). The settled
-direction is the canonical host arena + manager-owned GPU sidecar
-residency plan in `tasks/open/IMMUTABLE_TRANSFER_ARENA_PLAN.md` (ticket
-`628b0cb`): one-time Parameter canonicalization, no runtime repointing,
-per-Linear residency via static multi-range compact transfers (Python
-submission, ~11 us/copy), compile keyed by residency/layout fingerprint.
+Two offload runtimes coexist:
+
+- **Generic arena dispatcher** (`toolkit/memory_management/arena_offload/`,
+  sampling through `immutable_runtime.py`) -- the primary runtime and the
+  basis of the upstream extraction (ticket `553ffec`): canonical host arena,
+  no runtime Parameter repointing, manager-owned residency, and eager transfer
+  around functional block kernels. Strict per-block `fullgraph=True` is the
+  active compile target (`tasks/open/ARENA_FULLGRAPH_COMPILE_PLAN.md`, ticket
+  `c4e29f1`).
+- **Legacy MemoryManager** per-Linear streaming (`manager.py` /
+  `manager_modules.py`) remains a fallback runtime. Making its wrappers
+  fullgraph-compatible is not an active requirement.
+
+Compile-cache persistence across process restarts (Mega-Cache) is shipped for
+sampling; strict arena-block and full-model restoration are open
+(`tasks/open/COMPILE_MEGA_CACHE_PLAN.md`, ticket `ab208bf`).

@@ -79,8 +79,9 @@ running and remove a stale `.git/git-bug/lock` if present, then retry.
 
 ```bash
 # Memory-management / CUDA tests — through the project venv, hit the real GPU.
-# Fine to run directly; these finish in seconds.
-venv/Scripts/python.exe -m pytest tests/ -q
+# Run a targeted file (seconds). The FULL tests/ suite takes ~5 minutes
+# (process-isolated tests; ticket f2aceba) — don't run it by default, only for
+# genuinely cross-cutting changes, an explicit request, or a release gate.
 venv/Scripts/python.exe -m pytest tests/test_bounce_pool.py -q
 venv/Scripts/python.exe scripts/bench_bounce_fill_group.py   # ad-hoc GPU script
 
@@ -186,9 +187,15 @@ overrides that are not required for normal training.
       `memory_stats()['num_alloc_retries']` ticks once per OOM-retry reclaim;
       the gc_threshold sweep doesn't tick it (watch `num_device_free`). Keep
       retries ~0/step in steady state.
-    - **Pinned host memory grows/shrinks slowly, and torch never gives it back.**
-      Page-locking is per-page kernel work (~0.6–2 GB/s on consumer Windows), so
-      large pin/unpin is seconds, not free. Worse, anything pinned through torch's
+    - **Pinning populated pages is fast, but torch never gives pinned memory back.**
+      Measured: `cudaHostRegister` on RAM-resident (populated) pages is ms-scale
+      (~150 GiB/s; untouched demand-zero pages ~9 GiB/s) — always populate a buffer
+      before registering it. Cheap registration is what makes the arena's
+      residency-aware pinning viable: only streamed (non-resident) blocks plus the
+      next expected demotions (`DEFAULT_DEMOTION_PIN_RESERVE_BLOCKS = 2`, demotion
+      order) stay registered; resident blocks are unpinned after their promotion
+      copies settle, returning DXGI shared budget. The real cost is
+      retention: anything pinned through torch's
       caching host allocator (`pin_memory=True`, every `non_blocking=True` D2H
       staging buffer) is retained page-locked for the process lifetime on free —
       it commits against the DXGI budget until `torch._C._host_emptyCache()`.
@@ -223,4 +230,3 @@ overrides that are not required for normal training.
   text from helper files (bypassing shell quoting), fails fast on missing
   anchors, and preserves newline style. Run it via `venv/Scripts/python.exe`;
   keep the helper text files in the scratchpad/temp dir, not the repo.
-</content>

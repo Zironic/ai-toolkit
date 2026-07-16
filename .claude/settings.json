@@ -13,7 +13,7 @@
         ]
       },
       {
-        "matcher": "Edit|Write",
+        "matcher": "^(Edit|Write)$",
         "hooks": [
           {
             "type": "command",
@@ -24,7 +24,7 @@
         ]
       },
       {
-        "matcher": "^Read$|^mcp__.*__(read|get|open)",
+        "matcher": "^(Read|mcp__.*__(read|get|open).*)$",
         "hooks": [
           {
             "type": "command",
@@ -48,13 +48,13 @@
         ]
       },
       {
-        "matcher": "Edit|Write",
+        "matcher": "^(Edit|Write)$",
         "hooks": [
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR/venv/Scripts/python.exe\" \"$CLAUDE_PROJECT_DIR/.agent-hooks/agent_hooks.py\" format-after-edit",
-            "timeout": 60,
-            "statusMessage": "Linting edited files"
+            "timeout": 120,
+            "statusMessage": "Checking edited files"
           }
         ]
       }

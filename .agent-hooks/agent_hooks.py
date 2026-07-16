@@ -2,19 +2,23 @@
 """
 Agent hook policy bundle for Claude Code + OpenAI Codex.
 
-Implements four practical policies:
+Implements six practical policies:
   1. Block direct reads of large/generated files (bounded/ranged reads pass).
   2. Rewrite raw PowerShell-in-Bash invocations through a stable UTF-8/no-progress/plain-output wrapper.
   3. Cap likely-huge command output (Bash and PowerShell tools) by re-running the
      command through this wrapper in its original shell and saving raw logs under .agent/logs/.
-  4. Report Ruff findings that intersect lines changed relative to HEAD.
+  4. Report mirrored skill-tree drift and Ruff findings that intersect lines
+     changed relative to HEAD.
   5. Silently ASCII-fy edit/write payloads for source files: typographic
      punctuation is transliterated (smart quotes, em dash, arrows, ellipsis)
      and emoji/symbols are dropped. Letters (accented, CJK) and Markdown
      files are left alone, and Edit old_string anchors are never touched.
   6. Repo safety guards (policy 0, checked before any rewrite): deny
      `git-bug webui` and PYTORCH_CUDA_ALLOC_CONF assignments; ask before
-     full training runs (run.py) and recursive deletion touching output/.
+     full training runs (run.py), direct smoke-script execution and recognized
+     GPU job-control commands (skippable via the .agent/allow-gpu-smokes toggle
+     file), and recursive deletion touching output/ or any deletion touching
+     datasets/.
 
 This script is intentionally conservative: it blocks only mechanically obvious waste.
 """
@@ -38,17 +42,19 @@ from typing import Any
 
 # ----------------------------- policy knobs -----------------------------
 
-# Generic source files get a generous cap (Claude's Read self-truncates at 2000
-# lines anyway); only mechanically obvious waste gets blocked. Generated/vendor
-# files keep the strict cap.
+# Generic source files get a generous cap; only mechanically obvious waste is
+# blocked. Generated/vendor files keep the strict cap.
 LARGE_FILE_BYTES = int(os.environ.get("AGENT_HOOK_LARGE_FILE_BYTES", "300000"))
 GENERATED_FILE_BYTES = int(os.environ.get("AGENT_HOOK_GENERATED_FILE_BYTES", "10000"))
 
 # Tool-visible output cap for wrapped commands. Raw output is saved under .agent/logs/.
 VISIBLE_HEAD_LINES = int(os.environ.get("AGENT_HOOK_HEAD_LINES", "120"))
 VISIBLE_TAIL_LINES = int(os.environ.get("AGENT_HOOK_TAIL_LINES", "120"))
-# Keep below Claude Code's own 30k-char Bash output truncation, or this never fires.
+# Fallback threshold for an unwrapped post-tool result.
 POST_TOOL_MAX_CHARS = int(os.environ.get("AGENT_HOOK_POST_TOOL_MAX_CHARS", "24000"))
+# Structured hook output is capped at 10k characters by Claude Code. Leave
+# room for the surrounding JSON and explanatory text.
+POST_HOOK_SUMMARY_MAX_CHARS = 9000
 
 WRAP_MARKER = "__AGENT_HOOK_WRAPPED__=1"
 SKIP_CAP_MARKER = "AGENT_HOOK_NO_CAP=1"
@@ -86,6 +92,19 @@ NOISY_COMMAND_RE = re.compile(
     r"Get-ChildItem\b.*-Recurse\b)"
 )
 
+BOUNDED_READ_RE = re.compile(
+    r"(?ix)(?:"
+    r"\|\s*(?:head|tail)\b"
+    r"|\bSelect-Object\b[^|;&]*-(?:First|Last)\b"
+    r"|\bGet-Content\b[^|;&]*-(?:TotalCount|Tail)\b"
+    r"|\b(?:rg|grep)\b[^|;&]*(?:--max-count(?:=|\s)|\s-m(?:\d|\s))"
+    r")"
+)
+
+LOW_OUTPUT_COMMAND_RE = re.compile(
+    r"(?i)^\s*git\s+diff\b(?=[^;|&]*--(?:check|quiet)\b)[^;|&]*$"
+)
+
 # Repo safety guards: mechanical rules from CLAUDE.md that should never depend
 # on the model remembering them. deny = hard rule, ask = user confirms intent.
 SAFETY_DENY: list[tuple[re.Pattern[str], str]] = [
@@ -99,15 +118,91 @@ SAFETY_DENY: list[tuple[re.Pattern[str], str]] = [
      "on Windows. Leave allocator defaults alone (see CLAUDE.md)."),
 ]
 SAFETY_ASK: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"(?i)\bpython[\w.]*(?:\.exe)?['\"]?\s+[^\s;|&]*run\.py\b"),
+    (re.compile(
+        r"(?i)(?:\bpython[\w.]*(?:\.exe)?|(?:^|[\s'\"])py(?:\.exe)?)"
+        r"['\"]?\s+(?:-[^\s]+\s+)*['\"]?[^\s'\";|&]*run\.py\b"
+     ),
      "This looks like a full training run (minutes to hours, real datasets and "
      "checkpoints). CLAUDE.md says to launch these only when the user explicitly asks."),
+    (re.compile(
+        r"(?i)\b(?:Remove-Item|rm|ri|del|erase|rd|rmdir)(?:\.exe)?\b"
+        r"(?=[^;|&]*\bdatasets\b)"
+     ),
+     "datasets/ is a junction into the sibling checkout's real training data; "
+     "deleting any path there destroys user data. Confirm this is intended."),
     (re.compile(r"(?i)(\brm\s+-\w*[rf]\w*\s+[^;|&]*\boutput\b"
-                r"|\bRemove-Item\b(?=[^;|&]*-(?:Recurse|Force))(?=[^;|&]*\boutput\b)"
-                r"|\brmdir\s+/s\b[^;|&]*\boutput\b)"),
-     "output/ is a junction into the sibling checkout's real training outputs; "
-     "recursive deletion there destroys finished runs. Confirm this is intended."),
+                r"|\b(?:Remove-Item|rm|ri|del|erase|rd|rmdir)\b"
+                r"(?=[^;|&]*-(?:Recurse|Force|r|f)\b)"
+                r"(?=[^;|&]*\boutput\b)"
+                r"|\b(?:rmdir|rd|del|erase)(?:\.exe)?\b"
+                r"(?=[^;|&]*/s\b)(?=[^;|&]*\boutput\b))"),
+     "output/ is a junction into the sibling checkout's real training results; "
+     "recursive deletion there destroys user data. Confirm this is intended."),
 ]
+
+# Direct smoke runs load real models and reserve real GPU memory, so they ask
+# by default -- but the user can grant agents GPU access for a work session by
+# creating a toggle file (gitignored via /.agent/). Toggle ON: create the
+# file, empty or containing "on". Toggle OFF: delete it or write "off". The
+# .md spelling exists for easy creation/editing on Windows; the first
+# candidate that exists wins.
+GPU_SMOKE_TOGGLE_RELPATHS = tuple(
+    Path(".agent") / name
+    for name in ("allow-gpu-smokes", "allow-gpu-smokes.md")
+)
+GPU_SMOKE_TOGGLE_OFF_TOKENS = {"off", "false", "0", "deny", "ask"}
+SMOKE_ASK: tuple[re.Pattern[str], str] = (
+    re.compile(
+        r"(?i)(?:\bpython[\w.]*(?:\.exe)?|(?:^|[\s'\"])py(?:\.exe)?)"
+        r"['\"]?\s+(?:-[^\s]+\s+)*['\"]?"
+        r"[^\s'\";|&]*scripts[\\/]+smoke_[^\\/\s'\";|&]*\.py\b"
+    ),
+    "This directly runs a smoke script. Smoke scripts may exercise CUDA, load full "
+    "models, or reserve significant GPU memory, so they need user approval. To let "
+    "agents run GPU smokes without asking, create .agent/allow-gpu-smokes(.md) "
+    "(empty or 'on'); delete it or write 'off' to close the gate again.",
+)
+
+GPU_JOB_CONTROL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?is)(?:^|[;&]\s*)\$?node(?:\.exe)?\s+-e\b.*?"
+        r"dist[\\/]cron[\\/]actions[\\/]startJob\.js\b"
+    ),
+    re.compile(
+        r"(?is)\bpython[\w.]*(?:\.exe)?\s+-c\b.*?\bsqlite3\b.*?"
+        r"\bconnect\s*\(\s*r?['\"]aitk_db\.db['\"].*?\bupdate\s+Job\b"
+    ),
+    re.compile(
+        r"(?is)\bGet-Process\s+-Id\s+\d+\b.*?"
+        r"\bStop-Process\s+-Id\s+\d+\b"
+    ),
+)
+GPU_JOB_CONTROL_ASK = (
+    "This controls a local GPU training job (launch, database update, or process "
+    "restart), so it needs user approval. To allow recognized GPU job-control "
+    "commands without asking, create .agent/allow-gpu-smokes(.md) (empty or 'on'); "
+    "delete it or write 'off' to close the gate again."
+)
+
+
+def gpu_smokes_allowed(root: Path) -> bool:
+    """True when the user's local toggle file grants agents GPU smoke runs."""
+    for relpath in GPU_SMOKE_TOGGLE_RELPATHS:
+        toggle = root / relpath
+        try:
+            if not toggle.is_file():
+                continue
+            text = toggle.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            token = line.strip().lower()
+            if not token or token.startswith("#"):
+                continue
+            return token not in GPU_SMOKE_TOGGLE_OFF_TOKENS
+        # An existing but empty file counts as on: "touch" is the toggle gesture.
+        return True
+    return False
 
 # Typographic characters with an obvious ASCII spelling. Anything non-ASCII not
 # in this map is kept if it is a letter/digit/combining mark, turned into a
@@ -133,6 +228,8 @@ ASCII_MAP = {
 EMOJI_MODIFIER_DROP = {0x200D, 0xFE0E, 0xFE0F, 0x20E3, *range(0xFE00, 0xFE10), *range(0x1F3FB, 0x1F400)}
 
 SANITIZE_SKIP_EXTENSIONS = {".md", ".ipynb"}
+
+SKILL_TREE_PAIRS = ((".agents/skills", ".claude/skills"),)
 
 POWERSHELL_START_RE = re.compile(r"^\s*(pwsh(?:\.exe)?|powershell(?:\.exe)?)\b", re.I)
 POWERSHELL_CMDLET_RE = re.compile(
@@ -181,6 +278,16 @@ def ask_pre_tool(event: dict[str, Any], reason: str) -> None:
         "hookSpecificOutput": {
             "hookEventName": event_name(event, "PreToolUse"),
             "permissionDecision": "ask",
+            "permissionDecisionReason": reason,
+        }
+    })
+
+
+def allow_pre_tool(event: dict[str, Any], reason: str) -> None:
+    write_json({
+        "hookSpecificOutput": {
+            "hookEventName": event_name(event, "PreToolUse"),
+            "permissionDecision": "allow",
             "permissionDecisionReason": reason,
         }
     })
@@ -308,6 +415,39 @@ def sanitize_target_path(ti: dict[str, Any]) -> str:
     return ""
 
 
+def asciify_apply_patch(patch: str) -> str:
+    """Sanitize added source lines without changing patch anchors or Markdown."""
+    sanitize_section = False
+    out: list[str] = []
+
+    for line in patch.splitlines(keepends=True):
+        header = re.match(r"^\*\*\*\s+(?:Add|Update)\s+File:\s+(.+?)\s*$", line)
+        if header is not None:
+            suffix = Path(header.group(1)).suffix.lower()
+            sanitize_section = (
+                suffix not in SANITIZE_SKIP_EXTENSIONS
+                and (not suffix or suffix in TEXT_EXTENSIONS)
+            )
+            out.append(line)
+            continue
+
+        if re.match(r"^\*\*\*\s+Delete\s+File:", line):
+            sanitize_section = False
+            out.append(line)
+            continue
+
+        if (
+            sanitize_section
+            and line.startswith("+")
+            and not re.match(r"^\+\+\+\s+[ab]/", line)
+        ):
+            out.append("+" + asciify(line[1:]))
+        else:
+            out.append(line)
+
+    return "".join(out)
+
+
 def mode_pre_edit() -> int:
     event = read_event()
     ti = event.get("tool_input") or {}
@@ -342,6 +482,14 @@ def mode_pre_edit() -> int:
             new_edits.append(entry)
         if changed:
             updated["edits"] = new_edits
+
+    for key in ("command", "patch"):
+        val = ti.get(key)
+        if isinstance(val, str) and "*** Begin Patch" in val:
+            fixed = asciify_apply_patch(val)
+            if fixed != val:
+                updated[key] = fixed
+                changed = True
 
     if changed:
         # Silent by design: no reason text, just the sanitized input.
@@ -386,12 +534,7 @@ def self_command(mode: str, payload: str, *, extra_args: str = "", ps: bool = Fa
 
 
 def command_is_bounded_read(command: str) -> bool:
-    c = command.lower()
-    bounded_terms = [
-        "| head", "| tail", "select-object -first", "select-object -last",
-        "-totalcount", "-tail", "--max-count", "-n ", "--line-number",
-    ]
-    return any(t in c for t in bounded_terms)
+    return bool(BOUNDED_READ_RE.search(command))
 
 
 def extract_candidate_read_paths(command: str, cwd: Path) -> list[Path]:
@@ -416,8 +559,15 @@ def extract_candidate_read_paths(command: str, cwd: Path) -> list[Path]:
     m = re.search(r"(?i)\b(?:Get-Content|gc)\b\s+([^|;&]+)", command)
     if m:
         raw = m.group(1).strip()
-        # remove common flags and keep likely path-ish tokens
-        raw = re.sub(r"(?i)\s+-(Raw|Encoding|ReadCount|Wait)\b(?:\s+\S+)?", " ", raw)
+        # Remove switch-only flags without consuming the following path, then
+        # remove flags whose following token is their value.
+        raw = re.sub(r"(?i)(?:^|\s+)-(?:Raw|Wait)\b", " ", raw)
+        raw = re.sub(
+            r"(?i)(?:^|\s+)-(?:Encoding|ReadCount)\b\s+\S+",
+            " ",
+            raw,
+        )
+        raw = re.sub(r"(?i)(?:^|\s+)-(?:Path|LiteralPath)\b", " ", raw)
         for token in re.findall(r"\"([^\"]+)\"|'([^']+)'|(\S+)", raw):
             s = next((x for x in token if x), "")
             if s and not s.startswith("-"):
@@ -521,6 +671,8 @@ def likely_noisy(command: str) -> bool:
         return False
     if WRAP_MARKER in command:
         return False
+    if LOW_OUTPUT_COMMAND_RE.search(command):
+        return False
     if command_is_bounded_read(command):
         return False
     if NOISY_COMMAND_RE.search(command):
@@ -562,7 +714,7 @@ def mode_pre_bash() -> int:
     if not isinstance(ti, dict):
         return 0
     command = str(ti.get("command") or "")
-    if not command or WRAP_MARKER in command:
+    if not command:
         return 0
 
     # 0. Repo safety guards, before any rewrite can obscure the command.
@@ -574,6 +726,28 @@ def mode_pre_bash() -> int:
         if pattern.search(command):
             ask_pre_tool(event, why)
             return 0
+    gpu_allowed = gpu_smokes_allowed(root)
+    smoke_pattern, smoke_why = SMOKE_ASK
+    if smoke_pattern.search(command):
+        if gpu_allowed:
+            allow_pre_tool(event, "The user's GPU-access toggle allows this smoke run.")
+        else:
+            ask_pre_tool(event, smoke_why)
+        return 0
+    if any(pattern.search(command) for pattern in GPU_JOB_CONTROL_PATTERNS):
+        if gpu_allowed:
+            allow_pre_tool(
+                event,
+                "The user's GPU-access toggle allows this recognized job-control command.",
+            )
+        else:
+            ask_pre_tool(event, GPU_JOB_CONTROL_ASK)
+        return 0
+
+    # Rewritten commands skip read/output wrapping on their second pass, but
+    # never skip the safety rules above merely because they contain the marker.
+    if WRAP_MARKER in command:
+        return 0
 
     # 1. Block direct large/generated full-file reads.
     for path in extract_candidate_read_paths(command, cwd):
@@ -632,21 +806,28 @@ def mode_post_output(agent: str = "auto") -> int:
     cwd = cwd_from_event(event)
     log_path = save_raw_log(cwd, "post_tool_output", "<post tool output>", text, "")
     summary = summarize_output(text, "", log_path=log_path, returncode=None)
+    if len(summary) > POST_HOOK_SUMMARY_MAX_CHARS:
+        summary = (
+            summary[: POST_HOOK_SUMMARY_MAX_CHARS - 80]
+            + "\n[agent hook] Summary truncated; use the raw log path above."
+        )
 
-    # Codex includes model/turn_id fields. Claude requires updatedToolOutput with the original schema.
-    # Prefer the explicit --agent flag from the hook config; sniff only as fallback.
+    # Codex includes model/turn_id fields. Claude supports updatedToolOutput with
+    # the original response schema. Prefer the explicit config flag; sniff only
+    # as fallback.
     if agent == "auto":
         is_codex = "model" in event or "turn_id" in event
     else:
         is_codex = agent == "codex"
     if is_codex:
+        # Codex PostToolUse cannot currently suppress or replace tool output.
+        # Report the bounded copy as a supported system message without marking
+        # a successful tool call as blocked/failed.
         write_json({
-            "decision": "block",
-            "reason": "Tool output exceeded policy cap; replacing with bounded summary.",
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": summary,
-            },
+            "systemMessage": (
+                "Tool output exceeded the post-hook cap. The original output could not "
+                "be replaced by Codex; a bounded copy follows.\n" + summary
+            ),
         })
         return 0
 
@@ -871,20 +1052,93 @@ def format_ruff_diagnostic(
     return f"{rel}:{row}:{column}: {code} {message}"
 
 
+def path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.absolute().relative_to(parent.absolute())
+        return True
+    except ValueError:
+        return False
+
+
+def changed_files_touch_skill_trees(root: Path, files: Iterable[Path]) -> bool:
+    skill_roots = [root / rel for pair in SKILL_TREE_PAIRS for rel in pair]
+    return any(path_is_within(path, skill_root) for path in files for skill_root in skill_roots)
+
+
+def skill_tree_differences(root: Path) -> list[str]:
+    differences: list[str] = []
+
+    for left_rel, right_rel in SKILL_TREE_PAIRS:
+        left_root = root / left_rel
+        right_root = root / right_rel
+        left_files = {
+            path.relative_to(left_root).as_posix(): path
+            for path in left_root.rglob("*")
+            if path.is_file()
+        } if left_root.is_dir() else {}
+        right_files = {
+            path.relative_to(right_root).as_posix(): path
+            for path in right_root.rglob("*")
+            if path.is_file()
+        } if right_root.is_dir() else {}
+
+        for rel in sorted(left_files.keys() | right_files.keys()):
+            left = left_files.get(rel)
+            right = right_files.get(rel)
+            if left is None:
+                differences.append(f"{left_rel}/{rel}: missing (mirror: {right_rel}/{rel})")
+            elif right is None:
+                differences.append(f"{right_rel}/{rel}: missing (mirror: {left_rel}/{rel})")
+            else:
+                try:
+                    identical = left.read_bytes() == right.read_bytes()
+                except OSError as exc:
+                    differences.append(f"{rel}: could not compare mirrored skills: {exc}")
+                    continue
+                if not identical:
+                    differences.append(
+                        f"{left_rel}/{rel} differs from {right_rel}/{rel}"
+                    )
+
+    return differences
+
+
 def mode_format_after_edit() -> int:
-    """Report Ruff findings that intersect lines changed relative to HEAD."""
+    """Report mirrored-skill drift and Ruff findings on changed lines."""
     event = read_event()
     cwd = cwd_from_event(event)
     root = project_root(cwd)
 
-    files = sorted({
+    changed_files = sorted(set(extract_changed_files(event, cwd)))
+    output: list[str] = []
+
+    if changed_files_touch_skill_trees(root, changed_files):
+        differences = skill_tree_differences(root)
+        if differences:
+            output.append(
+                "mirrored skill trees are out of sync:\n"
+                + "\n".join(differences[:20])
+            )
+            if len(differences) > 20:
+                output.append(f"... {len(differences) - 20} more skill differences")
+
+    files = [
         path
-        for path in extract_changed_files(event, cwd)
+        for path in changed_files
         if path.exists() and path.is_file()
-    })
+    ]
     py_files = [path for path in files if path.suffix.lower() == ".py"]
 
-    if not py_files or len(py_files) > 20:
+    if not py_files:
+        if output:
+            add_context(event, "\n".join(output))
+        return 0
+
+    if len(py_files) > 20:
+        output.append(
+            f"ruff hook skipped: edit touched {len(py_files)} Python files (limit: 20)"
+        )
+        add_context(event, "\n".join(output))
         return 0
 
     exe_dir = Path(sys.executable).parent
@@ -898,6 +1152,8 @@ def mode_format_after_edit() -> int:
     ) or shutil.which("ruff")
 
     if not ruff:
+        if output:
+            add_context(event, "\n".join(output))
         return 0
 
     findings: list[str] = []
@@ -957,8 +1213,6 @@ def mode_format_after_edit() -> int:
             ):
                 findings.append(format_ruff_diagnostic(rel, diagnostic))
 
-    output: list[str] = []
-
     if findings:
         shown = findings[:40]
         output.append(
@@ -980,6 +1234,14 @@ def mode_format_after_edit() -> int:
 
 # ----------------------------- runner modes -----------------------------
 
+def emit_output(text: str) -> None:
+    if not text:
+        return
+    sys.stdout.write(text)
+    if not text.endswith(("\n", "\r")):
+        sys.stdout.write("\n")
+
+
 def mode_run_capped(args: argparse.Namespace) -> int:
     command = unb64(args.b64)
     cwd = Path.cwd()
@@ -989,7 +1251,14 @@ def mode_run_capped(args: argparse.Namespace) -> int:
     else:
         proc = subprocess.run(command, shell=True, cwd=str(cwd), text=True, capture_output=True, errors="replace")
     log_path = save_raw_log(cwd, "command", command, proc.stdout, proc.stderr)
-    print(summarize_output(proc.stdout, proc.stderr, log_path=log_path, returncode=proc.returncode))
+    emit_output(
+        summarize_output(
+            proc.stdout,
+            proc.stderr,
+            log_path=log_path,
+            returncode=proc.returncode,
+        )
+    )
     return proc.returncode
 
 
@@ -1004,7 +1273,14 @@ def mode_run_ps_capped(args: argparse.Namespace) -> int:
         # Fallback: run through shell, still capped, if PowerShell executable is not found.
         proc = subprocess.run(script, shell=True, cwd=str(cwd), text=True, capture_output=True, errors="replace")
         log_path = save_raw_log(cwd, "powershell_fallback", script, proc.stdout, proc.stderr)
-        print(summarize_output(proc.stdout, proc.stderr, log_path=log_path, returncode=proc.returncode))
+        emit_output(
+            summarize_output(
+                proc.stdout,
+                proc.stderr,
+                log_path=log_path,
+                returncode=proc.returncode,
+            )
+        )
         return proc.returncode
 
     wrapped_script = build_powershell_wrapper(script)
@@ -1025,21 +1301,30 @@ def mode_run_ps_capped(args: argparse.Namespace) -> int:
         ps1 = None
         run_cmd = encoded_cmd
 
-    proc = subprocess.run(
-        run_cmd,
-        cwd=str(cwd),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-    )
-    if ps1 is not None:
-        try:
-            ps1.unlink(missing_ok=True)
-        except Exception:
-            pass
+    try:
+        proc = subprocess.run(
+            run_cmd,
+            cwd=str(cwd),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+        )
+    finally:
+        if ps1 is not None:
+            try:
+                ps1.unlink(missing_ok=True)
+            except OSError:
+                pass
     log_path = save_raw_log(cwd, "powershell", script, proc.stdout, proc.stderr)
-    print(summarize_output(proc.stdout, proc.stderr, log_path=log_path, returncode=proc.returncode))
+    emit_output(
+        summarize_output(
+            proc.stdout,
+            proc.stderr,
+            log_path=log_path,
+            returncode=proc.returncode,
+        )
+    )
     return proc.returncode
 
 # ----------------------------- output helpers -----------------------------
@@ -1096,13 +1381,8 @@ def first_last_lines(text: str, head: int, tail: int) -> tuple[list[str], list[s
 
 
 def strip_git_crlf_noise(text: str) -> str:
-    """Hide Git's harmless line-ending warning and its PowerShell error record.
-
-    Windows PowerShell 5.1 promotes the first native stderr line to an
-    ErrorRecord when the capped wrapper merges streams. Keep real stderr in the
-    raw log, but do not surface this known warning or the wrapper metadata in
-    the bounded summary.
-    """
+    """Hide Git's harmless line-ending warning and legacy PS error metadata."""
+    had_trailing_newline = text.endswith(("\n", "\r"))
     lines = text.splitlines()
     out: list[str] = []
     skip_powershell_record = False
@@ -1122,19 +1402,29 @@ def strip_git_crlf_noise(text: str) -> str:
                 continue
             skip_powershell_record = False
         out.append(line)
-    return "\n".join(out)
+    cleaned = "\n".join(out)
+    if cleaned and had_trailing_newline:
+        cleaned += "\n"
+    return cleaned
 
 
 def summarize_output(stdout: str, stderr: str, *, log_path: Path, returncode: int | None) -> str:
+    stdout = strip_git_crlf_noise(stdout)
+    stderr = strip_git_crlf_noise(stderr)
     combined = ""
     if stdout:
         combined += stdout
     if stderr:
-        combined += ("\n" if combined else "") + "[stderr]\n" + stderr
+        separator = "" if not combined or combined.endswith(("\n", "\r")) else "\n"
+        combined += separator + "[stderr]\n" + stderr
 
-    combined = strip_git_crlf_noise(combined)
     head, tail, total = first_last_lines(combined, VISIBLE_HEAD_LINES, VISIBLE_TAIL_LINES)
-    error_lines = [ln for ln in combined.splitlines() if ERROR_LINE_RE.search(ln)]
+    if len(combined) <= POST_TOOL_MAX_CHARS and not tail:
+        return combined
+
+    error_lines = []
+    if returncode is None or returncode != 0:
+        error_lines = [ln for ln in combined.splitlines() if ERROR_LINE_RE.search(ln)]
     # Keep unique-ish first 80 error lines.
     seen = set()
     compact_errors = []
@@ -1182,8 +1472,11 @@ def resolve_powershell_exe(requested: str) -> str | None:
 
 
 def build_powershell_wrapper(script: str) -> str:
-    prelude = "$ErrorActionPreference = 'Continue'\n$ProgressPreference = 'SilentlyContinue'\n$InformationPreference = 'Continue'\n$WarningPreference = 'Continue'\ntry {\n    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)\n    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n    if ($PSVersionTable.PSVersion.Major -ge 7) { $PSStyle.OutputRendering = 'PlainText' }\n} catch {}\ntry {\n    & {\n"
-    postlude = '} *>&1 | Out-String -Width 4096\n    if ($global:LASTEXITCODE -is [int] -and $global:LASTEXITCODE -ne 0) { exit $global:LASTEXITCODE }\n} catch {\n    [Console]::Error.WriteLine(($_ | Out-String -Width 4096))\n    exit 1\n}\n'
+    prelude = "$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n$InformationPreference = 'Continue'\n$WarningPreference = 'Continue'\ntry {\n    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)\n    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n    if ($PSVersionTable.PSVersion.Major -ge 7) { $PSStyle.OutputRendering = 'PlainText' }\n} catch {}\ntry {\n    $global:LASTEXITCODE = 0\n    & {\n"
+    # Keep the error stream separate. Windows PowerShell 5.1 converts native
+    # stderr into ErrorRecord objects when 2>&1 is used; under Stop that turns a
+    # harmless warning from a successful native command into a terminating error.
+    postlude = '} 3>&1 4>&1 5>&1 6>&1 | Out-String -Width 4096\n    if ($global:LASTEXITCODE -is [int] -and $global:LASTEXITCODE -ne 0) { exit $global:LASTEXITCODE }\n} catch {\n    $ErrorActionPreference = \'Continue\'\n    Write-Output ($_ | Out-String -Width 4096)\n    exit 1\n}\n'
     return prelude + script + "\n" + postlude
 
 
@@ -1213,15 +1506,23 @@ def extract_changed_files(event: dict[str, Any], cwd: Path) -> list[Path]:
         return []
     out: list[Path] = []
 
-    for key in ("file_path", "filepath", "path"):
+    for key in ("file_path", "filepath", "path", "notebook_path"):
         val = ti.get(key)
         if isinstance(val, str) and val.strip():
             out.append(resolve_path(val, cwd))
 
-    cmd = ti.get("command")
-    if isinstance(cmd, str):
+    patch_payloads = [
+        value
+        for key in ("command", "patch")
+        if isinstance((value := ti.get(key)), str)
+    ]
+    for cmd in patch_payloads:
         # Codex apply_patch shape.
-        for m in re.finditer(r"^\*\*\*\s+(?:Update|Add)\s+File:\s+(.+)$", cmd, re.M):
+        for m in re.finditer(
+            r"^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+(.+)$",
+            cmd,
+            re.M,
+        ):
             out.append(resolve_path(m.group(1).strip(), cwd))
         for m in re.finditer(r"^\+\+\+\s+b/(.+)$", cmd, re.M):
             p = m.group(1).strip()

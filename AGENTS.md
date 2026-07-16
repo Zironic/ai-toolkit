@@ -27,10 +27,10 @@ changes.
 
 ## Workspace Conventions
 
-In Codex sandbox sessions the project temp folder is `/tmp`. In normal Windows
-terminals use the standard Windows temp location instead. Either way, put
-throwaway helper scripts (e.g. edit scripts, one-off probes) in the temp folder,
-not the repo root.
+Put throwaway helper scripts (e.g. edit scripts, one-off probes) in the Windows
+temp folder (`$env:TEMP`) or the repo-local, gitignored `.agent/tmp/`, never the
+repo root. Use `/tmp` only when actually running inside a Linux sandbox session
+where no Windows temp location exists.
 
 ### ASCII only
 
@@ -110,8 +110,18 @@ Do not use `git-bug webui` — in git-bug v0.10.1 it holds the `.git/git-bug` st
 
 ## Code Map
 
-- `toolkit/memory_management/manager.py` - planner, smart attach, live autotune,
-  promote/demote, sampling restore, memory safety.
+- `toolkit/memory_management/arena_offload/` - generic block-native arena
+  dispatcher (the primary offload runtime): planner, dispatcher, transfer,
+  load session, FP8, cap calibration.
+- `toolkit/memory_management/immutable_runtime.py` - immutable sampling
+  runtime over the arena.
+- `toolkit/memory_management/pin_manager.py` - single authority for pinned
+  host memory (priority, accounting, eviction).
+- `toolkit/memory_management/vram_budget.py` - NVML-backed free-VRAM and
+  allocator-budget sensors.
+- `toolkit/memory_management/allocator_cap.py` - WDDM hard allocator cap.
+- `toolkit/memory_management/manager.py` - legacy planner, smart attach, live
+  autotune, promote/demote, sampling restore, memory safety.
 - `toolkit/memory_management/manager_modules.py` - per-module streaming forward,
   trace lifecycle, block staging, FP8 helpers.
 - `toolkit/memory_management/bounce_pool.py` - pageable-to-pinned worker pool,

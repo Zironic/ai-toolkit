@@ -8,9 +8,14 @@ description: How to validate CUDA/FP8/memory-manager behavior on the real GPU in
 ## The ground rules
 
 - **Small real-GPU scripts are the normal way to check this code; no need to
-  ask first.** Run them through the project venv:
-  `venv/Scripts/python.exe -m pytest tests/ -q` (finishes in seconds) or an
-  ad-hoc script like `venv/Scripts/python.exe scripts/bench_bounce_fill_group.py`.
+  ask first.** Run them through the project venv: a targeted test file like
+  `venv/Scripts/python.exe -m pytest tests/test_bounce_pool.py -q` (seconds)
+  or an ad-hoc script like `venv/Scripts/python.exe scripts/bench_bounce_fill_group.py`.
+- **Do not run the full `tests/` suite as a default confidence check.** It
+  currently takes ~5 minutes (process-isolated tests; see ticket `f2aceba`).
+  A full-suite run is for genuinely cross-cutting changes, an explicit user
+  request, or a release gate -- otherwise pick the narrowest test that
+  answers the question (AGENTS.md "Validation" is the policy).
 - **Full training runs (`python run.py ...`) need the user's explicit
   go-ahead**: minutes to hours, real datasets/checkpoints, and a unit test is
   not a substitute. A pre-bash hook asks for confirmation on these.
@@ -67,6 +72,16 @@ outlives a test. **Do not hunt these.** The complete procedure:
 
 ## Full-model smokes
 
+Direct `scripts/smoke_*.py` runs load real models onto the GPU, so a pre-bash
+hook asks for user approval **unless** `.agent/allow-gpu-smokes` or the
+Windows-friendly `.agent/allow-gpu-smokes.md` exists (empty or "on" = allowed;
+"off" or absent = ask). The same grant explicitly allows recognized local job
+control commands: the compiled UI `startJob.js` launcher, `aitk_db.db` job
+updates, and targeted PowerShell process restarts. Direct `run.py` launches and
+the repository's deny/deletion guards still take precedence. The user flips
+this to grant or revoke agent GPU access; do not create or edit either toggle
+yourself. Focused `tests/` runs and `scripts/bench_*` scripts are not gated.
+
 Use `--load-mode smoke-direct-to-arena` for routine Krea2 smokes and
 quantization benchmarks. It is the intended default: it avoids measuring or
 paying for production checkpoint loading when the question is CUDA behavior,
@@ -90,10 +105,11 @@ fails when startup VRAM usage exceeds 30%; use `--ignore-contention` only when
 intentional contention is part of the test.
 
 `scripts/smoke_transformer_train_cuda.py`: multi-architecture full-model
-runner (profiles `krea2`/`zimage`/`ideogram4` in `scripts/smoke_profiles.py`)
-for the generic-block-dispatcher acceptance gates. zimage/ideogram4 and
-`--qtype qfloat8` fail fast until their blockers land -- see
-`tasks/open/GENERIC_BLOCK_DISPATCHER_PLAN.md` (Pre-built smoke tooling).
+runner (profiles `krea2`/`zimage`/`ideogram4`/`anima` in
+`scripts/smoke_profiles.py`)
+for the generic-block-dispatcher acceptance gates. Every profile defaults to
+`smoke-direct-to-arena`; use `production-model-load` only when checkpoint
+startup and production loader behavior are the subject of the run.
 
 `scripts/smoke_quantized_linear_cuda.py`: quantized-Linear contract smoke on
 a synthetic model; runnable today for qfloat8/convrot4/orbit4 (LoRA +
