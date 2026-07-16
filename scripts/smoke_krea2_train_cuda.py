@@ -694,7 +694,12 @@ def _parse_args():
         "--compile-cache-dir",
         default="tmp/torch_compile_cache",
         help="mega-cache dir for torch.compile artifacts (warm start turns "
-        "the ~2.5 min cold trunk compile into seconds); empty string disables",
+        "the ~2.5 min cold trunk compile into seconds)",
+    )
+    parser.add_argument(
+        "--no-compile-cache",
+        action="store_true",
+        help="explicitly disable the default-on torch.compile MegaCache",
     )
     parser.add_argument(
         "--no-compile",
@@ -902,14 +907,17 @@ def main():
     rows.append(_adapter_shape_histogram(network))
     _print_json(rows[-1])
 
-    compile_cache_key = None
-    if args.compile_cache_dir:
-        from extensions_built_in.diffusion_models.krea2.krea2 import _train_compile_cache_key
-        from toolkit.compile_cache import load_compile_cache
+    from toolkit.compile_cache import CompileCacheSession
 
-        compile_cache_key = _train_compile_cache_key(model)
-        if load_compile_cache(args.compile_cache_dir, compile_cache_key):
-            print(f"[smoke] loaded torch.compile mega-cache ({compile_cache_key})")
+    compile_cache = CompileCacheSession.for_model(
+        model,
+        model.model_config,
+        default_cache_dir=args.compile_cache_dir,
+        compile_enabled=not args.no_compile and not args.no_compile_cache,
+        logger=lambda message: print(f"[smoke] {message}"),
+    )
+    compile_cache.load()
+    compile_cache_key = compile_cache.key if compile_cache.enabled else None
 
     # Mirror BaseSDTrainProcess: finalize the permanent programs and activate
     # the TRAIN plan AFTER LoRA apply, so they capture the adapter leaves.
@@ -1186,13 +1194,11 @@ def main():
             f"fwd={phase_ms['forward_cuda_ms']:.1f}ms bwd={phase_ms['backward_cuda_ms']:.1f}ms "
             f"opt={phase_ms['optimizer_cuda_ms']:.1f}ms"
         )
-        if step == 0 and compile_cache_key is not None:
-            from toolkit.compile_cache import save_compile_cache
-
-            if save_compile_cache(args.compile_cache_dir, compile_cache_key):
-                print(f"[smoke] saved torch.compile mega-cache ({compile_cache_key})")
+        compile_cache.save()
         if grads_present == 0:
             raise SystemExit("no LoRA gradients produced -- training path is broken")
+
+    compile_cache.save(force=True)
 
     trace_path = None
     top_ops = None

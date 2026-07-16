@@ -408,6 +408,8 @@ def _parse_args():
         "default sizes). Checkpoint and streamed comparisons stay exact.",
     )
     parser.add_argument("--output-json", default=None)
+    parser.add_argument("--compile-cache-dir", default="tmp/torch_compile_cache")
+    parser.add_argument("--no-compile-cache", action="store_true")
     from scripts.smoke_runtime import add_contention_args
 
     add_contention_args(parser)
@@ -427,6 +429,16 @@ def main():
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+
+    from toolkit.compile_cache import CompileCacheSession
+
+    compile_cache = CompileCacheSession(
+        args.compile_cache_dir,
+        f"smoke_quantized_linear_{torch.__version__}_{args.qtype}",
+        enabled=args.compile and not args.no_compile_cache,
+        logger=lambda message: print(f"[smoke] {message}"),
+    )
+    compile_cache.load()
 
     failures: list[str] = []
     results: dict = {
@@ -628,6 +640,10 @@ def main():
         failures,
     )
 
+    compile_cache.save(force=True)
+    results["compile_cache_key"] = (
+        compile_cache.key if compile_cache.enabled else None
+    )
     results["failures"] = failures
     payload = json.dumps(results, indent=2, sort_keys=True, default=str)
     print(payload)

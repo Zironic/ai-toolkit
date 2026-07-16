@@ -91,6 +91,7 @@ def _parse_args():
     parser.add_argument("--fp8-sampling", action="store_true")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--compile-cache-dir", default="tmp/torch_compile_cache")
+    parser.add_argument("--no-compile-cache", action="store_true")
     parser.add_argument("--output", default=".codex/krea2_inference_smoke.png")
     parser.add_argument("--output-json", default=None)
     add_contention_args(parser)
@@ -131,6 +132,7 @@ def _model_config(args):
         layer_offloading_fp8_sampling=args.fp8_sampling,
         compile=not args.no_compile,
         compile_sample=not args.no_compile,
+        compile_cache=not args.no_compile_cache,
         compile_cache_dir=args.compile_cache_dir or None,
         model_kwargs=model_kwargs,
     )
@@ -212,6 +214,15 @@ def main():
     if runtime is None:
         raise RuntimeError("Krea2 did not prepare the arena offload runtime")
     runtime.finalize(network)
+    from toolkit.compile_cache import CompileCacheSession
+
+    compile_cache = CompileCacheSession.for_model(
+        model,
+        config,
+        default_cache_dir=args.compile_cache_dir,
+        logger=lambda message: print(f"[smoke] {message}"),
+    )
+    compile_cache.load()
 
     print("[smoke] loading VAE")
     model.vae = model._load_vae()
@@ -240,6 +251,7 @@ def main():
             extra={"skip_sampling_guard": True},
         )
     seconds = time.perf_counter() - started
+    compile_cache.save(force=True)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -111,6 +111,7 @@ def cache_evidence(
         "aot_hit": aot_hit,
         "aot_miss": aot_miss,
         "aot_bypass": aot_bypass,
+        "unique_graphs": get("stats.unique_graphs"),
         "fx_hit": fx_hit,
         "fx_miss": fx_miss,
         "fx_bypass": fx_bypass,

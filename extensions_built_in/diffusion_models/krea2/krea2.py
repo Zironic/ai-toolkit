@@ -64,7 +64,7 @@ from toolkit.memory_management.arena_offload import (
     prepare_canonical_storage_from_state_dict,
 )
 from toolkit.memory_management.runtime import get_memory_runtime
-from toolkit.compile_cache import load_compile_cache, save_compile_cache
+from toolkit.compile_cache import model_compile_cache_key
 
 from .src.mmdit import (
     DoubleSharedModulation,
@@ -439,53 +439,13 @@ def _sampling_shape_key(gen_config) -> tuple:
 
 
 def _compile_cache_key(base_model) -> str:
-    """Identity for the torch.compile mega-cache: resolved checkpoint + quant,
-    not the raw `name_or_path` (which may be an unresolved HF repo id or a
-    local path -- either way, not itself a stable model identity).
-
-    No shape/resolution tag needed: sampling compiles are static-shape
-    (`dynamic=False`) under the `eager_then_compile` stance, so torch's own
-    guard system (not us) decides whether a given call reuses or misses the
-    cached graph -- that's exactly the "safe miss" property the mega-cache
-    already relies on.
-    """
-    from toolkit.memory_management.arena_offload import DISPATCHER_GENERATION
-
-    checkpoint_path = getattr(base_model, "_resolved_checkpoint_path", None)
-    if checkpoint_path is None:
-        checkpoint_path = base_model.model_config.name_or_path
-    identity = {
-        "checkpoint_path": os.path.abspath(checkpoint_path) if os.path.exists(checkpoint_path) else checkpoint_path,
-        "qtype": str(base_model.model_config.qtype),
-        "torch_version": torch.__version__,
-        "dispatcher_generation": DISPATCHER_GENERATION,
-    }
-    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+    """Compatibility alias for the shared model-level MegaCache identity."""
+    return model_compile_cache_key(base_model)
 
 
 def _train_compile_cache_key(base_model) -> str:
-    """Identity for the TRAIN-side block-kernel mega-cache.
-
-    Unlike sampling, the immutable runtime's train compile is NOT always
-    static-shape: compile_dynamic/compile_dynamic_hints choose whether (and
-    how) the block kernel treats input shapes as dynamic, so two runs with
-    different settings can compile structurally different graphs for the
-    same checkpoint. Folding those settings into the key keeps them from
-    silently reusing each other's cached artifacts (found via a settings
-    sweep in scripts/smoke_krea2_train_cuda.py loading a stale cache after
-    a --compile-dynamic change).
-    """
-    config = base_model.model_config
-    compile_identity = {
-        "compile_dynamic": config.compile_dynamic,
-        "compile_dynamic_hints": tuple(config.compile_dynamic_hints or ()),
-        "fp8_forward": bool(config.layer_offloading_fp8_forward),
-        "fp8_grad_input": bool(config.layer_offloading_fp8_grad_input),
-    }
-    compile_tag = hashlib.sha256(
-        json.dumps(compile_identity, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()[:16]
-    return f"{_compile_cache_key(base_model)}_dispatcher_train_{compile_tag}"
+    """Compatibility alias; train and sample variants share one blob."""
+    return model_compile_cache_key(base_model)
 
 
 def _quantized_transformer_cache_info(base_model, checkpoint_path: str, dtype, config: SingleMMDiTConfig):
@@ -1306,19 +1266,6 @@ class Krea2Model(BaseModel):
 
         # CFG is zero-normalized for Krea 2.
         guidance = max(0.0, gen_config.guidance_scale - 1.0)
-        compile_cache_dir = getattr(self.model_config, 'compile_cache_dir', None)
-        compile_cache_key = _compile_cache_key(self)
-        if (
-            self.model_config.compile_sample
-            and compile_cache_dir
-            and not getattr(self, '_compile_cache_load_attempted', False)
-        ):
-            self._compile_cache_load_attempted = True
-            if load_compile_cache(compile_cache_dir, compile_cache_key):
-                self.print_and_status_update(
-                    f"Loaded torch.compile cache from {compile_cache_dir}"
-                )
-
         # The immutable runtime owns the whole sampling trunk via its permanent
         # SAMPLE program (_blocks_trunk routes to it first) and compiles the
         # block kernels itself. Its residency plan was activated at the sampling
@@ -1329,10 +1276,6 @@ class Krea2Model(BaseModel):
         # call with a given shape. The immutable arena owns block compilation
         # itself and must stay on the default stance: eager_then_compile's
         # example-input cloning cannot reconstruct Quanto QBytesTensor state.
-        frames_before = None
-        if compile_cache_dir and self.model_config.compile_sample:
-            frames_before = torch._dynamo.utils.counters["frames"].get("total", 0)
-
         compile_stance = _sampling_compile_stance(
             self.model_config.compile_sample,
             arena_runtime,
@@ -1366,14 +1309,6 @@ class Krea2Model(BaseModel):
                     batch_cfg=getattr(gen_config, "batch_cfg", False),
                     ref_latents=ref_latents,
                 )[0]
-        if frames_before is not None:
-            frames_after = torch._dynamo.utils.counters["frames"].get("total", 0)
-            if frames_after > frames_before and save_compile_cache(
-                compile_cache_dir, compile_cache_key
-            ):
-                self.print_and_status_update(
-                    f"Saved torch.compile cache to {compile_cache_dir}"
-                )
         return img
 
     # ------------------------------------------------------------------

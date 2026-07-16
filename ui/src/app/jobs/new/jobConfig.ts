@@ -33,6 +33,7 @@ export const defaultSliderConfig: SliderConfig = {
 
 export const defaultCompileOptions = {
   block_compile: true,
+  compile_cache: true,
 };
 
 export const defaultJobConfig: JobConfig = {

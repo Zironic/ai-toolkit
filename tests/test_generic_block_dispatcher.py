@@ -808,6 +808,18 @@ def test_cuda_fp8_gates_select_distinct_canonical_arena_paths():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_compiled_fp8_canonical_arena_emits_scaled_mm():
+    from torch._functorch import config as functorch_config
+    from torch._inductor import config as inductor_config
+
+    previous_aot_cache = functorch_config.enable_autograd_cache
+    previous_strict_cache = functorch_config.strict_autograd_cache
+    previous_custom_autograd_cache = (
+        functorch_config.autograd_cache_allow_custom_autograd_functions
+    )
+    previous_fx_cache = inductor_config.fx_graph_cache
+    functorch_config.enable_autograd_cache = True
+    functorch_config.strict_autograd_cache = True
+    inductor_config.fx_graph_cache = True
     graph_breaks_before = sum(
         torch._dynamo.utils.counters["graph_break"].values()
     )
@@ -845,4 +857,11 @@ def test_cuda_compiled_fp8_canonical_arena_emits_scaled_mm():
         )
     finally:
         close_arena_offload(model)
+        functorch_config.enable_autograd_cache = previous_aot_cache
+        functorch_config.strict_autograd_cache = previous_strict_cache
+        functorch_config.autograd_cache_allow_custom_autograd_functions = (
+            previous_custom_autograd_cache
+        )
+        inductor_config.fx_graph_cache = previous_fx_cache
+        torch._dynamo.reset()
         torch.cuda.empty_cache()

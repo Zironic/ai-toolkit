@@ -39,6 +39,10 @@ from toolkit.compile_utils import (
     configure_cuda_only_inductor,
     configure_quantized_compile_tuning,
 )
+from toolkit.compile_cache import (
+    CompileCacheSession,
+    DEFAULT_COMPILE_CACHE_BASENAME,
+)
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.data_loader import get_dataloader_from_datasets, trigger_dataloader_setup_epoch
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
@@ -208,6 +212,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._async_saver = None
         self._save_stager = None
         self._arena_runtime = None
+        self._compile_cache_session = None
         self._cleanup_started = False
         # start at 1 so we can do a sample at the start
         self.grad_accumulation_step = 1
@@ -579,11 +584,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 except Exception:
                     pass
 
+        self._checkpoint_compile_cache()
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
         if self.ema is not None:
             self.ema.train()
+
+    def _start_compile_cache_session(self):
+        if self._compile_cache_session is not None:
+            return self._compile_cache_session
+        default_cache_dir = os.path.join(
+            self.training_folder or "output", DEFAULT_COMPILE_CACHE_BASENAME
+        )
+        session = CompileCacheSession.for_model(
+            self.sd,
+            self.model_config,
+            default_cache_dir=default_cache_dir,
+            logger=print_acc,
+        )
+        self._compile_cache_session = session
+        session.load()
+        return session
+
+    def _checkpoint_compile_cache(self, *, force=False):
+        session = self._compile_cache_session
+        if session is not None:
+            session.save(force=force)
 
     def update_training_metadata(self):
         o_dict = OrderedDict({
@@ -712,6 +740,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 errors.append(f"{label}: {type(error).__name__}: {error}")
 
         try:
+            compile_cache_session = getattr(
+                self, "_compile_cache_session", None
+            )
+            if compile_cache_session is not None:
+                attempt(
+                    "torch.compile MegaCache",
+                    lambda: compile_cache_session.save(force=True),
+                )
+
             saver = getattr(self, "_async_saver", None)
             if saver is not None:
                 attempt("async saver wait", lambda: saver.wait_idle(timeout=10.0))
@@ -3273,6 +3310,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         wants_torch_compile = bool(
             self.model_config.compile
+            or self.model_config.compile_sample
             or getattr(self.model_config, 'train_compile_blocks', False)
         )
         compile_unavailable_reason = (
@@ -3285,10 +3323,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc(compile_unavailable_reason)
             print_acc("Install a working 'triton' package to use torch.compile.")
             self.model_config.compile = False
+            self.model_config.compile_sample = False
             self.model_config.train_compile_blocks = False
 
         self._apply_derived_compile_dynamic_hints()
         self._validate_arena_fullgraph_static_recompile_budget()
+        self._start_compile_cache_session()
 
         # ============================================================
         # COMPILE
@@ -4233,6 +4273,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # update various steps
                 self.step_num = step + 1
                 self.grad_accumulation_step += 1
+                self._checkpoint_compile_cache()
                 self.end_step_hook()
 
 

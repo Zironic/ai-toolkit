@@ -11,6 +11,10 @@ from diffusers import StableDiffusionXLAdapterPipeline, StableDiffusionAdapterPi
 from tqdm import tqdm
 
 from toolkit.config_modules import ModelConfig, GenerateImageConfig, preprocess_dataset_raw_config, DatasetConfig
+from toolkit.compile_cache import (
+    CompileCacheSession,
+    DEFAULT_COMPILE_CACHE_BASENAME,
+)
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.sampler import get_sampler
 from toolkit.stable_diffusion_model import StableDiffusion
@@ -96,6 +100,16 @@ class ReferenceGenerator(BaseExtensionProcess):
         super().run()
         print("Loading model...")
         self.sd.load_model()
+        compile_cache = CompileCacheSession.for_model(
+            self.sd,
+            self.model_config,
+            default_cache_dir=os.path.join(
+                self.output_folder, DEFAULT_COMPILE_CACHE_BASENAME
+            ),
+            compile_enabled=True,
+            logger=print,
+        )
+        compile_cache.load()
         device = torch.device(self.device)
 
         if self.generate_config.t2i_adapter_path is not None:
@@ -205,6 +219,7 @@ class ReferenceGenerator(BaseExtensionProcess):
             batch.cleanup()
 
         pbar.close()
+        compile_cache.save(force=True)
         print("Done generating images")
         # cleanup
         del self.sd

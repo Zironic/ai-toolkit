@@ -15,6 +15,10 @@ from jobs.process import BaseExtensionProcess
 import tqdm
 
 from toolkit.train_tools import get_torch_dtype
+from toolkit.compile_cache import (
+    CompileCacheSession,
+    DEFAULT_COMPILE_CACHE_BASENAME,
+)
 
 AITK_Status = Literal["running", "stopped", "error", "completed"]
 
@@ -45,6 +49,8 @@ class CaptionConfig:
             "caption_prompt", "Describe this image in detail."
         )
         self.compile = kwargs.get("compile", False)
+        self.compile_cache = kwargs.get("compile_cache", True)
+        self.compile_cache_dir = kwargs.get("compile_cache_dir", None)
 
 
 class BaseCaptioner(BaseExtensionProcess):
@@ -94,6 +100,15 @@ class BaseCaptioner(BaseExtensionProcess):
             self.start_stop_watcher()
             self.update_status("running", "Loading Model")
             self.load_model()
+            compile_cache = CompileCacheSession.for_model(
+                self.model,
+                self.caption_config,
+                default_cache_dir=os.path.join(
+                    "output", DEFAULT_COMPILE_CACHE_BASENAME
+                ),
+                logger=print,
+            )
+            compile_cache.load()
             self.maybe_compile_models()
             self.update_status("running", "Looking for files")
             self.find_files()
@@ -101,6 +116,7 @@ class BaseCaptioner(BaseExtensionProcess):
             self.update_step()
             self.update_status("running", f"Captioning {len(self.file_paths)} files")
             self.run_caption_loop()
+            compile_cache.save(force=True)
             self.update_status("completed", "Captioning completed")
             print("")
 

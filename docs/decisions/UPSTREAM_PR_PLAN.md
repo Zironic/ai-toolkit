@@ -115,6 +115,8 @@ The PR adds, as one unit:
 - transactional canonical arena storage, block discovery, state accounting,
   residency, transfer, and lifecycle ownership;
 - the generic saved-forward dispatcher and block compile boundary;
+- optional cross-process `torch.compile` MegaCache persistence around that
+  boundary, with cache misses falling back to ordinary compilation;
 - the quantization storage/substitution support the backend requires;
 - the minimal Krea2 loader, checkpointing, trainer, sampling, configuration,
   and teardown integration needed to demonstrate the feature end to end;
@@ -128,7 +130,42 @@ Arranged as reviewable commit groups, in dependency order:
 | 1 | Host and WDDM safety foundation (was PR P) | nothing |
 | 2 | Generic arena and dispatcher core | 1 |
 | 3 | Krea2 and trainer integration | 2 |
-| 4 | Acceptance tests, runnable validation instructions, documentation | 3 |
+| 4 | Optional MegaCache session and trainer lifecycle hooks | 2, 3 |
+| 5 | Acceptance tests, runnable validation instructions, documentation | 4 |
+
+### MegaCache upstream assessment (2026-07-16)
+
+Recommendation: include the portable MegaCache slice as commit group 4. A
+fresh FP8 dynamic compile is large enough to dominate startup, while the cache
+lifecycle is narrow and does not own Arena residency or model math. The local
+full-model matrix and `Mixed -> Mixed -> Full -> Full -> Mixed` benchmark prove
+that the pure block kernel reuses the same compiled entries across residency
+changes. The contract and measurements are in `MEGACACHE.md`.
+
+The upstream slice is deliberately smaller than the fork integration:
+
+- `toolkit/compile_cache.py` artifact/session logic and stable model/compiler
+  identity;
+- one load point before the first lazy compiled invocation and save points
+  after new variants/before teardown in the trainer lifecycle;
+- stable FP8/custom-pass compile identities required for cache hits;
+- focused nonfatal-miss, cache-key, cold/warm, and numerical-parity tests;
+- one explicit upstream config flag/directory and low-noise logging.
+
+Keep fork-specific output paths, ancillary smoke plumbing, caption/reference
+generator expansion, and the guided-UI checkbox out of the first upstream
+diff. This fork defaults persistence on for an already compiled workload, but
+the upstream extraction stays opt-in unless the maintainer explicitly accepts
+the changed disk-write default. Unsupported Torch builds must no-op cleanly.
+
+Estimated work after the Arena compile seam exists is 3-5 focused engineering
+days: about one day for extraction/version gating, one for trainer/Krea2
+integration, one for tests/docs/acceptance, and up to two for Torch-version and
+Windows Triton-bundle compatibility or maintainer-requested config changes.
+This is not blocked by residency policy. It is blocked only by the portable
+Arena/FP8 compile identity landing first. If PR size becomes the deciding
+constraint, commit group 4 can become an immediate follow-up without weakening
+Arena correctness.
 
 The in-fork pre-PR refactor (old Stage 2) still happens first and is not part
 of the PR diff. Deferred follow-ups (resident + native-FP8 sampling, second
@@ -171,6 +208,8 @@ refactor on an untested prediction, and let its breakage list re-order the work.
 - local search/replace scripts;
 - Hugging Face cache-drive configuration;
 - project-specific default paths or job assumptions;
+- fork-wide default-on cache policy, ancillary smoke cache plumbing, and the
+  guided-UI MegaCache checkbox;
 - broad UI restructuring unrelated to the submitted feature;
 - heavy per-layer offload profiler unless Ostris asks for it;
 - `bounce_pool.py` - a throughput optimization, not part of the safety

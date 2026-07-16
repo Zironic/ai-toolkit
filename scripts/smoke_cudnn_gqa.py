@@ -196,6 +196,8 @@ def main():
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--json", action="store_true", help="print raw JSON results")
+    parser.add_argument("--compile-cache-dir", default="tmp/torch_compile_cache")
+    parser.add_argument("--no-compile-cache", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -207,6 +209,15 @@ def main():
 
     environment = _environment()
     print(json.dumps(environment, indent=2))
+    from toolkit.compile_cache import CompileCacheSession
+
+    compile_cache = CompileCacheSession(
+        args.compile_cache_dir,
+        f"smoke_cudnn_gqa_{torch.__version__}",
+        enabled=not args.no_compile_cache,
+        logger=lambda message: print(f"[smoke] {message}"),
+    )
+    compile_cache.load()
     rows = []
     compiled_fns = {}
     compile_start_counts = dict(torch._dynamo.utils.counters["stats"])
@@ -270,6 +281,7 @@ def main():
         key: compile_end_counts.get(key, 0) - compile_start_counts.get(key, 0)
         for key in set(compile_start_counts) | set(compile_end_counts)
     }
+    compile_cache.save(force=True)
     print(f"compile counters delta: {json.dumps(compile_delta, sort_keys=True)}")
     _print_table(rows)
     for row in rows:

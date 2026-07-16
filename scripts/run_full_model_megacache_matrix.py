@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,7 +37,15 @@ def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--expected-variants", type=int, default=3)
+    parser.add_argument(
+        "--expected-variants",
+        type=int,
+        default=3,
+        help=(
+            "expected unique strict arena graph/AOT artifact count; ZImage's "
+            "fixed-residency train/sample/checkpoint lifecycle produces three"
+        ),
+    )
     parser.add_argument("--compile-dynamic", choices=("true", "false", "none"), default="true")
     parser.add_argument(
         "--compile-coordinate-descent",
@@ -62,6 +72,7 @@ def _parse_args(argv=None):
         "--compile-dynamic",
         "--compile-coordinate-descent",
         "--compile-fullgraph",
+        "--freeze-arena-residency",
     )
     for value in args.smoke_args:
         if any(value == item or value.startswith(item) for item in reserved):
@@ -120,6 +131,7 @@ def _command(args, arm: Arm, artifact: Path, result: Path) -> list[str]:
             "--compile-coordinate-descent",
             args.compile_coordinate_descent,
             "--compile-fullgraph",
+            "--freeze-arena-residency",
             "--megacache-mode",
             arm.mode,
             "--megacache-expected-arm",
@@ -142,13 +154,66 @@ def _phase_signature(rows: list[dict]) -> list[dict]:
             continue
         signature.append(
             {
+                "index": row["index"],
                 "phase": row["phase"],
                 "pred_checksum": row.get("pred_checksum"),
+                "pred_norm": row.get("pred_norm"),
+                "pred_shape": row.get("pred_shape"),
                 "grad_checksum": row.get("grad_checksum"),
+                "grad_norm": row.get("grad_norm"),
+                "grad_tensors": row.get("grad_tensors"),
                 "loss": row.get("loss"),
             }
         )
     return signature
+
+
+_PHASE_RTOL = {
+    "loss": 0.002,
+    "pred_norm": 0.002,
+    "grad_norm": 0.03,
+}
+
+
+def _phase_parity_failures(
+    baseline: list[dict], candidate: list[dict], arm_name: str
+) -> list[str]:
+    """Compare separate-process FP8 runs without requiring bitwise identity."""
+    failures = []
+    if len(candidate) != len(baseline):
+        return [
+            f"{arm_name}: expected {len(baseline)} phases, observed {len(candidate)}"
+        ]
+    for expected, actual in zip(baseline, candidate):
+        phase_label = f"phase {expected['index']} ({expected['phase']})"
+        for key in ("index", "phase", "pred_shape", "grad_tensors"):
+            if actual.get(key) != expected.get(key):
+                failures.append(
+                    f"{arm_name}: {phase_label} {key} differs: "
+                    f"cold={expected.get(key)!r}, arm={actual.get(key)!r}"
+                )
+        for key, relative_tolerance in _PHASE_RTOL.items():
+            expected_value = expected.get(key)
+            actual_value = actual.get(key)
+            if expected_value is None or actual_value is None:
+                if actual_value != expected_value:
+                    failures.append(
+                        f"{arm_name}: {phase_label} {key} presence differs: "
+                        f"cold={expected_value!r}, arm={actual_value!r}"
+                    )
+                continue
+            if not math.isclose(
+                float(actual_value),
+                float(expected_value),
+                rel_tol=relative_tolerance,
+                abs_tol=1e-5,
+            ):
+                failures.append(
+                    f"{arm_name}: {phase_label} {key} exceeds "
+                    f"rtol={relative_tolerance}: cold={expected_value}, "
+                    f"arm={actual_value}"
+                )
+    return failures
 
 
 def _write_json_atomic(path: Path, payload) -> None:
@@ -161,14 +226,24 @@ def _write_json_atomic(path: Path, payload) -> None:
     os.replace(temporary, path)
 
 
+def _git_head() -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        text=True,
+    ).strip()
+
+
 def main(argv=None) -> int:
     args = _parse_args(argv)
     out_dir = Path(args.out_dir).resolve()
     artifact = out_dir / "full_model.torchcompile_cache"
     arms = build_arms(out_dir, args.compile_dynamic, args.include_invalidation)
+    matrix_git_head = _git_head()
     plan = {
         "out_dir": str(out_dir),
         "artifact": str(artifact),
+        "toolkit_git_head": matrix_git_head,
         "arms": [
             {
                 "name": arm.name,
@@ -191,6 +266,13 @@ def main(argv=None) -> int:
     results = {}
     failures = []
     for arm in arms:
+        current_git_head = _git_head()
+        if current_git_head != matrix_git_head:
+            failures.append(
+                "repository HEAD changed during matrix: "
+                f"started={matrix_git_head}, current={current_git_head}"
+            )
+            break
         arm.cache_dir.mkdir(parents=True, exist_ok=True)
         result_path = out_dir / f"{arm.name}.json"
         command = _command(args, arm, artifact, result_path)
@@ -203,6 +285,7 @@ def main(argv=None) -> int:
             trace_dir.mkdir(parents=True, exist_ok=True)
             env["TORCH_TRACE"] = str(trace_dir)
         print(f"[megacache-matrix] starting {arm.name}")
+        arm_started = time.perf_counter()
         completed = subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -210,13 +293,18 @@ def main(argv=None) -> int:
             capture_output=True,
             text=True,
         )
+        wall_seconds = time.perf_counter() - arm_started
         (out_dir / f"{arm.name}.stdout.log").write_text(
             completed.stdout, encoding="utf-8"
         )
         (out_dir / f"{arm.name}.stderr.log").write_text(
             completed.stderr, encoding="utf-8"
         )
-        row = {"returncode": completed.returncode, "result": str(result_path)}
+        row = {
+            "returncode": completed.returncode,
+            "result": str(result_path),
+            "wall_seconds": wall_seconds,
+        }
         if result_path.is_file():
             rows = json.loads(result_path.read_text(encoding="utf-8"))
             done = next(
@@ -228,16 +316,24 @@ def main(argv=None) -> int:
         if completed.returncode:
             failures.append(f"{arm.name} exited with {completed.returncode}")
             break
+        current_git_head = _git_head()
+        if current_git_head != matrix_git_head:
+            failures.append(
+                "repository HEAD changed during matrix: "
+                f"started={matrix_git_head}, current={current_git_head}"
+            )
+            break
 
     if "cold" in results and results["cold"].get("phase_signature"):
         baseline = results["cold"]["phase_signature"]
         for name, result in results.items():
             if name == "cold" or "phase_signature" not in result:
                 continue
-            if result["phase_signature"] != baseline:
-                failures.append(
-                    f"{name} predictions, gradients, or losses differ from cold"
-                )
+            parity_failures = _phase_parity_failures(
+                baseline, result["phase_signature"], name
+            )
+            result["parity_failures"] = parity_failures
+            failures.extend(parity_failures)
     else:
         failures.append("cold arm produced no comparable phase signature")
 

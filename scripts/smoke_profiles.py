@@ -226,6 +226,7 @@ class SmokeProfile:
             layer_offloading_smart_working_reserve_gb=args.working_reserve_gib,
             layer_offloading_smart_wddm_margin_gb=args.wddm_margin_gib,
             layer_offloading_smart_wddm_hard_gb=args.wddm_hard_gib,
+            layer_offloading_simulated_vram_gb=args.simulated_vram_gib,
             layer_offloading_checkpoint_keep_last=args.checkpoint_keep_last,
             layer_offloading_prefetch_depth=args.prefetch_depth,
             compile=not args.no_compile,

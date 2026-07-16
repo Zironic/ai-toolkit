@@ -945,10 +945,12 @@ class ModelConfig:
         # compile the model with torch compile
         self.compile = kwargs.get("compile", False)
         self.compile_sample = kwargs.get("compile_sample", False)
-        # Directory to persist torch.compile's mega-cache (Inductor/AOTAutograd/
-        # Triton artifacts) across process restarts, so a fresh training-job
-        # resume or standalone generate run can skip the cold sampler compile.
-        # None = disabled (no cache read/write).
+        # Persist torch.compile's cumulative MegaCache (AOTAutograd/
+        # Inductor/Triton artifacts) by default whenever compilation is active.
+        # compile_cache=False is the explicit opt-out. A null directory asks
+        # the owning process to use its shared output-root default, so jobs can
+        # reuse artifacts instead of hiding them inside one job directory.
+        self.compile_cache = kwargs.get("compile_cache", True)
         self.compile_cache_dir = kwargs.get("compile_cache_dir", None)
 
         if self.compile and self.quantize:

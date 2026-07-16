@@ -225,6 +225,12 @@ def _megacache_manifest(args, model, phases, device) -> dict:
             "seed": int(args.seed),
             "conditioning": [str(Path(path).resolve()) for path in args.cond_cache],
         },
+        "arena": {
+            "simulated_vram_gib": float(args.simulated_vram_gib),
+            "working_reserve_gib": str(args.working_reserve_gib),
+            "residency_policy_frozen": bool(args.freeze_arena_residency),
+            "expected_residency": args.expected_residency,
+        },
         "compile": {
             "backend": "inductor",
             "mode": "default",
@@ -270,6 +276,11 @@ def _manifest_sidecar_path(args) -> Path | None:
     return None
 
 
+def _artifact_manifest_path(artifact) -> Path:
+    artifact = Path(artifact).resolve()
+    return artifact.with_name(f"{artifact.name}.manifest.json")
+
+
 def _artifact_inventory_has(counts: dict[str, int], name: str) -> bool:
     name = name.lower()
     return any(name in key.lower() and int(value) > 0 for key, value in counts.items())
@@ -304,31 +315,60 @@ def _validate_megacache_evidence(
             failures.append(
                 f"{expected_arm}: cold execution performed no observable backend codegen"
             )
-        variant_key = "aot_miss"
     else:
         if not evidence.get("aot_hit") or not evidence.get("fx_hit"):
             failures.append(
                 f"{expected_arm}: warm execution did not hit both AOT and FX caches: "
                 f"{evidence}"
             )
-        if evidence.get("aot_miss") or evidence.get("fx_miss"):
-            failures.append(f"{expected_arm}: warm execution also had cache misses: {evidence}")
-        warm_work = (
+        if evidence.get("fx_miss"):
+            failures.append(f"{expected_arm}: warm execution had an FX cache miss: {evidence}")
+
+        # ZImage's train/sample lifecycle makes four AOT lookups but PyTorch
+        # persists only the three autograd entries (the inference lookup is
+        # not saved). A restored process therefore reports three AOT hits and
+        # one frontend miss even though all five FX graphs hit and no backend
+        # code is generated. Permit only that measured non-serializable tail:
+        # every expected AOT entry must hit, at most one AOT lookup may miss,
+        # and its one runtime autotune selection must not grow beyond it.
+        expected_hits = 0 if expected_variants is None else expected_variants
+        residual_aot_misses = int(evidence.get("aot_miss", 0))
+        residual_autotune = int(evidence.get("autotune_benchmark_calls", 0))
+        if residual_aot_misses and (
+            int(evidence.get("aot_hit", 0)) < expected_hits
+            or residual_aot_misses > 1
+        ):
+            failures.append(
+                f"{expected_arm}: warm AOT misses exceed the single "
+                f"non-serializable lookup: {evidence}"
+            )
+        if residual_autotune > residual_aot_misses:
+            failures.append(
+                f"{expected_arm}: warm autotune work exceeds the "
+                f"non-serializable AOT tail: {evidence}"
+            )
+        warm_backend_work = (
             evidence.get("backend_codegen_observed")
             or evidence.get("inductor_codegen_calls")
             or evidence.get("triton_compile_calls")
-            or evidence.get("autotune_benchmark_calls")
             or evidence.get("coordinate_descent_calls")
         )
-        if warm_work:
-            failures.append(f"{expected_arm}: warm execution performed compiler work: {evidence}")
-        variant_key = "aot_hit"
+        if warm_backend_work:
+            failures.append(
+                f"{expected_arm}: warm execution performed backend compiler work: "
+                f"{evidence}"
+            )
 
-    if expected_variants is not None:
-        actual = int(evidence.get(variant_key, 0))
+    # AOT hit/miss counters count lookup attempts, not distinct variants. A
+    # full checkpointed lifecycle can request the same cache entry more than
+    # once, so compare the Dynamo unique-graph count with the serialized AOT
+    # inventory instead. An intentional invalidation changes the graph/config
+    # contract and therefore is not required to preserve producer cardinality.
+    if expected_variants is not None and expected_arm != "invalidation":
+        actual = int(evidence.get("unique_graphs", 0))
         if actual != expected_variants:
             failures.append(
-                f"{expected_arm}: expected {expected_variants} {variant_key} "
+                f"{expected_arm}: expected {expected_variants} unique graph "
                 f"variants, observed {actual}"
             )
     return failures
@@ -421,7 +461,11 @@ def _activate_megacache(
             manifest_matches = (
                 producer_manifest.get("fingerprint") == manifest.get("fingerprint")
             )
-            if args.megacache_expected_arm == "megacache" and not manifest_matches:
+            if (
+                args.megacache_expected_arm == "megacache"
+                and not manifest_matches
+                and not args.megacache_measure_only
+            ):
                 failures.append(
                     "MegaCache consumer manifest does not match the producer; "
                     "artifact load was rejected"
@@ -430,7 +474,11 @@ def _activate_megacache(
                 failures.append(
                     "invalidation arm did not change a compile-relevant manifest field"
                 )
-        should_load = manifest_matches or args.megacache_expected_arm == "invalidation"
+        should_load = (
+            manifest_matches
+            or args.megacache_expected_arm == "invalidation"
+            or args.megacache_measure_only
+        )
         if should_load and artifact_path is not None:
             started = time.perf_counter()
             loaded = load_compile_cache_artifact(artifact_path)
@@ -443,6 +491,7 @@ def _activate_megacache(
             "manifest": manifest,
             "producer_manifest": producer_manifest,
             "manifest_matches": manifest_matches,
+            "measure_only": bool(args.megacache_measure_only),
             "artifact": None if artifact_path is None else str(artifact_path),
             "manifest_path": None if manifest_path is None else str(manifest_path),
             "loaded": loaded is not None,
@@ -497,14 +546,19 @@ def _finish_megacache(args, diagnostics: dict | None, failures: list[str]) -> di
     evidence = cache_evidence(counters, backend_delta)
     saved = None
     save_seconds = 0.0
+    save_target = None
     if args.megacache_mode == "produce":
+        save_target = args.megacache_artifact
+    elif args.megacache_update_artifact:
+        save_target = args.megacache_update_artifact
+    if save_target is not None:
         started = time.perf_counter()
-        saved = save_compile_cache_artifact(args.megacache_artifact)
+        saved = save_compile_cache_artifact(save_target)
         save_seconds = time.perf_counter() - started
         if saved is None:
             failures.append("torch produced no MegaCache artifact")
         else:
-            manifest_path = _manifest_sidecar_path(args)
+            manifest_path = _artifact_manifest_path(save_target)
             if manifest_path is None:
                 failures.append("MegaCache producer has no manifest path")
             else:
@@ -519,9 +573,13 @@ def _finish_megacache(args, diagnostics: dict | None, failures: list[str]) -> di
                     f"{saved.artifact_counts}"
                 )
             expected = args.megacache_expected_variants
-            if expected is not None and _artifact_inventory_count(
-                saved.artifact_counts, "aot"
-            ) != expected:
+            if (
+                expected is not None
+                and args.megacache_mode == "produce"
+                and _artifact_inventory_count(
+                    saved.artifact_counts, "aot"
+                ) != expected
+            ):
                 failures.append(
                     f"saved MegaCache inventory does not contain {expected} AOT variants: "
                     f"{saved.artifact_counts}"
@@ -533,13 +591,14 @@ def _finish_megacache(args, diagnostics: dict | None, failures: list[str]) -> di
         failures.append(
             f"{args.megacache_expected_arm} consumer did not accept an artifact"
         )
-    failures.extend(
-        _validate_megacache_evidence(
-            args.megacache_expected_arm,
-            evidence,
-            args.megacache_expected_variants,
+    if not args.megacache_measure_only:
+        failures.extend(
+            _validate_megacache_evidence(
+                args.megacache_expected_arm,
+                evidence,
+                args.megacache_expected_variants,
+            )
         )
-    )
     diagnostics.update(
         {
             "counters": counters,
@@ -547,6 +606,11 @@ def _finish_megacache(args, diagnostics: dict | None, failures: list[str]) -> di
             "evidence": evidence,
             "saved_artifacts": {} if saved is None else saved.artifact_counts,
             "artifact_bytes_saved": 0 if saved is None else saved.byte_count,
+            "updated_artifact": (
+                None
+                if args.megacache_update_artifact is None
+                else str(Path(args.megacache_update_artifact).resolve())
+            ),
             "save_seconds": save_seconds,
             "disk_after_execute": cache_dir_stats(diagnostics["cache_dir"]),
             "windows_triton_bundle_fallback": (
@@ -765,9 +829,42 @@ def _parse_args(argv=None):
     parser.add_argument("--working-reserve-gib", default="-1")
     parser.add_argument("--wddm-margin-gib", type=float, default=1.0)
     parser.add_argument("--wddm-hard-gib", type=float, default=1.0)
+    parser.add_argument(
+        "--simulated-vram-gib",
+        type=float,
+        default=0.0,
+        help=(
+            "pretend the card has this many GiB so residency/streaming and "
+            "allocator caps match the smaller card; 0 uses the real card"
+        ),
+    )
     parser.add_argument("--checkpoint-keep-last", type=int, default=0)
     parser.add_argument("--prefetch-depth", type=int, default=3)
+    parser.add_argument(
+        "--freeze-arena-residency",
+        action="store_true",
+        help=(
+            "smoke-only: hold the finalized training residency plan fixed so "
+            "compiler-memory differences cannot change cache variants"
+        ),
+    )
+    parser.add_argument(
+        "--expected-residency",
+        choices=("mixed", "full"),
+        default=None,
+        help="assert the finalized smoke plan has this residency class",
+    )
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument(
+        "--compile-cache-dir",
+        default="tmp/torch_compile_cache",
+        help="shared default-on MegaCache directory for ordinary smoke runs",
+    )
+    parser.add_argument(
+        "--no-compile-cache",
+        action="store_true",
+        help="explicitly disable MegaCache for an ordinary smoke run",
+    )
     parser.add_argument(
         "--compile-dynamic", choices=("true", "false", "none"), default="true"
     )
@@ -785,6 +882,22 @@ def _parse_args(argv=None):
         help="full-model MegaCache matrix role; the matrix runner sets this",
     )
     parser.add_argument("--megacache-artifact", default=None)
+    parser.add_argument(
+        "--megacache-update-artifact",
+        default=None,
+        help=(
+            "benchmark-only: after consuming and executing, save the combined "
+            "hit/miss artifact inventory to this path"
+        ),
+    )
+    parser.add_argument(
+        "--megacache-measure-only",
+        action="store_true",
+        help=(
+            "benchmark-only: load across manifest/residency changes and report "
+            "cache misses and compiler work instead of failing on them"
+        ),
+    )
     parser.add_argument("--megacache-manifest", default=None)
     parser.add_argument(
         "--megacache-expected-arm",
@@ -827,6 +940,10 @@ def _parse_args(argv=None):
             parser.error("MegaCache matrix modes require --megacache-expected-arm")
         if args.megacache_mode in ("produce", "consume") and not args.megacache_artifact:
             parser.error(f"--megacache-mode {args.megacache_mode} requires an artifact")
+        if args.megacache_measure_only and args.megacache_mode != "consume":
+            parser.error("--megacache-measure-only requires --megacache-mode consume")
+        if args.megacache_update_artifact and args.megacache_mode != "consume":
+            parser.error("--megacache-update-artifact requires --megacache-mode consume")
         if args.megacache_expected_variants is not None and args.megacache_expected_variants < 1:
             parser.error("--megacache-expected-variants must be positive")
     return args
@@ -987,7 +1104,6 @@ def main():
     config = profile.build_model_config(args)
     from toolkit.compile_utils import configure_quantized_compile_tuning
 
-    configure_quantized_compile_tuning(config)
     if config.qtype != args.qtype and args.assistant_lora is None:
         raise SystemExit(
             f"requested qtype {args.qtype!r} became {config.qtype!r} in the "
@@ -1080,6 +1196,11 @@ def main():
         rows.append({"event": "representation", **representation})
         _print_json(rows[-1])
 
+        # TorchAO's quantization setup may install its preferred Inductor
+        # tuning defaults. Match production loading by applying the explicit
+        # job/smoke policy after model load and quantization are complete.
+        configure_quantized_compile_tuning(model.model_config)
+
         # The canonical arena accepts immutable base storage only. Model-specific
         # loaders such as Krea2 already freeze before attach, but the generic
         # architecture path must establish the same lifecycle explicitly.
@@ -1159,11 +1280,20 @@ def main():
 
     print("[smoke] finalizing arena runtime")
     memory_runtime.finalize(network)
+    if args.freeze_arena_residency:
+        # The controlled cache matrix compares compiler behavior across cold
+        # and restored processes. A cold compiler retains materially more VRAM
+        # than a cache hit, which otherwise drives the live Arena policy to
+        # promote a different set of blocks and changes tensor-layout guards.
+        # Freeze only this diagnostic smoke's already-safe finalized plan; real
+        # training retains the normal adaptive policy.
+        memory_runtime._apply_training_policy = lambda *, shape_key=None: None
     discovery = _discovery_audit(memory_runtime, transformer, profile)
     runtime_diagnostics = memory_runtime.diagnostics()
     rows.append(
         {
             "event": "runtime_finalized",
+            "residency_policy_frozen": bool(args.freeze_arena_residency),
             **discovery,
             "checkpoint_owner": runtime_diagnostics.get("checkpoint_owner"),
             "accounting": runtime_diagnostics.get("accounting"),
@@ -1199,6 +1329,22 @@ def main():
         failures.append("production smoke did not establish mixed residency")
     if not accounting.get("protected_training_blocks_resident"):
         failures.append("model keep-last checkpoint blocks are not fully resident")
+    if args.expected_residency == "mixed" and not accounting.get("mixed_residency"):
+        failures.append(
+            "expected mixed residency but finalized plan was not mixed: "
+            f"{accounting}"
+        )
+    if args.expected_residency == "full" and (
+        int(accounting.get("streamed_blocks", -1)) != 0
+        or int(accounting.get("resident_blocks", -1)) != int(
+            discovery.get("discovered_blocks", -2)
+        )
+        or not runtime_diagnostics.get("all_resident_fit")
+    ):
+        failures.append(
+            "expected full residency but finalized plan was not all-resident: "
+            f"{accounting}"
+        )
 
     # The dispatcher is finalized but its compiled block kernels are still
     # lazy. Load the artifact here so restored entries exist before the first
@@ -1206,6 +1352,18 @@ def main():
     megacache = _activate_megacache(
         args, model, phases, device, megacache, failures
     )
+    compile_cache = None
+    if args.megacache_mode == "off":
+        from toolkit.compile_cache import CompileCacheSession
+
+        compile_cache = CompileCacheSession.for_model(
+            model,
+            model.model_config,
+            default_cache_dir=args.compile_cache_dir,
+            compile_enabled=not args.no_compile and not args.no_compile_cache,
+            logger=lambda message: print(f"[smoke] {message}"),
+        )
+        compile_cache.load()
 
     # --- conditioning + fixed latents -------------------------------------
     embeds = profile.load_conditioning(args.cond_cache, args.batch_size)
@@ -1343,6 +1501,8 @@ def main():
             "dxgi": _dxgi_snapshot(f"phase_{index}"),
         }
         rows.append(row)
+        if compile_cache is not None:
+            compile_cache.save()
         print(
             f"[smoke] phase {index} ({phase}): {result['seconds']:.2f}s "
             + (
@@ -1360,6 +1520,8 @@ def main():
         )
 
     megacache = _finish_megacache(args, megacache, failures)
+    if compile_cache is not None:
+        compile_cache.save(force=True)
 
     # --- teardown ----------------------------------------------------------
     from toolkit.memory_management import pin_manager
@@ -1389,6 +1551,9 @@ def main():
         "phases": phases,
         "loss_series": loss_series,
         "megacache": megacache,
+        "compile_cache_key": (
+            compile_cache.key if compile_cache is not None and compile_cache.enabled else None
+        ),
         "dynamo": _dynamo_counters(),
         "runtime_diagnostics_before_close": diagnostics_before_close,
         "nonfinite_trace": (

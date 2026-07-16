@@ -143,6 +143,8 @@ Do not use `git-bug webui` — in git-bug v0.10.1 it holds the `.git/git-bug` st
   prefetch schedules, trace resync.
 - `toolkit/memory_management/checkpoint_autotuner.py` - checkpoint keep-last
   controller.
+- `toolkit/compile_cache.py` - default-on, best-effort cross-process
+  `torch.compile` MegaCache lifecycle and stable model/compiler identity.
 - `extensions_built_in/diffusion_models/krea2/` - Krea2 model integration.
 - `jobs/process/BaseSDTrainProcess.py` - training loop and step-boundary wiring.
 - `extensions_built_in/sd_trainer/SDTrainer.py` - trainer execution.
@@ -239,6 +241,10 @@ right entries should not build real pinned packs.
   conservative and validated.
 - Residency/layout changes should rebuild transfer plans without destroying
   durable execution traces unless execution order actually changed.
+- Arena residency and transfers stay outside the pure compiled block kernel;
+  Mixed and Full plans share guarded MegaCache entries. See
+  `docs/decisions/MEGACACHE.md` before changing the dispatcher ABI, FP8 compile
+  identity, cache key, or custom Inductor passes.
 - Unsupported hardware/models must fall back cleanly when flags are off or
   unsupported paths are requested.
 - Add focused tests for memory-manager behavior; GPU CI is not available here.

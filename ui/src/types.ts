@@ -215,6 +215,9 @@ export interface ModelConfig {
   assistant_lora_path?: string;
   unconditional_lora_path?: string;
   compile?: boolean;
+  /** Persist torch.compile artifacts across job processes; defaults to true. */
+  compile_cache?: boolean;
+  compile_cache_dir?: string;
   block_compile?: boolean;
   compile_mode?: 'default' | 'max-autotune' | 'fastest';
   compile_fullgraph?: boolean;

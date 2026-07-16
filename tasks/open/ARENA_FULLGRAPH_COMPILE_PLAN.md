@@ -3,6 +3,11 @@
 > Durable design and acceptance plan. Mutable status, experiment results, and
 > next-agent handoff notes live on git-bug ticket `c4e29f1`.
 >
+> Config routing, strict dispatcher compilation, diagnostics, trainer ownership
+> handling, static-recompile readiness, strict real-model CUDA, and MegaCache
+> acceptance are implemented. The stable cache contract and residency evidence
+> are in `../../docs/decisions/MEGACACHE.md`.
+>
 > This targets the generic arena dispatcher in
 > `toolkit/memory_management/arena_offload/`. Legacy
 > `LinearLayerMemoryManager` compilation is out of scope.
@@ -47,9 +52,9 @@ Not required:
 - changing the legacy/upstream per-Linear offload path;
 - adding a second arena compile mode or separate user-facing arena flag.
 
-## Verified starting point
+## Shipped foundation and remaining acceptance
 
-The arena already has the desired architecture:
+The arena has the desired compile boundary and configuration routing:
 
 - `_InstalledDispatcher.__call__` is compiler-disabled and owns eager block
   dispatch;
@@ -58,28 +63,31 @@ The arena already has the desired architecture:
   sampling allocation recovery;
 - `_get_dispatch_kernel()` reconstructs functional state and calls the saved
   block through `torch.func.functional_call`;
-- the pure kernel is currently compiled with a hard-coded
-  `fullgraph=False`;
-- `ArenaOffloadConfig.compile_blocks` is already derived from
-  `ModelConfig.compile`, and the trainer already recognizes that arena owns
-  block compilation and skips its own compiler;
-- focused CUDA coverage already exercises streamed compiled
+- `ArenaOffloadConfig` derives `_compile_fullgraph` from the existing model
+  compile settings and propagates it to the dispatcher;
+- the pure kernel passes the effective value to
+  `torch.compile(..., fullgraph=compile_fullgraph)`;
+- diagnostics report the effective strictness, and the trainer recognizes arena
+  compile ownership without downgrading or double-compiling strict blocks;
+- strict static jobs run an early recompile-budget readiness check once the
+  observed train/sample shapes are available;
+- existing non-strict CUDA coverage exercises streamed compiled
   train -> sample -> train, checkpoint ticket lifetime, FP8 native math, and
-  LoRA gradients under `fullgraph=False`.
+  LoRA gradients.
 
-The missing pieces are strictness propagation, actual graph-break diagnosis,
-and strict-mode acceptance. No new transfer or residency architecture is
+The remaining work is strict CUDA, FP8/checkpoint/shape, real-model, and
+cross-process Mega-Cache acceptance, plus fixes for any graph breaks those
+focused seams actually reproduce. No new transfer or residency architecture is
 needed.
 
 ## Design
 
-### 1. Propagate the existing fullgraph setting
+### 1. Preserve the existing fullgraph propagation
 
-Add a derived internal field such as `_compile_fullgraph` to
-`ArenaOffloadConfig`. It is populated from `ModelConfig.compile_fullgraph` only
-when arena block compilation is enabled.
+`ArenaOffloadConfig._compile_fullgraph` is derived from
+`ModelConfig.compile_fullgraph` only when arena block compilation is enabled.
 
-Propagate it through:
+The implemented path is:
 
 ```text
 ArenaOffloadConfig.from_model_config
@@ -89,7 +97,7 @@ ArenaOffloadConfig.from_model_config
   -> torch.compile(..., fullgraph=compile_fullgraph)
 ```
 
-Expose the effective value in arena diagnostics. Keep `False` as the existing
+Arena diagnostics expose the effective value. `False` remains the
 behavior-preserving default.
 
 The arena already has one shared training/sampling dispatcher policy. Do not
@@ -137,14 +145,11 @@ Add a guard, adapter, or compile-clean helper only for a failure reproduced by
 the strict CUDA seam. Do not add legacy-MM trampolines, duplicate source
 layouts, or new program abstractions.
 
-### 4. Correct trainer routing and messages
+### 4. Preserve trainer routing and messages
 
-The trainer currently computes `runtime_owns_block_compile`, but its global
-quantized-model branch still prints that `fullgraph=True` is incompatible and
-changes its local `compile_fullgraph` value before the arena-owned skip.
-
-Make that downgrade conditional on the trainer actually owning compilation.
-For arena-owned compilation:
+The trainer computes `runtime_owns_block_compile` and limits its global
+quantized-model fullgraph downgrade to cases where the trainer actually owns
+compilation. For arena-owned compilation, retain this contract:
 
 - preserve the value already propagated into `ArenaOffloadConfig`;
 - print that arena owns strict block compilation when enabled;
@@ -167,10 +172,10 @@ dispatcher kernels across phase transitions.
 Do not call `raise_dynamo_recompile_limit()` unconditionally. Preserve the
 default limit so it can still expose accidental guard churn.
 
-There is one risky supported config combination to reject early rather than
-allowing an hours-late failure. After dataset buckets and sampling resolutions
-are available, reuse `_observed_input_shapes()` to validate
-`compile_fullgraph=True, compile_dynamic=False`:
+One risky supported config combination is guarded early rather than allowed to
+fail hours into a job. After dataset buckets and sampling resolutions are
+available, the readiness validator reuses `_observed_input_shapes()` for
+`compile_fullgraph=True, compile_dynamic=False` to:
 
 - compute a conservative floor for the distinct train/sample shape variants
   that share the dispatcher kernel code object;
@@ -187,14 +192,16 @@ does not change dynamic arena training and does not create a new config field.
 
 ### 6. Coordinate with Mega-Cache without duplicating it
 
-Cross-process restoration remains tracked by `COMPILE_MEGA_CACHE_PLAN.md` and
-ticket `ab208bf`. This ticket supplies the strict arena kernels that plan must
-exercise.
+Cross-process restoration is owned by the generic session described in
+`COMPILE_MEGA_CACHE_PLAN.md` and `../../docs/decisions/MEGACACHE.md`. Do not
+invent a separate Arena cache format or residency key here.
 
-Do not invent a separate cache format or MM cache key here. Verify whether
-PyTorch's artifact guards already distinguish the effective fullgraph policy.
-Add fullgraph to a Toolkit-owned cache identity only if a controlled
-cold/shared/Mega-Cache matrix demonstrates a collision or incorrect reuse.
+The controlled full-model and residency-transition matrices established that
+Torch guards distinguish the compiled variants and that Mixed and Full Arena
+plans reuse the same entries. Toolkit's coarse identity includes the effective
+fullgraph/dynamic compiler policy and stable dispatcher generation, but not
+resolution, adapter topology, residency, simulated-card size, or transfer
+plan.
 
 ## Implementation sequence
 
@@ -214,14 +221,14 @@ Prove, in order:
 If a strict-capture failure occurs, record its exact target and smallest
 reproducer on the ticket before modifying production code.
 
-### Slice 1 - Config and dispatcher integration
+### Slice 1 - Shipped config and dispatcher integration
 
-Add `_compile_fullgraph`, propagate it to the dispatcher, include it in
-diagnostics, and correct the trainer's quantized downgrade/ownership branch.
-Add the static-shape readiness check at the setup seam where
+The shipped foundation propagates `_compile_fullgraph` to the dispatcher,
+includes it in diagnostics, preserves arena ownership in the trainer's
+quantized branch, and runs the static-shape readiness check where
 `_observed_input_shapes()` and the effective compiler limit are both known.
 
-Focused CPU tests prove:
+Keep focused CPU coverage for these contracts:
 
 - `compile=False` leaves arena compilation and strictness off;
 - `compile=True, compile_fullgraph=False` preserves current behavior;
@@ -234,8 +241,8 @@ Focused CPU tests prove:
 - an unknown static shape set produces the named readiness warning;
 - legacy compile routing is unchanged.
 
-Focused CUDA tests prove strict BF16 resident, streamed, and mixed-residency
-kernels without internal graph breaks.
+The remaining focused CUDA acceptance must prove strict BF16 resident,
+streamed, and mixed-residency kernels without internal graph breaks.
 
 ### Slice 2 - FP8, LoRA, checkpoint, and shapes
 
@@ -261,10 +268,11 @@ dispatcher failures are ordinary arena-runtime issues and are not graph breaks.
 
 ### Slice 3 - Real Z-Image and Mega-Cache acceptance
 
-First run one real Z-Image arena block under strict mode with autocast outside
-the kernel. Then execute the four-arm cache matrix from
-`COMPILE_MEGA_CACHE_PLAN.md`: cold, empty no-load control, shared disk, and
-Mega-Cache into an empty cache directory.
+The real Z-Image strict block and full-model four-arm matrix use autocast
+outside the kernel: cold, empty no-load control, shared disk, and MegaCache
+into an empty cache directory. The separate five-process residency benchmark
+uses `Mixed -> Mixed -> Full -> Full -> Mixed` and measures misses instead of
+failing on a transition.
 
 Require:
 
@@ -277,8 +285,13 @@ Require:
 - zero internal graph breaks;
 - no trainer compile wrapping around the arena dispatcher.
 
-Expand to the full known Z-Image graph/shape set only after the one-block gate
-passes. A full UI training job remains user-launched.
+The accepted full-model lifecycle saves three AOT variants and five FX graphs.
+Warm and cross-residency processes hit all of them with zero Inductor codegen,
+Triton compilation, coordinate descent, or graph breaks. One additional AOT
+miss is the measured non-serialized inference lookup and does not perform
+backend compilation. Exact timings and artifact paths are recorded in
+`../../docs/decisions/MEGACACHE.md`. A full UI training job remains
+user-launched.
 
 ## Acceptance criteria
 
@@ -316,14 +329,11 @@ rewriting model architecture. Record the exact break and keep
 Do not respond to a strict failure by reviving the legacy-MM trampoline plan or
 by compiling the entire transformer as one graph.
 
-## Rough size
+## Actual scope
 
-- Slice 0: a few focused hours if the existing pure kernel is already strict;
-- Slice 1: roughly half to one day for config, routing, diagnostics, and tests;
-- Slice 2: roughly half to two days depending on actual FP8/LoRA strict
-  failures;
-- Slice 3: roughly half to one day after the controlled cache harness is
-  adapted to the arena seam.
-
-The expected total is about one to three focused engineering days, with Slice
-0 providing the hard answer before broader implementation.
+The strict boundary required targeted dispatcher/FP8 identity fixes rather
+than a new execution architecture. The acceptance harness then expanded from a
+single strict block to the full-model four-arm cache matrix and the five-run
+residency transition benchmark. Future work here is regression maintenance;
+new MegaCache lifecycle or upstream-extraction work belongs in
+`COMPILE_MEGA_CACHE_PLAN.md` and `docs/decisions/UPSTREAM_PR_PLAN.md`.

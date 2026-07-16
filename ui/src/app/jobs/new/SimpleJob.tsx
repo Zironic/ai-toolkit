@@ -538,6 +538,13 @@ export default function SimpleJob({
                   }
                 }}
               />
+              {jobConfig.config.process[0].model.compile && (
+                <Checkbox
+                  label="Persistent Compile Cache"
+                  checked={jobConfig.config.process[0].model.compile_cache !== false}
+                  onChange={value => setJobConfig(value, 'config.process[0].model.compile_cache')}
+                />
+              )}
             </Card>
           )}
           {modelArch?.additionalSections?.includes('model.multistage') && (

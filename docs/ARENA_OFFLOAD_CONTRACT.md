@@ -5,6 +5,19 @@ name. An explicitly selected model is accepted when its live module graph and
 storage satisfy the following contracts; otherwise setup fails at the narrowest
 known boundary with the unmet contract in the error.
 
+## Backend ownership boundary
+
+Arena does not replace Toolkit's plain legacy memory manager. The ordinary
+legacy per-linear backend, including its current `_BouncingLinearFn` execution
+seam, remains supported for upstream compatibility and for capabilities Arena
+does not yet own, especially text-encoder offload.
+
+The retired surface is the C/D-era smart-training, prefetch, trace, profiling,
+block-stream, pinned-arena, and iteration-compatibility machinery layered
+around that backend. Repository-supported callers and explicit Toolkit
+workflows define that boundary; undocumented external use and this fork's old
+iteration names are not compatibility requirements.
+
 ## Model contract
 
 - The transformer exposes one or more repeated `ModuleList` or `Sequential`
@@ -56,6 +69,18 @@ known boundary with the unmet contract in the error.
 Arena compilation follows Toolkit's supported model `compile` setting and owns
 the one shared block dispatcher used by both training and sampling. Separate
 train/sample arena compile policies and caches are not part of this contract.
+The dispatcher's compiled callable is a pure functional block kernel; eager
+residency selection and transfers remain outside it. Therefore Mixed and Full
+residency, including transitions between them across processes, share the same
+guarded MegaCache entries.
+
+Compiled production and ordinary smoke paths load one cumulative model-level
+MegaCache before their first lazy invocation and save newly compiled variants
+best-effort. Cache misses and persistence failures fall back to a cold compile.
+`compile_cache: false` is the explicit production opt-out. Cache identity may
+include compile policy and dispatcher generation but must not include Arena
+residency, simulated-card size, transfer plan, or ring placement. See
+`decisions/MEGACACHE.md` for the complete contract and measured evidence.
 
 ## Maintainer validation matrix
 
@@ -68,6 +93,7 @@ model and quantization row must establish the relevant mechanisms below.
 | Quantization independence | Plain, TorchAO/Quanto tensor-subclass, and Ostris packed-buffer layouts pass declaration, canonical construction, resident/streamed execution, and teardown checks where available. |
 | Training | Resident and streamed adapter training produce finite gradients; checkpoint backward performs the planned re-fetches. |
 | Sampling transition | Train -> sample -> train preserves canonical storage and restores the training residency plan. |
+| Compile persistence | Cold -> warm and Mixed -> Full -> Mixed processes reuse every serialized AOT/FX entry with zero backend codegen, Triton compile, graph breaks, and numerical drift. |
 | Structured ABI | Positional or keyword tensor inputs and tensor or nested tensor outputs preserve the original block result. |
 | Sequential jobs | Arena ownership, legacy manager state, transfer runtime, device ring registry, and pin ledger return to baseline before the next job. |
 | Save/resume | Supported quantized layouts dequantize/save and resume through their existing serialization path without arena-specific state. |

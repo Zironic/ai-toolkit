@@ -242,6 +242,8 @@ def main():
         help="max-absolute input and adapter gradient tolerance",
     )
     parser.add_argument("--output-json", default=None)
+    parser.add_argument("--compile-cache-dir", default="tmp/torch_compile_cache")
+    parser.add_argument("--no-compile-cache", action="store_true")
     parser.add_argument(
         "--skip-outer-compile",
         action="store_true",
@@ -308,6 +310,16 @@ def main():
     _compile_resident_blocks(baseline)
     runtime.finalize()
     restored_targets = tuple(runtime._executor._saved_forwards)
+
+    from toolkit.compile_cache import CompileCacheSession
+
+    compile_cache = CompileCacheSession(
+        args.compile_cache_dir,
+        f"smoke_krea2_dispatcher_oracle_{torch.__version__}_{args.qtype}",
+        enabled=not args.no_compile_cache,
+        logger=lambda message: print(f"[oracle] {message}"),
+    )
+    compile_cache.load()
 
     input_args = SimpleNamespace(
         seed=args.seed,
@@ -416,6 +428,7 @@ def main():
         }
         del outer_compiled
 
+    compile_cache.save(force=True)
     executor = runtime._executor
     close_arena_offload(runtime_model)
     pinned_after = pin_manager.pinned_bytes_by_kind().get("weights", 0)

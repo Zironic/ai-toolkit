@@ -8,6 +8,10 @@ from safetensors.torch import save_file, load_file
 
 from jobs.process.BaseProcess import BaseProcess
 from toolkit.config_modules import ModelConfig, GenerateImageConfig
+from toolkit.compile_cache import (
+    CompileCacheSession,
+    DEFAULT_COMPILE_CACHE_BASENAME,
+)
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_model_hash_to_meta, \
     add_base_model_info_to_meta
 from toolkit.sampler import get_sampler
@@ -128,6 +132,17 @@ class GenerateProcess(BaseProcess):
             self.sd.load_model()
             self.sd.pipeline.to(self.device, self.torch_dtype)
 
+            compile_cache = CompileCacheSession.for_model(
+                self.sd,
+                self.model_config,
+                default_cache_dir=os.path.join(
+                    self.output_folder, DEFAULT_COMPILE_CACHE_BASENAME
+                ),
+                compile_enabled=self.generate_config.compile,
+                logger=print,
+            )
+            compile_cache.load()
+
             print("Compiling model...")
             # self.sd.unet = torch.compile(self.sd.unet, mode="reduce-overhead", fullgraph=True)
             if self.generate_config.compile:
@@ -165,6 +180,7 @@ class GenerateProcess(BaseProcess):
                     ))
             # generate images
             self.sd.generate_images(prompt_image_configs, sampler=self.generate_config.sampler)
+            compile_cache.save(force=True)
 
             print("Done generating images")
             # cleanup
