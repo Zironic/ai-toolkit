@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -42,6 +43,21 @@ def run_pre_bash(command: str, cwd: Path = REPO_ROOT) -> dict[str, object] | Non
     if not write_json.called:
         return None
     return write_json.call_args.args[0]
+
+
+class AsciiOnlyStream:
+    encoding = "ascii"
+
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+
+    def write(self, value: str) -> int:
+        value.encode(self.encoding)
+        self.parts.append(value)
+        return len(value)
+
+    def text(self) -> str:
+        return "".join(self.parts)
 
 
 class SharedJunctionSafetyTests(unittest.TestCase):
@@ -102,6 +118,35 @@ class SharedJunctionSafetyTests(unittest.TestCase):
         self.assertIsNone(safety_ask_reason("Get-ChildItem -LiteralPath datasets"))
         self.assertIsNone(safety_ask_reason("Get-ChildItem -LiteralPath output"))
         self.assertIsNone(safety_ask_reason("rm output\\one-disposable-log.txt"))
+
+    def test_lock_taking_ticket_reads_are_denied(self) -> None:
+        commands = (
+            ".\\tools\\git-bug.exe bug show c4e29f1",
+            ".\\tools\\git-bug.exe bug --format plain",
+            ".\\scripts\\tickets.cmd list",
+            ".\\scripts\\tickets.cmd list-closed",
+            ".\\scripts\\tickets.cmd show c4e29f1",
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = run_pre_bash(command)
+                self.assertIsNotNone(result)
+                output = result["hookSpecificOutput"]
+                self.assertEqual("deny", output["permissionDecision"])
+                self.assertIn("single-access lock", output["permissionDecisionReason"])
+
+    def test_ticket_writes_are_not_denied(self) -> None:
+        commands = (
+            ".\\tools\\git-bug.exe bug comment new c4e29f1 --message update",
+            ".\\tools\\git-bug.exe bug status close c4e29f1",
+            ".\\scripts\\tickets.cmd comment c4e29f1 update",
+            ".\\scripts\\tickets.cmd close c4e29f1",
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(run_pre_bash(command))
 
 
 class GpuSmokeToggleTests(unittest.TestCase):
@@ -250,6 +295,81 @@ class ReadPolicyTests(unittest.TestCase):
     def test_git_diff_check_is_not_wrapped_as_high_output(self) -> None:
         self.assertFalse(HOOKS.likely_noisy("git diff --check -- example.py"))
         self.assertTrue(HOOKS.likely_noisy("git diff -- example.py"))
+
+
+class CommandTimeoutTests(unittest.TestCase):
+    def test_test_commands_get_the_longer_timeout(self) -> None:
+        self.assertEqual(
+            HOOKS.TEST_TIMEOUT_SECONDS,
+            HOOKS.command_timeout_seconds("python -m pytest tests -q"),
+        )
+        self.assertEqual(
+            HOOKS.COMMAND_TIMEOUT_SECONDS,
+            HOOKS.command_timeout_seconds("git diff -- README.md"),
+        )
+
+    def test_timeout_is_returned_as_exit_124_with_partial_output(self) -> None:
+        expired = subprocess.TimeoutExpired(
+            cmd=["slow-command"],
+            timeout=1,
+            output="partial output\n",
+            stderr="partial error\n",
+        )
+        process = mock.Mock()
+        process.pid = 1234
+        process.returncode = -1
+        process.communicate.side_effect = [
+            expired,
+            ("partial output\n", "partial error\n"),
+        ]
+        with (
+            mock.patch.object(HOOKS.subprocess, "Popen", return_value=process),
+            mock.patch.object(HOOKS, "_terminate_process_tree") as terminate,
+        ):
+            result = HOOKS.run_bounded_subprocess(
+                ["slow-command"],
+                timeout_seconds=1,
+                text=True,
+                capture_output=True,
+            )
+
+        terminate.assert_called_once_with(process)
+        self.assertEqual(HOOKS.TIMEOUT_RETURN_CODE, result.returncode)
+        self.assertEqual("partial output\n", result.stdout)
+        self.assertIn("partial error", result.stderr)
+        self.assertIn("timed out after 1 seconds", result.stderr)
+
+    def test_real_child_is_stopped_at_the_timeout(self) -> None:
+        started = time.monotonic()
+        result = HOOKS.run_bounded_subprocess(
+            [HOOKS.sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout_seconds=0.2,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(HOOKS.TIMEOUT_RETURN_CODE, result.returncode)
+        self.assertLess(time.monotonic() - started, 5.0)
+
+
+class UnicodeOutputTests(unittest.TestCase):
+    def test_emit_output_escapes_text_unsupported_by_console_encoding(self) -> None:
+        stream = AsciiOnlyStream()
+        arrow = chr(0x2192)
+
+        with mock.patch.object(HOOKS.sys, "stdout", stream):
+            HOOKS.emit_output(f"before {arrow} after")
+
+        self.assertEqual("before \\u2192 after\n", stream.text())
+
+    def test_json_protocol_is_ascii_safe(self) -> None:
+        stream = AsciiOnlyStream()
+        arrow = chr(0x2192)
+
+        with mock.patch.object(HOOKS.sys, "stdout", stream):
+            HOOKS.write_json({"message": arrow})
+
+        self.assertEqual('{"message":"\\u2192"}\n', stream.text())
 
 
 class EditSanitizingTests(unittest.TestCase):

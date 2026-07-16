@@ -636,7 +636,7 @@ separate user-launched acceptance step and must be recorded on the ticket.
 ## Dependencies And Coordination
 
 - Coordinate canonical layout/lifecycle changes with umbrella ticket `553ffec`
-  and remaining acceptance ticket `02fe5b3`.
+  and acceptance ticket `02fe5b3`.
 - Build on the immutable arena implementation tracked by `628b0cb`; do not
   recreate legacy in-graph streaming machinery.
 - Build adapter integration on ticket `6dd9ba6` and

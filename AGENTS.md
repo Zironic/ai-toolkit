@@ -32,6 +32,21 @@ temp folder (`$env:TEMP`) or the repo-local, gitignored `.agent/tmp/`, never the
 repo root. Use `/tmp` only when actually running inside a Linux sandbox session
 where no Windows temp location exists.
 
+### Read-only sandbox commands
+
+Run routine read-only repository and diagnostic commands in the normal sandbox
+first, including reads through the canonical `output/` and `datasets/` paths.
+Do not request elevated execution preemptively. Escalate only after an actual
+filesystem or sandbox denial and only when the read cannot be expressed through
+a sandbox-compatible command.
+
+Native Windows sandbox commands run in constrained PowerShell language mode.
+For read-only summaries, avoid non-core casts such as `[pscustomobject]`, which
+fail in that mode even when every file read is allowed. Use plain strings,
+hashtables with `ConvertTo-Json`, or a focused Python diagnostic instead. Keep
+independent Git/read operations as simple command segments when practical so
+the existing prefix rules can recognize them.
+
 ### ASCII only
 
 Use plain ASCII in source files and in anything passed through PowerShell
@@ -113,8 +128,8 @@ Do not use `git-bug webui` — in git-bug v0.10.1 it holds the `.git/git-bug` st
 - `toolkit/memory_management/arena_offload/` - generic block-native arena
   dispatcher (the primary offload runtime): planner, dispatcher, transfer,
   load session, FP8, cap calibration.
-- `toolkit/memory_management/immutable_runtime.py` - immutable sampling
-  runtime over the arena.
+- `toolkit/memory_management/immutable_runtime.py` - compile-neutral immutable
+  source/residency runtime shared by training and sampling.
 - `toolkit/memory_management/pin_manager.py` - single authority for pinned
   host memory (priority, accounting, eviction).
 - `toolkit/memory_management/vram_budget.py` - NVML-backed free-VRAM and

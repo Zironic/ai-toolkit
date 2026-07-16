@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,20 @@ POST_TOOL_MAX_CHARS = int(os.environ.get("AGENT_HOOK_POST_TOOL_MAX_CHARS", "2400
 # Structured hook output is capped at 10k characters by Claude Code. Leave
 # room for the surrounding JSON and explanatory text.
 POST_HOOK_SUMMARY_MAX_CHARS = 9000
+
+# A wrapper must never turn a short diagnostic into an indefinitely running
+# agent command. Ordinary reads/diffs get a short wall-clock bound; test
+# commands get enough room for this repository's focused and full suites.
+COMMAND_TIMEOUT_SECONDS = float(
+    os.environ.get("AGENT_HOOK_COMMAND_TIMEOUT_SECONDS", "120")
+)
+TEST_TIMEOUT_SECONDS = float(
+    os.environ.get("AGENT_HOOK_TEST_TIMEOUT_SECONDS", "900")
+)
+INTERNAL_TIMEOUT_SECONDS = float(
+    os.environ.get("AGENT_HOOK_INTERNAL_TIMEOUT_SECONDS", "30")
+)
+TIMEOUT_RETURN_CODE = 124
 
 WRAP_MARKER = "__AGENT_HOOK_WRAPPED__=1"
 SKIP_CAP_MARKER = "AGENT_HOOK_NO_CAP=1"
@@ -105,6 +120,20 @@ LOW_OUTPUT_COMMAND_RE = re.compile(
     r"(?i)^\s*git\s+diff\b(?=[^;|&]*--(?:check|quiet)\b)[^;|&]*$"
 )
 
+TEST_COMMAND_RE = re.compile(
+    r"(?ix)(?:"
+    r"\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bpnpm\s+test\b|"
+    r"\byarn\s+test\b|\bdotnet\s+test\b|\bcargo\s+test\b|\bgo\s+test\b"
+    r")"
+)
+
+TICKET_READ_RE = re.compile(
+    r"(?ix)(?:"
+    r"\bgit-bug(?:\.exe)?['\"]?\s+bug\s+(?:show\b|--format\s+(?:plain|json)\b)"
+    r"|\btickets\.cmd['\"]?\s+(?:list(?:-all|-closed)?|show)\b"
+    r")"
+)
+
 # Repo safety guards: mechanical rules from CLAUDE.md that should never depend
 # on the model remembering them. deny = hard rule, ask = user confirms intent.
 SAFETY_DENY: list[tuple[re.Pattern[str], str]] = [
@@ -112,6 +141,10 @@ SAFETY_DENY: list[tuple[re.Pattern[str], str]] = [
      "git-bug webui holds git-bug's single-access lock for its whole lifetime and "
      "blocks all CLI ticket work. Read tickets via the app's /tickets page; use the "
      "CLI (scripts/tickets.cmd) only for writes."),
+    (TICKET_READ_RE,
+     "git-bug read commands take the store's single-access lock and can block "
+     "other ticket work. Browse through the app's /tickets page or use read-only "
+     "git plumbing over refs/bugs/*; reserve git-bug and tickets.cmd for writes."),
     (re.compile(r"(?i)PYTORCH_CUDA_ALLOC_CONF\s*="),
      "Setting PYTORCH_CUDA_ALLOC_CONF (max_split_size_mb/gc_threshold) caused ~30x "
      "slowdowns near full VRAM on this box, and expandable_segments is unsupported "
@@ -255,7 +288,9 @@ def read_event() -> dict[str, Any]:
 
 
 def write_json(obj: dict[str, Any]) -> None:
-    json.dump(obj, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    # JSON escapes preserve Unicode while remaining safe on Windows streams
+    # whose inherited encoding is still cp1252 or ASCII.
+    json.dump(obj, sys.stdout, ensure_ascii=True, separators=(",", ":"))
     sys.stdout.write("\n")
 
 
@@ -679,6 +714,98 @@ def likely_noisy(command: str) -> bool:
         return True
     return False
 
+
+def command_timeout_seconds(command: str) -> float:
+    if TEST_COMMAND_RE.search(command):
+        return TEST_TIMEOUT_SECONDS
+    return COMMAND_TIMEOUT_SECONDS
+
+
+def _timeout_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Best-effort termination of the wrapper child and its descendants."""
+    if proc.poll() is not None:
+        return
+
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_bounded_subprocess(
+    command,
+    *,
+    timeout_seconds: float,
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    """Run one hook child with a wall-clock bound and process-tree cleanup."""
+    timeout = None if timeout_seconds <= 0 else timeout_seconds
+    capture_output = bool(kwargs.pop("capture_output", False))
+    if capture_output:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError("stdout/stderr may not be used with capture_output")
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+
+    if os.name == "nt":
+        kwargs["creationflags"] = int(kwargs.get("creationflags", 0)) | int(
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    else:
+        kwargs.setdefault("start_new_session", True)
+
+    proc = subprocess.Popen(command, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(
+            command,
+            proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(proc)
+        try:
+            final_stdout, final_stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            final_stdout, final_stderr = exc.stdout, exc.stderr
+        stdout = _timeout_output(final_stdout) or _timeout_output(exc.stdout)
+        stderr = _timeout_output(final_stderr) or _timeout_output(exc.stderr)
+        note = f"agent hook: command timed out after {timeout_seconds:g} seconds"
+        stderr = f"{stderr.rstrip()}\n{note}\n" if stderr else note + "\n"
+        return subprocess.CompletedProcess(
+            command,
+            TIMEOUT_RETURN_CODE,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
 # ----------------------------- hook modes -----------------------------
 
 def mode_pre_read() -> int:
@@ -918,8 +1045,9 @@ def git_changed_line_ranges(
     if rel is None:
         return None
 
-    tracked = subprocess.run(
+    tracked = run_bounded_subprocess(
         ["git", "ls-files", "--error-unmatch", "--", rel],
+        timeout_seconds=INTERNAL_TIMEOUT_SECONDS,
         cwd=str(root),
         text=True,
         capture_output=True,
@@ -930,7 +1058,7 @@ def git_changed_line_ranges(
     if tracked.returncode != 0:
         return whole_file_line_ranges(path)
 
-    diff = subprocess.run(
+    diff = run_bounded_subprocess(
         [
             "git",
             "diff",
@@ -941,6 +1069,7 @@ def git_changed_line_ranges(
             "--",
             rel,
         ],
+        timeout_seconds=INTERNAL_TIMEOUT_SECONDS,
         cwd=str(root),
         text=True,
         capture_output=True,
@@ -1172,7 +1301,7 @@ def mode_format_after_edit() -> int:
         if not changed_ranges:
             continue
 
-        proc = subprocess.run(
+        proc = run_bounded_subprocess(
             [
                 ruff,
                 "check",
@@ -1180,6 +1309,7 @@ def mode_format_after_edit() -> int:
                 "json",
                 rel,
             ],
+            timeout_seconds=INTERNAL_TIMEOUT_SECONDS,
             cwd=str(root),
             text=True,
             capture_output=True,
@@ -1237,19 +1367,39 @@ def mode_format_after_edit() -> int:
 def emit_output(text: str) -> None:
     if not text:
         return
-    sys.stdout.write(text)
-    if not text.endswith(("\n", "\r")):
-        sys.stdout.write("\n")
+    output = text if text.endswith(("\n", "\r")) else text + "\n"
+    try:
+        sys.stdout.write(output)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        escaped = output.encode(encoding, errors="backslashreplace").decode(encoding)
+        sys.stdout.write(escaped)
 
 
 def mode_run_capped(args: argparse.Namespace) -> int:
     command = unb64(args.b64)
     cwd = Path.cwd()
+    timeout_seconds = command_timeout_seconds(command)
     bash_exe = shutil.which("bash") if getattr(args, "shell", "system") == "bash" else None
     if bash_exe:
-        proc = subprocess.run([bash_exe, "-c", command], cwd=str(cwd), text=True, capture_output=True, errors="replace")
+        proc = run_bounded_subprocess(
+            [bash_exe, "-c", command],
+            timeout_seconds=timeout_seconds,
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            errors="replace",
+        )
     else:
-        proc = subprocess.run(command, shell=True, cwd=str(cwd), text=True, capture_output=True, errors="replace")
+        proc = run_bounded_subprocess(
+            command,
+            timeout_seconds=timeout_seconds,
+            shell=True,
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            errors="replace",
+        )
     log_path = save_raw_log(cwd, "command", command, proc.stdout, proc.stderr)
     emit_output(
         summarize_output(
@@ -1267,11 +1417,20 @@ def mode_run_ps_capped(args: argparse.Namespace) -> int:
     requested_exe = str(payload.get("exe") or "pwsh")
     script = str(payload.get("script") or "")
     cwd = Path.cwd()
+    timeout_seconds = command_timeout_seconds(script)
 
     exe = resolve_powershell_exe(requested_exe)
     if not exe:
         # Fallback: run through shell, still capped, if PowerShell executable is not found.
-        proc = subprocess.run(script, shell=True, cwd=str(cwd), text=True, capture_output=True, errors="replace")
+        proc = run_bounded_subprocess(
+            script,
+            timeout_seconds=timeout_seconds,
+            shell=True,
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            errors="replace",
+        )
         log_path = save_raw_log(cwd, "powershell_fallback", script, proc.stdout, proc.stderr)
         emit_output(
             summarize_output(
@@ -1302,8 +1461,9 @@ def mode_run_ps_capped(args: argparse.Namespace) -> int:
         run_cmd = encoded_cmd
 
     try:
-        proc = subprocess.run(
+        proc = run_bounded_subprocess(
             run_cmd,
+            timeout_seconds=timeout_seconds,
             cwd=str(cwd),
             text=True,
             encoding="utf-8",

@@ -1,5 +1,5 @@
 # PRXTransformer2DModel -- vendored, self-contained copy of the Photoroom PRX
-# transformer so ai-toolkit does not depend on an unmerged diffusers PR
+# transformer because ai-toolkit's diffusers pin predates merged PR #13928
 # (https://github.com/huggingface/diffusers/pull/13928).
 #
 # This is the architecture as it appears on the ``prx-pixel`` branch, with two

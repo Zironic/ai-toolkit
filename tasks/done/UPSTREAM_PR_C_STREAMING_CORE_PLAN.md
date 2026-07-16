@@ -2,7 +2,7 @@
 > and the model-agnostic subplans were retired when the immutable arena runtime
 > became the sole transformer backend (commit `3dd7f38`): PRs C and D were built
 > on `_BouncingLinearFn`, which no longer exists on the active path. Kept as the
-> record of the reasoning. **Current plan:**
+> record of the reasoning. **Final extraction plan:**
 > `tasks/done/UPSTREAM_ARENA_EXTRACTION_PLAN.md` (PR P's crash-guard framing and
 > upstream audit survive there as Stage 1; PR A as the deferred Stage 4).
 

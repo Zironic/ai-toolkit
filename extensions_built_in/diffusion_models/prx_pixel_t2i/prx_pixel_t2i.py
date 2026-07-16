@@ -1,9 +1,10 @@
 """PRXPixelT2IModel -- the Photoroom pixel-space PRX-7B text-to-image model
 (https://huggingface.co/Photoroom/prxpixel-t2i) wired into ai-toolkit.
 
-This is implemented from scratch (the diffusers support is an unmerged PR,
-https://github.com/huggingface/diffusers/pull/13928) so ai-toolkit does not
-depend on it: the transformer architecture is vendored in ``src/transformer_prx.py``
+This is implemented from scratch because ai-toolkit's pinned diffusers revision
+predates merged PR #13928 (https://github.com/huggingface/diffusers/pull/13928),
+so that pin does not provide PRX support. The transformer architecture is vendored
+in ``src/transformer_prx.py``
 and a minimal sampler lives in ``src/pipeline.py``.
 
 What makes PRXPixel unusual (and what each override below is doing about it):

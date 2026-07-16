@@ -190,7 +190,8 @@ env vars.
 ## Pointers (source of truth for current behavior)
 
 - `toolkit/memory_management/arena_offload/` -- generic arena dispatcher
-  (primary offload runtime); sampling via `immutable_runtime.py`
+  (primary offload runtime), backed by `immutable_runtime.py` for shared
+  training/sampling source and residency transitions
 - `toolkit/memory_management/manager.py` -- legacy planner + live controllers
 - `toolkit/memory_management/manager_modules.py` -- per-Linear streaming
 - `toolkit/memory_management/bounce_pool.py` -- pinned bounce pool + ledger

@@ -166,7 +166,7 @@ A folder with the name and the training folder from the config file will be crea
 checkpoints and images in it. You can stop the training at any time using ctrl+c and when you resume, it will pick back up
 from the last checkpoint.
 
-This fork writes checkpoints atomically (each file is written to a temporary path and moved into place, on a background worker), so pressing ctrl+c during a save leaves the previous complete checkpoint intact instead of corrupting it. Letting a save finish before interrupting still avoids losing the newest checkpoint.
+This fork writes LoRA/network and recovery safetensors plus optimizer state atomically, using temporary paths and background workers. Other checkpoint types, including embedding, decorator, adapter, and full-model/diffusers saves, still use their existing save paths; wait for those saves to finish before pressing ctrl+c. Even for background saves, waiting avoids losing the newest checkpoint.
 
 ### Need help?
 
