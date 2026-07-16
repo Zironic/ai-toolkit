@@ -434,30 +434,23 @@ class AnimaModel(BaseModel):
                 (1, channels, 1, latent_height, latent_width),
                 generator=generator,
                 device=self.device_torch,
-                dtype=self.torch_dtype,
+                dtype=torch.float32,
             )
         else:
-            latents = gen_config.latents.to(self.device_torch, self.torch_dtype)
+            latents = gen_config.latents.to(self.device_torch, torch.float32)
             if latents.ndim == 4:
                 latents = latents.unsqueeze(2)
 
-        sequence_length = max(
-            max(item.shape[0] for item in conditional_embeds.text_embeds),
-            max(item.shape[0] for item in unconditional_embeds.text_embeds),
-        )
         conditional = _pad_prompt_embeds(
             conditional_embeds.text_embeds,
             self.device_torch,
             self.torch_dtype,
-            sequence_length,
         )
         unconditional = _pad_prompt_embeds(
             unconditional_embeds.text_embeds,
             self.device_torch,
             self.torch_dtype,
-            sequence_length,
         )
-        encoder_hidden_states = torch.cat([unconditional, conditional])
         padding_mask = latents.new_zeros(
             1, 1, height, width, dtype=self.torch_dtype
         )
@@ -470,17 +463,26 @@ class AnimaModel(BaseModel):
         for timestep in scheduler.timesteps:
             model_timestep = timestep.expand(1).to(self.torch_dtype)
             model_timestep = model_timestep / scheduler.config.num_train_timesteps
+            latent_model_input = latents.to(self.torch_dtype)
             with torch.no_grad():
-                prediction = self.model(
-                    hidden_states=torch.cat([latents, latents]),
-                    timestep=model_timestep.repeat(2),
-                    encoder_hidden_states=encoder_hidden_states,
+                conditional_prediction = self.model(
+                    hidden_states=latent_model_input,
+                    timestep=model_timestep,
+                    encoder_hidden_states=conditional,
                     padding_mask=padding_mask,
                     return_dict=False,
                 )[0]
-            if isinstance(prediction, QTensor):
-                prediction = prediction.dequantize()
-            unconditional_prediction, conditional_prediction = prediction.chunk(2)
+                unconditional_prediction = self.model(
+                    hidden_states=latent_model_input,
+                    timestep=model_timestep,
+                    encoder_hidden_states=unconditional,
+                    padding_mask=padding_mask,
+                    return_dict=False,
+                )[0]
+            if isinstance(conditional_prediction, QTensor):
+                conditional_prediction = conditional_prediction.dequantize()
+            if isinstance(unconditional_prediction, QTensor):
+                unconditional_prediction = unconditional_prediction.dequantize()
             prediction = unconditional_prediction + gen_config.guidance_scale * (
                 conditional_prediction - unconditional_prediction
             )

@@ -54,6 +54,7 @@ class _FakeTransformer(torch.nn.Module):
         self.hidden_states = None
         self.padding_mask = None
         self.encoder_hidden_states = None
+        self.encoder_sequence_lengths = []
 
     @property
     def device(self):
@@ -70,7 +71,23 @@ class _FakeTransformer(torch.nn.Module):
         self.hidden_states = hidden_states
         self.padding_mask = padding_mask
         self.encoder_hidden_states = encoder_hidden_states
+        self.encoder_sequence_lengths.append(encoder_hidden_states.shape[1])
         return (hidden_states,)
+
+
+class _FakeScheduler:
+    def __init__(self):
+        self.config = SimpleNamespace(num_train_timesteps=1000)
+        self.timesteps = torch.tensor([1000.0])
+
+    def set_timesteps(self, sigmas, device):
+        self.timesteps = self.timesteps.to(device)
+
+    def set_begin_index(self, index):
+        self.begin_index = index
+
+    def step(self, prediction, timestep, latents, return_dict=False):
+        return (latents,)
 
 
 class _FakeTokenizer:
@@ -185,3 +202,30 @@ def test_anima_scheduler_uses_checkpoint_static_shift():
 
     assert scheduler.config.use_dynamic_shifting is False
     torch.testing.assert_close(scheduler.timesteps, torch.tensor([1000.0, 750.0]))
+
+
+def test_anima_sampling_preserves_distinct_cfg_sequence_lengths():
+    model = _bare_model()
+    model.model = _FakeTransformer()
+    model.get_train_scheduler = lambda: _FakeScheduler()
+    model.decode_latents = lambda latents: torch.zeros(1, 3, 16, 16)
+    conditional = AdvancedPromptEmbeds(text_embeds=[torch.ones(7, 6)])
+    unconditional = AdvancedPromptEmbeds(text_embeds=[torch.ones(3, 6)])
+    gen_config = SimpleNamespace(
+        height=16,
+        width=16,
+        latents=None,
+        num_inference_steps=1,
+        guidance_scale=4.0,
+    )
+
+    model.generate_single_image(
+        pipeline=None,
+        gen_config=gen_config,
+        conditional_embeds=conditional,
+        unconditional_embeds=unconditional,
+        generator=torch.Generator().manual_seed(42),
+        extra={},
+    )
+
+    assert model.model.encoder_sequence_lengths == [7, 3]
