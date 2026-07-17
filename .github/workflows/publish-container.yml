@@ -1,0 +1,72 @@
+name: Publish fork container
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Compute image metadata
+        id: meta
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          short_sha="${GITHUB_SHA::12}"
+          ref_tag="$(printf '%s' "${GITHUB_REF_NAME}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g; s/^-//; s/-$//')"
+          created="$(git show -s --format=%aI "${GITHUB_SHA}")"
+          {
+            echo "image=${image}"
+            echo "short_sha=${short_sha}"
+            echo "ref_tag=${ref_tag}"
+            echo "created=${created}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build and push linux/amd64 image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short_sha }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.ref_tag }}
+          build-args: |
+            SOURCE_REPO=${{ github.server_url }}/${{ github.repository }}.git
+            SOURCE_REF=${{ github.sha }}
+            SOURCE_CREATED=${{ steps.meta.outputs.created }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Record immutable image identity
+        shell: bash
+        run: |
+          {
+            echo "### Published container"
+            echo ""
+            echo "- Image: \`${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short_sha }}\`"
+            echo "- Source: \`${GITHUB_SHA}\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

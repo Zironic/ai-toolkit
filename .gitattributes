@@ -1,0 +1,2 @@
+docker/*.sh text eol=lf
+build_and_push_docker* text eol=lf

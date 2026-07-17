@@ -1,70 +1,103 @@
 #!/bin/bash
-set -e  # Exit the script if any statement returns a non-true return value
+set -euo pipefail
 
-# ref https://github.com/runpod/containers/blob/main/container-template/start.sh
-
-# ---------------------------------------------------------------------------- #
-#                          Function Definitions                                #
-# ---------------------------------------------------------------------------- #
-
-
-# Setup ssh
+# Keep optional SSH support for remote Docker hosts without making the local
+# Docker path depend on provider-specific environment variables.
 setup_ssh() {
-    if [[ $PUBLIC_KEY ]]; then
-        echo "Setting up SSH..."
-        mkdir -p ~/.ssh
-        echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys
-        chmod 700 -R ~/.ssh
-
-         if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
-            ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -q -N ''
-            echo "RSA key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub
-        fi
-
-        if [ ! -f /etc/ssh/ssh_host_dsa_key ]; then
-            ssh-keygen -t dsa -f /etc/ssh/ssh_host_dsa_key -q -N ''
-            echo "DSA key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_dsa_key.pub
-        fi
-
-        if [ ! -f /etc/ssh/ssh_host_ecdsa_key ]; then
-            ssh-keygen -t ecdsa -f /etc/ssh/ssh_host_ecdsa_key -q -N ''
-            echo "ECDSA key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub
-        fi
-
-        if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
-            ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -q -N ''
-            echo "ED25519 key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-        fi
-
-        service ssh start
-
-        echo "SSH host keys:"
-        for key in /etc/ssh/*.pub; do
-            echo "Key: $key"
-            ssh-keygen -lf $key
-        done
+    if [[ -z "${PUBLIC_KEY:-}" ]]; then
+        return
     fi
+
+    echo "Setting up SSH..."
+    install -d -m 700 /root/.ssh
+    printf '%s\n' "${PUBLIC_KEY}" > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    ssh-keygen -A
+    service ssh start
 }
 
-# Export env vars
-export_env_vars() {
-    echo "Exporting environment variables..."
-    printenv | grep -E '^RUNPOD_|^PATH=|^_=' | awk -F = '{ print "export " $1 "=\"" $2 "\"" }' >> /etc/rp_environment
-    echo 'source /etc/rp_environment' >> ~/.bashrc
+# Preserve RunPod variables in interactive SSH shells when they are present.
+# This is inert on an ordinary local Docker Engine.
+export_runpod_env() {
+    if ! printenv | grep -q '^RUNPOD_'; then
+        return
+    fi
+
+    echo "Exporting RunPod environment variables..."
+    printenv | grep -E '^RUNPOD_|^PATH=|^_=' \
+        | awk -F = '{ print "export " $1 "=\"" $2 "\"" }' \
+        > /etc/rp_environment
+    grep -qF 'source /etc/rp_environment' /root/.bashrc \
+        || echo 'source /etc/rp_environment' >> /root/.bashrc
 }
 
-# ---------------------------------------------------------------------------- #
-#                               Main Program                                   #
-# ---------------------------------------------------------------------------- #
+# Initialize persistent state without overwriting anything the user already
+# placed in /workspace. Application paths are linked to these paths at runtime.
+prepare_workspace() {
+    mkdir -p \
+        /workspace/output \
+        /workspace/datasets \
+        /workspace/config \
+        /workspace/.cache/huggingface \
+        /workspace/.cache/torch \
+        /workspace/.cache/torchinductor
 
+    if [[ -z "$(find /workspace/config -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        cp -a /opt/ai-toolkit-seed/config/. /workspace/config/
+    fi
 
-echo "Pod Started"
+    if [[ ! -e /workspace/aitk_db.db ]]; then
+        cp /opt/ai-toolkit-seed/aitk_db.db /workspace/aitk_db.db
+    fi
+
+    link_workspace_directory output
+    link_workspace_directory datasets
+    link_workspace_directory config
+    link_workspace_file aitk_db.db
+
+    export HF_HOME=/workspace/.cache/huggingface
+    export TORCH_HOME=/workspace/.cache/torch
+    export TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+    export XDG_CACHE_HOME=/workspace/.cache
+}
+
+link_workspace_directory() {
+    local name="$1"
+    local target="/app/ai-toolkit/${name}"
+
+    if mountpoint -q "${target}"; then
+        echo "Using direct mount at ${target}"
+        return
+    fi
+
+    if [[ -L "${target}" ]]; then
+        rm -f "${target}"
+    elif [[ -e "${target}" ]]; then
+        rm -rf "${target}"
+    fi
+    ln -s "/workspace/${name}" "${target}"
+}
+
+link_workspace_file() {
+    local name="$1"
+    local target="/app/ai-toolkit/${name}"
+
+    if mountpoint -q "${target}"; then
+        echo "Using direct mount at ${target}"
+        return
+    fi
+
+    rm -f "${target}"
+    ln -s "/workspace/${name}" "${target}"
+}
+
+echo "AI Toolkit container started"
 
 setup_ssh
-export_env_vars
+export_runpod_env
+prepare_workspace
+
+cd /app/ai-toolkit/ui
+npm run update_db
 echo "Starting AI Toolkit UI..."
-cd /app/ai-toolkit/ui && npm run start 
+exec npm run start

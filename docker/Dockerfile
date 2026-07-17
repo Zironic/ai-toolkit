@@ -1,5 +1,9 @@
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 
+ARG SOURCE_REPO=https://github.com/Zironic/ai-toolkit.git
+ARG SOURCE_REF=faster-dop
+ARG SOURCE_CREATED=unknown
+
 LABEL authors="jaret"
 
 # Set noninteractive to avoid timezone prompts
@@ -72,20 +76,40 @@ RUN cd /app/ai-toolkit/ui && npm ci
 # Source code comes LAST. Only this layer (plus the UI build below) is rebuilt
 # on a code change, so servers only re-pull the (small) source, not the deps.
 # Clone to a temp dir and rsync the source in, preserving the dependency dirs
-# already populated above (ui/node_modules) and the manifests already used.
+# already populated above (ui/node_modules), the manifests already used, and
+# the shallow .git directory that identifies the image source.
 # ---------------------------------------------------------------------------- #
-ARG CACHEBUST=1234
-ARG GIT_COMMIT=main
-RUN echo "Cache bust: ${CACHEBUST}" && \
-    git clone https://github.com/ostris/ai-toolkit.git /tmp/ai-toolkit-src && \
+LABEL org.opencontainers.image.source="${SOURCE_REPO}" \
+      org.opencontainers.image.revision="${SOURCE_REF}" \
+      org.opencontainers.image.created="${SOURCE_CREATED}"
+
+ARG ALLOW_PACKAGE_LOCK_MISMATCH=0
+RUN git init /tmp/ai-toolkit-src && \
     cd /tmp/ai-toolkit-src && \
-    git checkout ${GIT_COMMIT} && \
+    git remote add origin "${SOURCE_REPO}" && \
+    git fetch --depth 1 origin "${SOURCE_REF}" && \
+    git checkout --detach FETCH_HEAD && \
+    actual_revision="$(git rev-parse HEAD)" && \
+    if [ "${#SOURCE_REF}" -eq 40 ]; then test "${actual_revision}" = "${SOURCE_REF}"; fi && \
+    diff --brief --strip-trailing-cr requirements.txt /app/ai-toolkit/requirements.txt && \
+    diff --brief --strip-trailing-cr requirements_base.txt /app/ai-toolkit/requirements_base.txt && \
+    diff --brief --strip-trailing-cr ui/package.json /app/ai-toolkit/ui/package.json && \
+    if ! diff --brief --strip-trailing-cr ui/package-lock.json /app/ai-toolkit/ui/package-lock.json; then \
+        test "${ALLOW_PACKAGE_LOCK_MISMATCH}" = "1"; \
+        echo "WARNING: using a local package-lock repair for dependency installation"; \
+    fi && \
     rsync -a --delete \
         --exclude 'ui/node_modules' \
-        --exclude 'requirements.txt' \
-        --exclude 'ui/package.json' \
-        --exclude 'ui/package-lock.json' \
         /tmp/ai-toolkit-src/ /app/ai-toolkit/ && \
+    python_version="$(python --version 2>&1 | awk '{print $2}')" && \
+    torch_version="$(python -c 'import torch; print(torch.__version__)')" && \
+    cuda_version="$(python -c 'import torch; print(torch.version.cuda)')" && \
+    node_version="$(node --version)" && \
+    printf '{"source":"%s","revision":"%s","created":"%s","python":"%s","torch":"%s","cuda":"%s","node":"%s","package_lock_mismatch_allowed":%s}\n' \
+        "${SOURCE_REPO}" "${actual_revision}" "${SOURCE_CREATED}" \
+        "${python_version}" "${torch_version}" "${cuda_version}" "${node_version}" \
+        "${ALLOW_PACKAGE_LOCK_MISMATCH}" \
+        > /etc/ai-toolkit-image.json && \
     rm -rf /tmp/ai-toolkit-src
 
 # Build UI (re-runs on code change, but reuses the cached node_modules above).
@@ -97,8 +121,17 @@ RUN cd /app/ai-toolkit/ui && \
     npm run update_db && \
     npm run build
 
-# Expose port (assuming the application runs on port 3000)
+# Keep immutable seeds outside the application tree. The entrypoint installs
+# workspace links at container start so the image's Git worktree stays clean.
+RUN mkdir -p /opt/ai-toolkit-seed && \
+    cp -a /app/ai-toolkit/config /opt/ai-toolkit-seed/config && \
+    cp /app/ai-toolkit/aitk_db.db /opt/ai-toolkit-seed/aitk_db.db && \
+    rm -f /app/ai-toolkit/aitk_db.db
+
+# Expose the Toolkit UI port.
 EXPOSE 8675
+
+VOLUME ["/workspace"]
 
 WORKDIR /
 

@@ -140,6 +140,12 @@ npm run build_and_start
 
 You can now access the UI at `http://localhost:8675` or `http://<your-ip>:8675` if you are running it on a server.
 
+## Docker image for this fork
+
+This fork includes an exact-commit Linux NVIDIA image, local Docker Engine GPU
+acceptance instructions, `/workspace` persistence, Docker Compose, and a manual
+GHCR publishing workflow. See [docs/DOCKER.md](docs/DOCKER.md).
+
 ## Securing the UI
 
 If you are hosting the UI on a cloud provider or any network that is not secure, I highly recommend securing it with an auth token. 

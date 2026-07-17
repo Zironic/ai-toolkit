@@ -1,21 +1,23 @@
-version: "3.8"
-
 services:
   ai-toolkit:
-    image: ostris/aitoolkit:latest
+    image: ${AI_TOOLKIT_IMAGE:-zironic/ai-toolkit:local}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        SOURCE_REPO: ${SOURCE_REPO:-https://github.com/Zironic/ai-toolkit.git}
+        SOURCE_REF: ${SOURCE_REF:-faster-dop}
+        SOURCE_CREATED: ${SOURCE_CREATED:-unknown}
+        ALLOW_PACKAGE_LOCK_MISMATCH: ${ALLOW_PACKAGE_LOCK_MISMATCH:-0}
     restart: unless-stopped
     ports:
       - "8675:8675"
     volumes:
-      - ~/.cache/huggingface/hub:/root/.cache/huggingface/hub
-      - ./aitk_db.db:/app/ai-toolkit/aitk_db.db
-      - ./datasets:/app/ai-toolkit/datasets
-      - ./output:/app/ai-toolkit/output
-      - ./config:/app/ai-toolkit/config
+      - ai-toolkit-workspace:/workspace
     environment:
-      - AI_TOOLKIT_AUTH=${AI_TOOLKIT_AUTH:-password}
-      - NODE_ENV=production
-      - TZ=UTC
+      AI_TOOLKIT_AUTH: ${AI_TOOLKIT_AUTH:-}
+      NODE_ENV: production
+      TZ: ${TZ:-UTC}
     deploy:
       resources:
         reservations:
@@ -23,3 +25,6 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+volumes:
+  ai-toolkit-workspace:

@@ -1,29 +1,36 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# Extract version from version.py
-if [ -f "version.py" ]; then
-    VERSION=$(python3 -c "from version import VERSION; print(VERSION)")
-    echo "Building version: $VERSION"
-else
-    echo "Error: version.py not found. Please create a version.py file with VERSION defined."
+IMAGE_REPO="${IMAGE_REPO:-ghcr.io/zironic/ai-toolkit}"
+SOURCE_REPO="${SOURCE_REPO:-https://github.com/Zironic/ai-toolkit.git}"
+SOURCE_REF="${SOURCE_REF:-$(git rev-parse HEAD)}"
+SOURCE_CREATED="${SOURCE_CREATED:-$(git show -s --format=%aI "${SOURCE_REF}")}"
+ALIAS_TAG="${ALIAS_TAG:-}"
+SHORT_SHA="${SOURCE_REF:0:12}"
+IMMUTABLE_TAG="${IMAGE_REPO}:sha-${SHORT_SHA}"
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Refusing to publish from a dirty worktree."
     exit 1
 fi
 
-echo "Docker builds from the repo, not this dir. Make sure changes are pushed to the repo."
-echo "Building version: $VERSION and latest"
-# wait 2 seconds
-sleep 2
+build_args=(
+    --file docker/Dockerfile
+    --build-arg "SOURCE_REPO=${SOURCE_REPO}"
+    --build-arg "SOURCE_REF=${SOURCE_REF}"
+    --build-arg "SOURCE_CREATED=${SOURCE_CREATED}"
+    --tag "${IMMUTABLE_TAG}"
+)
 
-# Build the image with cache busting
-docker build --build-arg CACHEBUST=$(date +%s) -t aitoolkit:$VERSION -f docker/Dockerfile .
+if [[ -n "${ALIAS_TAG}" ]]; then
+    build_args+=(--tag "${IMAGE_REPO}:${ALIAS_TAG}")
+fi
 
-# Tag with version and latest
-docker tag aitoolkit:$VERSION ostris/aitoolkit:$VERSION
-docker tag aitoolkit:$VERSION ostris/aitoolkit:latest
+docker build "${build_args[@]}" .
+docker push "${IMMUTABLE_TAG}"
 
-# Push both tags
-echo "Pushing images to Docker Hub..."
-docker push ostris/aitoolkit:$VERSION
-docker push ostris/aitoolkit:latest
+if [[ -n "${ALIAS_TAG}" ]]; then
+    docker push "${IMAGE_REPO}:${ALIAS_TAG}"
+fi
 
-echo "Successfully built and pushed ostris/aitoolkit:$VERSION and ostris/aitoolkit:latest"
+echo "Published ${IMMUTABLE_TAG}"
